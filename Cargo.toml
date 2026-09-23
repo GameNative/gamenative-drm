@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["modules/gndrm-uapi", "modules/gndrm-daemon"]
+members = ["modules/gndrm-uapi", "modules/gndrm-daemon", "modules/gndrm-android"]
 
 [workspace.package]
 version = "0.1.0"

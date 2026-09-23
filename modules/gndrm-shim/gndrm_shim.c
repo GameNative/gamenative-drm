@@ -104,11 +104,14 @@ static int connect_one(const char *path)
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof(sa));
     sa.sun_family = AF_UNIX;
-    if (path[0] == '@') { /* abstract namespace */
-        sa.sun_path[0] = '\0';
+    /* Address convention (matches the daemon's listen side): "/abs/path" is
+     * a filesystem socket; "@name" or a bare "name" is abstract namespace. */
+    if (path[0] == '@') {
         strncpy(sa.sun_path + 1, path + 1, sizeof(sa.sun_path) - 2);
-    } else {
+    } else if (strchr(path, '/')) {
         strncpy(sa.sun_path, path, sizeof(sa.sun_path) - 1);
+    } else {
+        strncpy(sa.sun_path + 1, path, sizeof(sa.sun_path) - 2);
     }
     if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         close(fd);
@@ -332,6 +335,19 @@ static int open_common(void)
     }
     g_opened = true;
     return g_event_fd;
+}
+
+/*
+ * Explicit connect API for patched clients (gamescope's D1 patch calls this
+ * via a weak symbol instead of relying on open("/dev/dri/cardN")
+ * interposition). Requires GAMENATIVE_DRM_SOCKET to be set; returns the
+ * event-channel fd exactly like an intercepted open() would, -1/errno on
+ * failure (ECONNREFUSED = daemon unreachable, EBUSY = already connected).
+ * Default visibility on purpose: this symbol is the shim's public ABI.
+ */
+int gamenative_drm_connect(void)
+{
+    return open_common();
 }
 
 /*

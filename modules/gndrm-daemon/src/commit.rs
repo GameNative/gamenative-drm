@@ -245,17 +245,16 @@ impl Device {
         }
         let crtc_on = self.crtc_state().active;
 
-        // Consume the fence: the buffer is ready to scan out. The real
-        // presenter will wait/poll it; phase-1 semantics: ownership moves to
-        // the daemon and we release it once the frame is presented.
-        if let Some(fd) = fence_fd {
-            close_fence_after_present(fd);
-        }
-
-        // Present when the primary FB changed under an active CRTC.
+        // Present when the primary FB changed under an active CRTC; fence
+        // ownership moves to the presenter (it polls before sampling).
+        // No present this commit (cursor-only update, CRTC off, …): nobody
+        // else consumes the fence, so release it here — the client must not
+        // leak it either way.
         let new_fb = self.primary_state().fb_id;
         if crtc_on && new_fb != 0 && new_fb != old_primary_fb {
-            self.present_primary(new_fb);
+            self.present_primary(new_fb, fence_fd);
+        } else if let Some(fd) = fence_fd {
+            crate::close_fd(fd);
         }
 
         if commit.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
@@ -297,11 +296,4 @@ pub(crate) fn apply_plane_prop_pub(
         P_PLANE_IN_FENCE_FD => {} // consumed, not state
         _ => {}
     }
-}
-
-/// Release the acquire fence. Phase 1 (NullPresenter): close immediately.
-/// Phase 3: the EGL presenter waits on it before sampling the buffer.
-fn close_fence_after_present(fd: RawFd) {
-    // SAFETY: fd ownership moved to the daemon by the wire contract.
-    unsafe { libc::close(fd) };
 }

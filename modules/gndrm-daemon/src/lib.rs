@@ -15,6 +15,7 @@ mod objects;
 #[doc(hidden)] // exposed for integration tests; not public API
 pub mod pod;
 mod props;
+pub mod server;
 
 use std::os::fd::RawFd;
 
@@ -22,11 +23,11 @@ use gndrm_uapi::drm::*;
 use gndrm_uapi::mode::*;
 use gndrm_uapi::wire::errno;
 
-pub use objects::{CrtcState, PanelDesc, PlaneState};
+pub use objects::{CrtcState, Framebuffer, PanelDesc, PlaneState, Stores};
 pub use objects::{CONNECTOR_ID, CRTC_ID, ENCODER_ID, PLANE_CURSOR_ID, PLANE_PRIMARY_ID};
 pub use props::find_prop_id;
 
-use objects::{Blob, Framebuffer, Stores};
+use objects::Blob;
 use pod::*;
 
 /// Driver identity reported by `DRM_IOCTL_VERSION`.
@@ -89,9 +90,14 @@ impl DispatchResult {
 /// EGL/GLES; tests use [`NullPresenter`].
 pub trait Presenter {
     /// Present the primary-plane FB of a commit. Called at most once per
-    /// non-test commit that has an active CRTC. `gems` gives access to the
+    /// non-test commit that has an active CRTC. `stores` gives access to the
     /// backing dma-buf fds.
-    fn present(&mut self, fb: &Framebuffer, stores: &Stores);
+    ///
+    /// `fence` is the acquire fence from the commit's `IN_FENCE_FD`
+    /// (ownership transferred; the presenter must close it). Real presenters
+    /// `poll()` it readable before sampling the buffer; `None` means the
+    /// client passed `-1` (no fence).
+    fn present(&mut self, fb: &Framebuffer, stores: &Stores, fence: Option<RawFd>);
 }
 
 /// Default presenter: drops frames. Phase-1 unit tests + headless runs.
@@ -102,8 +108,11 @@ pub struct NullPresenter {
 }
 
 impl Presenter for NullPresenter {
-    fn present(&mut self, _fb: &Framebuffer, _stores: &Stores) {
+    fn present(&mut self, _fb: &Framebuffer, _stores: &Stores, fence: Option<RawFd>) {
         self.frames += 1;
+        if let Some(fd) = fence {
+            close_fd(fd);
+        }
     }
 }
 
@@ -198,10 +207,13 @@ impl Device {
         commit::apply_plane_prop_pub(plane, prop_index, value);
     }
 
-    /// Hand the current primary FB to the presenter.
-    pub(crate) fn present_primary(&mut self, fb_id: u32) {
+    /// Hand the current primary FB to the presenter. Ownership of
+    /// `fence` moves to the presenter (see [`Presenter::present`]).
+    pub(crate) fn present_primary(&mut self, fb_id: u32, fence: Option<RawFd>) {
         if let Some(fb) = self.stores.fbs.get(&fb_id).cloned() {
-            self.presenter.present(&fb, &self.stores);
+            self.presenter.present(&fb, &self.stores, fence);
+        } else if let Some(fd) = fence {
+            close_fd(fd);
         }
     }
 

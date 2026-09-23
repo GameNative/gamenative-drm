@@ -1,0 +1,20 @@
+[package]
+name = "gndrm-android"
+description = "In-app daemon: JNI entry points, SEQPACKET server, EGL presenter (Android-only)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# System.loadLibrary("gamenative_drm") -> libgamenative_drm.so
+[lib]
+name = "gamenative_drm"
+crate-type = ["cdylib"]
+
+# Everything Android-specific is an android-only dependency: on the host the
+# crate compiles to an empty stub so workspace-wide fmt/clippy/test stay green
+# (real verification of this module is `tools/build-android.sh` + on-device).
+[target.'cfg(target_os = "android")'.dependencies]
+gndrm-daemon = { path = "../gndrm-daemon" }
+gndrm-uapi = { path = "../gndrm-uapi" }
+jni = "0.21"
+libc = "0.2"
