@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["modules/gndrm-uapi", "modules/gndrm-daemon"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Perf-critical profile settings shared by the Android cdylib later.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

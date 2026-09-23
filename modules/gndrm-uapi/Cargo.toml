@@ -1,0 +1,13 @@
+[package]
+name = "gndrm-uapi"
+description = "Linux DRM/KMS UAPI mirror (drm.h / drm_mode.h subset) + daemon wire protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints.clippy]
+all = "deny"
+pedantic = "warn"
+
+[dev-dependencies]
+cc = "1"
