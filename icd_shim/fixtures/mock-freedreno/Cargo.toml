@@ -1,0 +1,21 @@
+[package]
+name = "mock-freedreno"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host-test fixture: mock_vkdriver built under the payload fallback SONAME"
+publish = false
+
+# The shim's fallback path dlopens "libvulkan_freedreno.so" by name; building
+# the shared mock source under this lib name gives tests exactly that file.
+[lib]
+name = "vulkan_freedreno"
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"
+
+# FFI entry points; the safety contract is the vulkan/loader ABI, documented
+# in the crate-level docs.
+[lints.clippy]
+missing_safety_doc = "allow"

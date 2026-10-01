@@ -2,12 +2,17 @@
 //!
 //! The in-app half of gamenative-drm (doc `02` §7): JNI entry points called
 //! from GameNative's display screen, the SEQPACKET server gamescope's shim
-//! connects to, and the EGL presenter.
+//! connects to, and the native SurfaceControl presenter (doc `android/06`,
+//! see `asc.rs`).
 //!
-//! Lifecycle: `nativeStart(socket, surface, w, h, hz)` → EGL up on a
-//! dedicated server thread → accept RPC + event connections → `serve()`.
-//! `nativeStop()` shuts the sockets down (unblocks accept/recv), joins the
-//! thread (EGL teardown happens there), releases the window.
+//! JNI class: `app.gamenative.display.GameNativeDrm`.
+//!
+//! Lifecycle: `nativeStart(socket, surface, w, h, hz)` → the SurfaceControl
+//! layer is created on a dedicated server thread → accept the RPC and event
+//! connections → `serve()`, while a second thread accepts the scan-out
+//! allocator channel for as long as the session runs. `nativeStop()` shuts the
+//! sockets down (unblocks accept/recv), joins the threads (presenter teardown
+//! happens on the server thread), releases the window.
 //!
 //! On non-Android targets this crate is an empty stub so host-side
 //! workspace gates (fmt/clippy/test) stay green; the real gates for this
@@ -16,20 +21,25 @@
 #![deny(clippy::all)]
 #![cfg(target_os = "android")]
 
-mod egl;
+mod asc;
 pub mod ffi;
+mod injector;
 #[macro_use]
 mod log;
 
+use std::io;
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use jni::objects::{JClass, JObject, JString};
-use jni::sys::{jfloat, jint};
+use jni::sys::{jboolean, jfloat, jint, jlong};
 use jni::JNIEnv;
 
+use gndrm_daemon::diag;
 use gndrm_daemon::server;
 use gndrm_daemon::{Device, PanelDesc};
 
@@ -39,12 +49,22 @@ const E_INVAL: jint = -22;
 const E_FAULT: jint = -14;
 const E_IO: jint = -5;
 
+/// Real frames put on the panel (fb != 0 commits — gamescope's blank fb=0
+/// commits excluded). Reset by `nativeStart`/`nativeStop`; polled by the app
+/// via `nativeFramesPresented` for first-frame splash dismissal.
+pub(crate) static PRESENTED_FRAMES: AtomicU64 = AtomicU64::new(0);
+
 /// Client fds accepted so far (`-1` = not yet). Written by the server
 /// thread right after each accept; read by `nativeStop` to unblock a
 /// `serve()` stuck in `recvmsg`.
 struct AcceptedFds {
     rpc: RawFd,
     event: RawFd,
+    /// Current scan-out allocator channel, `-1` while no client holds one. The
+    /// acceptor thread rewrites this on every (re)connection; `nativeStop` and
+    /// the server thread read it to unblock a `serve_scanout` parked in
+    /// `recvmsg`.
+    scanout: RawFd,
 }
 
 /// Send-able window handle: the raw pointer is only dereferenced on the
@@ -66,6 +86,9 @@ struct Runtime {
 
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 
+/// Presenter lifetime: the SurfaceControl layer is created on the server
+/// thread and released there when `serve` returns (see `asc.rs`, doc
+/// `android/06`).
 fn server_thread(
     listener: RawFd,
     window: WindowPtr,
@@ -73,15 +96,15 @@ fn server_thread(
     fds: Arc<Mutex<AcceptedFds>>,
     ready: mpsc::Sender<Result<(), String>>,
 ) {
-    // 1. EGL first: init errors surface to nativeStart synchronously.
-    let presenter =
-        match egl::EglPresenter::new(window.0, i32::from(panel.width), i32::from(panel.height)) {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = ready.send(Err(e));
-                return;
-            }
-        };
+    // 1. Build the presenter first; it is owned by this thread for the whole
+    // session and released when `serve` returns.
+    let asc_state = Arc::new(Mutex::new(asc::AscState::new(
+        window.0,
+        i32::from(panel.width),
+        i32::from(panel.height),
+    )));
+    let presenter: Box<dyn gndrm_daemon::Presenter> =
+        Box::new(asc::AscPresenter::new(Arc::clone(&asc_state)));
     let _ = ready.send(Ok(()));
 
     // 2. Wire contract: first connection = RPC, second = events.
@@ -105,13 +128,186 @@ fn server_thread(
     fds.lock().expect("fds poisoned").event = event;
     log_info!("client connected (rpc={rpc} event={event})");
 
-    // 3. Serve until the peer closes or nativeStop shuts the fds down.
-    let mut dev = Device::new(panel, Box::new(presenter));
+    // 3. Third and later connections: the scan-out allocator channel (see
+    // `asc.rs`). The shim asks for a buffer here and gets a dma-buf fd back,
+    // because this process is the one that has to publish it and an
+    // `AHardwareBuffer` cannot be obtained from a bare fd on API 33. The
+    // accept is a loop, not a one-shot: a client that reconnects — after its
+    // own restart, or a previous channel dying — is served without anything
+    // being relaunched.
+    //
+    // The loop polls the listener together with a stop eventfd rather than
+    // blocking in `accept()`, so teardown can end it without shutting the
+    // listener down from under a pending accept.
+    // SAFETY: an eventfd with no other users in this process.
+    let stop_fd = match unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) } {
+        fd if fd >= 0 => Some(fd),
+        _ => {
+            log_warn!("eventfd for the scan-out acceptor failed; no client allocator");
+            None
+        }
+    };
+    // The allocator's own handle on the pool, cloned once here: the scan-out
+    // thread must never take the publish state's lock, which the presenter
+    // holds across its blocking SurfaceFlinger round-trip.
+    let pool = asc_state.lock().expect("asc state poisoned").pool();
+    // The spare-buffer worker keeps a pre-allocated buffer ready so a scan-out
+    // request never has to call AHardwareBuffer_allocate on the reply path (a
+    // gralloc allocation has no latency bound). It waits on the doorbell, never
+    // on the pool lock.
+    let doorbell = Arc::new(asc::WarmDoorbell::new());
+    let warm_thread = {
+        let pool = Arc::clone(&pool);
+        let doorbell = Arc::clone(&doorbell);
+        thread::Builder::new()
+            .name("gndrm-warm".into())
+            .spawn(move || asc::warm_worker(pool, doorbell))
+            .ok()
+    };
+    let scanout_thread = stop_fd.and_then(|signal| {
+        let doorbell = Arc::clone(&doorbell);
+        let fds = Arc::clone(&fds);
+        thread::Builder::new()
+            .name("gndrm-scanout".into())
+            .spawn(move || {
+                loop {
+                    let mut pfds = [
+                        libc::pollfd {
+                            fd: listener,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: signal,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    // Parked waiting for a connection: this row is what proves
+                    // the daemon never accepted a request a shim timed out on.
+                    diag::diag().set_role(diag::Role::Scanout, diag::State::ScanoutAccepting);
+                    // SAFETY: two valid pollfds waited on indefinitely.
+                    let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+                    if n < 0 {
+                        let e = io::Error::last_os_error();
+                        if e.raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        log_info!("scan-out acceptor poll: {e}");
+                        return;
+                    }
+                    if pfds[1].revents != 0 {
+                        log_info!("scan-out acceptor stopping");
+                        return;
+                    }
+                    if pfds[0].revents == 0 {
+                        continue;
+                    }
+                    let fd = match server::accept_newest(listener) {
+                        Ok(fd) => fd,
+                        Err(e) => {
+                            log_info!("accept(scanout): {e}; acceptor stopping");
+                            return;
+                        }
+                    };
+                    fds.lock().expect("fds poisoned").scanout = fd;
+                    log_info!("scan-out channel connected (fd={fd})");
+                    let outcome = asc::serve_scanout(fd, listener, signal, &pool, &doorbell);
+                    // The channel is done with this fd: it is either gone or
+                    // superseded by a newer connection. Clear the published fd
+                    // BEFORE closing it, and close it exactly once here (this
+                    // thread accepted it and is its only owner), so no reader is
+                    // left on a closed or replaced descriptor and nothing
+                    // double-closes the number.
+                    if let Ok(mut guard) = fds.lock() {
+                        if guard.scanout == fd {
+                            guard.scanout = -1;
+                        }
+                    }
+                    log_info!("scan-out channel closed (fd={fd})");
+                    // SAFETY: this thread accepted the fd and is its only owner.
+                    unsafe { libc::close(fd) };
+                    if matches!(outcome, asc::ScanoutChannel::Stop) {
+                        log_info!("scan-out acceptor stopping");
+                        return;
+                    }
+                    // Closed or Superseded: loop and adopt the newest connection
+                    // (Superseded left one queued on the listener, so the poll
+                    // below returns immediately).
+                }
+            })
+            .ok()
+    });
+    // The diagnostic watchdog. While a scan-out request is in flight it samples
+    // the shared registry and, once that request has been stuck past the
+    // warning threshold, logs exactly one snapshot naming the pool lock's
+    // holder and every thread's state — the one device run that has to answer
+    // "which thread or lock stopped the display". It only reads atomics, so a
+    // tick cannot perturb the timing it is measuring.
+    let watch_thread = thread::Builder::new()
+        .name("gndrm-diag".into())
+        .spawn(|| {
+            let d = diag::diag();
+            while !d.watchdog_stopped() {
+                thread::sleep(Duration::from_millis(diag::STALL_TICK_MS));
+                if d.watchdog_stopped() {
+                    break;
+                }
+                if let Some(line) = d.maybe_stall_dump(diag::STALL_WARN_MS) {
+                    log_warn!("asc: {line}");
+                }
+            }
+        })
+        .ok();
+
+    // 4. Serve until the peer closes or nativeStop shuts the fds down.
+    let mut dev = Device::new(panel, presenter);
+    dev.set_logger(Box::new(|msg| log_info!("{msg}")));
     let log = |msg: &str| log_info!("server: {msg}");
     server::serve(&mut dev, rpc, event, &log);
 
-    // 4. Owned-fd cleanup; the presenter (EGL) drops here, on its thread.
-    // SAFETY: serve() has returned; no further use of either fd.
+    // 5. Teardown. Wake and join the scan-out acceptor first (it may be parked
+    // in poll or in serve_scanout — both are signalled), so the presenter's
+    // shared state ends up referenced by `dev` alone, then drop it here — the
+    // SurfaceControl layer is therefore released on this thread.
+    if let Some(signal) = stop_fd {
+        let one: u64 = 1;
+        // SAFETY: an 8-byte counter write to the eventfd created above.
+        unsafe { libc::write(signal, (&raw const one).cast(), 8) };
+    }
+    if let Ok(f) = fds.lock() {
+        if f.scanout >= 0 {
+            // SAFETY: shutdown only unblocks a recvmsg; the acceptor thread
+            // remains the owner that closes the descriptor.
+            unsafe { libc::shutdown(f.scanout, libc::SHUT_RDWR) };
+        }
+    }
+    if let Some(t) = scanout_thread {
+        let _ = t.join();
+    }
+    // Stop the spare worker: its wait ends, it exits before the pool is
+    // released, and any spare it still holds is returned by the presenter's
+    // drop below.
+    doorbell.stop();
+    if let Some(t) = warm_thread {
+        let _ = t.join();
+    }
+    // Stop the diagnostic watchdog. It reads only atomics, so it sees the
+    // stopped flag within one tick; joining it before the presenter drops keeps
+    // a final snapshot from racing teardown.
+    diag::diag().watchdog_stop();
+    if let Some(t) = watch_thread {
+        let _ = t.join();
+    }
+    if let Some(signal) = stop_fd {
+        // SAFETY: the acceptor is joined; nothing else uses this descriptor.
+        unsafe { libc::close(signal) };
+    }
+    drop(dev);
+    if let Ok(state) = asc_state.lock() {
+        log_info!("asc: {} frames published", state.frames_presented());
+    }
+    // SAFETY: this thread owns both descriptors; nothing else uses them.
     unsafe {
         libc::close(rpc);
         libc::close(event);
@@ -127,6 +323,7 @@ fn start(
     height: jint,
     refresh_hz: jfloat,
 ) -> jint {
+    PRESENTED_FRAMES.store(0, Ordering::Relaxed);
     let name: String = match env.get_string(socket_name) {
         Ok(s) => s.to_string_lossy().into_owned(),
         Err(_) => return E_INVAL,
@@ -169,7 +366,11 @@ fn start(
         mm_width: 0,
         mm_height: 0,
     };
-    let fds = Arc::new(Mutex::new(AcceptedFds { rpc: -1, event: -1 }));
+    let fds = Arc::new(Mutex::new(AcceptedFds {
+        rpc: -1,
+        event: -1,
+        scanout: -1,
+    }));
     let (tx, rx) = mpsc::channel();
     let thread_fds = Arc::clone(&fds);
     let handle = thread::Builder::new()
@@ -188,12 +389,12 @@ fn start(
         }
     };
 
-    // Wait for the EGL bring-up handshake before reporting success.
+    // Wait for the presenter bring-up handshake before reporting success.
     match rx.recv() {
         Ok(Ok(())) => {}
         other => {
             if let Ok(Err(e)) = other {
-                log_error!("EGL init: {e}");
+                log_error!("server thread init: {e}");
             }
             // Thread already exited (or is exiting); reclaim everything.
             let _ = handle.join();
@@ -207,6 +408,7 @@ fn start(
     }
 
     log_info!("started: socket={name} {width}x{height} @{refresh_hz}Hz");
+    log_info!("gndrm build 20260926-1: ADDFB2_MODIFIERS + IN_FORMATS (LINEAR) on both planes");
     *slot = Some(Runtime {
         name,
         listener,
@@ -237,6 +439,10 @@ fn stop() {
             if f.event >= 0 {
                 libc::shutdown(f.event, libc::SHUT_RDWR);
             }
+            // Also unblocks a serve_scanout() parked in recvmsg.
+            if f.scanout >= 0 {
+                libc::shutdown(f.scanout, libc::SHUT_RDWR);
+            }
         }
     }
     if let Some(t) = rt.thread.take() {
@@ -244,16 +450,18 @@ fn stop() {
             log_error!("server thread panicked");
         }
     }
-    // EGL is down (dropped on the joined thread); the window is ours again.
+    // The presenter is down (dropped on the joined thread); the window is ours
+    // again.
     // SAFETY: presenter no longer references the window.
     unsafe { ffi::ANativeWindow_release(rt.window.0) };
+    PRESENTED_FRAMES.store(0, Ordering::Relaxed);
     log_info!("stopped");
 }
 
-/// `app.gamenative.drm.GnDrm.nativeStart` — see module docs. Returns 0 or a
+/// `GameNativeDrm.nativeStart` — see module docs. Returns 0 or a
 /// negative errno-style code.
 #[no_mangle]
-pub extern "system" fn Java_app_gamenative_drm_GnDrm_nativeStart(
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeStart(
     mut env: JNIEnv,
     _class: JClass,
     socket_name: JString,
@@ -268,17 +476,30 @@ pub extern "system" fn Java_app_gamenative_drm_GnDrm_nativeStart(
     .unwrap_or(E_FAULT)
 }
 
-/// `app.gamenative.drm.GnDrm.nativeStop`.
+/// `GameNativeDrm.nativeStop`.
 #[no_mangle]
-pub extern "system" fn Java_app_gamenative_drm_GnDrm_nativeStop(_env: JNIEnv, _class: JClass) {
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeStop(
+    _env: JNIEnv,
+    _class: JClass,
+) {
     let _ = std::panic::catch_unwind(stop);
 }
 
-/// `app.gamenative.drm.GnDrm.nativeSurfaceChanged` — v1 semantics: full
+/// `GameNativeDrm.nativeFramesPresented` — real frames put on the panel so
+/// far (see [`PRESENTED_FRAMES`]); 0 before the first start and after stop.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeFramesPresented(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    PRESENTED_FRAMES.load(Ordering::Relaxed) as jlong
+}
+
+/// `GameNativeDrm.nativeSurfaceChanged` — v1 semantics: full
 /// restart with the new surface/geometry (SurfaceView rotation/resize
 /// delivers a brand-new surface anyway).
 #[no_mangle]
-pub extern "system" fn Java_app_gamenative_drm_GnDrm_nativeSurfaceChanged(
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSurfaceChanged(
     env: JNIEnv,
     class: JClass,
     surface: JObject,
@@ -298,9 +519,101 @@ pub extern "system" fn Java_app_gamenative_drm_GnDrm_nativeSurfaceChanged(
             Ok(s) => s,
             Err(_) => return E_FAULT,
         };
-        Java_app_gamenative_drm_GnDrm_nativeStart(
+        Java_app_gamenative_display_GameNativeDrm_nativeStart(
             env, class, jname, surface, width, height, refresh_hz,
         )
     }))
     .unwrap_or(E_FAULT)
+}
+
+// ---------------------------------------------------------------------------
+// input injector (wayland virtual pointer/keyboard; see injector.rs)
+// ---------------------------------------------------------------------------
+
+/// `GameNativeDrm.nativeInjectorStart(xdgRuntimeDir, waylandDisplay)` —
+/// starts the injector thread; it connects (with retry) to gamescope's
+/// wayland socket at `<xdgRuntimeDir>/<waylandDisplay>`.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeInjectorStart(
+    mut env: JNIEnv,
+    _class: JClass,
+    xdg_runtime_dir: JString,
+    wayland_display: JString,
+) -> jint {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let dir: String = match env.get_string(&xdg_runtime_dir) {
+            Ok(s) => s.to_string_lossy().into_owned(),
+            Err(_) => return E_INVAL,
+        };
+        let display: String = match env.get_string(&wayland_display) {
+            Ok(s) => s.to_string_lossy().into_owned(),
+            Err(_) => return E_INVAL,
+        };
+        injector::start(dir, display)
+    }))
+    .unwrap_or(E_FAULT)
+}
+
+/// `GameNativeDrm.nativeInjectorStop()`.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeInjectorStop(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    let _ = std::panic::catch_unwind(injector::stop);
+}
+
+/// `GameNativeDrm.nativePointerAbsolute(x, y)`.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativePointerAbsolute(
+    _env: JNIEnv,
+    _class: JClass,
+    x: jint,
+    y: jint,
+) {
+    injector::pointer_absolute(x, y);
+}
+
+/// `GameNativeDrm.nativePointerMotion(dx, dy)`.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativePointerMotion(
+    _env: JNIEnv,
+    _class: JClass,
+    dx: jint,
+    dy: jint,
+) {
+    injector::pointer_motion(dx, dy);
+}
+
+/// `GameNativeDrm.nativePointerButton(button, pressed)` — evdev BTN_* code.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativePointerButton(
+    _env: JNIEnv,
+    _class: JClass,
+    button: jint,
+    pressed: jboolean,
+) {
+    injector::pointer_button(button, pressed != 0);
+}
+
+/// `GameNativeDrm.nativePointerAxis(axis, value)` — 0 = vertical, 1 = horizontal.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativePointerAxis(
+    _env: JNIEnv,
+    _class: JClass,
+    axis: jint,
+    value: jfloat,
+) {
+    injector::pointer_axis(axis, value);
+}
+
+/// `GameNativeDrm.nativeKey(keyCode, pressed)` — evdev key code.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeKey(
+    _env: JNIEnv,
+    _class: JClass,
+    key_code: jint,
+    pressed: jboolean,
+) {
+    injector::key(key_code, pressed != 0);
 }

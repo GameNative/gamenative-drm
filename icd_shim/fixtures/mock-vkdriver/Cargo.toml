@@ -1,0 +1,18 @@
+[package]
+name = "mock-vkdriver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host-test fixture: fake vulkan ICD for the icd_shim integration tests"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"
+
+# FFI entry points; the safety contract is the vulkan/loader ABI, documented
+# in the crate-level docs.
+[lints.clippy]
+missing_safety_doc = "allow"

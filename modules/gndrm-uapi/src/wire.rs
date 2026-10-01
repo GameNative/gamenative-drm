@@ -176,9 +176,121 @@ pub mod errno {
     pub const EFAULT: i32 = 14;
     pub const EBUSY: i32 = 16;
     pub const EINVAL: i32 = 22;
+    pub const ENOSPC: i32 = 28;
     pub const ERANGE: i32 = 34;
     pub const ENOSYS: i32 = 38;
+    pub const EPROTO: i32 = 71;
     pub const ENOTSUP: i32 = 95;
+}
+
+// ------------------------------------------------------- scan-out allocator
+//
+// A fourth message shape on the wire, carried by its own `SOCK_SEQPACKET`
+// connection: the scan-out allocator channel. It is not an ioctl frame — it is
+// a one-request/one-response exchange — so it gets its own magic instead of
+// the `MAGIC`/`ReqHdr` framing, and the response carries one dma-buf fd
+// out-of-band via `SCM_RIGHTS` exactly like `PRIME_HANDLE_TO_FD` does.
+//
+// Direction of ownership: the daemon allocates and owns the
+// `AHardwareBuffer`, because the daemon is the process that publishes it
+// through `SurfaceControl` — an `AHardwareBuffer` cannot be reconstructed from
+// a bare dma-buf fd on this platform, so whoever must call
+// `ASurfaceTransaction_setBuffer` has to be the process that called
+// `AHardwareBuffer_allocate`. The shim only asks for a buffer by geometry and
+// receives a descriptor to hand to gamescope as its heap allocation.
+//
+// Correlation needs no field on the wire: the daemon fstats the descriptor it
+// sends and registers the buffer under that `stat.st_ino`; gamescope's later
+// `PRIME_FD_TO_HANDLE` of the same dma-buf lands on the same inode, so the
+// presenter resolves a committed framebuffer to the buffer it allocated.
+
+/// Scan-out allocator message magic: ASCII "GNS1".
+pub const SCANOUT_MAGIC: u32 = 0x474E_5331;
+
+/// Format the scan-out pool is allocated in: HAL
+/// `AHARDWAREBUFFER_FORMAT_BGRA_8888` (value 5). Its memory layout is B,G,R,X
+/// — byte-identical to the DRM `XBGR8888`/`ABGR8888` scan-out layout gamescope
+/// renders — whereas `R8G8B8A8_UNORM` is R,G,B,A and would hand
+/// `SurfaceFlinger` a channel-swapped image.
+pub const SCANOUT_FORMAT_BGRA_8888: u32 = 5;
+
+/// Allocation request: geometry + the format the caller will render in.
+///
+/// Encoded little-endian, 16 bytes:
+/// `magic:u32, width:u32, height:u32, format:u32`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanoutAllocReq {
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+}
+
+impl ScanoutAllocReq {
+    pub const LEN: usize = 16;
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[0..4].copy_from_slice(&SCANOUT_MAGIC.to_le_bytes());
+        b[4..8].copy_from_slice(&self.width.to_le_bytes());
+        b[8..12].copy_from_slice(&self.height.to_le_bytes());
+        b[12..16].copy_from_slice(&self.format.to_le_bytes());
+        b
+    }
+
+    /// `None` when `b` is not exactly one encoded request (short frame, bad
+    /// magic, or trailing bytes).
+    #[must_use]
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN || u32::from_le_bytes(b[0..4].try_into().ok()?) != SCANOUT_MAGIC {
+            return None;
+        }
+        Some(Self {
+            width: u32::from_le_bytes(b[4..8].try_into().ok()?),
+            height: u32::from_le_bytes(b[8..12].try_into().ok()?),
+            format: u32::from_le_bytes(b[12..16].try_into().ok()?),
+        })
+    }
+}
+
+/// Allocation response, accompanied by one dma-buf fd via `SCM_RIGHTS`.
+///
+/// Encoded little-endian, 24 bytes:
+/// `magic:u32, ret:i32, ino:u64, stride:u32, reserved:u32`.
+/// `ret` is 0 or negative errno; `ino`/`stride` are meaningless unless it is
+/// 0.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanoutAllocResp {
+    pub ret: i32,
+    pub ino: u64,
+    pub stride: u32,
+}
+
+impl ScanoutAllocResp {
+    pub const LEN: usize = 24;
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[0..4].copy_from_slice(&SCANOUT_MAGIC.to_le_bytes());
+        b[4..8].copy_from_slice(&self.ret.to_le_bytes());
+        b[8..16].copy_from_slice(&self.ino.to_le_bytes());
+        b[16..20].copy_from_slice(&self.stride.to_le_bytes());
+        b
+    }
+
+    /// `None` when `b` is not exactly one encoded response.
+    #[must_use]
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN || u32::from_le_bytes(b[0..4].try_into().ok()?) != SCANOUT_MAGIC {
+            return None;
+        }
+        Some(Self {
+            ret: i32::from_le_bytes(b[4..8].try_into().ok()?),
+            ino: u64::from_le_bytes(b[8..16].try_into().ok()?),
+            stride: u32::from_le_bytes(b[16..20].try_into().ok()?),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -253,5 +365,90 @@ mod tests {
 
         bad_len[4..8].copy_from_slice(&((REQ_HDR_LEN as u32) - 1).to_le_bytes());
         assert_eq!(ReqHdr::decode(&bad_len), Err(WireError::BadLength));
+    }
+
+    #[test]
+    fn scanout_alloc_round_trip() {
+        let req = ScanoutAllocReq {
+            width: 1280,
+            height: 960,
+            format: SCANOUT_FORMAT_BGRA_8888,
+        };
+        let enc = req.encode();
+        assert_eq!(enc.len(), ScanoutAllocReq::LEN);
+        assert_eq!(enc[0..4], SCANOUT_MAGIC.to_le_bytes());
+        assert_eq!(ScanoutAllocReq::decode(&enc), Some(req));
+
+        let resp = ScanoutAllocResp {
+            ret: 0,
+            ino: 0xDEAD_BEEF_1234_5678,
+            stride: 5120,
+        };
+        let enc = resp.encode();
+        assert_eq!(enc.len(), ScanoutAllocResp::LEN);
+        assert_eq!(ScanoutAllocResp::decode(&enc), Some(resp));
+
+        let err = ScanoutAllocResp {
+            ret: -errno::EINVAL,
+            ..Default::default()
+        };
+        assert_eq!(ScanoutAllocResp::decode(&err.encode()), Some(err));
+    }
+
+    #[test]
+    fn scanout_alloc_wire_layout_is_pinned() {
+        // These are the exact bytes the shim's packed structs produce, and the
+        // C mirror asserts the same two struct sizes; pinning them here keeps
+        // the two language sides from drifting silently.
+        let req = ScanoutAllocReq {
+            width: 1280,
+            height: 960,
+            format: SCANOUT_FORMAT_BGRA_8888,
+        };
+        assert_eq!(
+            req.encode(),
+            [
+                0x31, 0x53, 0x4E, 0x47, // "GNS1"
+                0x00, 0x05, 0x00, 0x00, // 1280
+                0xC0, 0x03, 0x00, 0x00, // 960
+                0x05, 0x00, 0x00, 0x00, // BGRA_8888
+            ]
+        );
+        let resp = ScanoutAllocResp {
+            ret: 0,
+            ino: 0xDEAD_BEEF_1234_5678,
+            stride: 5120,
+        };
+        assert_eq!(
+            resp.encode(),
+            [
+                0x31, 0x53, 0x4E, 0x47, // "GNS1"
+                0x00, 0x00, 0x00, 0x00, // ret = 0
+                0x78, 0x56, 0x34, 0x12, 0xEF, 0xBE, 0xAD, 0xDE, // ino
+                0x00, 0x14, 0x00, 0x00, // 5120
+                0x00, 0x00, 0x00, 0x00, // reserved
+            ]
+        );
+    }
+
+    #[test]
+    fn scanout_alloc_rejects_bad_frames() {
+        assert_eq!(ScanoutAllocReq::decode(&[]), None);
+        assert_eq!(ScanoutAllocReq::decode(&[0u8; ScanoutAllocReq::LEN]), None);
+        // Trailing bytes are a protocol violation, not a longer message.
+        let mut extra = ScanoutAllocReq {
+            width: 1,
+            height: 1,
+            format: SCANOUT_FORMAT_BGRA_8888,
+        }
+        .encode()
+        .to_vec();
+        extra.push(0);
+        assert_eq!(ScanoutAllocReq::decode(&extra), None);
+        // A response is not a request, even though both start with the magic.
+        assert_eq!(
+            ScanoutAllocReq::decode(&ScanoutAllocResp::default().encode()),
+            None
+        );
     }
 }

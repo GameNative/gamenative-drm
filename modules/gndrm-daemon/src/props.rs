@@ -19,6 +19,9 @@ const FIRST_PROP_ID: u32 = 0x3000;
 pub enum PropKind {
     /// `DRM_MODE_PROP_RANGE`, values = \[min, max\].
     Range(u64, u64),
+    /// `DRM_MODE_PROP_SIGNED_RANGE`, values = \[min, max\] as i64
+    /// bit-patterns (kernel: `IN_FENCE_FD` is `(-1, INT_MAX)`).
+    SignedRange(i64, i64),
     /// `DRM_MODE_PROP_ENUM`, values + names.
     Enum(&'static [(u64, &'static str)]),
     /// `DRM_MODE_PROP_BLOB`.
@@ -49,7 +52,8 @@ pub static PROPS: &[(&str, PropKind, bool)] = &[
     ("CRTC_Y",            PropKind::Range(0, u32::MAX as u64), false),
     ("CRTC_W",            PropKind::Range(0, u32::MAX as u64), false),
     ("CRTC_H",            PropKind::Range(0, u32::MAX as u64), false),
-    ("IN_FENCE_FD",       PropKind::Range(0, u32::MAX as u64), false),
+    ("IN_FENCE_FD",       PropKind::SignedRange(-1, i32::MAX as i64), false),
+    ("IN_FORMATS",        PropKind::Blob, true),
 ];
 
 // Index constants matching the table above (compile-time checked below).
@@ -69,6 +73,7 @@ pub const P_PLANE_CRTC_Y: usize = 12;
 pub const P_PLANE_CRTC_W: usize = 13;
 pub const P_PLANE_CRTC_H: usize = 14;
 pub const P_PLANE_IN_FENCE_FD: usize = 15;
+pub const P_PLANE_IN_FORMATS: usize = 16;
 
 pub static CONNECTOR_PROPS: &[usize] = &[P_CONN_CRTC_ID, P_CONN_PANEL_ORIENTATION];
 pub static CRTC_PROPS: &[usize] = &[P_CRTC_ACTIVE, P_CRTC_MODE_ID];
@@ -85,6 +90,7 @@ pub static PLANE_PROPS: &[usize] = &[
     P_PLANE_CRTC_W,
     P_PLANE_CRTC_H,
     P_PLANE_IN_FENCE_FD,
+    P_PLANE_IN_FORMATS,
 ];
 
 /// All objects that carry properties, for `OBJ_GETPROPERTIES` dispatch.
@@ -136,7 +142,7 @@ pub fn resolve(obj_id: u32, id: u32) -> Option<usize> {
         .and_then(|(_, _, props)| props.contains(&idx).then_some(idx))
 }
 
-const _: () = assert!(PROPS.len() == 16);
+const _: () = assert!(PROPS.len() == 17);
 
 #[cfg(test)]
 mod tests {

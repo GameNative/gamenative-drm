@@ -1,6 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["modules/gndrm-uapi", "modules/gndrm-daemon", "modules/gndrm-android"]
+members = [
+    "modules/gndrm-uapi",
+    "modules/gndrm-daemon",
+    "modules/gndrm-android",
+    "icd_shim",
+    "icd_shim/fixtures/mock-adrenotools",
+    "icd_shim/fixtures/mock-freedreno",
+    "icd_shim/fixtures/mock-vkdriver",
+    "utils",
+]
 
 [workspace.package]
 version = "0.1.0"

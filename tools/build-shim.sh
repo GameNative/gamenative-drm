@@ -46,6 +46,6 @@ if [ "${1:-}" = "android" ]; then
     mkdir -p "$AOUT"
     # bionic has dl* in libc; pthread is built in. Only libc needed.
     "$TC/bin/aarch64-linux-android$API-clang" $CFLAGS -shared \
-        -o "$AOUT/libgndrm_shim.so" "$SRC" -ldl
+        -o "$AOUT/libgndrm_shim.so" "$SRC" -ldl -landroid
     echo "android: $AOUT/libgndrm_shim.so (NDK $(basename "$NDK"), API $API)"
 fi

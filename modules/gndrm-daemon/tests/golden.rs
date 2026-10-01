@@ -2,12 +2,17 @@
 //! against the daemon exactly as a libdrm client would drive it, asserting on
 //! the *bytes* returned (doc `02-gamenative-drm.md` §8, tasks A3–A7).
 
+use std::collections::HashSet;
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use gndrm_daemon::pod::{pod_read, pod_write};
 use gndrm_daemon::{
-    find_prop_id, Device, DispatchResult, NullPresenter, PanelDesc, CONNECTOR_ID, CRTC_ID,
-    ENCODER_ID, PLANE_CURSOR_ID, PLANE_PRIMARY_ID,
+    find_prop_id, Device, DispatchResult, FlipHandle, FlipLatch, Framebuffer, NullPresenter,
+    PanelDesc, PlaneState, Presenter, CONNECTOR_ID, CRTC_ID, ENCODER_ID, PLANE_CURSOR_ID,
+    PLANE_PRIMARY_ID,
 };
 use gndrm_uapi::drm::*;
 use gndrm_uapi::mode::*;
@@ -23,12 +28,98 @@ fn dev() -> Device {
     d
 }
 
+/// A presenter that latches on command: each `publish` returns a pending
+/// [`FlipHandle`] and parks its [`FlipLatch`] in a shared queue the test fires.
+/// This is the controllable mock the async-semantics tests drive.
+struct LatchPresenter {
+    latches: Arc<Mutex<Vec<FlipLatch>>>,
+    frames: Arc<AtomicU64>,
+}
+
+impl LatchPresenter {
+    fn new(latches: Arc<Mutex<Vec<FlipLatch>>>) -> Self {
+        Self {
+            latches,
+            frames: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl Presenter for LatchPresenter {
+    fn publish(
+        &mut self,
+        _fb: &Framebuffer,
+        _plane: &PlaneState,
+        _ino: Option<u64>,
+        _live_inos: &HashSet<u64>,
+        fence: Option<RawFd>,
+    ) -> FlipHandle {
+        if let Some(fd) = fence {
+            // SAFETY: the mock owns the fence the device handed it.
+            unsafe { libc::close(fd) };
+        }
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        let (handle, latch) = FlipHandle::new();
+        self.latches.lock().unwrap().push(latch);
+        handle
+    }
+}
+
+/// A device whose presenter latches on command.
+fn dev_latch() -> (Device, Arc<Mutex<Vec<FlipLatch>>>) {
+    let latches = Arc::new(Mutex::new(Vec::new()));
+    let mut d = Device::new(
+        PanelDesc::default(),
+        Box::new(LatchPresenter::new(Arc::clone(&latches))),
+    );
+    d.set_clock(Box::new(|| (1000, 500)));
+    (d, latches)
+}
+
+/// Block (up to `timeout_ms`) until the worker has produced at least one flip
+/// event, then drain and return them in commit order. Polls the queue directly
+/// rather than the eventfd, so a wake that races the queue's visibility cannot
+/// return an empty batch.
+fn wait_flip(d: &mut Device, timeout_ms: u64) -> Vec<DrmEventVblank> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let events = d.drain_flip_events();
+        if !events.is_empty() {
+            return events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no flip event within {timeout_ms}ms"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Fire the next latch the mock presenter has parked. The worker publishes
+/// asynchronously, so this waits (briefly) for a latch to appear rather than
+/// assuming it is already there.
+fn fire_next(latches: &Arc<Mutex<Vec<FlipLatch>>>) {
+    for _ in 0..1000 {
+        if let Some(latch) = latches.lock().unwrap().pop() {
+            latch.fire();
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("no latch became available from the presenter");
+}
+
 fn call(d: &mut Device, nr: u32, payload: &[u8]) -> DispatchResult {
     d.dispatch(nr, payload, None)
 }
 
 fn call_fd(d: &mut Device, nr: u32, payload: &[u8], fd: RawFd) -> DispatchResult {
-    d.dispatch(nr, payload, Some(fd))
+    // The wire's SCM_RIGHTS duplicates the descriptor into the daemon; the
+    // client keeps its own reference. Simulate that so the daemon and the test
+    // never share (and double-close) a single fd. SAFETY: dup of a live fd.
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    assert!(dup >= 0, "dup fd for SCM_RIGHTS");
+    d.dispatch(nr, payload, Some(dup))
 }
 
 fn ok(r: &DispatchResult) {
@@ -154,9 +245,92 @@ fn get_cap_table() {
     assert_eq!(cap(DRM_CAP_TIMESTAMP_MONOTONIC), (0, Some(1)));
     assert_eq!(cap(DRM_CAP_CURSOR_WIDTH), (0, Some(64)));
     assert_eq!(cap(DRM_CAP_CURSOR_HEIGHT), (0, Some(64)));
-    assert_eq!(cap(DRM_CAP_SYNCOBJ), (0, Some(0)));
-    assert_eq!(cap(DRM_CAP_ADDFB2_MODIFIERS), (0, Some(0)));
+    assert_eq!(cap(DRM_CAP_SYNCOBJ), (0, Some(1)));
+    assert_eq!(cap(DRM_CAP_ADDFB2_MODIFIERS), (0, Some(1)));
     assert_eq!(cap(0xDEAD).0, -errno::EINVAL);
+}
+
+/// gamescope's commit path: one always-signalled sync object, exported once and
+/// then ridden as the primary plane's in-fence on every commit. The export has
+/// to be poll-ready, since the presenter polls the in-fence before sampling.
+#[test]
+fn syncobj_create_signalled_export_is_poll_ready() {
+    let mut d = dev();
+    let mut c = DrmSyncobjCreate {
+        handle: 0,
+        flags: DRM_SYNCOBJ_CREATE_SIGNALED,
+    };
+    let r = call(&mut d, DRM_IOCTL_SYNCOBJ_CREATE, &pod(&c));
+    ok(&r);
+    c = pod_read(&r.body).expect("create reply");
+    assert_ne!(c.handle, 0, "handle allocated");
+
+    let h = DrmSyncobjHandle {
+        handle: c.handle,
+        flags: 0,
+        fd: 0,
+        pad: 0,
+        point: 0,
+    };
+    let r = call(&mut d, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &pod(&h));
+    ok(&r);
+    let fd = r.fd_out.expect("export fd");
+
+    let mut p = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `p` is a valid single pollfd.
+    assert_eq!(unsafe { libc::poll(&mut p, 1, 0) }, 1, "fence is readable");
+    assert_ne!(p.revents & libc::POLLIN, 0);
+    // SAFETY: the test owns `fd`.
+    assert_eq!(unsafe { libc::close(fd) }, 0);
+
+    let r = call(
+        &mut d,
+        DRM_IOCTL_SYNCOBJ_DESTROY,
+        &pod(&DrmSyncobjDestroy {
+            handle: c.handle,
+            pad: 0,
+        }),
+    );
+    ok(&r);
+    is_err(
+        &call(&mut d, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &pod(&h)),
+        errno::ENOENT,
+    );
+}
+
+/// Only signalled objects can be exported: an unsignalled one would need a real
+/// dma-fence behind the fd, which this device does not model.
+#[test]
+fn syncobj_unsignalled_export_is_rejected() {
+    let mut d = dev();
+    let r = call(
+        &mut d,
+        DRM_IOCTL_SYNCOBJ_CREATE,
+        &pod(&DrmSyncobjCreate {
+            handle: 0,
+            flags: 0,
+        }),
+    );
+    ok(&r);
+    let c = pod_read::<DrmSyncobjCreate>(&r.body).expect("create reply");
+    is_err(
+        &call(
+            &mut d,
+            DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD,
+            &pod(&DrmSyncobjHandle {
+                handle: c.handle,
+                flags: 0,
+                fd: 0,
+                pad: 0,
+                point: 0,
+            }),
+        ),
+        errno::EINVAL,
+    );
 }
 
 #[test]
@@ -461,6 +635,34 @@ fn property_queries_golden() {
     assert_eq!(e1.value, 1);
     assert_eq!(&e1.name[..7], b"Primary");
 
+    // GETPROPERTY: plane IN_FENCE_FD is ATOMIC|SIGNED_RANGE [-1, INT_MAX]
+    // (kernel drm_mode_config.c:488). libliftoff range-checks this
+    // client-side; an unsigned range rejects the -1 "no fence" sentinel
+    // and silently kills every plane allocation (failure #17).
+    let fence_prop = find_prop_id(PLANE_PRIMARY_ID, "IN_FENCE_FD").unwrap();
+    let r = call(
+        &mut d,
+        DRM_IOCTL_MODE_GETPROPERTY,
+        &pod(&DrmModeGetProperty {
+            prop_id: fence_prop,
+            values_ptr: 1,
+            count_values: 2,
+            ..Default::default()
+        }),
+    );
+    ok(&r);
+    let p: DrmModeGetProperty = pod_read(&r.body).unwrap();
+    assert_ne!(p.flags & DRM_MODE_PROP_ATOMIC, 0);
+    assert_ne!(p.flags & DRM_MODE_PROP_SIGNED_RANGE, 0);
+    assert_eq!(p.flags & DRM_MODE_PROP_RANGE, 0);
+    assert_eq!(p.count_values, 2);
+    let off = core::mem::size_of::<DrmModeGetProperty>();
+    let vals = &r.body[off..off + 16];
+    let min = u64::from_le_bytes(vals[0..8].try_into().unwrap()) as i64;
+    let max = u64::from_le_bytes(vals[8..16].try_into().unwrap()) as i64;
+    assert_eq!(min, -1);
+    assert_eq!(max, i64::from(i32::MAX));
+
     // Unknown property.
     is_err(
         &call(
@@ -532,6 +734,82 @@ fn blob_lifecycle() {
         ),
         errno::ENOENT,
     );
+}
+
+/// Both planes must serve a fetchable `IN_FORMATS` blob: libliftoff creates
+/// a plane object for *every* plane and aborts DRM backend creation when the
+/// blob lookup fails (a zero/garbage value yields ENOENT).
+#[test]
+fn in_formats_blob_on_both_planes() {
+    let mut d = dev();
+    for plane in [PLANE_PRIMARY_ID, PLANE_CURSOR_ID] {
+        let r = call(
+            &mut d,
+            DRM_IOCTL_MODE_OBJ_GETPROPERTIES,
+            &pod(&DrmModeObjGetProperties {
+                obj_id: plane,
+                obj_type: DRM_MODE_OBJECT_PLANE,
+                props_ptr: 1,
+                prop_values_ptr: 1,
+                count_props: 32,
+            }),
+        );
+        ok(&r);
+        let g: DrmModeObjGetProperties = pod_read(&r.body).unwrap();
+        let off = core::mem::size_of::<DrmModeObjGetProperties>();
+        let n = g.count_props as usize;
+        let ids: Vec<u32> = r.body[off..off + 4 * n]
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let vals: Vec<u64> = r.body[off + 4 * n..off + 12 * n]
+            .chunks(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let in_formats = find_prop_id(plane, "IN_FORMATS").unwrap();
+        let pos = ids.iter().position(|&id| id == in_formats).unwrap();
+        let blob_id = u32::try_from(vals[pos]).unwrap();
+        assert_ne!(blob_id, 0, "plane {plane}: IN_FORMATS must name a blob");
+
+        let r = call(
+            &mut d,
+            DRM_IOCTL_MODE_GETPROPBLOB,
+            &pod(&DrmModeGetBlob {
+                blob_id,
+                ..Default::default()
+            }),
+        );
+        ok(&r);
+        let g: DrmModeGetBlob = pod_read(&r.body).unwrap();
+        let r = call(
+            &mut d,
+            DRM_IOCTL_MODE_GETPROPBLOB,
+            &pod(&DrmModeGetBlob {
+                blob_id,
+                length: g.length,
+                data: 1,
+            }),
+        );
+        ok(&r);
+        let off = core::mem::size_of::<DrmModeGetBlob>();
+        let blob = &r.body[off..];
+        let u32at = |i: usize| u32::from_le_bytes(blob[4 * i..4 * i + 4].try_into().unwrap());
+        assert_eq!(u32at(0), 1, "drm_format_modifier_blob version");
+        assert_eq!(u32at(2), 5, "count_formats");
+        assert_eq!(u32at(3), 24, "formats_offset");
+        assert_eq!(u32at(4), 1, "count_modifiers");
+        assert_eq!(u32at(5), 24 + 4 * 5, "modifiers_offset");
+        // Modifier entry: all 5 formats at DRM_FORMAT_MOD_LINEAR (0).
+        let m = 24 + 4 * 5;
+        assert_eq!(
+            u64::from_le_bytes(blob[m..m + 8].try_into().unwrap()),
+            0b11111
+        );
+        assert_eq!(
+            u64::from_le_bytes(blob[m + 16..m + 24].try_into().unwrap()),
+            DRM_FORMAT_MOD_LINEAR
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -697,6 +975,121 @@ fn addfb2_validation_and_rmfb() {
     unsafe { libc::close(fd) };
 }
 
+#[test]
+fn getfb2_hands_fresh_closable_handles() {
+    // Kernel semantics (drm_mode_getfb2): returned handles are FRESH GEM
+    // references owned by the caller. libliftoff does GETFB2 then
+    // drmCloseBufferHandle — with raw passthrough ids that close failed
+    // EINVAL on device (gamescope had already closed its own handle).
+    let mut d = dev();
+    let (handle, fb, _fd) = import_fb(&mut d);
+
+    // gamescope pattern: close the importer handle right after ADDFB2.
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_GEM_CLOSE,
+        &pod(&DrmGemClose { handle, pad: 0 }),
+    ));
+
+    // GETFB2 must still succeed and return a *different*, closable handle.
+    let r = call(
+        &mut d,
+        DRM_IOCTL_MODE_GETFB2,
+        &pod(&DrmModeFbCmd2 {
+            fb_id: fb,
+            ..Default::default()
+        }),
+    );
+    ok(&r);
+    let g = pod_read::<DrmModeFbCmd2>(&r.body).unwrap();
+    assert_ne!(g.handles[0], 0, "GETFB2 must return a live handle");
+    assert_ne!(
+        g.handles[0], handle,
+        "GETFB2 must mint a fresh reference, not the importer's id"
+    );
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_GEM_CLOSE,
+        &pod(&DrmGemClose {
+            handle: g.handles[0],
+            pad: 0,
+        }),
+    ));
+}
+
+#[test]
+fn gem_close_with_live_fb_then_modeset_and_rmfb() {
+    // gamescope's real lifecycle: ADDFB2, then GEM_CLOSE immediately (kernel
+    // semantics — the FB holds its own reference). Day-two on-device: the
+    // daemon refused with EBUSY ("drmIoctl(GEM_CLOSE) failed: Device or
+    // resource busy" in gamescope's log). The FB must stay fully usable for
+    // modeset + flips; teardown + RMFB then frees the orphaned GEM.
+    let mut d = dev();
+    let (handle, fb, fd) = import_fb(&mut d);
+
+    // Close right after ADDFB2 — allowed; the handle is gone for new ioctls.
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_GEM_CLOSE,
+        &pod(&DrmGemClose { handle, pad: 0 }),
+    ));
+    is_err(
+        &call(
+            &mut d,
+            DRM_IOCTL_GEM_CLOSE,
+            &pod(&DrmGemClose { handle, pad: 0 }),
+        ),
+        errno::EINVAL,
+    );
+
+    // The closed-handle FB modesets + flips fine (orphan GEM still resolves).
+    let blob = create_mode_blob(&mut d).0;
+    let sets = modeset_sets(&d, blob, fb);
+    let req = atomic_req(
+        &sets,
+        DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_PAGE_FLIP_EVENT,
+        0xF00D,
+    );
+    let r = call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req);
+    ok(&r);
+    // The flip event arrives asynchronously, after the worker's latch (the
+    // default presenter latches immediately).
+    assert_eq!(
+        wait_flip(&mut d, 2000).len(),
+        1,
+        "modeset must emit the flip event"
+    );
+
+    // finish_drm-style teardown (plane/CRTC/connector to zero — RMFB of a
+    // scanned-out FB is EBUSY), then RMFB frees the orphaned GEM.
+    let zero = [
+        (
+            PLANE_PRIMARY_ID,
+            find_prop_id(PLANE_PRIMARY_ID, "FB_ID").unwrap(),
+            0,
+        ),
+        (
+            PLANE_PRIMARY_ID,
+            find_prop_id(PLANE_PRIMARY_ID, "CRTC_ID").unwrap(),
+            0,
+        ),
+        (CRTC_ID, find_prop_id(CRTC_ID, "ACTIVE").unwrap(), 0),
+        (CRTC_ID, find_prop_id(CRTC_ID, "MODE_ID").unwrap(), 0),
+        (
+            CONNECTOR_ID,
+            find_prop_id(CONNECTOR_ID, "CRTC_ID").unwrap(),
+            0,
+        ),
+    ];
+    let req = atomic_req(&zero, DRM_MODE_ATOMIC_ALLOW_MODESET, 0);
+    ok(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req));
+    ok(&call(&mut d, DRM_IOCTL_MODE_RMFB, &pod(&fb)));
+    is_err(&call(&mut d, DRM_IOCTL_MODE_RMFB, &pod(&fb)), errno::EINVAL);
+
+    // SAFETY: caller's fd.
+    unsafe { libc::close(fd) };
+}
+
 // ---------------------------------------------------------------------------
 // A6/A7: atomic commits
 // ---------------------------------------------------------------------------
@@ -717,6 +1110,9 @@ fn create_mode_blob(d: &mut Device) -> ModeBlob {
 
 fn import_fb(d: &mut Device) -> (u32, u32, RawFd) {
     let fd = memfd(1280 * 720 * 4);
+    // `call_fd` duplicates the descriptor into the daemon (SCM_RIGHTS), so the
+    // test keeps this reference and closes it at the end while the daemon owns
+    // its own copy.
     let r = call_fd(
         d,
         DRM_IOCTL_PRIME_FD_TO_HANDLE,
@@ -812,7 +1208,7 @@ fn modeset_sets(d: &Device, blob: u32, fb: u32) -> Vec<(u32, u32, u64)> {
 
 #[test]
 fn atomic_test_only_then_modeset_then_flip() {
-    let mut d = dev();
+    let (mut d, latches) = dev_latch();
     let blob = create_mode_blob(&mut d).0;
     let (_handle, fb, fd) = import_fb(&mut d);
 
@@ -825,7 +1221,7 @@ fn atomic_test_only_then_modeset_then_flip() {
     );
     let r = call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req);
     ok(&r);
-    assert!(r.events.is_empty());
+    assert!(d.drain_flip_events().is_empty());
     let r = call(
         &mut d,
         DRM_IOCTL_MODE_GETCRTC,
@@ -838,7 +1234,8 @@ fn atomic_test_only_then_modeset_then_flip() {
     assert_eq!(c.mode_valid, 0);
     assert_eq!(c.fb_id, 0);
 
-    // Real modeset: allowed, presents the FB, emits the flip event.
+    // Real modeset: queues and returns immediately — no flip event is
+    // observable until the presenter reports the latch.
     let req = atomic_req(
         &sets,
         DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
@@ -846,19 +1243,12 @@ fn atomic_test_only_then_modeset_then_flip() {
     );
     let r = call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req);
     ok(&r);
-    assert_eq!(r.events.len(), 1);
-    let ev = r.events[0];
-    assert_eq!(ev.base.ty, DRM_EVENT_FLIP_COMPLETE);
-    assert_eq!(
-        ev.base.length as usize,
-        core::mem::size_of::<DrmEventVblank>()
+    assert!(
+        d.drain_flip_events().is_empty(),
+        "no flip event before the latch"
     );
-    assert_eq!(ev.user_data, 0xCAFE);
-    assert_eq!(ev.crtc_id, CRTC_ID);
-    assert_eq!((ev.tv_sec, ev.tv_usec), (1000, 500));
-    assert_eq!(ev.sequence, 1);
 
-    // State is now visible to queries (GETCRTC / OBJ_GETPROPERTIES).
+    // State is already visible to queries (applied synchronously on commit).
     let r = call(
         &mut d,
         DRM_IOCTL_MODE_GETCRTC,
@@ -872,7 +1262,23 @@ fn atomic_test_only_then_modeset_then_flip() {
     assert_eq!(c.fb_id, fb);
     assert_eq!((c.mode.hdisplay, c.mode.vdisplay), (1280, 720));
 
-    // Page-flip-only commit (no ALLOW_MODESET) works and sequences.
+    // Fire the presenter's latch → exactly one flip event, ordered.
+    fire_next(&latches);
+    let events = wait_flip(&mut d, 2000);
+    assert_eq!(events.len(), 1);
+    let ev = events[0];
+    assert_eq!(ev.base.ty, DRM_EVENT_FLIP_COMPLETE);
+    assert_eq!(
+        ev.base.length as usize,
+        core::mem::size_of::<DrmEventVblank>()
+    );
+    assert_eq!(ev.user_data, 0xCAFE);
+    assert_eq!(ev.crtc_id, CRTC_ID);
+    assert_eq!((ev.tv_sec, ev.tv_usec), (1000, 500));
+    assert_eq!(ev.sequence, 1);
+
+    // Page-flip-only commit (no ALLOW_MODESET, same FB → no re-present) emits
+    // the next event immediately, still ordered after the first.
     let req = atomic_req(
         &[(
             PLANE_PRIMARY_ID,
@@ -884,9 +1290,10 @@ fn atomic_test_only_then_modeset_then_flip() {
     );
     let r = call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req);
     ok(&r);
-    assert_eq!(r.events.len(), 1);
-    assert_eq!(r.events[0].sequence, 2);
-    assert_eq!(r.events[0].user_data, 0xBEEF);
+    let events = wait_flip(&mut d, 2000);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].sequence, 2);
+    assert_eq!(events[0].user_data, 0xBEEF);
 
     // SAFETY: caller's fd.
     unsafe { libc::close(fd) };
@@ -906,6 +1313,15 @@ fn atomic_rejections() {
     // Unknown flag bit.
     let req = atomic_req(&sets, DRM_MODE_ATOMIC_ALLOW_MODESET | 0x8000, 0);
     is_err(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req), errno::EINVAL);
+
+    // PAGE_FLIP_ASYNC is accepted (libliftoff leaks it into TEST_ONLY
+    // commits — device-proven EINVAL before the fix).
+    let req = atomic_req(
+        &sets,
+        DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_PAGE_FLIP_ASYNC,
+        0,
+    );
+    ok(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req));
 
     // TEST_ONLY + EVENT.
     let req = atomic_req(
@@ -985,16 +1401,616 @@ fn atomic_in_fence_fd_contract() {
     let r = call_fd(&mut d, DRM_IOCTL_MODE_ATOMIC, &req, fence);
     ok(&r);
 
-    // -1 ("no fence") must NOT attach an fd.
+    // -1 ("no fence") must NOT attach an fd. Userspace sends the u64 sign
+    // extension of -1 (kernel convention), not u32::MAX — day-two on-device:
+    // gamescope's finish_drm teardown commit got EINVAL from this mismatch.
     let mut sets = modeset_sets(&d, blob, fb);
     sets.push((
         PLANE_PRIMARY_ID,
         find_prop_id(PLANE_PRIMARY_ID, "IN_FENCE_FD").unwrap(),
-        u64::from(u32::MAX),
+        u64::MAX,
     ));
     let req = atomic_req(&sets, DRM_MODE_ATOMIC_ALLOW_MODESET, 0);
     let r = call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req);
     ok(&r);
+
+    // SAFETY: caller's fd.
+    unsafe { libc::close(fd) };
+}
+
+// ---------------------------------------------------------------------------
+// async commit semantics (doc 07): commit → queue → latch → flip event
+// ---------------------------------------------------------------------------
+
+/// An unsignalled fence (eventfd count 0): `poll` reports it not ready, which
+/// is exactly what the NONBLOCK/EBUSY path keys on.
+fn unsignalled_fence() -> RawFd {
+    // SAFETY: eventfd(2) with count 0, standard flags.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    assert!(fd >= 0);
+    fd
+}
+
+/// The core async contract: a commit queues and returns immediately, no flip
+/// event is observable until the presenter reports the latch, and after the
+/// latch exactly one ordered event fires and the buffer becomes reusable.
+#[test]
+fn async_commit_returns_before_latch_event_follows_latch() {
+    let (mut d, latches) = dev_latch();
+    let blob = create_mode_blob(&mut d).0;
+    let (_handle, fb, fd) = import_fb(&mut d);
+
+    let sets = modeset_sets(&d, blob, fb);
+    let req = atomic_req(
+        &sets,
+        DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
+        0xC0DE,
+    );
+    let r = call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req);
+    // (a) the commit returned 0 immediately.
+    ok(&r);
+    // (b) no flip event is observable before the latch.
+    assert!(
+        d.drain_flip_events().is_empty(),
+        "no event before the latch"
+    );
+    // (e) TEST_ONLY validates without side effects (still no event).
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(
+            &sets,
+            DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_ALLOW_MODESET,
+            0,
+        ),
+    ));
+    assert!(d.drain_flip_events().is_empty());
+
+    // The committed fb is in-flight: RMFB must refuse it.
+    is_err(&call(&mut d, DRM_IOCTL_MODE_RMFB, &pod(&fb)), errno::EBUSY);
+
+    // (c) fire the latch → exactly one event fires, ordered, with the right
+    // payload.
+    fire_next(&latches);
+    let events = wait_flip(&mut d, 2000);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].base.ty, DRM_EVENT_FLIP_COMPLETE);
+    assert_eq!(events[0].user_data, 0xC0DE);
+    assert_eq!(events[0].sequence, 1);
+    assert_eq!(events[0].crtc_id, CRTC_ID);
+
+    // The buffer is now reusable: after a teardown commit moves it off the
+    // plane, RMFB succeeds.
+    let zero = [
+        (
+            PLANE_PRIMARY_ID,
+            find_prop_id(PLANE_PRIMARY_ID, "FB_ID").unwrap(),
+            0,
+        ),
+        (
+            PLANE_PRIMARY_ID,
+            find_prop_id(PLANE_PRIMARY_ID, "CRTC_ID").unwrap(),
+            0,
+        ),
+        (CRTC_ID, find_prop_id(CRTC_ID, "ACTIVE").unwrap(), 0),
+        (CRTC_ID, find_prop_id(CRTC_ID, "MODE_ID").unwrap(), 0),
+        (
+            CONNECTOR_ID,
+            find_prop_id(CONNECTOR_ID, "CRTC_ID").unwrap(),
+            0,
+        ),
+    ];
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(&zero, DRM_MODE_ATOMIC_ALLOW_MODESET, 0),
+    ));
+    ok(&call(&mut d, DRM_IOCTL_MODE_RMFB, &pod(&fb)));
+
+    // SAFETY: caller's fd.
+    unsafe { libc::close(fd) };
+}
+
+/// Two commits against different buffers stay ordered: the worker presents and
+/// emits in commit order, and both buffers are in-flight (refuse RMFB) until
+/// their own latch fires.
+#[test]
+fn async_commits_stay_ordered_and_track_in_flight() {
+    let (mut d, latches) = dev_latch();
+    let blob = create_mode_blob(&mut d).0;
+    let (_ha, fb_a, fd_a) = import_fb(&mut d);
+    let (_hb, fb_b, fd_b) = import_fb(&mut d);
+
+    // Modeset fb_a.
+    let sets_a = modeset_sets(&d, blob, fb_a);
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(
+            &sets_a,
+            DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
+            0xA1,
+        ),
+    ));
+    // Page-flip to fb_b (no ALLOW_MODESET), queued behind fb_a.
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(
+            &[(
+                PLANE_PRIMARY_ID,
+                find_prop_id(PLANE_PRIMARY_ID, "FB_ID").unwrap(),
+                u64::from(fb_b),
+            )],
+            DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
+            0xA2,
+        ),
+    ));
+
+    // Both fbs are in-flight: neither can be RMFB'd yet.
+    is_err(
+        &call(&mut d, DRM_IOCTL_MODE_RMFB, &pod(&fb_a)),
+        errno::EBUSY,
+    );
+    is_err(
+        &call(&mut d, DRM_IOCTL_MODE_RMFB, &pod(&fb_b)),
+        errno::EBUSY,
+    );
+    // No event has been emitted (both commits still await their latch).
+    assert!(d.drain_flip_events().is_empty());
+
+    // First latch → first event (fb_a), still no second event.
+    fire_next(&latches);
+    let events = wait_flip(&mut d, 2000);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].user_data, 0xA1);
+    assert_eq!(events[0].sequence, 1);
+
+    // Second latch → second event (fb_b), ordered after the first.
+    fire_next(&latches);
+    let events = wait_flip(&mut d, 2000);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].user_data, 0xA2);
+    assert_eq!(events[0].sequence, 2);
+
+    // SAFETY: caller's fds.
+    unsafe {
+        libc::close(fd_a);
+        libc::close(fd_b);
+    }
+}
+
+/// A non-blocking commit whose acquire fence is not signalled returns EBUSY
+/// rather than stalling; a signalled fence (or no fence) queues normally.
+#[test]
+fn nonblocking_unsignalled_fence_returns_ebusy() {
+    let (mut d, latches) = dev_latch();
+    let blob = create_mode_blob(&mut d).0;
+    let (_handle, fb, fd) = import_fb(&mut d);
+    let mut sets = modeset_sets(&d, blob, fb);
+    sets.push((
+        PLANE_PRIMARY_ID,
+        find_prop_id(PLANE_PRIMARY_ID, "IN_FENCE_FD").unwrap(),
+        1, // opaque fd number in the client
+    ));
+
+    // Unsignalled fence + NONBLOCK → EBUSY.
+    let fence = unsignalled_fence();
+    let req = atomic_req(
+        &sets,
+        DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK,
+        0,
+    );
+    is_err(
+        &call_fd(&mut d, DRM_IOCTL_MODE_ATOMIC, &req, fence),
+        errno::EBUSY,
+    );
+
+    // A signalled fence queues normally. On the host a memfd stands in (it is
+    // always poll-ready, like the always-signalled sync-file the daemon
+    // exports), and is deterministic under parallel test execution.
+    let fence = memfd(1);
+    let req = atomic_req(
+        &sets,
+        DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
+        0xF00D,
+    );
+    ok(&call_fd(&mut d, DRM_IOCTL_MODE_ATOMIC, &req, fence));
+    fire_next(&latches);
+    let events = wait_flip(&mut d, 2000);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].user_data, 0xF00D);
+
+    // SAFETY: caller's fd.
+    unsafe { libc::close(fd) };
+}
+
+/// A presenter that never reports a completion: its latches are parked and
+/// never fired — the on-device signature of a completion callback that never
+/// arrives.
+struct StuckPresenter {
+    latches: Arc<Mutex<Vec<FlipLatch>>>,
+}
+
+impl Presenter for StuckPresenter {
+    fn publish(
+        &mut self,
+        _fb: &Framebuffer,
+        _plane: &PlaneState,
+        _ino: Option<u64>,
+        _live_inos: &HashSet<u64>,
+        fence: Option<RawFd>,
+    ) -> FlipHandle {
+        if let Some(fd) = fence {
+            // SAFETY: the mock owns the fence the device handed it.
+            unsafe { libc::close(fd) };
+        }
+        let (handle, latch) = FlipHandle::new();
+        // Kept alive but never fired: the latch stays *connected*, so the
+        // worker must run out its bounded budget rather than see a disconnect.
+        self.latches.lock().unwrap().push(latch);
+        handle
+    }
+}
+
+/// The latch wait is bounded. A presenter that never reports a completion must
+/// not deadlock the commit worker: the flip event still fires (the frame
+/// degrades to "treated as latched"), and the worker keeps servicing later
+/// commits. Before the bounded wait this test hung forever on the first commit
+/// — the same stall that froze the panel on device.
+#[test]
+fn latch_wait_degrades_when_completion_never_arrives() {
+    let latches = Arc::new(Mutex::new(Vec::new()));
+    let mut d = Device::new(
+        PanelDesc::default(),
+        Box::new(StuckPresenter {
+            latches: Arc::clone(&latches),
+        }),
+    );
+    d.set_clock(Box::new(|| (1000, 500)));
+    let blob = create_mode_blob(&mut d).0;
+    let (_h1, fb1, fd1) = import_fb(&mut d);
+
+    let sets1 = modeset_sets(&d, blob, fb1);
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(
+            &sets1,
+            DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
+            0xB1,
+        ),
+    ));
+    // No latch is ever fired; the event must still arrive, within the bound.
+    let events = wait_flip(&mut d, 2000);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].user_data, 0xB1);
+
+    // The worker is not wedged: a second commit completes too.
+    let (_h2, fb2, fd2) = import_fb(&mut d);
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(
+            &[(
+                PLANE_PRIMARY_ID,
+                find_prop_id(PLANE_PRIMARY_ID, "FB_ID").unwrap(),
+                u64::from(fb2),
+            )],
+            DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
+            0xB2,
+        ),
+    ));
+    let events = wait_flip(&mut d, 2000);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].user_data, 0xB2);
+
+    // Both publishes happened and both latches are still parked, unfired.
+    assert_eq!(latches.lock().unwrap().len(), 2);
+
+    // SAFETY: caller's fds.
+    unsafe {
+        libc::close(fd1);
+        libc::close(fd2);
+    }
+}
+
+/// A presenter that records whether each publish was handed an acquire fence,
+/// then latches on command.
+struct FenceSpyPresenter {
+    latches: Arc<Mutex<Vec<FlipLatch>>>,
+    fences: Arc<Mutex<Vec<bool>>>,
+}
+
+impl Presenter for FenceSpyPresenter {
+    fn publish(
+        &mut self,
+        _fb: &Framebuffer,
+        _plane: &PlaneState,
+        _ino: Option<u64>,
+        _live_inos: &HashSet<u64>,
+        fence: Option<RawFd>,
+    ) -> FlipHandle {
+        self.fences.lock().unwrap().push(fence.is_some());
+        if let Some(fd) = fence {
+            // SAFETY: the mock owns the fence the device handed it.
+            unsafe { libc::close(fd) };
+        }
+        let (handle, latch) = FlipHandle::new();
+        self.latches.lock().unwrap().push(latch);
+        handle
+    }
+}
+
+/// A commit that rides the device's own always-signalled sync-object fence back
+/// as its `IN_FENCE_FD` must reach the presenter as *no fence*. That export is a
+/// bare eventfd (there is no userspace way to mint a real `sync_file`), it is
+/// already signalled, and SurfaceFlinger cannot inspect it — it logs
+/// `sync_file_info returned NULL for fd N`. A fence the device did not mint is
+/// passed through untouched.
+#[test]
+fn emulated_signalled_fence_is_not_forwarded_to_the_presenter() {
+    let latches = Arc::new(Mutex::new(Vec::new()));
+    let fences = Arc::new(Mutex::new(Vec::new()));
+    let mut d = Device::new(
+        PanelDesc::default(),
+        Box::new(FenceSpyPresenter {
+            latches: Arc::clone(&latches),
+            fences: Arc::clone(&fences),
+        }),
+    );
+    d.set_clock(Box::new(|| (1000, 500)));
+    let blob = create_mode_blob(&mut d).0;
+    let (_h1, fb1, fb1_fd) = import_fb(&mut d);
+    let (_h2, fb2, fb2_fd) = import_fb(&mut d);
+
+    // The device's own always-signalled sync object, exported like gamescope
+    // does once at init.
+    let r = call(
+        &mut d,
+        DRM_IOCTL_SYNCOBJ_CREATE,
+        &pod(&DrmSyncobjCreate {
+            handle: 0,
+            flags: DRM_SYNCOBJ_CREATE_SIGNALED,
+        }),
+    );
+    ok(&r);
+    let handle = pod_read::<DrmSyncobjCreate>(&r.body).unwrap().handle;
+    let r = call(
+        &mut d,
+        DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD,
+        &pod(&DrmSyncobjHandle {
+            handle,
+            flags: 0,
+            fd: 0,
+            pad: 0,
+            point: 0,
+        }),
+    );
+    ok(&r);
+    let export = r.fd_out.expect("exported fence fd");
+
+    let prop = find_prop_id(PLANE_PRIMARY_ID, "IN_FENCE_FD").unwrap();
+    let mut sets = modeset_sets(&d, blob, fb1);
+    sets.push((PLANE_PRIMARY_ID, prop, 1)); // opaque client fd number
+    ok(&call_fd(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(
+            &sets,
+            DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
+            0xF1,
+        ),
+        export,
+    ));
+    fire_next(&latches);
+    let _ = wait_flip(&mut d, 2000);
+    assert!(
+        !fences.lock().unwrap()[0],
+        "the emulated always-signalled fence must be dropped, not forwarded"
+    );
+
+    // A fence the device did not mint is forwarded unchanged.
+    let mut sets2 = vec![(
+        PLANE_PRIMARY_ID,
+        find_prop_id(PLANE_PRIMARY_ID, "FB_ID").unwrap(),
+        u64::from(fb2),
+    )];
+    sets2.push((PLANE_PRIMARY_ID, prop, 1));
+    let other = memfd(1);
+    ok(&call_fd(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(
+            &sets2,
+            DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
+            0xF2,
+        ),
+        other,
+    ));
+    fire_next(&latches);
+    let _ = wait_flip(&mut d, 2000);
+    assert!(
+        fences.lock().unwrap()[1],
+        "a fence the device did not mint must be forwarded unchanged"
+    );
+
+    // SAFETY: caller's fds.
+    unsafe {
+        libc::close(export);
+        libc::close(other);
+        libc::close(fb1_fd);
+        libc::close(fb2_fd);
+    }
+}
+
+/// The full gamescope call chain, driven in order: discovery → buffer import →
+/// modeset → page flips → syncobj, with every flip event observed after its
+/// latch.
+#[test]
+fn full_gamescope_chain_discovery_to_syncobj_async() {
+    let (mut d, latches) = dev_latch();
+
+    // 1. Discovery — assert a coherent topology.
+    let r = call(
+        &mut d,
+        DRM_IOCTL_MODE_GETRESOURCES,
+        &pod(&DrmModeCardRes::default()),
+    );
+    ok(&r);
+    let res: DrmModeCardRes = pod_read(&r.body).unwrap();
+    assert_eq!(res.count_crtcs, 1);
+    assert_eq!(res.count_connectors, 1);
+    assert_eq!(res.count_encoders, 1);
+
+    let r = call(
+        &mut d,
+        DRM_IOCTL_MODE_GETCONNECTOR,
+        &pod(&DrmModeGetConnector {
+            connector_id: CONNECTOR_ID,
+            ..Default::default()
+        }),
+    );
+    ok(&r);
+    let conn: DrmModeGetConnector = pod_read(&r.body).unwrap();
+    assert_eq!(conn.connection, DRM_MODE_CONNECTED);
+    assert_eq!(conn.count_modes, 1);
+    assert_eq!(conn.encoder_id, ENCODER_ID);
+
+    let r = call(
+        &mut d,
+        DRM_IOCTL_MODE_GETENCODER,
+        &pod(&DrmModeGetEncoder {
+            encoder_id: ENCODER_ID,
+            ..Default::default()
+        }),
+    );
+    ok(&r);
+    let enc: DrmModeGetEncoder = pod_read(&r.body).unwrap();
+    assert_eq!(enc.crtc_id, CRTC_ID);
+    assert_eq!(enc.possible_crtcs, 1);
+
+    let r = call(
+        &mut d,
+        DRM_IOCTL_MODE_GETPLANE,
+        &pod(&DrmModeGetPlane {
+            plane_id: PLANE_PRIMARY_ID,
+            format_type_ptr: 1,
+            count_format_types: 16,
+            ..Default::default()
+        }),
+    );
+    ok(&r);
+    let plane: DrmModeGetPlane = pod_read(&r.body).unwrap();
+    assert_eq!(plane.possible_crtcs, 1);
+    let off = core::mem::size_of::<DrmModeGetPlane>();
+    let fmts: Vec<u32> = r.body[off..]
+        .chunks(4)
+        .take(plane.count_format_types as usize)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert!(fmts.contains(&DRM_FORMAT_XRGB8888));
+
+    // 2. Buffer: import a memfd, ADDFB2, GETFB2 echoes pitch/format.
+    let fd = memfd(1280 * 720 * 4);
+    let r = call_fd(
+        &mut d,
+        DRM_IOCTL_PRIME_FD_TO_HANDLE,
+        &pod(&DrmPrimeHandle::default()),
+        fd,
+    );
+    ok(&r);
+    let handle = pod_read::<DrmPrimeHandle>(&r.body).unwrap().handle;
+    let r = call(
+        &mut d,
+        DRM_IOCTL_MODE_ADDFB2,
+        &pod(&DrmModeFbCmd2 {
+            width: 1280,
+            height: 720,
+            pixel_format: DRM_FORMAT_XRGB8888,
+            handles: [handle, 0, 0, 0],
+            pitches: [1280 * 4, 0, 0, 0],
+            ..Default::default()
+        }),
+    );
+    ok(&r);
+    let fb = pod_read::<DrmModeFbCmd2>(&r.body).unwrap().fb_id;
+
+    // 3. Modeset → flip event (after the latch).
+    let blob = create_mode_blob(&mut d).0;
+    let sets = modeset_sets(&d, blob, fb);
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(
+            &sets,
+            DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
+            0x100,
+        ),
+    ));
+    fire_next(&latches);
+    let events = wait_flip(&mut d, 2000);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].user_data, 0x100);
+    assert_eq!(events[0].sequence, 1);
+
+    // Plain page-flip (same FB) → next ordered event, no re-present.
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(
+            &[(
+                PLANE_PRIMARY_ID,
+                find_prop_id(PLANE_PRIMARY_ID, "FB_ID").unwrap(),
+                u64::from(fb),
+            )],
+            DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
+            0x200,
+        ),
+    ));
+    let events = wait_flip(&mut d, 2000);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].user_data, 0x200);
+    assert_eq!(events[0].sequence, 2);
+
+    // 5. Syncobj: create-signalled → export (poll-ready) → destroy.
+    let r = call(
+        &mut d,
+        DRM_IOCTL_SYNCOBJ_CREATE,
+        &pod(&DrmSyncobjCreate {
+            handle: 0,
+            flags: DRM_SYNCOBJ_CREATE_SIGNALED,
+        }),
+    );
+    ok(&r);
+    let syncobj = pod_read::<DrmSyncobjCreate>(&r.body).unwrap().handle;
+    let r = call(
+        &mut d,
+        DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD,
+        &pod(&DrmSyncobjHandle {
+            handle: syncobj,
+            ..Default::default()
+        }),
+    );
+    ok(&r);
+    let sync_fd = r.fd_out.expect("exported sync fd");
+    let mut pfd = libc::pollfd {
+        fd: sync_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd.
+    assert_eq!(unsafe { libc::poll(&mut pfd, 1, 0) }, 1);
+    // SAFETY: caller's fd.
+    unsafe { libc::close(sync_fd) };
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_SYNCOBJ_DESTROY,
+        &pod(&DrmSyncobjDestroy {
+            handle: syncobj,
+            pad: 0,
+        }),
+    ));
 
     // SAFETY: caller's fd.
     unsafe { libc::close(fd) };

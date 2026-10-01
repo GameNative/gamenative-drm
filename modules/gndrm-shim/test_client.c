@@ -87,9 +87,9 @@ int main(void)
     /* caps */
     uint64_t v = 1;
     CHECK(drmGetCap(fd, DRM_CAP_DUMB_BUFFER, &v) == 0 && v == 1, "DUMB_BUFFER=1");
-    CHECK(drmGetCap(fd, DRM_CAP_SYNCOBJ, &v) == 0 && v == 0, "SYNCOBJ=0");
+    CHECK(drmGetCap(fd, DRM_CAP_SYNCOBJ, &v) == 0 && v == 1, "SYNCOBJ=1");
     CHECK(drmGetCap(fd, DRM_CAP_TIMESTAMP_MONOTONIC, &v) == 0 && v == 1, "MONOTONIC=1");
-    printf("caps: syncobj=0 monotonic=1 dumb=1 (as designed)\n");
+    printf("caps: syncobj=1 monotonic=1 dumb=1\n");
 
     /* client caps */
     CHECK(drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1) == 0, "ATOMIC cap");
@@ -268,6 +268,71 @@ int main(void)
     CHECK(drmModeAtomicCommit(fd, req, 0, NULL) != 0 && errno == EINVAL,
           "modeset without ALLOW_MODESET rejected");
     drmModeAtomicFree(req);
+
+    /* dup'd fds must keep working (libliftoff dup()s the DRM fd — day-two
+     * on-device: liftoff_device_create → dup → ENOTTY before the shim
+     * learned to track dups). */
+    int dupfd = dup(fd);
+    CHECK(dupfd >= 0, "dup(event fd)");
+    drmModeRes *dres = drmModeGetResources(dupfd);
+    CHECK(dres != NULL && dres->count_crtcs == 1, "drmModeGetResources on dup fd");
+    drmModeFreeResources(dres);
+    drmModePlaneRes *dpres = drmModeGetPlaneResources(dupfd);
+    CHECK(dpres != NULL && dpres->count_planes == 2, "drmModeGetPlaneResources on dup fd");
+    drmModeFreePlaneResources(dpres);
+    int dupfd2 = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    CHECK(dupfd2 >= 0, "fcntl(F_DUPFD_CLOEXEC)");
+    CHECK(drmModeGetResources(dupfd2) != NULL, "drmModeGetResources on fcntl-dup fd");
+    close(dupfd2);
+    close(dupfd);
+    /* the original fd is still alive after the dups are gone */
+    pres = drmModeGetPlaneResources(fd);
+    CHECK(pres != NULL && pres->count_planes == 2, "original fd alive after dup close");
+    drmModeFreePlaneResources(pres);
+
+    /* finish_drm-style teardown: IN_FENCE_FD = (u64)-1 must travel as "no
+     * fence" (day-two: daemon mistook the u64 sentinel for a fence fd and
+     * rejected the commit EINVAL). */
+    CHECK(in_fence != 0, "IN_FENCE_FD prop exists");
+    req = drmModeAtomicAlloc();
+    drmModeAtomicAddProperty(req, conn->connector_id, conn_crtc, 0);
+    drmModeAtomicAddProperty(req, crtc_id, crtc_active, 0);
+    drmModeAtomicAddProperty(req, crtc_id, crtc_mode, 0);
+    drmModeAtomicAddProperty(req, plane_id, plane_fb, 0);
+    drmModeAtomicAddProperty(req, plane_id, in_fence, (uint64_t)-1);
+    drmModeAtomicAddProperty(req, plane_id, plane_crtc, 0);
+    drmModeAtomicAddProperty(req, plane_id, src_x, 0);
+    drmModeAtomicAddProperty(req, plane_id, src_y, 0);
+    drmModeAtomicAddProperty(req, plane_id, src_w, 0);
+    drmModeAtomicAddProperty(req, plane_id, src_h, 0);
+    drmModeAtomicAddProperty(req, plane_id, crtc_x, 0);
+    drmModeAtomicAddProperty(req, plane_id, crtc_y, 0);
+    drmModeAtomicAddProperty(req, plane_id, crtc_w, 0);
+    drmModeAtomicAddProperty(req, plane_id, crtc_h, 0);
+    CHECK(drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL) == 0,
+          "teardown commit with IN_FENCE_FD=-1");
+    drmModeAtomicFree(req);
+
+    /* gamescope's DRM backend creates one always-signalled sync object at init
+     * and rides the fd it exports as the primary plane's in-fence on every
+     * commit. The export has to be poll-ready for the presenter's poll-based
+     * in-fence wait to pass, so assert that too. */
+    uint32_t syncobj = 0;
+    CHECK(drmSyncobjCreate(fd, DRM_SYNCOBJ_CREATE_SIGNALED, &syncobj) == 0,
+          "drmSyncobjCreate(SIGNALED)");
+    CHECK(syncobj != 0, "sync object handle allocated");
+    int sync_fd = -1;
+    CHECK(drmSyncobjExportSyncFile(fd, syncobj, &sync_fd) == 0,
+          "drmSyncobjExportSyncFile");
+    CHECK(sync_fd >= 0, "exported sync file fd");
+    struct pollfd spfd;
+    memset(&spfd, 0, sizeof(spfd));
+    spfd.fd = sync_fd;
+    spfd.events = POLLIN;
+    CHECK(poll(&spfd, 1, 0) == 1 && (spfd.revents & POLLIN) != 0,
+          "exported always-signalled fence is poll-ready");
+    close(sync_fd);
+    CHECK(drmSyncobjDestroy(fd, syncobj) == 0, "drmSyncobjDestroy");
 
     /* teardown */
     CHECK(drmModeDestroyPropertyBlob(fd, blob_id) == 0, "destroy blob");

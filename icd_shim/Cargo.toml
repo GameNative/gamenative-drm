@@ -1,0 +1,23 @@
+[package]
+name = "adrenotools_icd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Passthrough-or-proxy Vulkan ICD for GameNative's GameScope mode"
+
+# NEEDEDs stay libc/libdl/libwayland-client — no libvulkan, every real
+# driver symbol resolves via dlopen/dlsym at runtime (see lib.rs).
+# The rlib half exists so the probe binary and the host integration tests
+# can reuse the vk FFI types; the shipped artifact is the cdylib.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Loader-side test harness: dlopens the built ICD like the Khronos loader
+# and drives the negotiated-v5 entry points. Used by tests/shim_integration.rs
+# on the host and as an on-device diagnostic (not packaged into the payload).
+[[bin]]
+name = "icd_probe"
+path = "src/bin/icd_probe.rs"
+
+[dependencies]
+libc = "0.2"

@@ -242,6 +242,8 @@ pub const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
 pub const DRM_MODE_PROP_BITMASK: u32 = 1 << 5;
 /// `DRM_MODE_PROP_TYPE(1)` — property value is another object's ID.
 pub const DRM_MODE_PROP_OBJECT: u32 = 1 << 6;
+/// `DRM_MODE_PROP_TYPE(2)` — signed [min, max] range (e.g. `IN_FENCE_FD`).
+pub const DRM_MODE_PROP_SIGNED_RANGE: u32 = 2 << 6;
 pub const DRM_MODE_PROP_ATOMIC: u32 = 0x8000_0000;
 
 // ---------------------------------------------------------------------------
@@ -256,6 +258,7 @@ pub const DRM_MODE_TYPE_DRIVER: u32 = 1 << 6;
 // ---------------------------------------------------------------------------
 
 pub const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
+pub const DRM_MODE_PAGE_FLIP_ASYNC: u32 = 0x02;
 pub const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x0100;
 pub const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x0200;
 pub const DRM_MODE_ATOMIC_ALLOW_MODESET: u32 = 0x0400;

@@ -123,6 +123,47 @@ pub const DRM_IOCTL_PRIME_HANDLE_TO_FD: u32 = iowr::<DrmPrimeHandle>(DRM_IOCTL_B
 pub const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = iowr::<DrmPrimeHandle>(DRM_IOCTL_BASE, 0x2e);
 
 // ---------------------------------------------------------------------------
+// sync objects (`drm_syncobj_*`)
+//
+// gamescope advertises `wp_linux_drm_syncobj_v1` and, when `DRM_CAP_SYNCOBJ`
+// is set, creates ONE always-signalled syncobj and exports it to a sync file,
+// which it then passes as the primary plane's `IN_FENCE_FD` on every commit.
+// So the surface a client actually needs is create-signalled + export.
+// ---------------------------------------------------------------------------
+
+/// `drm_syncobj_create.flags`: the new sync object starts signalled.
+pub const DRM_SYNCOBJ_CREATE_SIGNALED: u32 = 1 << 0;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DrmSyncobjCreate {
+    pub handle: u32,
+    pub flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DrmSyncobjDestroy {
+    pub handle: u32,
+    pub pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DrmSyncobjHandle {
+    pub handle: u32,
+    pub flags: u32,
+    pub fd: i32,
+    pub pad: u32,
+    pub point: u64,
+}
+
+pub const DRM_IOCTL_SYNCOBJ_CREATE: u32 = iowr::<DrmSyncobjCreate>(DRM_IOCTL_BASE, 0xbf);
+pub const DRM_IOCTL_SYNCOBJ_DESTROY: u32 = iowr::<DrmSyncobjDestroy>(DRM_IOCTL_BASE, 0xc0);
+pub const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: u32 = iowr::<DrmSyncobjHandle>(DRM_IOCTL_BASE, 0xc1);
+pub const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: u32 = iowr::<DrmSyncobjHandle>(DRM_IOCTL_BASE, 0xc2);
+
+// ---------------------------------------------------------------------------
 // layout assertions (LP64: host x86_64, Android aarch64 — both identical)
 // ---------------------------------------------------------------------------
 

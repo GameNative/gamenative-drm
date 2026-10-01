@@ -30,5 +30,6 @@ fn main() {
     log("client connected (rpc + events)");
 
     let mut dev = Device::new(PanelDesc::default(), Box::<NullPresenter>::default());
+    dev.set_logger(Box::new(|msg| eprintln!("[gndrm-hostd] {msg}")));
     server::serve(&mut dev, rpc, events, &log);
 }

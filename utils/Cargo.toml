@@ -1,0 +1,25 @@
+[package]
+name = "gn-utils"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GameScope smoke-test clients: gn-dmabuf-test (client-dmabuf output half) and gn-wsi-test (WSI proxy end to end)"
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "gn-dmabuf-test"
+path = "src/bin/gn_dmabuf_test.rs"
+
+[[bin]]
+name = "gn-wsi-test"
+path = "src/bin/gn_wsi_test.rs"
+
+[[bin]]
+name = "gn-device-probe"
+path = "src/bin/gn_device_probe.rs"
+
+[[bin]]
+name = "gn-submit2-probe"
+path = "src/bin/gn_submit2_probe.rs"

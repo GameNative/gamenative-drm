@@ -4,10 +4,18 @@
  * Presents a fake /dev/dri/card* whose fd is a connected Unix socket pair to
  * the gamenative-drm daemon (doc 02-gamenative-drm.md §4/§6):
  *
- *   - open("/dev/dri/cardN")  → two SOCK_SEQPACKET connections to the daemon;
+ *   - open("/dev/dri/cardN")  → three SOCK_SEQPACKET connections to the daemon;
  *                               the *event* connection fd is returned to the
  *                               caller (read/poll on it behave exactly like a
- *                               real DRM fd delivering drm_event bytes).
+ *                               real DRM fd delivering drm_event bytes). The
+ *                               third connection is the scan-out allocator
+ *                               channel (see scanout_request): the daemon owns
+ *                               the scan-out AHardwareBuffers, because it is
+ *                               the process that publishes them, and hands
+ *                               back a dma-buf fd here. It is deliberately NOT
+ *                               part of the framed RPC stream, which a
+ *                               descriptor-carrying exchange would
+ *                               desynchronise.
  *   - ioctl(fd, ...)          → marshalled into one RPC frame on the hidden
  *                               RPC connection; the response bytes are
  *                               de-linearized back into the caller's struct
@@ -18,12 +26,11 @@
  * read/poll/epoll/fcntl are NOT intercepted: the returned fd is a real
  * socket, so the kernel handles them natively.
  *
- * No glibc-isms beyond RTLD_NEXT dlsym; builds with bionic (NDK) and glibc.
+ * No glibc-isms; builds with bionic (NDK) and glibc.
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
-#include <dlfcn.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -31,11 +38,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+/* The uapi header gives the ioctl number when it is available (host builds and
+ * newer NDKs); the literal is the cross-checked fallback. */
+#if defined(__has_include)
+#if __has_include(<linux/dma-heap.h>)
+#include <linux/dma-heap.h>
+#endif
+#endif
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <drm/drm.h>
@@ -48,6 +65,8 @@
 #define GNDRM_MAGIC 0x474E4431u /* "GND1" */
 #define GNDRM_FLAG_FD (1u << 0)
 #define GNDRM_MAX_FRAME (1u << 20)
+/* Scratch RPC buffer capacity; the daemon's frames are far below this. */
+#define GNDRM_SCRATCH_CAP (GNDRM_MAX_FRAME / 4)
 #define GNDRM_REQ_HDR 24
 #define GNDRM_RESP_HDR 24
 
@@ -67,29 +86,145 @@ struct gndrm_resp {
     uint32_t out_len;
 } __attribute__((packed));
 
+/*
+ * Scan-out allocator channel (third connection): one request, one response
+ * carrying a dma-buf fd via SCM_RIGHTS. Not an ioctl frame, so it has its own
+ * magic instead of GNDRM_MAGIC. Mirrors the ScanoutAllocReq/ScanoutAllocResp
+ * pair in gndrm-uapi/src/wire.rs.
+ */
+#define GNDRM_SCANOUT_MAGIC 0x474E5331u /* "GNS1" */
+/* HAL AHardwareBuffer format BGRA_8888: B,G,R,X in memory, which is the DRM
+ * XBGR8888/ABGR8888 scan-out layout gamescope renders. A pool in any other
+ * format would reach SurfaceFlinger with swapped channels. */
+#define GNDRM_SCANOUT_FORMAT_BGRA_8888 5u
+/* Reply budget and attempt count for one scan-out request. A request that is
+ * not answered inside the budget has either been lost or is being served
+ * slowly; see scanout_request for why neither re-establishes the channel. */
+#define GNDRM_SCANOUT_TIMEOUT_US 250000
+#define GNDRM_SCANOUT_ATTEMPTS 3
+
+struct gndrm_scanout_req {
+    uint32_t magic;
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+} __attribute__((packed));
+_Static_assert(sizeof(struct gndrm_scanout_req) == 16,
+               "ScanoutAllocReq is 16 bytes on the wire");
+
+struct gndrm_scanout_resp {
+    uint32_t magic;
+    int32_t ret;
+    uint64_t ino;
+    uint32_t stride;
+    uint32_t reserved;
+} __attribute__((packed));
+_Static_assert(sizeof(struct gndrm_scanout_resp) == 24,
+               "ScanoutAllocResp is 24 bytes on the wire");
+
 /* ------------------------------------------------------------------ */
 /* shim state                                                          */
 /* ------------------------------------------------------------------ */
 
 static int g_rpc_fd = -1;    /* hidden request/response channel */
 static int g_event_fd = -1;  /* fd handed to the app (event channel) */
+/*
+ * Scan-out allocator channel (third connection, see scanout_request). Its own
+ * socket because it is a request/response exchange that carries a descriptor,
+ * not an ioctl frame: mixing it into the framed RPC stream would desynchronise
+ * the ioctl responses. A daemon restart closes it, so it is re-established on
+ * demand rather than at the one-time init.
+ */
+static int g_scanout_fd = -1;
+static pthread_mutex_t g_scanout_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_seq;
 static pthread_mutex_t g_rpc_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 static int g_init_ok;
 static uint32_t g_in_fence_prop; /* discovered at init, 0 = unsupported */
 
-static int (*real_open)(const char *, int, ...) = NULL;
-static int (*real_open64)(const char *, int, ...) = NULL;
-static int (*real_openat)(int, const char *, int, ...) = NULL;
-static int (*real_close)(int) = NULL;
-static ssize_t (*real_read)(int, void *, size_t) = NULL;
+/*
+ * Pass-throughs use raw syscalls, never dlsym(RTLD_NEXT) pointers: with
+ * LD_PRELOAD the shim also captures libc's *own* calls (e.g. the
+ * open/close inside __system_properties_init → PropertyInfoAreaFile::
+ * LoadPath), which run during libc's constructor — BEFORE any shim init
+ * could populate a dlsym-resolved pointer, so the pass-through would call
+ * address 0 (observed on-device 2026-09-24: SIGSEGV at pc=0 in
+ * PropertyInfoAreaFile::LoadPath, before main()). Syscalls need no libc
+ * state and are safe at any init stage. bionic's open/open64 are plain
+ * openat(AT_FDCWD, …) wrappers on arm64, so the mapping is exact.
+ */
 
 #define LOG(...)                       \
     do {                               \
         if (getenv("GNDRM_SHIM_DEBUG")) \
             fprintf(stderr, "[gndrm-shim] " __VA_ARGS__); \
     } while (0)
+
+/*
+ * Sync-object ioctl numbers are spelled out rather than taken from
+ * <drm/drm.h>: the NDK's copy is older than the kernel's and its
+ * `struct drm_syncobj_handle` lacks the trailing `__u64 point`. `_IOWR`
+ * encodes the struct size, so that header yields 0xc01064c1 while callers
+ * built against current headers send the kernel's 0xc01864c1 — a silent
+ * mismatch that shows up only as "unhandled ioctl". The wire layout is
+ * asserted here so it cannot drift again.
+ */
+struct gndrm_syncobj_handle {
+    uint32_t handle;
+    uint32_t flags;
+    int32_t fd;
+    uint32_t pad;
+    uint64_t point;
+};
+_Static_assert(sizeof(struct gndrm_syncobj_handle) == 24,
+               "sync-object handle must match the kernel's drm_syncobj_handle");
+
+/* Literal kernel values: `_IOWR('d', 0xBF, struct drm_syncobj_create)` and
+ * `_IOWR('d', {0xC0,0xC1,0xC2}, …)` as of Linux 6.x. Literals, not the macro,
+ * so no header can move them again. */
+#define GNDRM_IOCTL_SYNCOBJ_CREATE 0xc00864bfu
+#define GNDRM_IOCTL_SYNCOBJ_DESTROY 0xc00864c0u
+#define GNDRM_IOCTL_SYNCOBJ_HANDLE_TO_FD 0xc01864c1u
+#define GNDRM_IOCTL_SYNCOBJ_FD_TO_HANDLE 0xc01864c2u
+
+/* On a host the system <drm/drm.h> is current, so cross-check the literals
+ * above against it there. The NDK's copy is older (see above) and cannot be
+ * used for this check. */
+#ifndef __ANDROID__
+_Static_assert(GNDRM_IOCTL_SYNCOBJ_CREATE ==
+                   (unsigned int)DRM_IOCTL_SYNCOBJ_CREATE,
+               "syncobj create number must match the kernel's");
+_Static_assert(GNDRM_IOCTL_SYNCOBJ_DESTROY ==
+                   (unsigned int)DRM_IOCTL_SYNCOBJ_DESTROY,
+               "syncobj destroy number must match the kernel's");
+_Static_assert(GNDRM_IOCTL_SYNCOBJ_HANDLE_TO_FD ==
+                   (unsigned int)DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD,
+               "syncobj handle-to-fd number must match the kernel's");
+_Static_assert(GNDRM_IOCTL_SYNCOBJ_FD_TO_HANDLE ==
+                   (unsigned int)DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE,
+               "syncobj fd-to-handle number must match the kernel's");
+#endif
+
+/*
+ * Output-path diagnostics (GNDRM_SHIM_DEBUG=1). The KMS scan-out gate is an
+ * exact (format, modifier) match, so a rejected ADDFB2 is only diagnosable
+ * from its arguments; and the ATOMIC stream is the compositor's flip loop, so
+ * a rate-limited line there doubles as a liveness heartbeat that stops when
+ * the flip loop does.
+ */
+static unsigned long g_n_addfb2, g_n_addfb2_fail, g_n_atomic, g_n_atomic_fail;
+static long g_hb_last;
+
+static int rate_ok(long every_sec)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (g_hb_last && ts.tv_sec - g_hb_last < every_sec)
+        return 0;
+    g_hb_last = ts.tv_sec ? ts.tv_sec : 1;
+    return 1;
+}
 
 /* ------------------------------------------------------------------ */
 /* daemon connection                                                   */
@@ -126,15 +261,10 @@ static int connect_one(const char *path)
  * Talks the wire protocol directly (the shim's own ioctls would recurse).
  */
 static void discover_in_fence_prop(void);
+static int scanout_chan_init(void);
 
 static void init_shim(void)
 {
-    real_open = dlsym(RTLD_NEXT, "open");
-    real_open64 = dlsym(RTLD_NEXT, "open64");
-    real_openat = dlsym(RTLD_NEXT, "openat");
-    real_close = dlsym(RTLD_NEXT, "close");
-    real_read = dlsym(RTLD_NEXT, "read");
-
     const char *path = getenv("GAMENATIVE_DRM_SOCKET");
     if (!path || !*path) {
         LOG("GAMENATIVE_DRM_SOCKET not set\n");
@@ -153,9 +283,15 @@ static void init_shim(void)
         return;
     }
     g_init_ok = 1;
+    /* Third connection: the scan-out allocator channel. Connected here, in
+     * order, because the daemon accepts the first two inline and everything
+     * after as an allocator client. A failure is not fatal: the channel is
+     * re-established on demand, and the daemon may not be listening yet. */
+    if (scanout_chan_init() != 0)
+        LOG("scanout channel connect failed: %s\n", strerror(errno));
     discover_in_fence_prop();
-    LOG("connected to %s (rpc=%d event=%d) in_fence prop=%u\n",
-        path, g_rpc_fd, g_event_fd, g_in_fence_prop);
+    LOG("connected to %s (rpc=%d event=%d scanout=%d) in_fence prop=%u\n",
+        path, g_rpc_fd, g_event_fd, g_scanout_fd, g_in_fence_prop);
 }
 
 static bool ensure_init(void)
@@ -201,10 +337,10 @@ static int send_frame(uint32_t ioctl_nr, const void *payload, uint32_t len,
     return 0;
 }
 
-static int recv_frame(uint8_t *buf, uint32_t *len_io, int *fd_out, uint64_t seq)
+static int recv_frame(uint8_t *buf, uint32_t cap, uint32_t *len_io, int *fd_out, uint64_t seq)
 {
     struct msghdr msg = { 0 };
-    struct iovec iov = { .iov_base = buf, .iov_len = GNDRM_MAX_FRAME };
+    struct iovec iov = { .iov_base = buf, .iov_len = cap };
     char cbuf[CMSG_SPACE(sizeof(int))];
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
@@ -214,6 +350,9 @@ static int recv_frame(uint8_t *buf, uint32_t *len_io, int *fd_out, uint64_t seq)
     ssize_t n = recvmsg(g_rpc_fd, &msg, 0);
     if (n < 0)
         return -errno;
+    /* SEQPACKET truncates oversized records: detect before trusting n. */
+    if (msg.msg_flags & MSG_TRUNC)
+        return -EMSGSIZE;
     if ((size_t)n < GNDRM_RESP_HDR)
         return -EPROTO;
 
@@ -237,6 +376,8 @@ static int recv_frame(uint8_t *buf, uint32_t *len_io, int *fd_out, uint64_t seq)
 /*
  * Full round trip. `out` receives the frame body (response struct +
  * linearized extensions); *out_len set on success. Returns 0 or -errno.
+ * `out` is always the g_resp_buf scratch (g_rpc_lock serializes), so its
+ * capacity is a compile-time constant here.
  */
 static int rpc(uint32_t ioctl_nr, const void *in, uint32_t in_len,
                uint8_t *out, uint32_t *out_len, int fd_send, int *fd_recv)
@@ -246,14 +387,14 @@ static int rpc(uint32_t ioctl_nr, const void *in, uint32_t in_len,
     uint64_t seq = ++g_seq;
     ret = send_frame(ioctl_nr, in, in_len, fd_send, seq);
     if (ret == 0)
-        ret = recv_frame(out, out_len, fd_recv, seq);
+        ret = recv_frame(out, GNDRM_SCRATCH_CAP, out_len, fd_recv, seq);
     pthread_mutex_unlock(&g_rpc_lock);
     return ret;
 }
 
 /* Scratch buffers (protected by g_rpc_lock via rpc()). */
-static uint8_t g_req_buf[GNDRM_MAX_FRAME / 4];
-static uint8_t g_resp_buf[GNDRM_MAX_FRAME / 4];
+static uint8_t g_req_buf[GNDRM_SCRATCH_CAP];
+static uint8_t g_resp_buf[GNDRM_SCRATCH_CAP];
 
 /* ------------------------------------------------------------------ */
 /* IN_FENCE_FD discovery (uses rpc() against the daemon's own tables)  */
@@ -307,16 +448,52 @@ static bool is_drm_card_path(const char *path)
     return path && strncmp(path, "/dev/dri/card", 13) == 0;
 }
 
+/* App-facing fds: the event fd handed out by open_common plus every dup of
+ * it. Real KMS fds survive dup() (libliftoff's liftoff_device_create dups
+ * the DRM fd and issues ioctls on the copy — day-two on-device finding), so
+ * ours must too. fds are small ints; a 1024-bit map covers anything bionic
+ * hands out. g_our_fd_count == 0 means the connection is logically closed.
+ * The hidden rpc fd is deliberately NOT in the map: ioctls never arrive on
+ * it (it's not visible to the app… though nothing stops a pathological app
+ * from ioctl()ing it — those go to the kernel and fail, which is fine). */
+static uint64_t g_our_fd_map[16]; /* fds 0..1023 */
+static int g_our_fd_count;
+static bool g_opened; /* single open at a time (phase-1 contract) */
+
 static bool is_our_fd(int fd)
 {
-    return fd >= 0 && fd == g_event_fd;
+    return fd >= 0 && fd < 1024 &&
+           (g_our_fd_map[fd >> 6] & (1ULL << (fd & 63))) != 0;
+}
+
+static void our_fd_add(int fd)
+{
+    if (fd >= 0 && fd < 1024 && !is_our_fd(fd)) {
+        g_our_fd_map[fd >> 6] |= 1ULL << (fd & 63);
+        g_our_fd_count++;
+    }
+}
+
+/* Drop one app-facing reference. When the last one goes, tear the hidden
+ * rpc side down as well (the event socket dies with its last kernel fd). */
+static void our_fd_release(int fd)
+{
+    if (!is_our_fd(fd))
+        return;
+    g_our_fd_map[fd >> 6] &= ~(1ULL << (fd & 63));
+    g_our_fd_count--;
+    if (g_our_fd_count == 0) {
+        syscall(SYS_close, g_rpc_fd);
+        g_rpc_fd = g_event_fd = -1;
+        g_opened = false;
+        /* note: pthread_once keeps the (now dead) connection state; a
+         * second open in the same process fails — phase-1 contract. */
+    }
 }
 
 /* ------------------------------------------------------------------ */
 /* open family                                                         */
 /* ------------------------------------------------------------------ */
-
-static bool g_opened; /* single open at a time (phase-1 contract) */
 
 /*
  * Returns the event-channel fd, or -1 with errno set. Only called when the
@@ -334,6 +511,7 @@ static int open_common(void)
         return -1;
     }
     g_opened = true;
+    our_fd_add(g_event_fd);
     return g_event_fd;
 }
 
@@ -374,7 +552,7 @@ int open(const char *path, int flags, ...)
     }
     if (should_intercept(path))
         return open_common();
-    return real_open(path, flags, mode);
+    return syscall(SYS_openat, AT_FDCWD, path, flags, mode);
 }
 
 int open64(const char *path, int flags, ...)
@@ -388,8 +566,7 @@ int open64(const char *path, int flags, ...)
     }
     if (should_intercept(path))
         return open_common();
-    return real_open64 ? real_open64(path, flags, mode)
-                       : real_open(path, flags, mode);
+    return syscall(SYS_openat, AT_FDCWD, path, flags, mode);
 }
 
 int openat(int dirfd, const char *path, int flags, ...)
@@ -403,22 +580,77 @@ int openat(int dirfd, const char *path, int flags, ...)
     }
     if (should_intercept(path))
         return open_common();
-    return real_openat(dirfd, path, flags, mode);
+    return syscall(SYS_openat, dirfd, path, flags, mode);
 }
 
 int close(int fd)
 {
     if (is_our_fd(fd)) {
-        real_close(g_rpc_fd);
-        real_close(g_event_fd);
-        g_rpc_fd = g_event_fd = -1;
-        g_opened = false;
-        /* note: pthread_once keeps the (now dead) connection state; a
-         * second open in the same process fails with ECONNREFUSED — fine
-         * for gamescope's one-open lifetime (phase-1 contract). */
-        return 0;
+        our_fd_release(fd);
+        return (int)syscall(SYS_close, fd);
     }
-    return real_close(fd);
+    return (int)syscall(SYS_close, fd);
+}
+
+/* ------------------------------------------------------------------ */
+/* dup family + fcntl: duplicated fds must keep working (kernel DRM    */
+/* semantics — libliftoff relies on them, see the fd-map note above)   */
+/* ------------------------------------------------------------------ */
+
+int dup(int oldfd)
+{
+    int ret = (int)syscall(SYS_dup, oldfd);
+    if (ret >= 0 && is_our_fd(oldfd))
+        our_fd_add(ret);
+    return ret;
+}
+
+int dup2(int oldfd, int newfd)
+{
+    bool src = is_our_fd(oldfd);
+    bool dst = oldfd != newfd && is_our_fd(newfd); /* dup2 closes newfd first */
+#ifdef SYS_dup2
+    int ret = (int)syscall(SYS_dup2, oldfd, newfd);
+#else
+    /* arm64 has no dup2 syscall; libc implements dup2() as dup3(…, 0) */
+    int ret = (int)syscall(SYS_dup3, oldfd, newfd, 0);
+#endif
+    if (ret >= 0) {
+        if (dst)
+            our_fd_release(newfd);
+        if (src)
+            our_fd_add(ret);
+    }
+    return ret;
+}
+
+#ifdef SYS_dup3
+int dup3(int oldfd, int newfd, int flags)
+{
+    bool src = is_our_fd(oldfd);
+    bool dst = is_our_fd(newfd); /* dup3 rejects oldfd == newfd */
+    int ret = (int)syscall(SYS_dup3, oldfd, newfd, flags);
+    if (ret >= 0) {
+        if (dst)
+            our_fd_release(newfd);
+        if (src)
+            our_fd_add(ret);
+    }
+    return ret;
+}
+#endif
+
+int fcntl(int fd, int cmd, ...)
+{
+    void *arg = NULL;
+    va_list ap;
+    va_start(ap, cmd);
+    arg = va_arg(ap, void *); /* harmless for arg-less cmds (see ioctl) */
+    va_end(ap);
+    int ret = (int)syscall(SYS_fcntl, fd, cmd, arg);
+    if (ret >= 0 && (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) && is_our_fd(fd))
+        our_fd_add(ret);
+    return ret;
 }
 
 /* ------------------------------------------------------------------ */
@@ -453,6 +685,372 @@ static void ext_copy_array(struct ext_reader *r, uintptr_t user_ptr,
 /* ------------------------------------------------------------------ */
 /* ioctl                                                               */
 /* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* dma-heap scan-out redirect                                          */
+/* ------------------------------------------------------------------ */
+/*
+ * gamescope allocates its scan-out buffers - and the swapchain images it hands
+ * to the guest through the gamescope_swapchain protocol - from
+ * /dev/dma_heap/system, outside the DRM channel. gndrm therefore never sees the
+ * allocation, only the fd later through PRIME_FD_TO_HANDLE. Redirecting that
+ * allocation to an AHardwareBuffer is what lets the daemon hand the very buffer
+ * gamescope rendered into to SurfaceFlinger, with no copy on either side.
+ *
+ * DMA_HEAP_IOCTL_ALLOC carries a length only, so the geometry comes from the
+ * connector mode list the shim already marshals: a scan-out allocation is
+ * exactly w * h * 4. Anything that does not match a known mode is left to the
+ * kernel untouched, which keeps non-frame heap users unaffected.
+ */
+#ifndef GNDRM_IOCTL_DMAHEAP_ALLOC
+#define GNDRM_IOCTL_DMAHEAP_ALLOC 0xc0184800u /* _IOWR('H', 0, alloc_data) */
+#endif
+#ifdef DMA_HEAP_IOCTL_ALLOC
+_Static_assert(GNDRM_IOCTL_DMAHEAP_ALLOC == DMA_HEAP_IOCTL_ALLOC,
+               "dma-heap alloc ioctl number drifted from the uapi header");
+#endif
+
+struct gndrm_dmaheap_alloc {
+    uint64_t len;
+    uint32_t fd;
+    uint32_t fd_flags;
+    uint64_t heap_flags;
+};
+_Static_assert(sizeof(struct gndrm_dmaheap_alloc) == 24,
+               "dma_heap_allocation_data is 24 bytes on the wire");
+
+#define GNDRM_MAX_MODES 8
+
+static uint32_t g_scan_modes[GNDRM_MAX_MODES][2];
+static int g_scan_nmodes;
+
+/* ------------------------------------------------------------------ */
+/* scan-out allocator channel                                          */
+/* ------------------------------------------------------------------ */
+/*
+ * The daemon allocates and owns the scan-out AHardwareBuffer, and that is the
+ * direction it has to run in: the daemon is the process that calls
+ * ASurfaceTransaction_setBuffer, and an AHardwareBuffer cannot be built from a
+ * bare dma-buf fd on API 33, so the publisher has to be the allocator. The shim
+ * asks here by geometry and receives the buffer's mappable dma-buf through
+ * SCM_RIGHTS, exactly as the ioctl path already receives one for
+ * PRIME_HANDLE_TO_FD. The daemon files it under that fd's st_ino, which is also
+ * how gamescope's PRIME_FD_TO_HANDLE of the same dma-buf identifies it.
+ */
+
+/*
+ * Establish the allocator channel. 0 on success, -1 with errno set otherwise
+ * (the caller retries: the daemon may not be listening yet). Called with
+ * g_scanout_lock held.
+ */
+static int scanout_chan_init(void)
+{
+    if (g_scanout_fd >= 0)
+        return 0;
+    const char *path = getenv("GAMENATIVE_DRM_SOCKET");
+    if (!path || !*path) {
+        errno = ECONNREFUSED;
+        return -1;
+    }
+    int fd = connect_one(path);
+    if (fd < 0)
+        return -1;
+    /* Bound both directions: one small request out, one small reply back, so a
+     * daemon that stops answering cannot stall gamescope's allocation path. */
+    struct timeval tv = { .tv_sec = 0, .tv_usec = GNDRM_SCANOUT_TIMEOUT_US };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    g_scanout_fd = fd;
+    return 0;
+}
+
+/*
+ * Whether an exchange error means the connection itself is gone. A reply
+ * timeout (EAGAIN/EWOULDBLOCK/ETIMEDOUT) is deliberately NOT one of these: it
+ * says the daemon is slow or the request was lost, not that the socket died.
+ * Re-establishing on a timeout is what splits the two sides onto different
+ * fds - the daemon still reading this one, the shim writing on a fresh one -
+ * so every request after the reconnect is written to a connection the daemon
+ * is not reading. Only a genuinely dead channel is dropped and reconnected.
+ */
+static bool scanout_err_dead(int e)
+{
+    e = -e;
+    /* EPROTO is included because a malformed reply means the framing on this
+     * connection can no longer be trusted; it is as unusable as a closed one. */
+    return e == EPIPE || e == ECONNRESET || e == ECONNABORTED ||
+           e == ENOTCONN || e == EBADF || e == EPROTO;
+}
+
+/*
+ * Whether an exchange error is a reply timeout rather than a dead channel.
+ */
+static bool scanout_err_timeout(int e)
+{
+    e = -e;
+    return e == EAGAIN || e == EWOULDBLOCK || e == ETIMEDOUT;
+}
+
+/* Milliseconds elapsed since t0 (a CLOCK_MONOTONIC reading). */
+static long elapsed_ms_since(const struct timespec *t0)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long ms = (long)(now.tv_sec - t0->tv_sec) * 1000L +
+              (now.tv_nsec - t0->tv_nsec) / 1000000L;
+    return ms < 0 ? 0 : ms;
+}
+
+/*
+ * Retire a channel that failed, so the next request re-establishes it. Called
+ * with g_scanout_lock held.
+ */
+static void scanout_chan_drop(void)
+{
+    if (g_scanout_fd >= 0)
+        syscall(SYS_close, g_scanout_fd);
+    g_scanout_fd = -1;
+}
+
+/*
+ * One request/response exchange on a connected channel. Returns 0 or -errno;
+ * on success *resp holds the reply and *fd_out the received descriptor.
+ * Called with g_scanout_lock held.
+ */
+static int scanout_exchange(uint32_t w, uint32_t h,
+                            struct gndrm_scanout_resp *resp, int *fd_out)
+{
+    struct gndrm_scanout_req req = {
+        .magic = GNDRM_SCANOUT_MAGIC,
+        .width = w,
+        .height = h,
+        .format = GNDRM_SCANOUT_FORMAT_BGRA_8888,
+    };
+    struct iovec iov = { .iov_base = &req, .iov_len = sizeof(req) };
+    struct msghdr msg = { 0 };
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    /* MSG_NOSIGNAL: a daemon that has closed this channel must make the send
+     * fail with EPIPE so scanout_request's retry can re-establish it, rather
+     * than raising SIGPIPE and taking the client down. */
+    if (sendmsg(g_scanout_fd, &msg, MSG_NOSIGNAL) < 0)
+        return -errno;
+
+    uint8_t buf[sizeof(struct gndrm_scanout_resp)];
+    memset(buf, 0, sizeof(buf));
+    struct iovec riov = { .iov_base = buf, .iov_len = sizeof(buf) };
+    char cbuf[CMSG_SPACE(sizeof(int))];
+    struct msghdr rmsg = { 0 };
+    rmsg.msg_iov = &riov;
+    rmsg.msg_iovlen = 1;
+    rmsg.msg_control = cbuf;
+    rmsg.msg_controllen = sizeof(cbuf);
+    ssize_t n = recvmsg(g_scanout_fd, &rmsg, 0);
+    if (n < 0)
+        return -errno;
+
+    /* Take the descriptor before validating anything: whatever arrived has to
+     * be closed here if the frame turns out not to be a usable reply. */
+    *fd_out = -1;
+    if (rmsg.msg_controllen >= CMSG_LEN(sizeof(int))) {
+        struct cmsghdr *c = CMSG_FIRSTHDR(&rmsg);
+        if (c && c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS)
+            memcpy(fd_out, CMSG_DATA(c), sizeof(int));
+    }
+    if ((size_t)n == sizeof(buf)) {
+        memcpy(resp, buf, sizeof(*resp));
+        if (resp->magic == GNDRM_SCANOUT_MAGIC) {
+            if (resp->ret != 0 && *fd_out >= 0) {
+                /* An error reply carries no buffer. */
+                syscall(SYS_close, *fd_out);
+                *fd_out = -1;
+            }
+            return 0;
+        }
+    }
+    if (*fd_out >= 0) {
+        syscall(SYS_close, *fd_out);
+        *fd_out = -1;
+    }
+    return -EPROTO;
+}
+
+/*
+ * Ask the daemon for one scan-out buffer of w x h. 0 on success with *out_fd
+ * owned by the caller. The channel is re-established (with a bounded backoff)
+ * only when it could not be connected or when it is genuinely dead; a reply
+ * timeout leaves it in place, because a timeout does not mean the socket died
+ * and reconnecting on it is what splits the two sides onto different fds. On
+ * any failure *out_attempts and *out_elapsed_ms report which attempt failed
+ * and the whole time spent inside this call, so the shim line can be aligned
+ * with the daemon's request log.
+ */
+static int scanout_request(uint32_t w, uint32_t h, int *out_fd,
+                           uint64_t *out_ino, uint32_t *out_stride,
+                           int *out_attempts, long *out_elapsed_ms)
+{
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rc = -ECONNREFUSED;
+    int attempts = 0;
+
+    for (int i = 0; i < GNDRM_SCANOUT_ATTEMPTS; i++) {
+        attempts = i + 1;
+        bool reconnect = false;
+        pthread_mutex_lock(&g_scanout_lock);
+        if (scanout_chan_init() != 0) {
+            /* Not connected (the daemon may not be listening yet): this is the
+             * reconnect case, so back off and try to connect again. */
+            rc = -ECONNREFUSED;
+            reconnect = true;
+        } else {
+            struct gndrm_scanout_resp resp;
+            int fd = -1;
+            memset(&resp, 0, sizeof(resp));
+            rc = scanout_exchange(w, h, &resp, &fd);
+            bool timed_out = (rc != 0) && scanout_err_timeout(rc);
+            if (rc == 0 && resp.ret != 0)
+                rc = resp.ret; /* daemon refusal: the channel is healthy */
+            if (rc != 0 && scanout_err_dead(rc)) {
+                /* The connection itself is gone: drop it so the next attempt
+                 * re-establishes it, and back off first. */
+                scanout_chan_drop();
+                reconnect = true;
+            } else if (timed_out) {
+                /* Reply timeout: the peer is slow or the request was lost. The
+                 * channel is still the current one, so it is deliberately kept
+                 * and not retried - resending could be answered twice and
+                 * reconnecting would orphan the fd the daemon is reading. */
+                reconnect = false;
+            } else if (rc == 0 && fd < 0) {
+                rc = -EIO; /* a success reply must carry a buffer */
+            } else if (rc == 0) {
+                *out_fd = fd;
+                if (out_ino)
+                    *out_ino = resp.ino;
+                if (out_stride)
+                    *out_stride = resp.stride;
+            }
+        }
+        pthread_mutex_unlock(&g_scanout_lock);
+        if (rc == 0)
+            break;
+        if (!reconnect)
+            break; /* a daemon refusal or a timeout keeps the channel */
+        /* 5 ms, 10 ms: a daemon that is restarting needs a moment to listen. */
+        struct timespec ts = { 0, (5 * 1000 * 1000L) << i };
+        nanosleep(&ts, NULL);
+    }
+    if (out_attempts)
+        *out_attempts = attempts;
+    if (out_elapsed_ms)
+        *out_elapsed_ms = elapsed_ms_since(&t0);
+    return rc;
+}
+
+/* Remember a connector mode. Several are offered and gamescope picks one, so
+ * they are all kept and matched by size rather than guessed. */
+static void scanout_note_mode(uint32_t w, uint32_t h)
+{
+    if (!w || !h)
+        return;
+    for (int i = 0; i < g_scan_nmodes; i++)
+        if (g_scan_modes[i][0] == w && g_scan_modes[i][1] == h)
+            return;
+    if (g_scan_nmodes >= GNDRM_MAX_MODES)
+        return;
+    g_scan_modes[g_scan_nmodes][0] = w;
+    g_scan_modes[g_scan_nmodes][1] = h;
+    g_scan_nmodes++;
+}
+
+/* Seed the geometry from GNDRM_SCANOUT ("WxH", set by the launcher from the
+ * same values it passes gamescope). The connector exchange does not always
+ * precede the first frame-sized allocation - a buffer allocated before any mode
+ * was seen stays a plain heap buffer, which the native presenter cannot
+ * publish - so the intended geometry is available up front instead. */
+static bool g_scan_env_done;
+
+static void scanout_seed_from_env(void)
+{
+    if (g_scan_env_done)
+        return;
+    g_scan_env_done = true;
+    const char *v = getenv("GNDRM_SCANOUT");
+    unsigned w = 0, h = 0;
+    if (v && sscanf(v, "%ux%u", &w, &h) == 2)
+        scanout_note_mode(w, h);
+}
+
+/*
+ * 0 = redirected to a daemon-owned buffer, -1 = not a scan-out allocation (the
+ * caller then lets the real kernel ioctl handle it).
+ */
+static int scanout_redirect(void *arg)
+{
+    struct gndrm_dmaheap_alloc *a = arg;
+    if (!a)
+        return -1;
+    scanout_seed_from_env();
+    if (g_scan_nmodes == 0) {
+        if (rate_ok(5))
+            LOG("scanout: heap alloc %llu B before any mode was seen\n",
+                (unsigned long long)a->len);
+        return -1;
+    }
+    for (int i = 0; i < g_scan_nmodes; i++) {
+        uint32_t w = g_scan_modes[i][0], h = g_scan_modes[i][1];
+        uint64_t want = (uint64_t)w * h * 4;
+        if (a->len != want)
+            continue;
+        int fd = -1;
+        uint64_t ino = 0;
+        uint32_t stride = 0;
+        int attempts = 0;
+        long elapsed_ms = 0;
+        int rc = scanout_request(w, h, &fd, &ino, &stride, &attempts, &elapsed_ms);
+        if (rc != 0) {
+            /* No buffer means no publishable frame; falling through leaves the
+             * allocation a plain heap buffer, which is the pre-redirect
+             * behaviour rather than a broken one. Name the fault rather than
+             * reporting a bare errno: a request that ran out its reply budget,
+             * a full pool, an allocator failure, an unsupported geometry or a
+             * daemon that is unreachable. The elapsed time and attempt number
+             * are logged so this line can be aligned with the daemon's
+             * "received (seq=)" receipt (or its absence). */
+            const char *why = "allocation failure";
+            if (rc == -EAGAIN || rc == -ETIMEDOUT)
+                why = "request timed out waiting for a reply";
+            else if (rc == -ENOSPC)
+                why = "daemon pool exhausted";
+            else if (rc == -ENOSYS)
+                why = "daemon presenter disabled";
+            else if (rc == -EINVAL)
+                why = "unsupported geometry/format";
+            else if (rc == -ECONNREFUSED)
+                why = "allocator channel unreachable";
+            else if (rc == -EPROTO)
+                why = "malformed daemon reply";
+            if (rate_ok(2))
+                LOG("scanout: daemon allocated no %ux%u buffer: %s "
+                    "(elapsed=%ldms attempt=%d/%d) (errno %d %s)\n",
+                    w, h, why, elapsed_ms, attempts, GNDRM_SCANOUT_ATTEMPTS,
+                    -rc, strerror(-rc));
+            return -1;
+        }
+        if (a->fd_flags & O_CLOEXEC)
+            syscall(SYS_fcntl, fd, F_SETFD, FD_CLOEXEC);
+        a->fd = (uint32_t)fd;
+        a->heap_flags = 0;
+        LOG("scanout: heap alloc %llu B -> daemon buffer %ux%u fd=%d ino=%llu stride=%u\n",
+            (unsigned long long)want, w, h, fd, (unsigned long long)ino, stride);
+        return 0;
+    }
+    if (rate_ok(5))
+        LOG("scanout: heap alloc %llu B not redirected (modes=%d)\n",
+            (unsigned long long)a->len, g_scan_nmodes);
+    return -1;
+}
 
 static int drm_ioctl(int fd, unsigned long req, void *arg)
 {
@@ -571,6 +1169,13 @@ static int drm_ioctl(int fd, unsigned long req, void *arg)
             ext_copy_array(&r, v.encoders_ptr, v.count_encoders ? ne : 0, 4);
         if (v.modes_ptr)
             ext_copy_array(&r, v.modes_ptr, v.count_modes ? nm : 0, sizeof(struct drm_mode_modeinfo));
+        /* The heap allocation that follows is sized from one of these modes. */
+        {
+            uint32_t mc = v.count_modes ? nm : 0;
+            const struct drm_mode_modeinfo *mm = (const void *)v.modes_ptr;
+            for (uint32_t mi = 0; mm && mi < mc; mi++)
+                scanout_note_mode(mm[mi].hdisplay, mm[mi].vdisplay);
+        }
         if (v.props_ptr)
             ext_copy_array(&r, v.props_ptr, v.count_props ? np : 0, 4);
         if (v.prop_values_ptr)
@@ -719,17 +1324,37 @@ static int drm_ioctl(int fd, unsigned long req, void *arg)
     }
     case DRM_IOCTL_MODE_ADDFB2:
     case DRM_IOCTL_MODE_GETFB2: {
+        /* Snapshot first: the success path overwrites `arg` with the reply. */
+        const struct drm_mode_fb_cmd2 fb = *(const struct drm_mode_fb_cmd2 *)arg;
+        const char *op = req == DRM_IOCTL_MODE_ADDFB2 ? "ADDFB2" : "GETFB2";
+        unsigned long n = g_n_addfb2++;
         ret = rpc(req, arg, sizeof(struct drm_mode_fb_cmd2),
                   g_resp_buf, &out_len, -1, &fd_recv);
-        if (ret)
+        if (ret) {
+            g_n_addfb2_fail++;
+            LOG("%s FAIL ret=%d %ux%u fourcc=0x%08x flags=0x%x "
+                "mods=%#llx,%#llx,%#llx,%#llx handles=%u,%u,%u,%u "
+                "pitches=%u,%u,%u,%u offsets=%u,%u,%u,%u\n",
+                op, ret, fb.width, fb.height, fb.pixel_format, fb.flags,
+                (unsigned long long)fb.modifier[0], (unsigned long long)fb.modifier[1],
+                (unsigned long long)fb.modifier[2], (unsigned long long)fb.modifier[3],
+                fb.handles[0], fb.handles[1], fb.handles[2], fb.handles[3],
+                fb.pitches[0], fb.pitches[1], fb.pitches[2], fb.pitches[3],
+                fb.offsets[0], fb.offsets[1], fb.offsets[2], fb.offsets[3]);
             break;
+        }
         memcpy(arg, g_resp_buf, sizeof(struct drm_mode_fb_cmd2));
+        if (n < 4)
+            LOG("%s ok #%lu %ux%u fourcc=0x%08x flags=0x%x mods=%#llx\n",
+                op, n + 1, fb.width, fb.height, fb.pixel_format, fb.flags,
+                (unsigned long long)fb.modifier[0]);
         break;
     }
     case DRM_IOCTL_MODE_ATOMIC: {
         struct drm_mode_atomic v = *(struct drm_mode_atomic *)arg;
         uint32_t nobjs = v.count_objs;
         if (!nobjs || nobjs > 64) {
+            LOG("ATOMIC REJECT nobjs=%u\n", nobjs);
             ret = -EINVAL;
             break;
         }
@@ -741,6 +1366,7 @@ static int drm_ioctl(int fd, unsigned long req, void *arg)
         for (uint32_t i = 0; i < nobjs; i++)
             total += counts[i];
         if (total > 512) {
+            LOG("ATOMIC REJECT total=%u\n", total);
             ret = -EINVAL;
             break;
         }
@@ -768,6 +1394,52 @@ static int drm_ioctl(int fd, unsigned long req, void *arg)
             }
         }
         ret = rpc(req, g_req_buf, in_len, g_resp_buf, &out_len, fd_send, &fd_recv);
+        g_n_atomic++;
+        if (ret) {
+            g_n_atomic_fail++;
+            LOG("ATOMIC FAIL ret=%d objs=%u total=%u\n", ret, nobjs, total);
+        } else if (rate_ok(2)) {
+            LOG("ATOMIC heartbeat #%lu ok=%lu fail=%lu addfb2=%lu fail=%lu objs=%u total=%u\n",
+                g_n_atomic, g_n_atomic - g_n_atomic_fail, g_n_atomic_fail,
+                g_n_addfb2, g_n_addfb2_fail, nobjs, total);
+        }
+        break;
+    }
+    /* Sync objects (gamescope's DRM backend creates one always-signalled
+     * object at init and rides its exported fd as the primary plane's
+     * in-fence). HANDLE_TO_FD returns an fd, so it uses the same SCM_RIGHTS
+     * path as PRIME_HANDLE_TO_FD. */
+    case GNDRM_IOCTL_SYNCOBJ_CREATE: {
+        ret = rpc(req, arg, sizeof(struct drm_syncobj_create),
+                  g_resp_buf, &out_len, -1, &fd_recv);
+        if (ret)
+            break;
+        memcpy(arg, g_resp_buf, sizeof(struct drm_syncobj_create));
+        break;
+    }
+    case GNDRM_IOCTL_SYNCOBJ_DESTROY: {
+        ret = rpc(req, arg, sizeof(struct drm_syncobj_destroy),
+                  g_resp_buf, &out_len, -1, &fd_recv);
+        break;
+    }
+    case GNDRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: {
+        struct gndrm_syncobj_handle v = *(struct gndrm_syncobj_handle *)arg;
+        ret = rpc(req, &v, sizeof(v), g_resp_buf, &out_len, -1, &fd_recv);
+        if (ret)
+            break;
+        if (fd_recv < 0) {
+            ret = -EIO;
+            break;
+        }
+        v.fd = fd_recv;
+        *(struct gndrm_syncobj_handle *)arg = v;
+        break;
+    }
+    case GNDRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: {
+        /* Forwarded so the daemon owns the answer (it needs real dma-fence
+         * plumbing to import a sync file, so it refuses). */
+        struct gndrm_syncobj_handle v = *(struct gndrm_syncobj_handle *)arg;
+        ret = rpc(req, &v, sizeof(v), g_resp_buf, &out_len, (int)v.fd, &fd_recv);
         break;
     }
     default:
@@ -784,10 +1456,14 @@ static int drm_ioctl(int fd, unsigned long req, void *arg)
 }
 
 #ifdef __ANDROID__
-/* bionic declares ioctl(int, int, ...) — match its prototype exactly */
+/* bionic declares ioctl(int, int, ...) — match its prototype exactly.
+ * Widen through unsigned int: request encodes dir/size/type/nr and
+ * _IOR/_IOWR values have bit31 set; widening the int straight to
+ * unsigned long would sign-extend (0xFFFFFFFFC04064A0) and never match
+ * the drm.h constants. */
 int ioctl(int fd, int req, ...)
 {
-    unsigned long req_l = (unsigned long)req;
+    unsigned long req_l = (unsigned long)(unsigned int)req;
 #else
 int ioctl(int fd, unsigned long req, ...)
 {
@@ -798,6 +1474,9 @@ int ioctl(int fd, unsigned long req, ...)
     va_start(ap, req);
     arg = va_arg(ap, void *);
     va_end(ap);
+
+    if (req_l == GNDRM_IOCTL_DMAHEAP_ALLOC && scanout_redirect(arg) == 0)
+        return 0;
 
     if (is_our_fd(fd))
         return drm_ioctl(fd, req_l, arg);

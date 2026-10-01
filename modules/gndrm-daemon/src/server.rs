@@ -17,8 +17,9 @@ use std::os::fd::RawFd;
 
 use gndrm_uapi::wire::{ReqHdr, RespHdr, MAX_FRAME_LEN, REQ_HDR_LEN, RESP_HDR_LEN};
 
+use crate::diag::{diag, Role, State};
 use crate::pod::pod_write;
-use crate::{Device, DispatchResult};
+use crate::{close_fd, Device, DispatchResult};
 
 /// Log sink: `eprintln` adapter on host, `__android_log_write` on Android.
 /// Cold paths only — the per-frame hot path never logs.
@@ -94,12 +95,102 @@ pub fn accept(listener: RawFd) -> io::Result<RawFd> {
     Ok(fd)
 }
 
-/// Blocking dispatch loop: one frame in → one frame out, events pushed on
-/// the event channel. Returns when the peer closes the RPC socket, the RPC
+/// Accept the *newest* connection already queued on `listener`, closing any
+/// connection that was queued before it.
+///
+/// The scan-out channel is re-established by the shim, and a reconnect can be
+/// queued on the listener while the daemon is still serving the previous
+/// connection. Accepting in accept order would leave the daemon reading the
+/// older, already-abandoned connection while the shim writes every request on
+/// the newest one, so nothing the shim sends after the reconnect is ever read.
+/// This drains the backlog and keeps only the latest, which is what "one
+/// reader, on the current fd" requires; each superseded descriptor is closed
+/// here so none is leaked and no reader is left on a replaced fd.
+///
+/// The first accept blocks (the caller polls the listener first); the rest of
+/// the drain is non-blocking, so at most one connection is consumed when only
+/// one is queued.
+pub fn accept_newest(listener: RawFd) -> io::Result<RawFd> {
+    let mut newest = accept(listener)?;
+    // F_GETFL/F_SETFL on the listener is the portable way to make accept(2)
+    // report "nothing queued" (EAGAIN) instead of blocking; the accepted
+    // descriptors do not inherit O_NONBLOCK, so the served fd stays blocking,
+    // which `recvmsg` on the request path relies on. The original flags are
+    // restored before returning.
+    // SAFETY: fcntl on a live listening socket.
+    let flags = unsafe { libc::fcntl(listener, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(listener, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Ok(newest);
+    }
+    while let Ok(fd) = accept(listener) {
+        // A connection newer than the one held: the peer moved on, so the
+        // previous one is dead to it. Close it and keep the newer descriptor as
+        // the current one.
+        // SAFETY: `newest` came from accept and is not used again.
+        unsafe { libc::close(newest) };
+        newest = fd;
+    }
+    // SAFETY: restore the listener's original (blocking) flags; the listening
+    // socket must keep them for the acceptor's own blocking poll/accept.
+    unsafe { libc::fcntl(listener, libc::F_SETFL, flags) };
+    Ok(newest)
+}
+
+/// Blocking dispatch loop: one frame in → one frame out, plus flip events the
+/// commit worker produces. Returns when the peer closes the RPC socket, the RPC
 /// fd is shut down externally (`nativeStop`), or a send fails.
+///
+/// The loop polls the RPC socket together with the device's flip-event fd so a
+/// flip event is delivered promptly even while no request is in flight — a
+/// client (gamescope) parks in `poll()` on its event fd right after a commit,
+/// and the serve thread must not wait for the *next* request to push the event
+/// through.
 pub fn serve(dev: &mut Device, rpc_fd: RawFd, event_fd: RawFd, log: Log) {
     let mut buf = vec![0u8; MAX_FRAME_LEN];
+    let flip_fd = dev.flip_event_fd();
+    // Publish this loop's state so a stalled scan-out request can rule the
+    // serve thread in or out as the blocker.
+    let d = diag();
     loop {
+        // Wait for either an RPC frame or a flip event from the worker.
+        d.set_role(Role::Serve, State::ServeWaitingRpc);
+        let mut pfds = [
+            libc::pollfd {
+                fd: rpc_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: flip_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: two valid pollfds waited on indefinitely.
+        let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            log(&format!("poll: {e}"));
+            return;
+        }
+        // Flip events are ready: write them to the client's event channel in
+        // commit order.
+        if pfds[1].revents != 0 {
+            for ev in dev.drain_flip_events() {
+                let mut bytes = Vec::new();
+                pod_write(&mut bytes, &ev);
+                if send_frame(event_fd, &bytes, None).is_err() {
+                    log("event send failed");
+                    return;
+                }
+            }
+        }
+        if pfds[0].revents == 0 {
+            continue;
+        }
         let (n, fd_in) = match recv_frame(rpc_fd, &mut buf) {
             Ok(v) => v,
             Err(e) => {
@@ -116,6 +207,7 @@ pub fn serve(dev: &mut Device, rpc_fd: RawFd, event_fd: RawFd, log: Log) {
             return;
         };
         let payload = &buf[REQ_HDR_LEN..hdr.total_len as usize];
+        d.set_role(Role::Serve, State::ServeDispatch);
         let result: DispatchResult = dev.dispatch(hdr.ioctl_nr, payload, fd_in);
 
         let resp = RespHdr {
@@ -126,18 +218,17 @@ pub fn serve(dev: &mut Device, rpc_fd: RawFd, event_fd: RawFd, log: Log) {
         };
         let mut frame = resp.encode().to_vec();
         frame.extend_from_slice(&result.body);
-        if send_frame(rpc_fd, &frame, result.fd_out).is_err() {
+        let sent = send_frame(rpc_fd, &frame, result.fd_out);
+        // The daemon's copy of the attached descriptor is closed either way:
+        // `SCM_RIGHTS` duplicates it into the peer on success, and a failed
+        // `sendmsg` transfers nothing. Not closing it leaks one descriptor per
+        // `PRIME_HANDLE_TO_FD`, which pins the exported dma-buf forever.
+        if let Some(fd) = result.fd_out {
+            close_fd(fd);
+        }
+        if sent.is_err() {
             log("send failed");
             return;
-        }
-
-        for ev in result.events {
-            let mut bytes = Vec::new();
-            pod_write(&mut bytes, &ev);
-            if send_frame(event_fd, &bytes, None).is_err() {
-                log("event send failed");
-                return;
-            }
         }
     }
 }
@@ -215,4 +306,115 @@ fn send_frame(fd: RawFd, bytes: &[u8], fd_send: Option<RawFd>) -> io::Result<()>
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Connect one `SOCK_SEQPACKET` client to the abstract-name listener the
+    /// way the shim does (full `sizeof(sockaddr_un)` addrlen).
+    fn client_connect(name: &str) -> RawFd {
+        // SAFETY: fresh socket; the sockaddr_un is zeroed and the abstract name
+        // is copied into sun_path+1 with the length bounds checked by the test.
+        unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0);
+            assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+            let mut sa: libc::sockaddr_un = core::mem::zeroed();
+            sa.sun_family = libc::AF_UNIX as u16;
+            assert!(name.len() < sa.sun_path.len() - 1);
+            core::ptr::copy_nonoverlapping(
+                name.as_ptr().cast::<u8>(),
+                sa.sun_path.as_mut_ptr().add(1).cast::<u8>(),
+                name.len(),
+            );
+            let rc = libc::connect(
+                fd,
+                (&raw const sa).cast(),
+                core::mem::size_of::<libc::sockaddr_un>() as u32,
+            );
+            assert_eq!(rc, 0, "connect: {}", io::Error::last_os_error());
+            fd
+        }
+    }
+
+    /// A unique abstract socket name per test invocation (tests are threads in
+    /// one process, so a fixed name would collide across parallel runs).
+    fn unique_name() -> String {
+        static N: AtomicU32 = AtomicU32::new(0);
+        format!(
+            "gndrm-srv-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// The accept-newest contract the scan-out acceptor depends on: when a
+    /// shim reconnect is queued behind the connection it is abandoning, the
+    /// daemon must end up reading the *newest* connection and the superseded
+    /// one must be closed (no reader left on a replaced fd, no leak).
+    #[test]
+    fn accept_newest_adopts_the_latest_and_drops_the_superseded() {
+        let name = unique_name();
+        let listener = listen_seqpacket(&name).expect("listen");
+        let old = client_connect(&name);
+        let new = client_connect(&name);
+
+        let adopted = accept_newest(listener).expect("accept_newest");
+
+        // The adopted fd is the newest client: a byte it sends is readable here.
+        let marker = [0xA5u8];
+        // SAFETY: valid sockets and a one-byte buffer.
+        let sent = unsafe { libc::send(new, marker.as_ptr().cast(), 1, 0) };
+        assert_eq!(sent, 1, "send(new): {}", io::Error::last_os_error());
+        let mut got = [0u8; 1];
+        let n = unsafe { libc::recv(adopted, got.as_mut_ptr().cast(), 1, 0) };
+        assert_eq!(n, 1, "recv(adopted): {}", io::Error::last_os_error());
+        assert_eq!(got[0], 0xA5);
+
+        // The superseded connection was closed by `accept_newest`: a write from
+        // it now fails instead of reaching a reader nobody owns.
+        // SAFETY: valid socket; MSG_NOSIGNAL avoids SIGPIPE on the closed peer.
+        let r = unsafe { libc::send(old, marker.as_ptr().cast(), 1, libc::MSG_NOSIGNAL) };
+        assert!(
+            r < 0,
+            "the superseded connection must be closed, send returned {r}"
+        );
+
+        // SAFETY: every descriptor created here is closed once.
+        unsafe {
+            libc::close(old);
+            libc::close(new);
+            libc::close(adopted);
+            libc::close(listener);
+        }
+    }
+
+    /// A single queued connection is adopted unchanged (the common case: no
+    /// reconnect, the drain touches nothing).
+    #[test]
+    fn accept_newest_adopts_a_lone_connection() {
+        let name = unique_name();
+        let listener = listen_seqpacket(&name).expect("listen");
+        let client = client_connect(&name);
+
+        let adopted = accept_newest(listener).expect("accept_newest");
+
+        let marker = [0x11u8];
+        // SAFETY: valid sockets and a one-byte buffer.
+        let sent = unsafe { libc::send(client, marker.as_ptr().cast(), 1, 0) };
+        assert_eq!(sent, 1);
+        let mut got = [0u8; 1];
+        let n = unsafe { libc::recv(adopted, got.as_mut_ptr().cast(), 1, 0) };
+        assert_eq!(n, 1);
+        assert_eq!(got[0], 0x11);
+
+        // SAFETY: every descriptor created here is closed once.
+        unsafe {
+            libc::close(client);
+            libc::close(adopted);
+            libc::close(listener);
+        }
+    }
 }

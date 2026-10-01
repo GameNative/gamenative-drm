@@ -35,6 +35,7 @@ pub const PLANE_CURSOR_ID: u32 = 0x44;
 const FIRST_GEM_HANDLE: u32 = 1;
 const FIRST_FB_ID: u32 = 0x1000;
 const FIRST_BLOB_ID: u32 = 0x2000;
+const FIRST_SYNCOBJ_HANDLE: u32 = 0x3000;
 
 /// Physical panel description, supplied by the Android side (surface size +
 /// refresh) — phase 3 wires this to `ANativeWindow` metrics.
@@ -158,27 +159,45 @@ pub struct CrtcState {
 /// All mutable object stores. Split from `Device` so the commit path can
 /// borrow stores while the presenter is called.
 #[derive(Debug)]
+/// A sync object. Only the always-signalled form is modelled (see the UAPI
+/// comment): the export fd is an eventfd holding a count, so a `poll` on a dup
+/// of it is ready immediately — which is exactly what an always-signalled
+/// fence means to the presenter.
+pub struct Syncobj {
+    pub signaled: bool,
+    pub export_fd: Option<RawFd>,
+}
+
 pub struct Stores {
+    pub syncobjs: HashMap<u32, Syncobj>,
     pub gems: HashMap<u32, GemObject>,
     /// `stat.st_ino` → GEM handle (dedup index).
     pub gem_by_ino: HashMap<u64, u32>,
+    /// Handle-closed GEMs still referenced by a live FB (kernel semantics:
+    /// GEM_CLOSE drops the handle's reference; the object dies with the
+    /// last FB referencing it). Keyed by the (now-invalid) handle.
+    pub gems_closed: HashMap<u32, GemObject>,
     pub fbs: HashMap<u32, Framebuffer>,
     pub blobs: HashMap<u32, Blob>,
     next_gem: u32,
     next_fb: u32,
     next_blob: u32,
+    next_syncobj: u32,
 }
 
 impl Default for Stores {
     fn default() -> Self {
         Self {
+            syncobjs: HashMap::new(),
             gems: HashMap::new(),
             gem_by_ino: HashMap::new(),
+            gems_closed: HashMap::new(),
             fbs: HashMap::new(),
             blobs: HashMap::new(),
             next_gem: FIRST_GEM_HANDLE,
             next_fb: FIRST_FB_ID,
             next_blob: FIRST_BLOB_ID,
+            next_syncobj: FIRST_SYNCOBJ_HANDLE,
         }
     }
 }
@@ -195,6 +214,12 @@ impl Stores {
         let id = self.next_fb;
         self.next_fb += 1;
         assert!(self.next_fb < FIRST_BLOB_ID, "FB id space exhausted");
+        id
+    }
+
+    pub fn alloc_syncobj(&mut self) -> u32 {
+        let id = self.next_syncobj;
+        self.next_syncobj += 1;
         id
     }
 

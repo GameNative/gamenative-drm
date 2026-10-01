@@ -15,6 +15,7 @@
 //! rides this frame via `SCM_RIGHTS` (phase-1 contract: at most one fence per
 //! commit — gamescope only ever fences the primary plane).
 
+use std::collections::HashSet;
 use std::os::fd::RawFd;
 
 use gndrm_uapi::drm::*;
@@ -23,7 +24,7 @@ use gndrm_uapi::wire::errno;
 
 use crate::objects::{CONNECTOR_ID, CRTC_ID, PLANE_CURSOR_ID, PLANE_PRIMARY_ID};
 use crate::pod::*;
-use crate::{props, Device, DispatchResult};
+use crate::{props, CommitJob, Device, DispatchResult};
 
 /// One parsed `(obj, prop, value)` triple.
 #[derive(Debug, Clone, Copy)]
@@ -43,50 +44,147 @@ struct ParsedCommit {
 }
 
 impl Device {
-    pub(crate) fn ioctl_atomic(&mut self, payload: &[u8], fd_in: Option<RawFd>) -> DispatchResult {
+    pub(crate) fn ioctl_atomic(
+        &mut self,
+        payload: &[u8],
+        mut fd_in: Option<RawFd>,
+    ) -> DispatchResult {
         let Some(a) = pod_read::<DrmModeAtomic>(payload) else {
             return DispatchResult::err(errno::EINVAL);
         };
-        // Unknown flag bits are a hard error, like the kernel.
+        // Unknown flag bits are a hard error, like the kernel. ASYNC is
+        // accepted: our present path is asynchronous anyway (commit queues and
+        // returns; the worker presents on the latch), so "present immediately"
+        // is the only behaviour we have.
         const KNOWN: u32 = DRM_MODE_ATOMIC_TEST_ONLY
             | DRM_MODE_ATOMIC_NONBLOCK
             | DRM_MODE_ATOMIC_ALLOW_MODESET
-            | DRM_MODE_PAGE_FLIP_EVENT;
+            | DRM_MODE_PAGE_FLIP_EVENT
+            | DRM_MODE_PAGE_FLIP_ASYNC;
         if a.flags & !KNOWN != 0 || a.reserved != 0 {
+            self.diag(&format!(
+                "atomic: reject EINVAL unknown flags=0x{:x} reserved=0x{:x}",
+                a.flags, a.reserved
+            ));
             return DispatchResult::err(errno::EINVAL);
         }
-        // Events without NONBLOCK would deadlock a blocking commit path; we
-        // emulate commits synchronously, so both orders are safe — but reject
-        // the combination the kernel rejects (event without ALLOW_MODESET is
-        // fine; TEST_ONLY with event is not).
+        // TEST_ONLY with an event is what the kernel rejects (a test commit has
+        // nothing to latch).
         if a.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0 && a.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
+            self.diag("atomic: reject EINVAL TEST_ONLY+EVENT");
             return DispatchResult::err(errno::EINVAL);
         }
 
-        let parsed = match Self::parse_atomic(&a, payload) {
+        let mut parsed = match self.parse_atomic(&a, payload) {
             Ok(p) => p,
             Err(e) => return e,
         };
+        // An always-signalled emulated fence — our own exported sync object,
+        // which is a bare eventfd — is already signalled, so as far as the
+        // emulated hardware is concerned there is no fence to carry. It must
+        // not be forwarded either: it is not a `sync_file`, and SurfaceFlinger
+        // logs `sync_file_info returned NULL` when asked to inspect one. Treat
+        // it exactly like the `-1` "no fence" sentinel.
+        if fd_in.is_some_and(|fd| self.is_emulated_fence(fd)) {
+            if let Some(fd) = fd_in {
+                crate::close_fd(fd);
+            }
+            fd_in = None;
+            parsed.wants_fence = false;
+        }
         if parsed.wants_fence != fd_in.is_some() {
-            // Fence promised but not delivered (or an unsolicited fd).
+            // Fence promised but not delivered (or an unsolicited fd). Close the
+            // unsolicited reference we were given either way.
+            if let Some(fd) = fd_in {
+                crate::close_fd(fd);
+            }
+            self.diag(&format!(
+                "atomic: reject EINVAL fence mismatch wants={} got={}",
+                parsed.wants_fence,
+                fd_in.is_some()
+            ));
             return DispatchResult::err(errno::EINVAL);
         }
 
         if let Err(e) = self.validate_commit(&parsed) {
+            if let Some(fd) = fd_in {
+                crate::close_fd(fd);
+            }
             return DispatchResult::err(e);
         }
         if a.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0 {
+            // TEST_ONLY validates and stops here: no state change, no queue,
+            // no event. The fence was never going to be consumed.
+            if let Some(fd) = fd_in {
+                crate::close_fd(fd);
+            }
             return DispatchResult::ok(Vec::new());
         }
+        // A non-blocking commit whose acquire fence has not signalled cannot
+        // proceed without stalling: the kernel returns EBUSY rather than block
+        // the caller (which is what a blocking commit would be allowed to do).
+        if a.flags & DRM_MODE_ATOMIC_NONBLOCK != 0 {
+            if let Some(fd) = fd_in {
+                if !fence_ready(fd) {
+                    crate::close_fd(fd);
+                    self.diag("atomic: reject EBUSY non-blocking commit with unsignalled in-fence");
+                    return DispatchResult::err(errno::EBUSY);
+                }
+            }
+        }
 
-        // Apply.
-        let mut result = DispatchResult::ok(Vec::new());
-        self.apply_commit(&parsed, fd_in, &mut result);
-        result
+        // Apply software state synchronously (queries see it immediately), then
+        // queue the present + flip event for the worker.
+        self.apply_commit(&parsed, fd_in);
+        if !self.logged_first_commit {
+            self.logged_first_commit = true;
+            self.diag(&format!(
+                "atomic: first commit queued (primary fb={}, {} props, flags=0x{:x})",
+                self.primary_state().fb_id,
+                parsed.sets.len(),
+                parsed.flags
+            ));
+        }
+        // Periodic commit geometry: what the client actually puts on the
+        // primary plane. First 30 commits in full, then every 120th — this
+        // is the ground truth for "stretched/misplaced frame" bugs (run 12:
+        // taskbar band at top of a white screen).
+        self.commit_count = self.commit_count.wrapping_add(1);
+        if self.commit_count <= 30 || self.commit_count.is_multiple_of(120) {
+            let p = self.primary_state();
+            let (w, h, fmt, pitch) = self
+                .stores
+                .fbs
+                .get(&p.fb_id)
+                .map(|f| (f.width, f.height, f.pixel_format, f.pitches[0]))
+                .unwrap_or((0, 0, 0, 0));
+            self.diag(&format!(
+                "atomic #{}: fb={} {}x{} fmt={:#010x} pitch={} src=({},{}) {}x{} crtc=({},{}) {}x{}",
+                self.commit_count,
+                p.fb_id,
+                w,
+                h,
+                fmt,
+                pitch,
+                p.src_x >> 16,
+                p.src_y >> 16,
+                p.src_w >> 16,
+                p.src_h >> 16,
+                p.crtc_x,
+                p.crtc_y,
+                p.crtc_w,
+                p.crtc_h,
+            ));
+        }
+        DispatchResult::ok(Vec::new())
     }
 
     /// Decode the linearized extension into `(obj, prop, value)` triples.
-    fn parse_atomic(a: &DrmModeAtomic, payload: &[u8]) -> Result<ParsedCommit, DispatchResult> {
+    fn parse_atomic(
+        &self,
+        a: &DrmModeAtomic,
+        payload: &[u8],
+    ) -> Result<ParsedCommit, DispatchResult> {
         let mut off = core::mem::size_of::<DrmModeAtomic>();
         let n = a.count_objs as usize;
         // Kernel caps the object count; mirror with a sane bound.
@@ -135,9 +233,12 @@ impl Device {
                 let value = values[flat];
                 flat += 1;
                 let Some(prop_index) = props::resolve(obj_id, prop_id) else {
+                    self.diag(&format!(
+                        "atomic: reject ENOENT unresolved prop obj={obj_id} prop=0x{prop_id:x}"
+                    ));
                     return Err(DispatchResult::err(errno::ENOENT));
                 };
-                if prop_index == props::P_PLANE_IN_FENCE_FD && value != u64::from(u32::MAX) {
+                if prop_index == props::P_PLANE_IN_FENCE_FD && value != u64::MAX {
                     wants_fence = true;
                 }
                 sets.push(PropSet {
@@ -161,6 +262,11 @@ impl Device {
         for s in &commit.sets {
             let (_, _, immutable) = props::PROPS[s.prop_index];
             if immutable {
+                self.diag(&format!(
+                    "atomic: reject EPERM immutable prop {} (idx {})",
+                    props::PROPS[s.prop_index].0,
+                    s.prop_index
+                ));
                 return Err(errno::EPERM);
             }
         }
@@ -172,6 +278,7 @@ impl Device {
             )
         });
         if modeset && commit.flags & DRM_MODE_ATOMIC_ALLOW_MODESET == 0 {
+            self.diag("atomic: reject EINVAL modeset props without ALLOW_MODESET");
             return Err(errno::EINVAL);
         }
         // Referenced objects must exist.
@@ -179,16 +286,22 @@ impl Device {
             match s.prop_index {
                 props::P_PLANE_FB_ID => {
                     if s.value != 0 && !self.stores().fbs.contains_key(&(s.value as u32)) {
+                        self.diag(&format!("atomic: reject ENOENT unknown fb={}", s.value));
                         return Err(errno::ENOENT);
                     }
                 }
                 props::P_CRTC_MODE_ID => {
                     if s.value != 0 && !self.stores().blobs.contains_key(&(s.value as u32)) {
+                        self.diag(&format!(
+                            "atomic: reject ENOENT unknown mode blob={}",
+                            s.value
+                        ));
                         return Err(errno::ENOENT);
                     }
                 }
                 props::P_PLANE_CRTC_ID | props::P_CONN_CRTC_ID => {
                     if s.value != 0 && s.value != u64::from(CRTC_ID) {
+                        self.diag(&format!("atomic: reject ENOENT unknown crtc={}", s.value));
                         return Err(errno::ENOENT);
                     }
                 }
@@ -210,18 +323,17 @@ impl Device {
         }
         for plane in [&primary, &cursor] {
             if plane.fb_id != 0 && plane.crtc_id != CRTC_ID {
+                self.diag(&format!(
+                    "atomic: reject EINVAL fb={} without crtc (crtc_id={})",
+                    plane.fb_id, plane.crtc_id
+                ));
                 return Err(errno::EINVAL);
             }
         }
         Ok(())
     }
 
-    fn apply_commit(
-        &mut self,
-        commit: &ParsedCommit,
-        fence_fd: Option<RawFd>,
-        result: &mut DispatchResult,
-    ) {
+    fn apply_commit(&mut self, commit: &ParsedCommit, fence_fd: Option<RawFd>) {
         let old_primary_fb = self.primary_state().fb_id;
 
         for s in &commit.sets {
@@ -244,23 +356,56 @@ impl Device {
             }
         }
         let crtc_on = self.crtc_state().active;
-
-        // Present when the primary FB changed under an active CRTC; fence
-        // ownership moves to the presenter (it polls before sampling).
-        // No present this commit (cursor-only update, CRTC off, …): nobody
-        // else consumes the fence, so release it here — the client must not
-        // leak it either way.
         let new_fb = self.primary_state().fb_id;
-        if crtc_on && new_fb != 0 && new_fb != old_primary_fb {
-            self.present_primary(new_fb, fence_fd);
-        } else if let Some(fd) = fence_fd {
-            crate::close_fd(fd);
+
+        // Publish only when the primary FB changed under an active CRTC — the
+        // kernel does not re-present an unchanged plane on a re-commit.
+        let publish = crtc_on && new_fb != 0 && new_fb != old_primary_fb;
+
+        let fb = if publish {
+            self.stores.fbs.get(&new_fb).cloned()
+        } else {
+            None
+        };
+        // Resolve the buffer identity the presenter will look up (the GEM may
+        // already be orphaned-but-FB-referenced, so search both tables).
+        let ino = fb.as_ref().and_then(|fb| {
+            fb.handles
+                .first()
+                .copied()
+                .filter(|h| *h != 0)
+                .and_then(|h| {
+                    self.stores
+                        .gems
+                        .get(&h)
+                        .or_else(|| self.stores.gems_closed.get(&h))
+                })
+                .map(|gem| gem.ino)
+        });
+        // Inodes still backed by a GEM object — the presenter's retire signal
+        // ("client stopped importing") now also requires the flip event to have
+        // fired, which the worker's latch wait enforces.
+        let live_inos: HashSet<u64> = self
+            .stores
+            .gems
+            .values()
+            .map(|g| g.ino)
+            .chain(self.stores.gems_closed.values().map(|g| g.ino))
+            .collect();
+        let plane = self.primary_state();
+
+        // Real GEM semantics: the buffer is in-flight from commit until its
+        // flip event fires; the worker clears it after the latch.
+        if let Some(fb) = &fb {
+            self.mark_in_flight(fb.id);
         }
 
-        if commit.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
+        // The flip event is built now (sequence + timestamp) but the worker
+        // emits it only after the presenter reports the latch.
+        let event = if commit.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
             let (sec, usec) = self.now();
             let seq = self.next_flip_sequence();
-            result.events.push(DrmEventVblank {
+            Some(DrmEventVblank {
                 base: DrmEvent {
                     ty: DRM_EVENT_FLIP_COMPLETE,
                     length: core::mem::size_of::<DrmEventVblank>() as u32,
@@ -270,8 +415,19 @@ impl Device {
                 tv_usec: usec,
                 sequence: seq,
                 crtc_id: CRTC_ID,
-            });
-        }
+            })
+        } else {
+            None
+        };
+
+        self.queue_commit(CommitJob {
+            fb,
+            plane,
+            ino,
+            live_inos,
+            fence: fence_fd,
+            event,
+        });
     }
 }
 
@@ -296,4 +452,18 @@ pub(crate) fn apply_plane_prop_pub(
         P_PLANE_IN_FENCE_FD => {} // consumed, not state
         _ => {}
     }
+}
+
+/// Is `fd` poll-ready (readable)? Used to honour the NONBLOCK contract without
+/// stalling the serve thread: a signalled fence is an eventfd holding a count,
+/// and any regular fd (a sync_file) is readable once its fence fires.
+fn fence_ready(fd: RawFd) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, zero timeout.
+    let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+    n > 0 && pfd.revents & libc::POLLIN != 0
 }

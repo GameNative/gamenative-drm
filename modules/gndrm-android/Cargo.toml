@@ -1,6 +1,6 @@
 [package]
 name = "gndrm-android"
-description = "In-app daemon: JNI entry points, SEQPACKET server, EGL presenter (Android-only)"
+description = "In-app daemon: JNI entry points, SEQPACKET server, native SurfaceControl presenter (Android-only)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -18,3 +18,7 @@ gndrm-daemon = { path = "../gndrm-daemon" }
 gndrm-uapi = { path = "../gndrm-uapi" }
 jni = "0.21"
 libc = "0.2"
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-scanner = "0.31"
+wayland-backend = "0.3"

@@ -1,0 +1,21 @@
+[package]
+name = "mock-adrenotools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host-test fixture: fake libadrenotools.so for the icd_shim integration tests"
+publish = false
+
+# The shim dlopens "libadrenotools.so" by name; build under that SONAME so
+# tests can put it on LD_LIBRARY_PATH.
+[lib]
+name = "adrenotools"
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"
+
+# FFI entry points; the safety contract is the vulkan/loader ABI, documented
+# in the crate-level docs.
+[lints.clippy]
+missing_safety_doc = "allow"
