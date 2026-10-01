@@ -1564,6 +1564,12 @@ unsafe extern "C" fn gn_vkCreateWaylandSurfaceKHR(
 // compositor then routes this surface's commits as the X window's content
 // (wlserver handle_override_window_content re-points the window's
 // x11_surface_info at our surface and drains g_PendingCommits for it).
+//
+// This is the only WSI provider in the stack: the Vulkan driver (turnip)
+// exports no xlib or wayland WSI entry points at all, so handing an X11
+// surface to it cannot work (its ICD carries no vkCreateXlibSurfaceKHR, and
+// surface setup then fails VK_ERROR_INITIALIZATION_FAILED). The shim must
+// present every window itself, so there is no driver-WSI fallback route.
 
 unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
     instance: VkInstance,
@@ -1704,11 +1710,24 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
             supportedTransforms: VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
             currentTransform: VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
             supportedCompositeAlpha: VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+            // Exactly what the pool's AHardwareBuffer backs, no more. The pool
+            // allocates GPU_SAMPLED_IMAGE | GPU_COLOR_OUTPUT | COMPOSER_OVERLAY
+            // | CPU_READ_OFTEN and the guest renders straight into it, so
+            // SAMPLED_BIT comes with the first flag and COLOR_ATTACHMENT_BIT
+            // with the second. The transfer bits are on every image the proxy
+            // creates (`GnSwapchain::usage`) and the WSI smoke client actually
+            // exercises them: its present readback copies a swapchain image to
+            // host memory (TRANSFER_SRC) and its clear scene clears one in
+            // TRANSFER_DST_OPTIMAL (TRANSFER_DST). COMPOSER_OVERLAY and
+            // CPU_READ_OFTEN are SurfaceFlinger/host usages with no Vulkan
+            // equivalent. No STORAGE_BIT: an AHardwareBuffer grants that only
+            // through AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER, which this pool
+            // does not set, so advertising it would promise a capability the
+            // scan-out buffer cannot back.
             supportedUsageFlags: VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
                 | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
                 | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                | VK_IMAGE_USAGE_SAMPLED_BIT
-                | VK_IMAGE_USAGE_STORAGE_BIT,
+                | VK_IMAGE_USAGE_SAMPLED_BIT,
         };
     }
     VK_SUCCESS

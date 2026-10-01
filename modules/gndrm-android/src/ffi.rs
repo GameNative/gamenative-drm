@@ -77,19 +77,24 @@ pub struct AHardwareBufferDesc {
 
 /// `AHARDWAREBUFFER_USAGE_*` bits the scan-out pool uses.
 ///
-/// `CPU_READ_NEVER`/`CPU_WRITE_NEVER` are both `0`, i.e. absent from `usage`:
-/// the pool is GPU/composer-only, since neither the daemon nor gamescope
-/// touches it through `AHardwareBuffer_lock` (gamescope maps the raw dma-buf
-/// instead, and the memory is linear).
+/// `CPU_READ_NEVER`/`CPU_WRITE_NEVER` are both `0`, i.e. absent from `usage`
+/// when unset. The pool declares `CPU_READ_OFTEN` because the daemon locks the
+/// buffer to dump the published frame (see `asc::dump_published`); gamescope
+/// still maps the raw dma-buf to render, it does not go through the lock.
+pub const AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN: u64 = 1 << 1;
 pub const AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE: u64 = 1 << 8;
 pub const AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT: u64 = 1 << 9;
 pub const AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY: u64 = 1 << 11;
 
-/// The scan-out pool's usage: sampled by the composer, written by the GPU as a
-/// colour attachment, and usable as an overlay plane. This is the exact set
-/// the shim used before the daemon owned the allocation, so the buffers are
-/// the same ones that were measured linear and directly composable.
-pub const SCANOUT_POOL_USAGE: u64 = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE
+/// The scan-out pool's usage: CPU-readable for the panel dump, sampled by the
+/// composer, written by the GPU as a colour attachment, and usable as an
+/// overlay plane. `GPU_SAMPLED_IMAGE`/`GPU_COLOR_OUTPUT`/`COMPOSER_OVERLAY`
+/// are the flags the shim allocated with before the daemon owned the pool;
+/// `CPU_READ_OFTEN` was added afterwards for the panel dump, so the
+/// linear-and-directly-composable result does not attest this set — gralloc
+/// may pick a different layout once a CPU-visible usage is present.
+pub const SCANOUT_POOL_USAGE: u64 = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN
+    | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE
     | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT
     | AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY;
 
@@ -137,6 +142,21 @@ unsafe extern "C" {
         buffer: *const AHardwareBuffer,
         out_desc: *mut AHardwareBufferDesc,
     );
+    /// Locks `buffer` for CPU access under `usage` (a subset of the allocation
+    /// usage) and stores the base address of the mapped pixels in
+    /// `out_virtual_address`; release with [`AHardwareBuffer_unlock`]. `fence`
+    /// is `-1` for no wait, `rect` null for the whole buffer. Returns 0 or a
+    /// negative errno; `out_virtual_address` is null on failure.
+    pub fn AHardwareBuffer_lock(
+        buffer: *mut AHardwareBuffer,
+        usage: u64,
+        fence: c_int,
+        rect: *const ARect,
+        out_virtual_address: *mut *mut c_void,
+    ) -> c_int;
+    /// Releases a lock taken by [`AHardwareBuffer_lock`]. `fence` is null when
+    /// the caller does not want the buffer's release fence.
+    pub fn AHardwareBuffer_unlock(buffer: *mut AHardwareBuffer, fence: *mut c_int);
     pub fn AHardwareBuffer_release(buffer: *mut AHardwareBuffer);
 }
 

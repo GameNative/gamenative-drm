@@ -405,12 +405,13 @@ impl<T: Copy> ReusePool<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gndrm_uapi::wire::SCANOUT_FORMAT_BGRA_8888;
 
     fn geom(width: u32, height: u32) -> Geometry {
         Geometry {
             width,
             height,
-            format: 5,
+            format: SCANOUT_FORMAT_BGRA_8888,
         }
     }
 
@@ -440,7 +441,7 @@ mod tests {
         let bgra = Geometry {
             width: 1280,
             height: 960,
-            format: 5,
+            format: SCANOUT_FORMAT_BGRA_8888,
         };
         let xbgr = Geometry {
             width: 1280,

@@ -22,6 +22,7 @@
 #![cfg(target_os = "android")]
 
 mod asc;
+mod dump;
 pub mod ffi;
 mod injector;
 #[macro_use]

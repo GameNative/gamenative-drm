@@ -59,7 +59,7 @@ use std::io;
 use std::os::fd::RawFd;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -91,6 +91,25 @@ const MAX_SCANOUT_DIM: u32 = 8192;
 /// never retired, so they hold slots permanently; on top of those sit the
 /// in-flight scan-out set, one spare, and a free list per geometry in use.
 const MAX_SCANOUT_POOL: usize = 64;
+
+/// Panel-dump rate limit: the first [`DUMP_FIRST`] published frames in full,
+/// then every [`DUMP_EVERY`]-th, and one immediately on a geometry change (a
+/// resized scan-out must not wait for the next sample). Matches the daemon's
+/// other periodic diagnostics.
+const DUMP_FIRST: u64 = 10;
+const DUMP_EVERY: u64 = 120;
+
+/// `GNDRM_DUMP_DIR`, read once: the directory the panel dump is written to.
+/// `None` (unset or empty) disables the dump entirely, so it costs nothing on
+/// the publish path when dumps are off.
+static DUMP_DIR: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
+
+/// The dump directory if the environment requests one.
+fn dump_dir() -> Option<&'static std::ffi::OsString> {
+    DUMP_DIR
+        .get_or_init(|| std::env::var_os("GNDRM_DUMP_DIR").filter(|v| !v.is_empty()))
+        .as_ref()
+}
 
 /// Debug name of the layer; shows up in SurfaceFlinger dumps.
 const SC_DEBUG_NAME: &core::ffi::CStr = c"gndrm-scanout";
@@ -586,6 +605,10 @@ pub struct AscState {
     logged_unregistered: Vec<u64>,
     /// Inodes already reported as re-publishing a stale buffer (log once each).
     logged_stale: Vec<u64>,
+    /// Frames the panel dump has considered, and the geometry it last dumped
+    /// (see [`AscState::dump_published`]).
+    dump_n: u64,
+    dump_geom: Option<(u32, u32)>,
 }
 
 // SAFETY: the state is only ever reached through the `Arc<Mutex<_>>` shared by
@@ -638,6 +661,8 @@ impl AscState {
             warned_fence_timeout: false,
             logged_unregistered: Vec::new(),
             logged_stale: Vec::new(),
+            dump_n: 0,
+            dump_geom: None,
         };
         // A layer is created empty, and an empty layer makes SurfaceFlinger
         // composite nothing. Everything this session knows lives in the
@@ -775,7 +800,9 @@ impl AscState {
                 FlipHandle::latched_now()
             }
             Some((buf, published_ino, stale)) => {
-                let PoolBuf { ahb, ctx, .. } = buf;
+                let PoolBuf {
+                    ahb, ctx, stride, ..
+                } = buf;
                 // Attach a looper to *this* thread the first time we publish.
                 // `ALooper_pollOnce` must run on the thread the looper was
                 // prepared on: polling a looper prepared elsewhere fails with
@@ -863,6 +890,9 @@ impl AscState {
                                 src,
                                 dst,
                             });
+                            // The frame is on the layer; dump what we
+                            // published (rate-limited, off the reply path).
+                            self.dump_published(ahb, fb.width, fb.height, stride);
                             handle
                         }
                         // Transaction creation failed: nothing went out, so the
@@ -892,6 +922,67 @@ impl AscState {
             crate::PRESENTED_FRAMES.fetch_add(1, Ordering::Relaxed);
         }
         handle
+    }
+
+    /// Keep a rolling PPM of the frame the presenter just published as
+    /// `$GNDRM_DUMP_DIR/gn-fb-latest.ppm`, so what gamescope rendered here can
+    /// be compared with the client's own submitted buffer (the ICD shim's
+    /// `GAMENATIVE_DUMP_DIR` dump). The pool buffer is locked for CPU read and
+    /// its BGRA rows converted to a P6 PPM (byte 2 is red — see
+    /// [`crate::dump::ppm_bgra`]).
+    ///
+    /// Runs after the transaction is applied, on the commit worker, so it holds
+    /// no pool lock and never touches the serve loop. Rate-limited to the first
+    /// frames, every [`DUMP_EVERY`]-th afterwards, and every geometry change.
+    /// A no-op (a single cached env lookup) when the dump directory is unset.
+    fn dump_published(
+        &mut self,
+        ahb: *mut ffi::AHardwareBuffer,
+        width: u32,
+        height: u32,
+        stride: u32,
+    ) {
+        let Some(dir) = dump_dir() else {
+            return;
+        };
+        let changed = self.dump_geom != Some((width, height));
+        self.dump_geom = Some((width, height));
+        let n = self.dump_n;
+        self.dump_n += 1;
+        if !changed && n >= DUMP_FIRST && !n.is_multiple_of(DUMP_EVERY) {
+            return;
+        }
+        let mut base: *mut c_void = ptr::null_mut();
+        // SAFETY: `ahb` is a live buffer the presenter owns; the lock maps its
+        // pixels read-only at `base` until the matching unlock.
+        let rc = unsafe {
+            ffi::AHardwareBuffer_lock(
+                ahb,
+                ffi::AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
+                -1,
+                ptr::null(),
+                &mut base,
+            )
+        };
+        if rc != 0 || base.is_null() {
+            crate::log::daemon_info(&format!("dump {n}: AHardwareBuffer_lock failed (rc={rc})"));
+            return;
+        }
+        let len = stride as usize * height as usize;
+        // SAFETY: the lock above maps `stride * height` readable bytes at
+        // `base`; the slice is not used after the unlock below.
+        let src = unsafe { core::slice::from_raw_parts(base.cast::<u8>(), len) };
+        let ppm = crate::dump::ppm_bgra(src, width as usize, height as usize, stride as usize);
+        // SAFETY: `ahb` is locked by this call and nothing reads `base` after.
+        unsafe { ffi::AHardwareBuffer_unlock(ahb, ptr::null_mut()) };
+        let path = std::path::Path::new(dir).join("gn-fb-latest.ppm");
+        match std::fs::write(&path, &ppm) {
+            Ok(()) => crate::log::daemon_info(&format!(
+                "dump {n}: {width}x{height} stride={stride} wrote {}",
+                path.display()
+            )),
+            Err(e) => crate::log::daemon_info(&format!("dump {n}: write failed: {e}")),
+        }
     }
 
     /// Put the last published buffer back on the layer.

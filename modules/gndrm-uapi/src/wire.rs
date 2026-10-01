@@ -207,12 +207,47 @@ pub mod errno {
 /// Scan-out allocator message magic: ASCII "GNS1".
 pub const SCANOUT_MAGIC: u32 = 0x474E_5331;
 
-/// Format the scan-out pool is allocated in: HAL
-/// `AHARDWAREBUFFER_FORMAT_BGRA_8888` (value 5). Its memory layout is B,G,R,X
-/// — byte-identical to the DRM `XBGR8888`/`ABGR8888` scan-out layout gamescope
-/// renders — whereas `R8G8B8A8_UNORM` is R,G,B,A and would hand
-/// `SurfaceFlinger` a channel-swapped image.
-pub const SCANOUT_FORMAT_BGRA_8888: u32 = 5;
+/// The scan-out pool's colour layout. Allocation sites pick a layout through
+/// this key and [`scanout_ahb_format`] rather than naming a HAL constant, so a
+/// future capability adds one arm below instead of a hardcoded value chasing
+/// across the wire, the C shim and the presenter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanoutLayout {
+    /// 8-bit B,G,R,A. The pool's only layout today.
+    EightBit,
+}
+
+/// HAL `AHardwareBuffer` format for `layout`.
+///
+/// `EightBit` is **`AHARDWAREBUFFER_FORMAT_BGRA_8888`** (HAL value 5): B,G,R,A
+/// in memory. That is the byte order of the `XR24` (`0x34325258`) the
+/// compositor commits for scan-out, whose fourth byte is ignored. It is *not*
+/// `R8G8B8X8_UNORM` (value 2), which is R,G,B,X: the two share a stride and
+/// nothing else, so allocating the pool as value 2 exchanges red and blue
+/// between the guest's frame and the panel.
+///
+/// There is no alpha-less B,G,R entry in the HAL enum — value 5 is the only
+/// B,G,R form — so "declare the fourth byte as X" is not a route the platform
+/// offers. The alpha hypothesis for the presented-content defect is falsified
+/// by measurement: the guest writes a don't-care fourth byte (Nidhogg's frames
+/// are ~92.9% alpha-zero, the rest alpha-1), yet the panel is ~94% dark with
+/// either declaration, so that zero-alpha statistic is not the cause of the
+/// missing background.
+///
+/// The 10-bit/HDR entry (`R10G10B10A2_UNORM`-class) belongs here as a
+/// `TenBit` arm once the DRM side carries what it needs — 10-bit plane
+/// formats, the `Colorspace` property, `HDR_OUTPUT_METADATA`, HDR EDID — none
+/// of which exist yet.
+#[must_use]
+pub const fn scanout_ahb_format(layout: ScanoutLayout) -> u32 {
+    match layout {
+        ScanoutLayout::EightBit => 5, // AHARDWAREBUFFER_FORMAT_BGRA_8888
+    }
+}
+
+/// The format the scan-out path requires today, i.e.
+/// [`scanout_ahb_format`]`(ScanoutLayout::EightBit)`.
+pub const SCANOUT_FORMAT_BGRA_8888: u32 = scanout_ahb_format(ScanoutLayout::EightBit);
 
 /// Allocation request.
 ///
@@ -497,5 +532,14 @@ mod tests {
         // direction on the channel (requests travel shim -> daemon, responses
         // daemon -> shim), not by shape. Nothing decodes a response as a
         // request on either side.
+    }
+
+    #[test]
+    fn scanout_ahb_format_is_bgra_8888() {
+        // HAL value 5 is `BGRA_8888` (B,G,R,A), the byte order the compositor's
+        // `XR24` scan-out expects. Value 2 is `R8G8B8X8_UNORM` (R,G,B,X), which
+        // would exchange red and blue on the panel.
+        assert_eq!(scanout_ahb_format(ScanoutLayout::EightBit), 5);
+        assert_eq!(SCANOUT_FORMAT_BGRA_8888, 5);
     }
 }
