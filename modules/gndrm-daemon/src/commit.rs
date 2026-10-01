@@ -22,7 +22,7 @@ use gndrm_uapi::drm::*;
 use gndrm_uapi::mode::*;
 use gndrm_uapi::wire::errno;
 
-use crate::objects::{CONNECTOR_ID, CRTC_ID, PLANE_CURSOR_ID, PLANE_PRIMARY_ID};
+use crate::objects::{PlaneState, CONNECTOR_ID, CRTC_ID, PLANE_CURSOR_ID, PLANE_PRIMARY_ID};
 use crate::pod::*;
 use crate::{props, CommitJob, Device, DispatchResult};
 
@@ -176,7 +176,55 @@ impl Device {
                 p.crtc_h,
             ));
         }
+        // Plane census: the full plane set, on the same rate policy as the
+        // `atomic #N:` line, plus every change at once — a plane that only
+        // appears (or turns on/changes fb) late in a session must not be
+        // missed by sampling only the first seconds. Diagnostics only.
+        let census = self.plane_census_text();
+        let changed = census != self.plane_census;
+        if changed {
+            self.plane_census = census.clone();
+        }
+        if changed || self.commit_count <= 30 || self.commit_count.is_multiple_of(120) {
+            self.diag(&format!("planes #{}: {}", self.commit_count, census));
+        }
         DispatchResult::ok(Vec::new())
+    }
+
+    /// One line describing every KMS plane this device exposes: object id,
+    /// type, framebuffer, CRTC, z-order, alpha and the source/CRTC rects.
+    /// Inactive planes (`fb_id == 0`) are included so "no plane" is
+    /// distinguishable from "a plane the daemon dropped". `zpos`/`alpha` are
+    /// not exposed by this device (props.rs), so they print as `-`.
+    #[must_use]
+    fn plane_census_text(&self) -> String {
+        let planes: [(u32, &str, PlaneState); 2] = [
+            (PLANE_PRIMARY_ID, "primary", self.primary_state()),
+            (PLANE_CURSOR_ID, "cursor", self.cursor_state()),
+        ];
+        let parts: Vec<String> = planes
+            .iter()
+            .map(|(id, ty, p)| {
+                if p.fb_id == 0 {
+                    format!("[{ty} id={id} fb=0 crtc={} zpos=- alpha=- **]", p.crtc_id)
+                } else {
+                    format!(
+                        "[{ty} id={id} fb={} crtc={} zpos=- alpha=- src={}x{}+({},{}) crtc={}x{}+({},{})]",
+                        p.fb_id,
+                        p.crtc_id,
+                        p.src_w >> 16,
+                        p.src_h >> 16,
+                        p.src_x >> 16,
+                        p.src_y >> 16,
+                        p.crtc_w,
+                        p.crtc_h,
+                        p.crtc_x,
+                        p.crtc_y,
+                    )
+                }
+            })
+            .collect();
+        format!("count={} {}", planes.len(), parts.join(" "))
     }
 
     /// Decode the linearized extension into `(obj, prop, value)` triples.

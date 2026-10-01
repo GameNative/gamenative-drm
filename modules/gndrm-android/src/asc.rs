@@ -86,7 +86,11 @@ const WARM_RETRY_MS: u64 = 100;
 /// at once. gamescope's scan-out swapchain is a handful of mode-sized buffers;
 /// the cap bounds what a misbehaving client can pin.
 const MAX_SCANOUT_DIM: u32 = 8192;
-const MAX_SCANOUT_POOL: usize = 16;
+/// Cap on the buffers the pool owns: it bounds `live + free + reserved`.
+/// The guest's swapchain images are imported for the whole session and are
+/// never retired, so they hold slots permanently; on top of those sit the
+/// in-flight scan-out set, one spare, and a free list per geometry in use.
+const MAX_SCANOUT_POOL: usize = 64;
 
 /// Debug name of the layer; shows up in SurfaceFlinger dumps.
 const SC_DEBUG_NAME: &core::ffi::CStr = c"gndrm-scanout";

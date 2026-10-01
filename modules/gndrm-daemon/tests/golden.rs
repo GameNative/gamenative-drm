@@ -2276,3 +2276,117 @@ fn full_gamescope_chain_discovery_to_syncobj_async() {
     // SAFETY: caller's fd.
     unsafe { libc::close(fd) };
 }
+
+/// The plane census must name every plane the commit drives, in z-order, and
+/// must show a plane turned off as inactive rather than silently dropping it —
+/// the evidence for "which KMS planes gamescope actually uses".
+#[test]
+fn plane_census_names_every_plane_in_z_order() {
+    let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&logs);
+    let mut d = dev();
+    d.set_logger(Box::new(move |m: &str| {
+        sink.lock().unwrap().push(m.to_string());
+    }));
+
+    let blob = create_mode_blob(&mut d).0;
+    let (_h1, primary_fb, fd1) = import_fb(&mut d);
+    let (_h2, cursor_fb, fd2) = import_fb(&mut d);
+
+    // One commit driving both planes: primary (bottom) + cursor (top).
+    let mut sets = modeset_sets(&d, blob, primary_fb);
+    sets.extend([
+        (
+            PLANE_CURSOR_ID,
+            find_prop_id(PLANE_CURSOR_ID, "FB_ID").unwrap(),
+            u64::from(cursor_fb),
+        ),
+        (
+            PLANE_CURSOR_ID,
+            find_prop_id(PLANE_CURSOR_ID, "CRTC_ID").unwrap(),
+            u64::from(CRTC_ID),
+        ),
+        (
+            PLANE_CURSOR_ID,
+            find_prop_id(PLANE_CURSOR_ID, "SRC_W").unwrap(),
+            64 << 16,
+        ),
+        (
+            PLANE_CURSOR_ID,
+            find_prop_id(PLANE_CURSOR_ID, "SRC_H").unwrap(),
+            64 << 16,
+        ),
+        (
+            PLANE_CURSOR_ID,
+            find_prop_id(PLANE_CURSOR_ID, "CRTC_W").unwrap(),
+            64,
+        ),
+        (
+            PLANE_CURSOR_ID,
+            find_prop_id(PLANE_CURSOR_ID, "CRTC_H").unwrap(),
+            64,
+        ),
+    ]);
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(&sets, DRM_MODE_ATOMIC_ALLOW_MODESET, 0),
+    ));
+
+    let census = logs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|l| l.starts_with("planes #"))
+        .cloned()
+        .expect("a plane-census line was emitted");
+    assert!(census.contains("count=2"), "{census}");
+    assert!(
+        census.contains(&format!("[primary id={PLANE_PRIMARY_ID} fb={primary_fb}")),
+        "{census}"
+    );
+    assert!(
+        census.contains(&format!("[cursor id={PLANE_CURSOR_ID} fb={cursor_fb}")),
+        "{census}"
+    );
+    // Listed bottom-to-top: primary before cursor.
+    assert!(
+        census.find("[primary").unwrap() < census.find("[cursor").unwrap(),
+        "{census}"
+    );
+    // The cursor's 64x64 source rect is reported from its plane state.
+    assert!(census.contains("src=64x64+(0,0)"), "{census}");
+
+    // Turning the cursor plane off must be visible as an inactive plane.
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(
+            &[(
+                PLANE_CURSOR_ID,
+                find_prop_id(PLANE_CURSOR_ID, "FB_ID").unwrap(),
+                0,
+            )],
+            DRM_MODE_ATOMIC_ALLOW_MODESET,
+            0,
+        ),
+    ));
+    let last = logs
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|l| l.starts_with("planes #"))
+        .cloned()
+        .unwrap();
+    assert!(
+        last.contains(&format!("[cursor id={PLANE_CURSOR_ID} fb=0")),
+        "{last}"
+    );
+
+    // SAFETY: caller's fds.
+    unsafe {
+        libc::close(fd1);
+        libc::close(fd2);
+    }
+}

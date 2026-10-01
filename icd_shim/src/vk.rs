@@ -193,6 +193,7 @@ pub type VkPresentModeKHR = i32;
 pub const VK_PRESENT_MODE_IMMEDIATE_KHR: VkPresentModeKHR = 0;
 pub const VK_PRESENT_MODE_MAILBOX_KHR: VkPresentModeKHR = 1;
 pub const VK_PRESENT_MODE_FIFO_KHR: VkPresentModeKHR = 2;
+pub const VK_PRESENT_MODE_FIFO_RELAXED_KHR: VkPresentModeKHR = 3;
 
 pub type VkPipelineStageFlags = u32;
 pub const VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: VkPipelineStageFlags = 0x1;

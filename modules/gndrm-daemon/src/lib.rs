@@ -286,6 +286,10 @@ pub struct Device {
     logged_exhaustion: Vec<&'static str>,
     pub(crate) logged_first_commit: bool,
     pub(crate) commit_count: u32,
+    /// Last plane set the census logged (see `commit::plane_census_text`):
+    /// comparing against it logs every change, not just the rate policy's
+    /// samples. Empty until the first commit.
+    pub(crate) plane_census: String,
 }
 
 impl Device {
@@ -351,6 +355,7 @@ impl Device {
             logged_exhaustion: Vec::new(),
             logged_first_commit: false,
             commit_count: 0,
+            plane_census: String::new(),
         }
     }
 

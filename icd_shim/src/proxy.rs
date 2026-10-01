@@ -335,8 +335,11 @@ fn dump_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) {
         out.extend_from_slice(format!("P6\n{w} {h}\n255\n").as_bytes());
         for y in 0..h {
             for x in 0..w {
+                // The slot is BGRA in memory (the pool's layout), so the red
+                // channel is byte 2 — writing 0,1,2 as P6 "R,G,B" would swap
+                // red and blue in the dump and every colour read from it.
                 let q = p.add(y * stride + x * 4);
-                out.extend_from_slice(&[*q, *q.add(1), *q.add(2)]);
+                out.extend_from_slice(&[*q.add(2), *q.add(1), *q]);
             }
         }
         let path = std::path::Path::new(dir).join("gn-buf-latest.ppm");
@@ -379,6 +382,32 @@ fn sc_modifiers() -> &'static [u64] {
         Ok("auto") => &[GN_DRM_MOD_QCOM_COMPRESSED, GN_DRM_MOD_QCOM_TILED3],
         _ => &[],
     }
+}
+
+/// Swapchain image ceiling from the container config (`WRAPPER_MAX_IMAGE_COUNT`,
+/// 0 = the wrapper's default). The proxy caps both the `maxImageCount` it
+/// advertises and its ring to the same value, so the guest's chosen image count
+/// and the pool it is handed agree. A value below minImageCount (2) is not a
+/// legal `maxImageCount` and is ignored.
+fn max_swapchain_images() -> u32 {
+    match std::env::var("WRAPPER_MAX_IMAGE_COUNT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    {
+        Some(v) if v >= 2 => v.min(GN_MAX_SC_IMAGES as u32),
+        _ => GN_MAX_SC_IMAGES as u32,
+    }
+}
+
+/// Swapchain/WSI extensions the guest must not see. The proxy owns the
+/// swapchain and implements none of their entry points, so a guest that
+/// enabled one would call it through the wrapper-swapping thunk with a shim
+/// swapchain handle the driver has never seen — and a title pacing against a
+/// present_wait that never signals presents unfinished frames.
+fn unimplemented_wsi_ext(name: &CStr) -> bool {
+    name == c"VK_KHR_present_wait"
+        || name == c"VK_KHR_present_id"
+        || name == c"VK_EXT_swapchain_maintenance1"
 }
 
 // ---------------------------------------------------------------- objects
@@ -1414,6 +1443,74 @@ unsafe extern "C" fn gn_vkEnumerateInstanceExtensionProperties(
     }
 }
 
+/// Forwards the driver's device-extension list minus the WSI extensions the
+/// proxy's client-side swapchain cannot honour. Without this the list passes
+/// through verbatim, and a guest that enabled e.g. VK_KHR_present_wait would
+/// call it through the wrapper-swapping thunk with a shim swapchain handle the
+/// driver has never seen.
+unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
+    pd: VkPhysicalDevice,
+    layer: *const c_char,
+    count: *mut u32,
+    props: *mut VkExtensionProperties,
+) -> VkResult {
+    let gipa = G.lock().unwrap().real_gipa;
+    let Some(gipa) = gipa else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    // Instance-level function: mesa resolves it only against a live instance.
+    let gi = unsafe { find_instance_by_pd(pd) };
+    let inst = if gi.is_null() {
+        ptr::null_mut()
+    } else {
+        unsafe { (*gi).real }
+    };
+    let real: Option<PFN_vkEnumerateDeviceExtensionProperties> = unsafe {
+        std::mem::transmute(gipa(inst, c"vkEnumerateDeviceExtensionProperties".as_ptr()))
+    };
+    let Some(real) = real else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    unsafe {
+        let mut n: u32 = 0;
+        let res = real(pd, layer, &mut n, ptr::null_mut());
+        if res != VK_SUCCESS {
+            return res;
+        }
+        let mut buf = vec![
+            VkExtensionProperties {
+                extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
+                specVersion: 0,
+            };
+            n as usize
+        ];
+        let mut got = n;
+        let res = real(pd, layer, &mut got, buf.as_mut_ptr());
+        if res != VK_SUCCESS && res != VK_INCOMPLETE {
+            return res;
+        }
+        let mut kept = 0usize;
+        for i in 0..got as usize {
+            if !unimplemented_wsi_ext(CStr::from_ptr(buf[i].extensionName.as_ptr())) {
+                buf[kept] = buf[i];
+                kept += 1;
+            }
+        }
+        if props.is_null() {
+            *count = kept as u32;
+            return VK_SUCCESS;
+        }
+        let n_copy = (*count as usize).min(kept);
+        ptr::copy_nonoverlapping(buf.as_ptr(), props, n_copy);
+        *count = n_copy as u32;
+        if n_copy < kept {
+            VK_INCOMPLETE
+        } else {
+            VK_SUCCESS
+        }
+    }
+}
+
 // ------------------------------------------------- wayland surface (proxy)
 
 unsafe extern "C" fn gn_vkCreateWaylandSurfaceKHR(
@@ -1590,7 +1687,7 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     unsafe {
         *caps = VkSurfaceCapabilitiesKHR {
             minImageCount: 2,
-            maxImageCount: GN_MAX_SC_IMAGES as u32,
+            maxImageCount: max_swapchain_images(),
             currentExtent: VkExtent2D {
                 width: u32::MAX,
                 height: u32::MAX,
@@ -1658,6 +1755,64 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceFormatsKHR(
     }
 }
 
+/// The present modes the proxy's client-side swapchain serves. The proxy owns
+/// the swapchain (a dma-buf ring published straight to the compositor) and
+/// never presents through the driver's WSI, so there is no surface on which the
+/// underlying driver's vkGetPhysicalDeviceSurfacePresentModesKHR could be
+/// asked: the shim's VkSurfaceKHR is a private pointer the driver has never
+/// seen, and this driver family carries no wayland WSI to build one with. Every
+/// mode here is served by the same publish path — presents never block on the
+/// compositor and a slot is reused on wl_buffer.release — so the guest may pick
+/// any of them; FIFO is always offered.
+const SERVED_PRESENT_MODES: [VkPresentModeKHR; 3] = [
+    VK_PRESENT_MODE_IMMEDIATE_KHR,
+    VK_PRESENT_MODE_MAILBOX_KHR,
+    VK_PRESENT_MODE_FIFO_KHR,
+];
+
+/// Parses MESA_VK_WSI_PRESENT_MODE exactly as mesa's wsi_common.c does: the four
+/// names are matched case-sensitively and anything else is reported and ignored.
+fn parse_present_mode_override(val: Option<&str>) -> Option<VkPresentModeKHR> {
+    let mode = match val? {
+        "fifo" => VK_PRESENT_MODE_FIFO_KHR,
+        "relaxed" => VK_PRESENT_MODE_FIFO_RELAXED_KHR,
+        "mailbox" => VK_PRESENT_MODE_MAILBOX_KHR,
+        "immediate" => VK_PRESENT_MODE_IMMEDIATE_KHR,
+        _ => {
+            crate::logf!("Invalid MESA_VK_WSI_PRESENT_MODE value!");
+            return None;
+        }
+    };
+    Some(mode)
+}
+
+/// The list offered to the guest: the override mode first when the ring can
+/// serve it, then the served modes in their fixed order, FIFO always present.
+/// An override the ring cannot serve is dropped instead of advertised, matching
+/// mesa's "Unsupported …" behaviour of keeping the requested mode.
+fn offered_present_modes(
+    served: &[VkPresentModeKHR],
+    override_mode: Option<VkPresentModeKHR>,
+) -> Vec<VkPresentModeKHR> {
+    let mut v = Vec::with_capacity(served.len() + 1);
+    if let Some(m) = override_mode {
+        if served.contains(&m) {
+            v.push(m);
+        } else {
+            crate::logf!("Unsupported MESA_VK_WSI_PRESENT_MODE value!");
+        }
+    }
+    for &m in served {
+        if !v.contains(&m) {
+            v.push(m);
+        }
+    }
+    if !v.contains(&VK_PRESENT_MODE_FIFO_KHR) {
+        v.push(VK_PRESENT_MODE_FIFO_KHR);
+    }
+    v
+}
+
 unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfacePresentModesKHR(
     _pd: VkPhysicalDevice,
     surface: VkSurfaceKHR,
@@ -1668,19 +1823,10 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfacePresentModesKHR(
         crate::logf!("proxy surface present-modes query: {surface:#x} not one of ours");
         return VK_ERROR_SURFACE_LOST_KHR;
     }
-    // Bring-up A/B: the X11 path's wrapper forces IMMEDIATE
-    // ("override_present_mode"), so offer it (or MAILBOX) ahead of FIFO when
-    // asked, to match the guest's pacing. FIFO stays last — it is the mode
-    // that is always available and what our commits assume.
-    let extra = match std::env::var("GN_VKSHIM_PRESENT").ok().as_deref() {
-        Some("IMMEDIATE") => Some(VK_PRESENT_MODE_IMMEDIATE_KHR),
-        Some("MAILBOX") => Some(VK_PRESENT_MODE_MAILBOX_KHR),
-        _ => None,
-    };
-    let modes_list: Vec<VkPresentModeKHR> = match extra {
-        Some(m) => vec![m, VK_PRESENT_MODE_FIFO_KHR],
-        None => vec![VK_PRESENT_MODE_FIFO_KHR],
-    };
+    let modes_list = offered_present_modes(
+        &SERVED_PRESENT_MODES,
+        parse_present_mode_override(std::env::var("MESA_VK_WSI_PRESENT_MODE").ok().as_deref()),
+    );
     unsafe {
         if modes.is_null() {
             *count = modes_list.len() as u32;
@@ -1743,6 +1889,13 @@ unsafe extern "C" fn gn_vkCreateDevice(
         )
     };
     for &name in names {
+        // The guest must never enable a WSI extension the proxy cannot honour
+        // (see `unimplemented_wsi_ext`); drop it before the driver sees it.
+        let n_ = unsafe { CStr::from_ptr(name) };
+        if unimplemented_wsi_ext(n_) {
+            crate::logf!("proxy device: masking {}", n_.to_string_lossy());
+            continue;
+        }
         if n < exts.len() {
             exts[n] = name;
             n += 1;
@@ -2617,8 +2770,8 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     if n_slots < 2 {
         n_slots = 2;
     }
-    if n_slots > GN_MAX_SC_IMAGES as u32 {
-        n_slots = GN_MAX_SC_IMAGES as u32;
+    if n_slots > max_swapchain_images() {
+        n_slots = max_swapchain_images();
     }
     let mut sc = Box::new(GnSwapchain {
         surf,
@@ -3469,6 +3622,17 @@ static G_INST_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ) -> VkResult,
         )
     }),
+    (c"vkEnumerateDeviceExtensionProperties", unsafe {
+        std::mem::transmute(
+            gn_vkEnumerateDeviceExtensionProperties
+                as unsafe extern "C" fn(
+                    VkPhysicalDevice,
+                    *const c_char,
+                    *mut u32,
+                    *mut VkExtensionProperties,
+                ) -> VkResult,
+        )
+    }),
     (c"vkCreateDevice", unsafe {
         std::mem::transmute(
             gn_vkCreateDevice
@@ -3746,6 +3910,11 @@ unsafe extern "C" fn gn_vkGetDeviceProcAddr(
     name: *const c_char,
 ) -> PFN_vkVoidFunction {
     let name = unsafe { CStr::from_ptr(name) };
+    if unimplemented_wsi_ext(name) {
+        // The proxy owns the swapchain: never hand the driver one of these with
+        // a shim swapchain handle it has never seen.
+        return None;
+    }
     if let Some(f) = device_func(name) {
         return Some(f);
     }
@@ -3802,5 +3971,89 @@ mod tests {
         assert!(!swapchain_format_allowed(VK_FORMAT_R8G8B8A8_UNORM, false));
         assert!(swapchain_format_allowed(VK_FORMAT_R8G8B8A8_UNORM, true));
         assert_eq!(SCANOUT_SWAPCHAIN_FORMAT, VK_FORMAT_B8G8R8A8_UNORM);
+    }
+
+    /// The override parser mirrors mesa's `MESA_VK_WSI_PRESENT_MODE`: exactly
+    /// four names, matched case-sensitively; anything else is ignored.
+    #[test]
+    fn present_mode_override_matches_mesa() {
+        assert_eq!(
+            parse_present_mode_override(Some("fifo")),
+            Some(VK_PRESENT_MODE_FIFO_KHR)
+        );
+        assert_eq!(
+            parse_present_mode_override(Some("relaxed")),
+            Some(VK_PRESENT_MODE_FIFO_RELAXED_KHR)
+        );
+        assert_eq!(
+            parse_present_mode_override(Some("mailbox")),
+            Some(VK_PRESENT_MODE_MAILBOX_KHR)
+        );
+        assert_eq!(
+            parse_present_mode_override(Some("immediate")),
+            Some(VK_PRESENT_MODE_IMMEDIATE_KHR)
+        );
+        // mesa's strcmp is case-sensitive, and its UI also carries label
+        // strings ("Never"/"Normal"/"Always") that are not valid names.
+        for bad in ["FIFO", "Immediate", "Never", "Normal", "Always", ""] {
+            assert_eq!(parse_present_mode_override(Some(bad)), None, "{bad}");
+        }
+        assert_eq!(parse_present_mode_override(None), None);
+    }
+
+    /// The offered list leads with a served override, keeps the served order
+    /// otherwise, drops an override the ring cannot serve, and always offers
+    /// FIFO.
+    #[test]
+    fn offered_list_prefers_override_and_always_offers_fifo() {
+        assert_eq!(
+            offered_present_modes(&SERVED_PRESENT_MODES, None),
+            [
+                VK_PRESENT_MODE_IMMEDIATE_KHR,
+                VK_PRESENT_MODE_MAILBOX_KHR,
+                VK_PRESENT_MODE_FIFO_KHR
+            ]
+        );
+        assert_eq!(
+            offered_present_modes(&SERVED_PRESENT_MODES, Some(VK_PRESENT_MODE_IMMEDIATE_KHR)),
+            [
+                VK_PRESENT_MODE_IMMEDIATE_KHR,
+                VK_PRESENT_MODE_MAILBOX_KHR,
+                VK_PRESENT_MODE_FIFO_KHR
+            ]
+        );
+        // FIFO leads when it is the override, and is not duplicated.
+        assert_eq!(
+            offered_present_modes(&SERVED_PRESENT_MODES, Some(VK_PRESENT_MODE_FIFO_KHR)),
+            [
+                VK_PRESENT_MODE_FIFO_KHR,
+                VK_PRESENT_MODE_IMMEDIATE_KHR,
+                VK_PRESENT_MODE_MAILBOX_KHR
+            ]
+        );
+        // An override the ring cannot serve is dropped, not advertised.
+        assert_eq!(
+            offered_present_modes(
+                &[VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR],
+                Some(VK_PRESENT_MODE_FIFO_RELAXED_KHR)
+            ),
+            [VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR]
+        );
+        // FIFO is appended when the served set lacks it.
+        assert_eq!(
+            offered_present_modes(
+                &[VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR],
+                None
+            ),
+            [
+                VK_PRESENT_MODE_MAILBOX_KHR,
+                VK_PRESENT_MODE_IMMEDIATE_KHR,
+                VK_PRESENT_MODE_FIFO_KHR
+            ]
+        );
+        assert_eq!(
+            offered_present_modes(&[VK_PRESENT_MODE_FIFO_KHR], None),
+            [VK_PRESENT_MODE_FIFO_KHR]
+        );
     }
 }
