@@ -14,11 +14,21 @@
 //!   (`latched`), the same rule that governs re-publishing — a buffer
 //!   SurfaceFlinger may still be compositing is never handed back out;
 //! - the cap bounds `live + free + reserved`, so the pool settles at the
-//!   session's working set and then allocates nothing more.
+//!   session's working set and then allocates nothing more;
+//! - a request may arrive as a bare allocation length (the shim matched no
+//!   connector mode), which is resolved to a geometry the daemon knows — a
+//!   connector mode, a committed framebuffer size, or a geometry already in the
+//!   pool — so a window-sized scan-out buffer is pool-owned just like a
+//!   mode-sized one, and a length no known geometry produces stays kernel-owned.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// Bytes per pixel of the pool's single scan-out format. A scan-out
+/// `DMA_HEAP_IOCTL_ALLOC` length is exactly `width * height * 4`, which is what
+/// makes a bare length resolvable against a known geometry.
+const SCANOUT_BPP: u64 = 4;
 
 /// Geometry a pooled buffer can serve. A free buffer only matches a request of
 /// the exact same width, height and format.
@@ -30,6 +40,15 @@ pub struct Geometry {
     pub height: u32,
     /// Gralloc format (the presenter's single BGRA layout).
     pub format: u32,
+}
+
+impl Geometry {
+    /// The dma-heap allocation length a scan-out buffer of this geometry is
+    /// requested with, for resolving a length-only request.
+    #[must_use]
+    pub fn alloc_len(self) -> u64 {
+        u64::from(self.width) * u64::from(self.height) * SCANOUT_BPP
+    }
 }
 
 /// A buffer the client holds (handed out but not yet retired).
@@ -46,16 +65,25 @@ struct Live<T> {
 }
 
 /// A retired buffer held for reuse.
+///
+/// `ino` is the identity the buffer was registered under when it was last
+/// handed out. The reuse cache keeps it so a handout can *verify* the
+/// `st_ino`-stability assumption (a duplicate of the cached dma-buf must keep
+/// the same inode) instead of trusting it, and re-register under whatever
+/// identity the fresh descriptor actually carries.
 struct Free<T> {
     geom: Geometry,
+    ino: u64,
     payload: T,
 }
 
 /// What [`ReusePool::begin`] reserved for one request.
 pub enum Reservation<T> {
     /// A retired buffer of the requested geometry: hand it straight out, no
-    /// allocation. This is the steady state.
-    Reuse(T),
+    /// allocation. This is the steady state. `ino` is the identity it was
+    /// registered under when last retired, for the caller to re-register
+    /// against (and to check against the fresh descriptor's inode).
+    Reuse { ino: u64, payload: T },
     /// Nothing reusable matched; the caller allocates outside the lock.
     /// `evicted` is a free buffer the pool dropped to stay under the cap and
     /// the caller must release.
@@ -102,6 +130,20 @@ pub struct ReusePool<T> {
     /// Cold allocations in flight outside the lock, counted against the cap so
     /// concurrent reservations cannot exceed it.
     reserved: usize,
+    /// Commits that resolved to no registration at all: the presenter was
+    /// asked to publish a buffer it never handed out. Counted (not merely
+    /// logged) so a session can be checked for the fault by number.
+    misses: u64,
+    /// Geometries a length-only request may resolve to, keyed by allocation
+    /// length. `DMA_HEAP_IOCTL_ALLOC` carries only a length, so a scan-out
+    /// allocation that matches no connector mode arrives as a length and is
+    /// resolved here — from the connector modes the daemon advertises, from
+    /// every framebuffer the client registers, and from the geometries already
+    /// in the pool (folded in on commit). Keyed by allocation length *and*
+    /// format: two formats at the same resolution share a byte length, so a
+    /// length-only key would hand a request the wrong layout. See
+    /// [`Self::resolve_len`].
+    by_len: HashMap<(u64, u32), Geometry>,
 }
 
 impl<T: Copy> ReusePool<T> {
@@ -113,6 +155,8 @@ impl<T: Copy> ReusePool<T> {
             live: HashMap::new(),
             free: Vec::new(),
             reserved: 0,
+            misses: 0,
+            by_len: HashMap::new(),
         }
     }
 
@@ -135,13 +179,51 @@ impl<T: Copy> ReusePool<T> {
         self.free.len()
     }
 
-    /// Take a retired buffer of exactly `geom`, if one is held. This is the
-    /// allocation-free answer and is preferred over every other. `remove`
-    /// (not `swap_remove`) keeps the free list ordered oldest-first, which the
-    /// over-cap eviction relies on.
-    pub fn take_reusable(&mut self, geom: Geometry) -> Option<T> {
+    /// Commits that resolved to no registration (see [`Self::resolve`]).
+    #[must_use]
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    /// Record a geometry a length-only request may be resolved against: a
+    /// connector mode the daemon advertises, or a framebuffer geometry the
+    /// client committed. Keyed by length *and* format, so a request is never
+    /// answered with a geometry of a different layout. Where two geometries
+    /// share both, the first note wins.
+    pub fn note_geometry(&mut self, geom: Geometry) {
+        if geom.width == 0 || geom.height == 0 {
+            return;
+        }
+        self.by_len
+            .entry((geom.alloc_len(), geom.format))
+            .or_insert(geom);
+    }
+
+    /// Resolve an allocation length and format to a geometry the daemon can
+    /// serve, or `None` when no known geometry produces that pairing — i.e. the
+    /// buffer is not a scan-out allocation and stays kernel-owned.
+    #[must_use]
+    pub fn resolve_len(&self, len: u64, format: u32) -> Option<Geometry> {
+        self.by_len.get(&(len, format)).copied()
+    }
+
+    /// Reserve an answer to a length-only request: resolve `len` to a geometry,
+    /// then [`Self::begin`]. `None` when the length is not a scan-out
+    /// allocation.
+    pub fn begin_len(&mut self, len: u64, format: u32) -> Option<Reservation<T>> {
+        let geom = self.resolve_len(len, format)?;
+        Some(self.begin(geom))
+    }
+
+    /// Take a retired buffer of exactly `geom`, if one is held, returned with
+    /// the identity it was last registered under. This is the allocation-free
+    /// answer and is preferred over every other. `remove` (not `swap_remove`)
+    /// keeps the free list ordered oldest-first, which the over-cap eviction
+    /// relies on.
+    pub fn take_reusable(&mut self, geom: Geometry) -> Option<(u64, T)> {
         let i = self.free.iter().position(|f| f.geom == geom)?;
-        Some(self.free.remove(i).payload)
+        let f = self.free.remove(i);
+        Some((f.ino, f.payload))
     }
 
     /// Reserve capacity for one cold allocation. The caller has already taken
@@ -172,8 +254,8 @@ impl<T: Copy> ReusePool<T> {
     /// one is held, otherwise capacity for a cold allocation. A free buffer is
     /// preferred over an allocation, which is what stops the per-frame churn.
     pub fn begin(&mut self, geom: Geometry) -> Reservation<T> {
-        if let Some(payload) = self.take_reusable(geom) {
-            return Reservation::Reuse(payload);
+        if let Some((ino, payload)) = self.take_reusable(geom) {
+            return Reservation::Reuse { ino, payload };
         }
         self.reserve()
     }
@@ -187,8 +269,8 @@ impl<T: Copy> ReusePool<T> {
     /// Put a reused payload back after it could not be handed out (its client
     /// descriptor could not be duplicated), so the pool does not pay an
     /// allocation for a buffer it already holds.
-    pub fn recycle(&mut self, geom: Geometry, payload: T) {
-        self.free.push(Free { geom, payload });
+    pub fn recycle(&mut self, geom: Geometry, ino: u64, payload: T) {
+        self.free.push(Free { geom, ino, payload });
     }
 
     /// Register a handed-out buffer under `ino`. `cold` releases the capacity
@@ -206,6 +288,9 @@ impl<T: Copy> ReusePool<T> {
         if cold {
             self.reserved = self.reserved.saturating_sub(1);
         }
+        // A committed geometry is one the pool can serve again, so a later
+        // length-only request for the same window size resolves to it.
+        self.note_geometry(geom);
         self.live
             .insert(
                 ino,
@@ -223,6 +308,26 @@ impl<T: Copy> ReusePool<T> {
     pub fn mark_live(&mut self, ino: u64) {
         if let Some(entry) = self.live.get_mut(&ino) {
             entry.seen_live = true;
+        }
+    }
+
+    /// Resolve a commit's identity to its registration and mark it published
+    /// (`seen_live`), returning the payload. `None` when the inode was never
+    /// registered: the presenter was asked to publish a buffer it does not own
+    /// (a client dma-buf gamescope scanned out directly, or a table rebuilt
+    /// under a running client). Such a commit is counted in [`Self::misses`]
+    /// so it is a number in the diagnostics rather than only a log line — the
+    /// caller must fall back, and a nonzero total is the fault.
+    pub fn resolve(&mut self, ino: u64) -> Option<T> {
+        match self.live.get_mut(&ino) {
+            Some(entry) => {
+                entry.seen_live = true;
+                Some(entry.payload)
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
         }
     }
 
@@ -272,6 +377,7 @@ impl<T: Copy> ReusePool<T> {
         if !entry.seen_live || entry.latched.load(Ordering::Acquire) {
             self.free.push(Free {
                 geom: entry.geom,
+                ino,
                 payload: entry.payload,
             });
             Removed::Kept {
@@ -318,12 +424,36 @@ mod tests {
     fn hand_out(pool: &mut ReusePool<Id>, g: Geometry, id: Id, cold_id: Id) -> Arc<AtomicBool> {
         let latch = Arc::new(AtomicBool::new(false));
         let (payload, cold) = match pool.begin(g) {
-            Reservation::Reuse(p) => (p, false),
+            Reservation::Reuse { payload, .. } => (payload, false),
             Reservation::Cold { .. } => (cold_id, true),
             Reservation::Full => panic!("pool reported full at {g:?}"),
         };
         pool.commit(id, g, payload, Arc::clone(&latch), cold);
         latch
+    }
+
+    #[test]
+    fn same_length_different_format_resolves_separately() {
+        let mut pool: ReusePool<()> = ReusePool::new(4);
+        // Two layouts of one resolution share a byte length, so a length-only
+        // key would answer both requests with whichever was noted first.
+        let bgra = Geometry {
+            width: 1280,
+            height: 960,
+            format: 5,
+        };
+        let xbgr = Geometry {
+            width: 1280,
+            height: 960,
+            format: 0x3432_4258,
+        };
+        assert_eq!(bgra.alloc_len(), xbgr.alloc_len());
+        pool.note_geometry(bgra);
+        pool.note_geometry(xbgr);
+        assert_eq!(pool.resolve_len(bgra.alloc_len(), bgra.format), Some(bgra));
+        assert_eq!(pool.resolve_len(xbgr.alloc_len(), xbgr.format), Some(xbgr));
+        // An unrelated format at the same length resolves to nothing.
+        assert_eq!(pool.resolve_len(bgra.alloc_len(), 0xdead_beef), None);
     }
 
     #[test]
@@ -348,13 +478,101 @@ mod tests {
         // The next request of the same geometry is answered from the cache:
         // no allocation.
         match pool.begin(g) {
-            Reservation::Reuse(100) => {}
+            Reservation::Reuse {
+                ino: 100,
+                payload: 100,
+            } => {}
             other => panic!(
                 "expected the retired buffer to be handed back out, got {}",
                 describe(&other)
             ),
         }
         assert_eq!(pool.free_len(), 0, "the reused buffer left the free list");
+    }
+
+    /// The reuse cache remembers the identity a retired buffer was registered
+    /// under, so a free-list handout can (a) check the fresh descriptor's
+    /// inode against it and (b) re-register under the identity actually
+    /// carried. Without the stored `ino` the handout is a blind re-register.
+    #[test]
+    fn reused_buffer_resolves_on_the_next_commit() {
+        let g = geom(1280, 960);
+        let mut pool = ReusePool::<Id>::new(4);
+
+        // A published, latched buffer retires into the free list with its ino.
+        let latch = hand_out(&mut pool, g, 42, 42);
+        pool.mark_live(42);
+        latch.store(true, Ordering::Release);
+        pool.retire(&HashSet::new(), None);
+
+        // The reuse handout carries that identity back out.
+        let reserved = match pool.begin(g) {
+            Reservation::Reuse { ino, payload } => (ino, payload),
+            other => panic!("expected reuse, got {}", describe(&other)),
+        };
+        assert_eq!(reserved, (42, 42), "the free-list entry kept its ino");
+
+        // Re-registering the handed-out buffer (same ino: a dup keeps the
+        // inode) makes the next commit resolve rather than miss.
+        let latch = Arc::new(AtomicBool::new(false));
+        pool.commit(42, g, reserved.1, latch, false);
+        assert_eq!(pool.resolve(42), Some(42));
+        assert_eq!(pool.misses(), 0, "a reused buffer must not miss");
+    }
+
+    /// A retain/reuse cycle must never drop the registration of a buffer that
+    /// is still live in the pool: after `Kept` the entry is back in the free
+    /// list with its identity, and re-handing it out resolves again.
+    #[test]
+    fn registration_survives_a_retain_reuse_cycle() {
+        let g = geom(640, 480);
+        let mut pool = ReusePool::<Id>::new(4);
+        let latch = hand_out(&mut pool, g, 7, 7);
+        pool.mark_live(7);
+        latch.store(true, Ordering::Release);
+
+        let removed = pool.retire(&HashSet::new(), None);
+        assert!(matches!(removed[0], Removed::Kept { ino: 7, .. }));
+        assert_eq!(pool.misses(), 0, "a retire is not a miss");
+
+        // Two full cycles: each handout re-registers and each commit resolves.
+        for _ in 0..2 {
+            let (ino, payload) = match pool.begin(g) {
+                Reservation::Reuse { ino, payload } => (ino, payload),
+                other => panic!("expected reuse, got {}", describe(&other)),
+            };
+            assert_eq!(ino, 7, "the retained identity is stable across cycles");
+            let latch = Arc::new(AtomicBool::new(false));
+            pool.commit(7, g, payload, Arc::clone(&latch), false);
+            assert_eq!(pool.resolve(7), Some(7));
+            pool.mark_live(7);
+            latch.store(true, Ordering::Release);
+            pool.retire(&HashSet::new(), None);
+        }
+        assert_eq!(pool.misses(), 0);
+    }
+
+    /// A commit for an identity the pool never handed out (a client dma-buf
+    /// gamescope scanned out directly) must be *counted* as a miss, not
+    /// silently ignored — the presenter falls back to its last frame, and the
+    /// number is what says the fallback happened.
+    #[test]
+    fn unregistered_commit_is_reported_not_silent() {
+        let mut pool = ReusePool::<Id>::new(4);
+        assert_eq!(pool.misses(), 0);
+        assert_eq!(
+            pool.resolve(0xDEAD),
+            None,
+            "an unknown ino resolves to none"
+        );
+        assert_eq!(pool.misses(), 1, "the miss is counted");
+        // Resolving a registered ino still works and is not a miss.
+        let g = geom(320, 200);
+        let latch = hand_out(&mut pool, g, 1, 1);
+        pool.mark_live(1);
+        assert_eq!(pool.resolve(1), Some(1));
+        assert_eq!(pool.misses(), 1);
+        drop(latch);
     }
 
     #[test]
@@ -428,7 +646,7 @@ mod tests {
         for frame in 0..40u32 {
             let reservation = pool.begin(g);
             let (id, cold) = match reservation {
-                Reservation::Reuse(id) => (id, false),
+                Reservation::Reuse { payload, .. } => (payload, false),
                 Reservation::Cold { .. } => {
                     allocations += 1;
                     next_id += 1;
@@ -490,9 +708,134 @@ mod tests {
         assert_eq!(pool.owned(), 0);
     }
 
+    /// A length-only request — what the shim sends for a window-sized scan-out
+    /// allocation it cannot size from a connector mode — resolves to a geometry
+    /// the daemon knows, and a length no known geometry produces stays
+    /// kernel-owned (the 4096-byte heap allocations).
+    #[test]
+    fn length_only_request_resolves_to_a_known_geometry() {
+        let mut pool = ReusePool::<Id>::new(8);
+        let mode = geom(1280, 960);
+        let window = geom(800, 600);
+
+        // Unknown until the daemon learns it: from a connector mode or from a
+        // framebuffer the client commits.
+        assert_eq!(pool.resolve_len(window.alloc_len(), window.format), None);
+        pool.note_geometry(mode);
+        pool.note_geometry(window);
+
+        // A bare length now resolves to the exact geometry, and a length-only
+        // request behaves exactly like a geometry one.
+        assert_eq!(pool.resolve_len(mode.alloc_len(), mode.format), Some(mode));
+        assert_eq!(
+            pool.resolve_len(window.alloc_len(), window.format),
+            Some(window)
+        );
+        match pool.begin_len(window.alloc_len(), window.format) {
+            Some(Reservation::Cold { evicted: None }) => {}
+            Some(other) => panic!("expected a cold reservation, got {}", describe(&other)),
+            None => panic!("a known geometry must resolve"),
+        }
+        assert_eq!(
+            pool.resolve_len(4096, 5),
+            None,
+            "4096 B is not a frame length"
+        );
+        assert!(pool.begin_len(4096, 5).is_none());
+    }
+
+    /// A commit teaches the pool its geometry, so a window size first seen as a
+    /// framebuffer becomes resolvable by length afterwards.
+    #[test]
+    fn committed_geometry_becomes_resolvable_by_length() {
+        let mut pool = ReusePool::<Id>::new(4);
+        let g = geom(960, 600);
+        assert_eq!(pool.resolve_len(g.alloc_len(), g.format), None);
+
+        let latch = hand_out(&mut pool, g, 5, 5);
+        assert_eq!(
+            pool.resolve_len(g.alloc_len(), g.format),
+            Some(g),
+            "the committed geometry is now a pool key"
+        );
+        drop(latch);
+    }
+
+    /// One pool serves several geometries at once — the mode plus the window
+    /// sizes games read at — with each answered from its own working set and no
+    /// eviction (thrash) between them.
+    #[test]
+    fn multiple_geometries_share_one_pool_without_thrashing() {
+        const CAP: usize = 12;
+        let mut pool = ReusePool::<Id>::new(CAP);
+        let geoms = [geom(1280, 960), geom(960, 600), geom(800, 600)];
+        for g in geoms {
+            pool.note_geometry(g);
+        }
+
+        let mut next_id: Id = 100;
+        let mut allocations = 0u32;
+        let mut settled_at: Option<u32> = None;
+        let mut in_flight: Vec<(Id, Arc<AtomicBool>)> = Vec::new();
+
+        for round in 0..60u32 {
+            // One frame of each window gamescope is compositing, each requested
+            // by length as the shim would send it.
+            for g in geoms {
+                let reservation = pool
+                    .begin_len(g.alloc_len(), g.format)
+                    .expect("known geometry");
+                let (id, cold) = match reservation {
+                    Reservation::Reuse { payload, .. } => (payload, false),
+                    Reservation::Cold { evicted: None } => {
+                        allocations += 1;
+                        next_id += 1;
+                        (next_id, true)
+                    }
+                    Reservation::Cold { evicted: Some(_) } => {
+                        panic!("pool thrashed: evicted a free buffer at cap {CAP}")
+                    }
+                    Reservation::Full => panic!("pool wedged at cap {CAP}"),
+                };
+                let latch = Arc::new(AtomicBool::new(false));
+                pool.commit(id, g, id, Arc::clone(&latch), cold);
+                pool.mark_live(id);
+                in_flight.push((id, latch));
+            }
+            // Everything published so far flips before the retire below.
+            for (_, l) in &in_flight {
+                l.store(true, Ordering::Release);
+            }
+            // Retire everything but the three most recent (one per geometry).
+            while in_flight.len() > geoms.len() {
+                let (old_id, _) = in_flight.remove(0);
+                let live: HashSet<u64> = in_flight.iter().map(|(id, _)| *id).collect();
+                let removed = pool.retire(&live, None);
+                assert!(removed
+                    .iter()
+                    .any(|r| matches!(r, Removed::Kept { ino, .. } if *ino == old_id)));
+            }
+            if round == 5 {
+                settled_at = Some(allocations);
+            }
+        }
+
+        let settled = settled_at.expect("round 5 ran");
+        assert_eq!(
+            allocations, settled,
+            "allocations must stop once every geometry's working set is warm"
+        );
+        assert!(
+            pool.owned() <= CAP,
+            "the pool must stay under its cap, owns {}",
+            pool.owned()
+        );
+        assert_eq!(pool.misses(), 0, "every length-only request resolved");
+    }
+
     fn describe<T>(r: &Reservation<T>) -> &'static str {
         match r {
-            Reservation::Reuse(_) => "reuse",
+            Reservation::Reuse { .. } => "reuse",
             Reservation::Cold { .. } => "cold",
             Reservation::Full => "full",
         }

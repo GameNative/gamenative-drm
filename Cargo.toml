@@ -17,7 +17,17 @@ edition = "2021"
 license = "MIT"
 
 # Perf-critical profile settings shared by the Android cdylib later.
+#
+# Panic strategy is `unwind`, NOT `abort`. The Android cdylib
+# (modules/gndrm-android -> libgamenative_drm.so) hosts the gndrm daemon inside
+# the GameNative app process, and containment depends on `std::panic::catch_unwind`
+# at the JNI boundary and in the worker threads. Under `panic = "abort"` a panic
+# terminates the process immediately and `catch_unwind` never runs, so a single
+# runtime panic anywhere in the daemon would SIGABRT `app.gamenative` — exactly
+# the tombstone this change removes. Unwinding is the price of that guarantee;
+# the codegen/size cost is accepted for a display path that must never take the
+# host app down.
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"

@@ -272,6 +272,9 @@ pub struct Device {
     emulated_fences: HashSet<u64>,
     /// Request numbers already announced via `diag` (one-shot each).
     seen_ioctls: Vec<u32>,
+    /// Id/handle spaces already reported exhausted. One line per space: a
+    /// sustained leak must surface once, not flood logcat.
+    logged_exhaustion: Vec<&'static str>,
     pub(crate) logged_first_commit: bool,
     pub(crate) commit_count: u32,
 }
@@ -281,7 +284,8 @@ impl Device {
     /// worker thread.
     pub fn new(panel: PanelDesc, presenter: Box<dyn Presenter>) -> Self {
         let mut stores = Stores::default();
-        let in_formats_blob = stores.alloc_blob();
+        // Infallible: a fresh store has the whole blob space free.
+        let in_formats_blob = stores.alloc_blob().expect("in_formats blob id");
         stores.blobs.insert(
             in_formats_blob,
             Blob {
@@ -334,6 +338,7 @@ impl Device {
             logger,
             emulated_fences: HashSet::new(),
             seen_ioctls: Vec::new(),
+            logged_exhaustion: Vec::new(),
             logged_first_commit: false,
             commit_count: 0,
         }
@@ -342,6 +347,27 @@ impl Device {
     /// Install a diagnostics logger (rejections only; see commit.rs).
     pub fn set_logger(&mut self, logger: LogFn) {
         *self.logger.lock().unwrap_or_else(PoisonError::into_inner) = Some(logger);
+    }
+
+    /// The id-space high-water marks (`[gem, fb, blob, syncobj]`), for tests
+    /// and diagnostics: a bounded space is the property the leak fix holds.
+    #[must_use]
+    pub fn id_watermarks(&self) -> [u32; 4] {
+        self.stores.watermarks()
+    }
+
+    /// Report an id/handle space as exhausted, once per space, and return the
+    /// errno the client sees. Returning an errno (not aborting) is what keeps
+    /// `app.gamenative` alive when a resource runs out: the display path stops
+    /// accepting new resources, the app keeps running.
+    fn note_exhausted(&mut self, space: &'static str) -> i32 {
+        if !self.logged_exhaustion.contains(&space) {
+            self.logged_exhaustion.push(space);
+            self.diag(&format!(
+                "resource: {space} exhausted; returning ENOSPC (display path degraded, app continues)"
+            ));
+        }
+        errno::ENOSPC
     }
 
     pub(crate) fn diag(&self, msg: &str) {
@@ -457,7 +483,9 @@ impl Device {
     }
 
     pub(crate) fn next_flip_sequence(&mut self) -> u32 {
-        self.flip_sequence += 1;
+        // Wrapping: a sequence number is a monotonic counter the client only
+        // compares for ordering; it must never panic on overflow.
+        self.flip_sequence = self.flip_sequence.wrapping_add(1);
         self.flip_sequence
     }
 
@@ -896,7 +924,10 @@ impl Device {
         let Some(data) = payload.get(data_off..data_off + c.length as usize) else {
             return DispatchResult::err(errno::EINVAL);
         };
-        let id = self.stores.alloc_blob();
+        let id = match self.stores.alloc_blob() {
+            Ok(id) => id,
+            Err(_) => return DispatchResult::err(self.note_exhausted("property-blob id space")),
+        };
         self.stores.blobs.insert(
             id,
             Blob {
@@ -938,6 +969,9 @@ impl Device {
         if self.stores.blobs.remove(&d.blob_id).is_none() {
             return DispatchResult::err(errno::ENOENT);
         }
+        // Recycle the id: a client that recreates its MODE_ID blob every
+        // modeset must not exhaust the blob space.
+        self.stores.free_blob(d.blob_id);
         DispatchResult::ok(Vec::new())
     }
 
@@ -971,7 +1005,15 @@ impl Device {
             );
             return DispatchResult::ok(body);
         }
-        let handle = self.stores.alloc_gem();
+        let handle = match self.stores.alloc_gem() {
+            Ok(h) => h,
+            Err(_) => {
+                // The wire handed us this reference; an unclaimed fd is closed
+                // here, exactly as an ioctl that ignores its fd would.
+                close_fd(fd);
+                return DispatchResult::err(self.note_exhausted("GEM handle space"));
+            }
+        };
         self.stores
             .gems
             .insert(handle, objects::GemObject { fd, ino, size });
@@ -1019,7 +1061,10 @@ impl Device {
             return DispatchResult::err(errno::EINVAL);
         };
         let signaled = c.flags & DRM_SYNCOBJ_CREATE_SIGNALED != 0;
-        c.handle = self.stores.alloc_syncobj();
+        c.handle = match self.stores.alloc_syncobj() {
+            Ok(h) => h,
+            Err(_) => return DispatchResult::err(self.note_exhausted("syncobj handle space")),
+        };
         self.stores.syncobjs.insert(
             c.handle,
             Syncobj {
@@ -1042,6 +1087,9 @@ impl Device {
                 if let Some(fd) = s.export_fd {
                     close_fd(fd);
                 }
+                // Recycle the handle id so a client creating/destroying fences
+                // per frame cannot exhaust the space.
+                self.stores.free_syncobj(d.handle);
                 DispatchResult::ok(Vec::new())
             }
             None => DispatchResult::err(errno::ENOENT),
@@ -1134,6 +1182,10 @@ impl Device {
                     self.stores.gems_closed.insert(c.handle, gem);
                 } else {
                     close_fd(gem.fd);
+                    // No FB references it: the handle is truly gone, so its id
+                    // returns to the space (gamescope opens/closes a handle per
+                    // buffer; without this the id space leaks one per frame).
+                    self.stores.free_gem(c.handle);
                 }
                 DispatchResult::ok(Vec::new())
             }
@@ -1183,7 +1235,10 @@ impl Device {
                 return DispatchResult::err(errno::ENOENT);
             }
         }
-        let id = self.stores.alloc_fb();
+        let id = match self.stores.alloc_fb() {
+            Ok(id) => id,
+            Err(_) => return DispatchResult::err(self.note_exhausted("FB id space")),
+        };
         cmd.fb_id = id;
         self.stores.fbs.insert(
             id,
@@ -1232,16 +1287,27 @@ impl Device {
                 Some(g) => match dup_fd(g.fd, 0) {
                     Some(new_fd) => {
                         let (ino, size) = (g.ino, g.size);
-                        let new_handle = self.stores.alloc_gem();
-                        self.stores.gems.insert(
-                            new_handle,
-                            objects::GemObject {
-                                fd: new_fd,
-                                ino,
-                                size,
-                            },
-                        );
-                        new_handle
+                        match self.stores.alloc_gem() {
+                            Ok(new_handle) => {
+                                self.stores.gems.insert(
+                                    new_handle,
+                                    objects::GemObject {
+                                        fd: new_fd,
+                                        ino,
+                                        size,
+                                    },
+                                );
+                                new_handle
+                            }
+                            // Space exhausted: release the dup we just made and
+                            // report 0 for this handle rather than abort. The
+                            // caller (libliftoff) sees a 0 handle and skips it.
+                            Err(_) => {
+                                close_fd(new_fd);
+                                self.note_exhausted("GEM handle space");
+                                0
+                            }
+                        }
                     }
                     None => 0,
                 },
@@ -1287,8 +1353,13 @@ impl Device {
             }
             if let Some(gem) = self.stores.gems_closed.remove(&h) {
                 close_fd(gem.fd);
+                // The last reference is gone: recycle the handle id too.
+                self.stores.free_gem(h);
             }
         }
+        // Recycle the fb id: gamescope adds/removes a framebuffer per frame, so
+        // without this the fb id space leaks one per frame.
+        self.stores.free_fb(fb_id);
         DispatchResult::ok(Vec::new())
     }
 }
@@ -1357,12 +1428,53 @@ const LATCH_TIMEOUT: Duration = Duration::from_millis(100);
 /// Latch-wait poll granularity: short enough to notice `shutdown` promptly.
 const LATCH_POLL: Duration = Duration::from_millis(20);
 
+/// The commit worker: a thin panic barrier around [`commit_worker_loop`].
+///
+/// A panic anywhere on this worker — most plausibly inside the presenter — is
+/// caught here, reported once, and ends the worker. The subsystem then stops
+/// (no further frames are presented) while `app.gamenative` stays alive: this
+/// replaces the old behaviour where a worker panic aborted the whole process.
+#[allow(clippy::too_many_arguments)]
+fn commit_worker(
+    presenter: Box<dyn Presenter>,
+    commit_rx: mpsc::Receiver<CommitJob>,
+    flip_queue: Arc<Mutex<VecDeque<DrmEventVblank>>>,
+    flip_event_fd: RawFd,
+    in_flight: Arc<Mutex<HashSet<u32>>>,
+    shutdown: Arc<AtomicBool>,
+    logger: Arc<Mutex<Option<LogFn>>>,
+) {
+    let report = Arc::clone(&logger);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        commit_worker_loop(
+            presenter,
+            commit_rx,
+            flip_queue,
+            flip_event_fd,
+            in_flight,
+            shutdown,
+            logger,
+        );
+    }));
+    if caught.is_err() {
+        if let Some(log) = report
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            log("commit: worker PANICKED; display path stopped, app continues");
+        }
+    }
+    // Always released, whether the loop returned or unwound through it.
+    close_fd(flip_event_fd);
+}
+
 /// The commit worker: one serial loop that pops a commit, publishes it, waits
 /// for the presenter's latch, then emits the flip event and frees the buffer.
 /// The latch wait is bounded — see [`LATCH_TIMEOUT`] — so a lost completion
 /// degrades to "treat the frame as latched" instead of stalling the loop.
 #[allow(clippy::too_many_arguments)]
-fn commit_worker(
+fn commit_worker_loop(
     mut presenter: Box<dyn Presenter>,
     commit_rx: mpsc::Receiver<CommitJob>,
     flip_queue: Arc<Mutex<VecDeque<DrmEventVblank>>>,
@@ -1454,7 +1566,6 @@ fn commit_worker(
         }
         d.set_role(Role::Commit, State::CommitWaitingJob);
     }
-    close_fd(flip_event_fd);
 }
 
 /// `drm_format_modifier_blob` for the primary plane's `IN_FORMATS`: every

@@ -86,10 +86,42 @@ struct Runtime {
 
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 
+/// Log a caught panic payload, naming the subsystem that stopped. Every
+/// containment site funnels through here so a contained panic is always
+/// reported rather than silently swallowed.
+fn report_panic(subsystem: &str, payload: &(dyn std::any::Any + Send)) {
+    let msg = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>");
+    log_error!("{subsystem}: PANICKED: {msg}; subsystem stopped, app continues");
+}
+
 /// Presenter lifetime: the SurfaceControl layer is created on the server
 /// thread and released there when `serve` returns (see `asc.rs`, doc
 /// `android/06`).
+///
+/// This is a hard panic barrier: a panic anywhere in the daemon session
+/// (device bring-up, the serve loop, the presenter, teardown) stops the
+/// display subsystem and is reported, but never unwinds into the JNI caller or
+/// aborts the process. The spawned worker threads have their own barriers.
 fn server_thread(
+    listener: RawFd,
+    window: WindowPtr,
+    panel: PanelDesc,
+    fds: Arc<Mutex<AcceptedFds>>,
+    ready: mpsc::Sender<Result<(), String>>,
+) {
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        server_thread_inner(listener, window, panel, fds, ready);
+    }));
+    if let Err(e) = caught {
+        report_panic("gndrm server", e.as_ref());
+    }
+}
+
+fn server_thread_inner(
     listener: RawFd,
     window: WindowPtr,
     panel: PanelDesc,
@@ -161,7 +193,16 @@ fn server_thread(
         let doorbell = Arc::clone(&doorbell);
         thread::Builder::new()
             .name("gndrm-warm".into())
-            .spawn(move || asc::warm_worker(pool, doorbell))
+            .spawn(move || {
+                // A panic in the spare-buffer worker must not take the app
+                // down: report it and let the worker stop (the pool simply
+                // loses its pre-allocated spare).
+                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    asc::warm_worker(pool, doorbell);
+                })) {
+                    report_panic("gndrm-warm", e.as_ref());
+                }
+            })
             .ok()
     };
     let scanout_thread = stop_fd.and_then(|signal| {
@@ -170,70 +211,78 @@ fn server_thread(
         thread::Builder::new()
             .name("gndrm-scanout".into())
             .spawn(move || {
-                loop {
-                    let mut pfds = [
-                        libc::pollfd {
-                            fd: listener,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        },
-                        libc::pollfd {
-                            fd: signal,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        },
-                    ];
-                    // Parked waiting for a connection: this row is what proves
-                    // the daemon never accepted a request a shim timed out on.
-                    diag::diag().set_role(diag::Role::Scanout, diag::State::ScanoutAccepting);
-                    // SAFETY: two valid pollfds waited on indefinitely.
-                    let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
-                    if n < 0 {
-                        let e = io::Error::last_os_error();
-                        if e.raw_os_error() == Some(libc::EINTR) {
-                            continue;
-                        }
-                        log_info!("scan-out acceptor poll: {e}");
-                        return;
-                    }
-                    if pfds[1].revents != 0 {
-                        log_info!("scan-out acceptor stopping");
-                        return;
-                    }
-                    if pfds[0].revents == 0 {
-                        continue;
-                    }
-                    let fd = match server::accept_newest(listener) {
-                        Ok(fd) => fd,
-                        Err(e) => {
-                            log_info!("accept(scanout): {e}; acceptor stopping");
+                // The acceptor is a subsystem: a panic here stops scan-out
+                // allocation and is reported, but the app (and the serve loop
+                // on the main gndrm thread) stay alive.
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    loop {
+                        let mut pfds = [
+                            libc::pollfd {
+                                fd: listener,
+                                events: libc::POLLIN,
+                                revents: 0,
+                            },
+                            libc::pollfd {
+                                fd: signal,
+                                events: libc::POLLIN,
+                                revents: 0,
+                            },
+                        ];
+                        // Parked waiting for a connection: this row is what proves
+                        // the daemon never accepted a request a shim timed out on.
+                        diag::diag().set_role(diag::Role::Scanout, diag::State::ScanoutAccepting);
+                        // SAFETY: two valid pollfds waited on indefinitely.
+                        let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+                        if n < 0 {
+                            let e = io::Error::last_os_error();
+                            if e.raw_os_error() == Some(libc::EINTR) {
+                                continue;
+                            }
+                            log_info!("scan-out acceptor poll: {e}");
                             return;
                         }
-                    };
-                    fds.lock().expect("fds poisoned").scanout = fd;
-                    log_info!("scan-out channel connected (fd={fd})");
-                    let outcome = asc::serve_scanout(fd, listener, signal, &pool, &doorbell);
-                    // The channel is done with this fd: it is either gone or
-                    // superseded by a newer connection. Clear the published fd
-                    // BEFORE closing it, and close it exactly once here (this
-                    // thread accepted it and is its only owner), so no reader is
-                    // left on a closed or replaced descriptor and nothing
-                    // double-closes the number.
-                    if let Ok(mut guard) = fds.lock() {
-                        if guard.scanout == fd {
-                            guard.scanout = -1;
+                        if pfds[1].revents != 0 {
+                            log_info!("scan-out acceptor stopping");
+                            return;
                         }
+                        if pfds[0].revents == 0 {
+                            continue;
+                        }
+                        let fd = match server::accept_newest(listener) {
+                            Ok(fd) => fd,
+                            Err(e) => {
+                                log_info!("accept(scanout): {e}; acceptor stopping");
+                                return;
+                            }
+                        };
+                        fds.lock().expect("fds poisoned").scanout = fd;
+                        log_info!("scan-out channel connected (fd={fd})");
+                        let outcome = asc::serve_scanout(fd, listener, signal, &pool, &doorbell);
+                        // The channel is done with this fd: it is either gone or
+                        // superseded by a newer connection. Clear the published fd
+                        // BEFORE closing it, and close it exactly once here (this
+                        // thread accepted it and is its only owner), so no reader is
+                        // left on a closed or replaced descriptor and nothing
+                        // double-closes the number.
+                        if let Ok(mut guard) = fds.lock() {
+                            if guard.scanout == fd {
+                                guard.scanout = -1;
+                            }
+                        }
+                        log_info!("scan-out channel closed (fd={fd})");
+                        // SAFETY: this thread accepted the fd and is its only owner.
+                        unsafe { libc::close(fd) };
+                        if matches!(outcome, asc::ScanoutChannel::Stop) {
+                            log_info!("scan-out acceptor stopping");
+                            return;
+                        }
+                        // Closed or Superseded: loop and adopt the newest connection
+                        // (Superseded left one queued on the listener, so the poll
+                        // below returns immediately).
                     }
-                    log_info!("scan-out channel closed (fd={fd})");
-                    // SAFETY: this thread accepted the fd and is its only owner.
-                    unsafe { libc::close(fd) };
-                    if matches!(outcome, asc::ScanoutChannel::Stop) {
-                        log_info!("scan-out acceptor stopping");
-                        return;
-                    }
-                    // Closed or Superseded: loop and adopt the newest connection
-                    // (Superseded left one queued on the listener, so the poll
-                    // below returns immediately).
+                }));
+                if let Err(e) = caught {
+                    report_panic("gndrm-scanout", e.as_ref());
                 }
             })
             .ok()
@@ -248,14 +297,18 @@ fn server_thread(
         .name("gndrm-diag".into())
         .spawn(|| {
             let d = diag::diag();
-            while !d.watchdog_stopped() {
-                thread::sleep(Duration::from_millis(diag::STALL_TICK_MS));
-                if d.watchdog_stopped() {
-                    break;
+            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                while !d.watchdog_stopped() {
+                    thread::sleep(Duration::from_millis(diag::STALL_TICK_MS));
+                    if d.watchdog_stopped() {
+                        break;
+                    }
+                    if let Some(line) = d.maybe_stall_dump(diag::STALL_WARN_MS) {
+                        log_warn!("asc: {line}");
+                    }
                 }
-                if let Some(line) = d.maybe_stall_dump(diag::STALL_WARN_MS) {
-                    log_warn!("asc: {line}");
-                }
+            })) {
+                report_panic("gndrm-diag", e.as_ref());
             }
         })
         .ok();
@@ -359,9 +412,24 @@ fn start(
         }
     };
 
+    // The window is the authority on the size actually presented into: the
+    // caller's width/height can predate layout (a view measured before its
+    // insets apply), which would size the emulated mode differently from the
+    // surface it draws into and resample every frame.
+    let (win_w, win_h) = unsafe {
+        (
+            ffi::ANativeWindow_getWidth(window.0),
+            ffi::ANativeWindow_getHeight(window.0),
+        )
+    };
+    let (panel_w, panel_h) = if win_w > 0 && win_h > 0 {
+        (win_w as u16, win_h as u16)
+    } else {
+        (width as u16, height as u16)
+    };
     let panel = PanelDesc {
-        width: width as u16,
-        height: height as u16,
+        width: panel_w,
+        height: panel_h,
         refresh_mhz: (refresh_hz * 1000.0) as u32,
         mm_width: 0,
         mm_height: 0,
@@ -407,7 +475,7 @@ fn start(
         }
     }
 
-    log_info!("started: socket={name} {width}x{height} @{refresh_hz}Hz");
+    log_info!("started: socket={name} {panel_w}x{panel_h} @{refresh_hz}Hz");
     log_info!("gndrm build 20260926-1: ADDFB2_MODIFIERS + IN_FORMATS (LINEAR) on both planes");
     *slot = Some(Runtime {
         name,
@@ -492,7 +560,7 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeFramesPre
     _env: JNIEnv,
     _class: JClass,
 ) -> jlong {
-    PRESENTED_FRAMES.load(Ordering::Relaxed) as jlong
+    std::panic::catch_unwind(|| PRESENTED_FRAMES.load(Ordering::Relaxed) as jlong).unwrap_or(0)
 }
 
 /// `GameNativeDrm.nativeSurfaceChanged` — v1 semantics: full
@@ -571,7 +639,11 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativePointerAb
     x: jint,
     y: jint,
 ) {
-    injector::pointer_absolute(x, y);
+    // Input handlers are a subsystem too: a poisoned injector lock must not
+    // abort the app (see injector.rs), and anything else is contained here.
+    if let Err(e) = std::panic::catch_unwind(|| injector::pointer_absolute(x, y)) {
+        report_panic("gndrm-input", e.as_ref());
+    }
 }
 
 /// `GameNativeDrm.nativePointerMotion(dx, dy)`.
@@ -582,7 +654,9 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativePointerMo
     dx: jint,
     dy: jint,
 ) {
-    injector::pointer_motion(dx, dy);
+    if let Err(e) = std::panic::catch_unwind(|| injector::pointer_motion(dx, dy)) {
+        report_panic("gndrm-input", e.as_ref());
+    }
 }
 
 /// `GameNativeDrm.nativePointerButton(button, pressed)` — evdev BTN_* code.
@@ -593,7 +667,9 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativePointerBu
     button: jint,
     pressed: jboolean,
 ) {
-    injector::pointer_button(button, pressed != 0);
+    if let Err(e) = std::panic::catch_unwind(|| injector::pointer_button(button, pressed != 0)) {
+        report_panic("gndrm-input", e.as_ref());
+    }
 }
 
 /// `GameNativeDrm.nativePointerAxis(axis, value)` — 0 = vertical, 1 = horizontal.
@@ -604,7 +680,9 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativePointerAx
     axis: jint,
     value: jfloat,
 ) {
-    injector::pointer_axis(axis, value);
+    if let Err(e) = std::panic::catch_unwind(|| injector::pointer_axis(axis, value)) {
+        report_panic("gndrm-input", e.as_ref());
+    }
 }
 
 /// `GameNativeDrm.nativeKey(keyCode, pressed)` — evdev key code.
@@ -615,5 +693,7 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeKey(
     key_code: jint,
     pressed: jboolean,
 ) {
-    injector::key(key_code, pressed != 0);
+    if let Err(e) = std::panic::catch_unwind(|| injector::key(key_code, pressed != 0)) {
+        report_panic("gndrm-input", e.as_ref());
+    }
 }

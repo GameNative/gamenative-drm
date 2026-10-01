@@ -214,19 +214,37 @@ pub const SCANOUT_MAGIC: u32 = 0x474E_5331;
 /// `SurfaceFlinger` a channel-swapped image.
 pub const SCANOUT_FORMAT_BGRA_8888: u32 = 5;
 
-/// Allocation request: geometry + the format the caller will render in.
+/// Allocation request.
 ///
-/// Encoded little-endian, 16 bytes:
-/// `magic:u32, width:u32, height:u32, format:u32`.
+/// Two shapes, told apart by `width`/`height`:
+/// - a **geometry** request (both non-zero) when the shim matched the
+///   allocation length to a connector mode it already knows;
+/// - a **length-only** request (`width == 0 && height == 0`, `len != 0`) when
+///   it did not: the daemon resolves `len` to a geometry it can serve (a
+///   connector mode, a framebuffer the client registered, or a geometry
+///   already in its pool), so the shim does not have to know every window size
+///   in advance.
+///
+/// Encoded little-endian, 24 bytes:
+/// `magic:u32, width:u32, height:u32, format:u32, len:u64`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanoutAllocReq {
     pub width: u32,
     pub height: u32,
     pub format: u32,
+    /// Allocation length in bytes. Carried on every request: it is the
+    /// geometry on a length-only request and a cross-check on a geometry one.
+    pub len: u64,
 }
 
 impl ScanoutAllocReq {
-    pub const LEN: usize = 16;
+    pub const LEN: usize = 24;
+
+    /// Whether this request carries a length instead of a geometry.
+    #[must_use]
+    pub fn is_length_only(&self) -> bool {
+        self.width == 0 && self.height == 0 && self.len != 0
+    }
 
     #[must_use]
     pub fn encode(self) -> [u8; Self::LEN] {
@@ -235,6 +253,7 @@ impl ScanoutAllocReq {
         b[4..8].copy_from_slice(&self.width.to_le_bytes());
         b[8..12].copy_from_slice(&self.height.to_le_bytes());
         b[12..16].copy_from_slice(&self.format.to_le_bytes());
+        b[16..24].copy_from_slice(&self.len.to_le_bytes());
         b
     }
 
@@ -249,6 +268,7 @@ impl ScanoutAllocReq {
             width: u32::from_le_bytes(b[4..8].try_into().ok()?),
             height: u32::from_le_bytes(b[8..12].try_into().ok()?),
             format: u32::from_le_bytes(b[12..16].try_into().ok()?),
+            len: u64::from_le_bytes(b[16..24].try_into().ok()?),
         })
     }
 }
@@ -373,11 +393,24 @@ mod tests {
             width: 1280,
             height: 960,
             format: SCANOUT_FORMAT_BGRA_8888,
+            len: 1280 * 960 * 4,
         };
         let enc = req.encode();
         assert_eq!(enc.len(), ScanoutAllocReq::LEN);
         assert_eq!(enc[0..4], SCANOUT_MAGIC.to_le_bytes());
         assert_eq!(ScanoutAllocReq::decode(&enc), Some(req));
+        assert!(!req.is_length_only());
+
+        // A length-only request resolves to the same bytes, differing only in
+        // the two geometry fields.
+        let by_len = ScanoutAllocReq {
+            width: 0,
+            height: 0,
+            format: SCANOUT_FORMAT_BGRA_8888,
+            len: 800 * 600 * 4,
+        };
+        assert_eq!(ScanoutAllocReq::decode(&by_len.encode()), Some(by_len));
+        assert!(by_len.is_length_only());
 
         let resp = ScanoutAllocResp {
             ret: 0,
@@ -404,6 +437,7 @@ mod tests {
             width: 1280,
             height: 960,
             format: SCANOUT_FORMAT_BGRA_8888,
+            len: 1280 * 960 * 4,
         };
         assert_eq!(
             req.encode(),
@@ -412,6 +446,7 @@ mod tests {
                 0x00, 0x05, 0x00, 0x00, // 1280
                 0xC0, 0x03, 0x00, 0x00, // 960
                 0x05, 0x00, 0x00, 0x00, // BGRA_8888
+                0x00, 0x00, 0x4B, 0x00, 0x00, 0x00, 0x00, 0x00, // 4915200
             ]
         );
         let resp = ScanoutAllocResp {
@@ -440,15 +475,27 @@ mod tests {
             width: 1,
             height: 1,
             format: SCANOUT_FORMAT_BGRA_8888,
+            len: 4,
         }
         .encode()
         .to_vec();
         extra.push(0);
         assert_eq!(ScanoutAllocReq::decode(&extra), None);
-        // A response is not a request, even though both start with the magic.
-        assert_eq!(
-            ScanoutAllocReq::decode(&ScanoutAllocResp::default().encode()),
-            None
-        );
+        // A frame of the right magic but the wrong length is rejected too.
+        let mut short = ScanoutAllocReq {
+            width: 1,
+            height: 1,
+            format: SCANOUT_FORMAT_BGRA_8888,
+            len: 4,
+        }
+        .encode()
+        .to_vec();
+        short.truncate(ScanoutAllocReq::LEN - 1);
+        assert_eq!(ScanoutAllocReq::decode(&short), None);
+        // The request carries the allocation length in the last eight bytes, so
+        // it is now the same length as the response; the two are told apart by
+        // direction on the channel (requests travel shim -> daemon, responses
+        // daemon -> shim), not by shape. Nothing decodes a response as a
+        // request on either side.
     }
 }

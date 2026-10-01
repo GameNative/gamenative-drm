@@ -1637,14 +1637,11 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceFormatsKHR(
             colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
         },
     ];
-    // Bring-up A/B: DXVK picks R8G8B8A8 here while the X11 path is believed to
-    // run B8G8R8A8; offering BGRA only forces the guest onto that format (and
-    // fails loudly if the driver cannot do it).
-    let n_formats = if std::env::var_os("GN_VKSHIM_FORCE_BGRA").is_some() {
-        1
-    } else {
-        K_FMTS.len()
-    };
+    // BGRA_8888 only by default, so the guest renders in the scan-out pool's
+    // own layout (see `advertises_rgba` — offering RGBA let Nidhogg render
+    // R/B-exchanged into a daemon BGRA buffer, which reached the panel as
+    // cyan). RGBA is offered only under `GN_VKSHIM_ALLOW_RGBA`.
+    let n_formats = if advertises_rgba() { K_FMTS.len() } else { 1 };
     unsafe {
         if formats.is_null() {
             *count = n_formats as u32;
@@ -2005,6 +2002,40 @@ fn vk_format_to_fourcc(format: VkFormat) -> u32 {
         VK_FORMAT_R8G8B8A8_UNORM => GN_DRM_FORMAT_XBGR8888,
         _ => 0,
     }
+}
+
+/// The scan-out pool's memory layout, which is what a guest swapchain buffer
+/// actually is whenever the daemon's allocator catches it. Kept as the single
+/// accepted/offered format (see [`advertises_rgba`]).
+const SCANOUT_SWAPCHAIN_FORMAT: VkFormat = VK_FORMAT_B8G8R8A8_UNORM;
+
+/// Whether the proxy offers (and accepts) `VK_FORMAT_R8G8B8A8_UNORM` in
+/// addition to `B8G8R8A8_UNORM`. **Off by default.**
+///
+/// This is measured, not stylistic. The guest's swapchain buffers are handed
+/// out by the gndrm daemon's scan-out pool whenever their geometry matches the
+/// panel mode — the shim's own `dma_heap_alloc` is intercepted
+/// (`[gndrm-shim] scanout: heap alloc 4915200 B -> daemon buffer 1280x960 …
+/// ino=…`) — and that pool allocates
+/// `AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM`. A guest that picks RGBA
+/// (Nidhogg did: `proxy swapchain … 1280x960 fmt 37 -> fourcc 0x34324258`)
+/// renders R,G,B,X into a buffer the daemon then publishes to SurfaceFlinger
+/// *as* BGRA, exchanging red and blue: Nidhogg's yellow/red art reached the
+/// panel as cyan, while a BGRA guest (Dishonored, `fmt 44`) was correct. The
+/// memory is the pool's, so the format the guest renders in must be the
+/// pool's. `GN_VKSHIM_ALLOW_RGBA=1` re-offers RGBA for bring-up A/B;
+/// `GN_VKSHIM_FORCE_BGRA` forces this off regardless.
+fn advertises_rgba() -> bool {
+    std::env::var_os("GN_VKSHIM_FORCE_BGRA").is_none()
+        && std::env::var_os("GN_VKSHIM_ALLOW_RGBA").is_some()
+}
+
+/// Whether a guest swapchain of `format` may be created, given whether RGBA is
+/// offered (`allow_rgba` = [`advertises_rgba`]). Pure so the rule is
+/// host-testable: exactly `SCANOUT_SWAPCHAIN_FORMAT`, plus RGBA only when
+/// explicitly re-enabled.
+fn swapchain_format_allowed(format: VkFormat, allow_rgba: bool) -> bool {
+    format == SCANOUT_SWAPCHAIN_FORMAT || (allow_rgba && format == VK_FORMAT_R8G8B8A8_UNORM)
 }
 
 unsafe fn slot_release(sc: *mut GnSwapchain, s: *mut GnSlot) {
@@ -2548,6 +2579,17 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     let fourcc = vk_format_to_fourcc(ci.imageFormat);
     if fourcc == 0 {
         crate::logf!("proxy: unsupported swapchain format {}", ci.imageFormat);
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    // Only the scan-out pool's own layout can be served end to end (see
+    // `advertises_rgba`): the guest often renders straight into a daemon-owned
+    // BGRA buffer, so a swapchain in any other channel order would publish
+    // R/B-exchanged pixels. Refuse it loudly rather than render wrong colours.
+    if !swapchain_format_allowed(ci.imageFormat, advertises_rgba()) {
+        crate::logf!(
+            "proxy: refusing swapchain format {} (scan-out pool is B8G8R8A8; set GN_VKSHIM_ALLOW_RGBA to opt in)",
+            ci.imageFormat
+        );
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
     let mut n_slots = ci.minImageCount + 1;
@@ -3703,4 +3745,41 @@ unsafe extern "C" fn gn_vkGetDeviceProcAddr(
         return None;
     }
     thunk::thunk_for(name.to_str().unwrap(), target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two layouts the proxy knows must map to the DRM fourcc of their
+    /// memory order: BGRA memory is XRGB8888, RGBA memory is XBGR8888.
+    #[test]
+    fn format_to_fourcc_names_the_memory_order() {
+        assert_eq!(
+            vk_format_to_fourcc(VK_FORMAT_B8G8R8A8_UNORM),
+            GN_DRM_FORMAT_XRGB8888
+        );
+        assert_eq!(
+            vk_format_to_fourcc(VK_FORMAT_R8G8B8A8_UNORM),
+            GN_DRM_FORMAT_XBGR8888
+        );
+        assert_eq!(
+            vk_format_to_fourcc(37 + 1000),
+            0,
+            "unknown formats are refused"
+        );
+    }
+
+    /// Regression for the Nidhogg B/R swap: only the scan-out pool's layout is
+    /// accepted by default, so a guest cannot render RGBA into a buffer the
+    /// daemon publishes as BGRA. RGBA is reachable only under the explicit A/B
+    /// opt-in.
+    #[test]
+    fn only_the_scanout_layout_is_accepted_by_default() {
+        assert!(swapchain_format_allowed(VK_FORMAT_B8G8R8A8_UNORM, false));
+        assert!(swapchain_format_allowed(VK_FORMAT_B8G8R8A8_UNORM, true));
+        assert!(!swapchain_format_allowed(VK_FORMAT_R8G8B8A8_UNORM, false));
+        assert!(swapchain_format_allowed(VK_FORMAT_R8G8B8A8_UNORM, true));
+        assert_eq!(SCANOUT_SWAPCHAIN_FORMAT, VK_FORMAT_B8G8R8A8_UNORM);
+    }
 }

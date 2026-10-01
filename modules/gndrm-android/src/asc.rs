@@ -10,11 +10,14 @@
 //! Ownership runs this way round because the daemon is the process that must
 //! call `ASurfaceTransaction_setBuffer`, and an `AHardwareBuffer` cannot be
 //! obtained from a bare dma-buf fd on API 33 — whoever publishes it has to be
-//! whoever allocated it. So the shim asks for a scan-out buffer by geometry
-//! over a dedicated Unix socket ([`serve_scanout`]) and receives a dma-buf fd
-//! back; gamescope renders into that fd exactly as it would into a dma-heap
-//! allocation. The registration key is the fd's `stat.st_ino`, the same
-//! identity the GEM store dedups `PRIME_FD_TO_HANDLE` imports by, so a
+//! whoever allocated it. So the shim asks for a scan-out buffer over a
+//! dedicated Unix socket ([`serve_scanout`]) — by geometry when it matched a
+//! connector mode, or by allocation length when it did not, in which case the
+//! daemon resolves the length to a geometry it knows (a mode, a committed
+//! framebuffer size, or a geometry already in its pool) — and receives a
+//! dma-buf fd back; gamescope renders into that fd exactly as it would into a
+//! dma-heap allocation. The registration key is the fd's `stat.st_ino`, the
+//! same identity the GEM store dedups `PRIME_FD_TO_HANDLE` imports by, so a
 //! committed framebuffer resolves to its buffer with no extra bookkeeping.
 //!
 //! The buffer pool is a separate lock ([`ScanoutPool`]) from the publish
@@ -220,8 +223,10 @@ enum Reservation {
     /// A ready spare matching the request: no gralloc work needed.
     Warm(Warm),
     /// A retired buffer matching the request: handed back out with only a
-    /// client-descriptor duplicate — no allocation.
-    Reuse(PoolBuf),
+    /// client-descriptor duplicate — no allocation. `ino` is the identity the
+    /// free-list entry was registered under, carried out so the handout can
+    /// verify the fresh descriptor keeps it and re-register if it moved.
+    Reuse { ino: u64, payload: PoolBuf },
     /// Nothing matched; the caller allocates outside the lock. `evicted` is a
     /// free buffer the cache dropped to stay under the cap and the caller must
     /// release.
@@ -323,8 +328,8 @@ impl ScanoutPool {
         };
         // The steady-state answer: a retired buffer of this geometry, handed
         // back out with no allocation at all.
-        if let Some(payload) = self.cache.take_reusable(geom) {
-            return Ok(Reservation::Reuse(payload));
+        if let Some((ino, payload)) = self.cache.take_reusable(geom) {
+            return Ok(Reservation::Reuse { ino, payload });
         }
         // Then the pre-allocated spare, so the request does not allocate
         // synchronously (the worker rebuilds the spare afterwards).
@@ -342,7 +347,7 @@ impl ScanoutPool {
         // change does not wedge the pool.
         match self.cache.reserve() {
             CacheReservation::Cold { evicted } => Ok(Reservation::Cold { evicted }),
-            CacheReservation::Reuse(payload) => Ok(Reservation::Reuse(payload)),
+            CacheReservation::Reuse { ino, payload } => Ok(Reservation::Reuse { ino, payload }),
             CacheReservation::Full => Err(io::Error::from_raw_os_error(libc::ENOSPC)),
         }
     }
@@ -353,10 +358,42 @@ impl ScanoutPool {
         self.cache.abort_cold();
     }
 
+    /// Resolve a length-only request to a geometry the pool knows, then reserve
+    /// its answer. `EINVAL` when the length resolves to no known geometry (not
+    /// a scan-out allocation: the shim leaves it to the kernel), and whatever
+    /// [`Self::begin_alloc`] returns otherwise.
+    ///
+    /// # Errors
+    /// `EINVAL` for an unknown length or a format the pool does not serve,
+    /// `ENOSYS`/`ENOSPC` as [`Self::begin_alloc`].
+    fn begin_alloc_len(&mut self, len: u64, format: u32) -> io::Result<(u32, u32, Reservation)> {
+        if format != SCANOUT_FORMAT_BGRA_8888 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let Some(geom) = self.cache.resolve_len(len, format) else {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        };
+        let reservation = self.begin_alloc(geom.width, geom.height, format)?;
+        Ok((geom.width, geom.height, reservation))
+    }
+
+    /// Record a committed framebuffer's geometry, so a later length-only
+    /// request for the same window size resolves to it. `publish` is the one
+    /// place the presenter sees the framebuffer table, and it is where the
+    /// window-sized geometries the shim cannot name become resolvable.
+    fn note_framebuffer(&mut self, width: u32, height: u32) {
+        self.cache.note_geometry(Geometry {
+            width,
+            height,
+            format: SCANOUT_FORMAT_BGRA_8888,
+        });
+    }
+
     /// Put a reused buffer back after its client descriptor could not be
-    /// duplicated, so the pool does not lose the buffer.
-    fn recycle(&mut self, geom: Geometry, payload: PoolBuf) {
-        self.cache.recycle(geom, payload);
+    /// duplicated, so the pool does not lose the buffer. `ino` is the identity
+    /// the free-list entry was registered under.
+    fn recycle(&mut self, geom: Geometry, ino: u64, payload: PoolBuf) {
+        self.cache.recycle(geom, ino, payload);
     }
 
     /// A fresh completion mailbox for one registration, with the reuse gate
@@ -482,11 +519,16 @@ impl ScanoutPool {
 
     /// Resolve `ino` to its registered buffer and mark it live. `None` when the
     /// inode was never registered (the commit must fall back to the last
-    /// published buffer).
-    fn mark_live(&mut self, ino: u64) -> Option<PoolBuf> {
-        let handle = self.cache.get(ino)?;
-        self.cache.mark_live(ino);
-        Some(handle)
+    /// published buffer), and the miss is counted.
+    fn resolve(&mut self, ino: u64) -> Option<PoolBuf> {
+        self.cache.resolve(ino)
+    }
+
+    /// Commits this session that resolved to no registration (the presenter
+    /// had to fall back), i.e. buffers the presenter never handed out.
+    #[must_use]
+    pub fn pool_misses(&self) -> u64 {
+        self.cache.misses()
     }
 
     /// Resolve `ino` to its registered buffer without marking it live.
@@ -597,6 +639,15 @@ impl AscState {
         // allocator pool, which is empty at this point, so there is normally
         // nothing to put up yet — re-publishing is a no-op here and only does
         // work on a path that re-creates the layer over an existing table.
+        // The panel mode is a geometry the daemon can serve from a bare length,
+        // so a mode-sized scan-out allocation resolves by length even before a
+        // framebuffer of that size is committed.
+        if panel_w > 0 && panel_h > 0 {
+            state
+                .pool
+                .lock(Role::Commit)
+                .note_framebuffer(panel_w as u32, panel_h as u32);
+        }
         state.republish_last();
         state
     }
@@ -672,18 +723,22 @@ impl AscState {
         // service and the transaction build/apply run after it is dropped, so a
         // commit — including a retirement burst — can never queue a scan-out
         // reply behind slow work.
-        let (resolved, removed) = {
+        let (resolved, removed, misses) = {
             let mut pool = self.pool.lock(Role::Commit);
+            // Teach the pool this framebuffer's geometry so a later
+            // length-only scan-out request for the same window size resolves to
+            // it — the window geometries the shim cannot name arrive this way.
+            pool.note_framebuffer(fb.width, fb.height);
             let removed = pool.retire(live_inos, keep);
             // Resolve the buffer this commit publishes. Both lookups copy out
             // the payload, so neither borrow outlives its statement and the
             // fallback path can consult the cache again.
-            let resolved = pool.mark_live(ino).map(|buf| (buf, ino, false));
+            let resolved = pool.resolve(ino).map(|buf| (buf, ino, false));
             let resolved = resolved.or_else(|| {
                 self.last_publish
                     .and_then(|lp| pool.get(lp.ino).map(|buf| (buf, lp.ino, true)))
             });
-            (resolved, removed)
+            (resolved, removed, pool.pool_misses())
         };
 
         // Retain the retired buffers whose flip event has been reported for
@@ -700,7 +755,9 @@ impl AscState {
                 // back to, so the frame is dropped and the fence released.
                 if !self.logged_unregistered.contains(&ino) {
                     self.logged_unregistered.push(ino);
-                    log_warn!("asc: no AHardwareBuffer for dma-buf ino {ino}; frame dropped");
+                    log_warn!(
+                        "asc: no AHardwareBuffer for dma-buf ino {ino}; frame dropped (misses={misses})"
+                    );
                 }
                 close_fence(fence);
                 FlipHandle::latched_now()
@@ -762,7 +819,7 @@ impl AscState {
                     if stale && !self.logged_stale.contains(&ino) {
                         self.logged_stale.push(ino);
                         log_warn!(
-                            "asc: no AHardwareBuffer for dma-buf ino {ino}; re-publishing ino {published_ino}"
+                            "asc: no AHardwareBuffer for dma-buf ino {ino}; re-publishing ino {published_ino} (misses={misses})"
                         );
                     }
                     match build_show(&api, self.sc, ahb, ctx, src, dst, fence) {
@@ -1026,9 +1083,10 @@ pub fn serve_scanout(
         // thread at all — a channel/accept fault, not a slow reply path.
         if d.receipt_allowed() {
             log_info!(
-                "asc: scan-out request {}x{} fmt={:#x} received (seq={})",
+                "asc: scan-out request {}x{} len={} fmt={:#x} received (seq={})",
                 req.width,
                 req.height,
+                req.len,
                 req.format,
                 d.requests_seen()
             );
@@ -1042,13 +1100,28 @@ pub fn serve_scanout(
         // contention-induced refusal is measured against. The guard reports how
         // long the acquisition took (the tracked lock publishes the holder and
         // the waiters into the diagnostic registry independent of this).
-        let (began, lock_waited_ms) = {
+        //
+        // A request the shim could not size from a connector mode arrives
+        // length-only; it is resolved here to a geometry the daemon knows, so a
+        // window-sized scan-out buffer is pool-owned exactly like a mode-sized
+        // one. `width`/`height` below are the geometry actually served, which is
+        // what the commit, the allocation and the spare must use.
+        let (began, lock_waited_ms, width, height) = {
             let mut pool_guard = pool.lock(Role::Scanout);
             let waited = pool_guard.waited_ms();
-            (
-                pool_guard.begin_alloc(req.width, req.height, req.format),
-                waited,
-            )
+            let (width, height, began) = if req.is_length_only() {
+                match pool_guard.begin_alloc_len(req.len, req.format) {
+                    Ok((w, h, reservation)) => (w, h, Ok(reservation)),
+                    Err(e) => (0, 0, Err(e)),
+                }
+            } else {
+                (
+                    req.width,
+                    req.height,
+                    pool_guard.begin_alloc(req.width, req.height, req.format),
+                )
+            };
+            (began, waited, width, height)
         };
         d.note_stage(Stage::Lock, lock_waited_ms);
 
@@ -1056,7 +1129,10 @@ pub fn serve_scanout(
             // A retired buffer of this geometry: no allocation, just a fresh
             // client descriptor duplicated from the buffer the pool already
             // holds. This is the steady state.
-            Ok(Reservation::Reuse(payload)) => {
+            Ok(Reservation::Reuse {
+                ino: cached_ino,
+                payload,
+            }) => {
                 d.step(State::ScanoutLocked);
                 let api = pool.lock(Role::Scanout).api();
                 let dup_started = Instant::now();
@@ -1064,14 +1140,27 @@ pub fn serve_scanout(
                 d.note_stage(Stage::Alloc, dup_started.elapsed().as_millis() as u64);
                 match resolved {
                     Some((fd, ino)) => {
+                        // The cached buffer was registered under `cached_ino`,
+                        // and a dup of its dma-buf keeps the inode — so the
+                        // fresh descriptor should carry the same identity.
+                        // Verify rather than trust the assumption: if it moved,
+                        // the registration key the client will import has
+                        // changed, and the commit below re-registers under the
+                        // identity actually handed out so the next commit for
+                        // this buffer still resolves.
+                        if ino != cached_ino {
+                            log_warn!(
+                                "asc: scan-out reuse ino moved ({cached_ino} -> {ino}); the free-list identity is stale, re-registering"
+                            );
+                        }
                         let buffer = ScanoutBuffer {
                             fd,
                             ino,
                             stride: payload.stride,
                         };
                         let replaced = pool.lock(Role::Scanout).commit(
-                            req.width,
-                            req.height,
+                            width,
+                            height,
                             &buffer,
                             payload.ahb,
                             false,
@@ -1095,11 +1184,11 @@ pub fn serve_scanout(
                         // The cached buffer could not be turned into a client
                         // descriptor: put it back so the pool does not lose it.
                         let geom = Geometry {
-                            width: req.width,
-                            height: req.height,
+                            width,
+                            height,
                             format: req.format,
                         };
-                        pool.lock(Role::Scanout).recycle(geom, payload);
+                        pool.lock(Role::Scanout).recycle(geom, cached_ino, payload);
                         let refused = refuse_scanout(req, libc::EIO, lock_waited_ms, pool, d);
                         (refused.0, refused.1, false, false)
                     }
@@ -1110,8 +1199,8 @@ pub fn serve_scanout(
             Ok(Reservation::Warm(warm)) => {
                 d.step(State::ScanoutLocked);
                 let replaced = pool.lock(Role::Scanout).commit(
-                    req.width,
-                    req.height,
+                    width,
+                    height,
                     &warm.buffer,
                     warm.ahb,
                     false,
@@ -1144,14 +1233,14 @@ pub fn serve_scanout(
                 d.set_role(Role::Scanout, State::ScanoutAllocating);
                 let alloc_started = Instant::now();
                 let allocated = api.map_or(Err(libc::ENOSYS), |api| {
-                    allocate_buffer(api, req.width, req.height, req.format)
+                    allocate_buffer(api, width, height, req.format)
                 });
                 d.note_stage(Stage::Alloc, alloc_started.elapsed().as_millis() as u64);
                 match allocated {
                     Ok((buffer, ahb)) => {
                         let replaced = pool.lock(Role::Scanout).commit(
-                            req.width,
-                            req.height,
+                            width,
+                            height,
                             &buffer,
                             ahb,
                             true,
@@ -1243,7 +1332,7 @@ pub fn serve_scanout(
         // cache leaves the spare as it is. Raising the request is not on the
         // reply path.
         if refill_spare {
-            doorbell.request((req.width, req.height, req.format));
+            doorbell.request((width, height, req.format));
         }
     }
 }
@@ -1325,10 +1414,15 @@ fn refuse_scanout(
         let pool = pool.lock(Role::Scanout);
         (pool.pool_owned(), pool.pool_live(), pool.pool_free())
     };
+    // A length-only request has no geometry to name (it failed to resolve, or
+    // resolved and then failed); report the length it carried instead.
+    let what = if req.is_length_only() {
+        format!("len={} (unresolved)", req.len)
+    } else {
+        format!("{}x{}", req.width, req.height)
+    };
     log_warn!(
-        "asc: scan-out alloc {}x{} refused: {} (errno {errno}, waited {waited_ms} ms for the pool lock, pool={owned}/{MAX_SCANOUT_POOL} live={live} free={free}) {}",
-        req.width,
-        req.height,
+        "asc: scan-out alloc {what} refused: {} (errno {errno}, waited {waited_ms} ms for the pool lock, pool={owned}/{MAX_SCANOUT_POOL} live={live} free={free}) {}",
         refusal_reason(errno),
         d.snapshot("refused")
     );

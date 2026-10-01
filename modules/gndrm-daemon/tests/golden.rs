@@ -1091,6 +1091,267 @@ fn gem_close_with_live_fb_then_modeset_and_rmfb() {
 }
 
 // ---------------------------------------------------------------------------
+// resource churn / exhaustion (the ~216 s on-device leak)
+// ---------------------------------------------------------------------------
+
+/// One frame of the churn a framebuffer-heavy game (Nidhogg) produces, driven
+/// end-to-end through the daemon: create a MODE_ID blob, import a fresh dma-buf,
+/// ADDFB2, GETFB2 (libliftoff's fresh closable handle) then close that handle,
+/// close the importer handle (orphaning the GEM), modeset + flip, tear the plane
+/// down, RMFB (frees the orphan GEM and the fb id), destroy the blob, and churn
+/// one sync object.
+///
+/// Every allocation has a matching free, so the id-space high-water marks must
+/// not move once the working set has settled.
+fn churn_one_frame(d: &mut Device) {
+    let blob = create_mode_blob(d).0;
+    let (handle, fb, fd) = import_fb(d);
+
+    // libliftoff: GETFB2 then drmCloseBufferHandle on the returned handle.
+    let r = call(
+        d,
+        DRM_IOCTL_MODE_GETFB2,
+        &pod(&DrmModeFbCmd2 {
+            fb_id: fb,
+            ..Default::default()
+        }),
+    );
+    ok(&r);
+    let fresh = pod_read::<DrmModeFbCmd2>(&r.body).unwrap().handles[0];
+    assert_ne!(fresh, 0, "GETFB2 must return a live handle");
+    ok(&call(
+        d,
+        DRM_IOCTL_GEM_CLOSE,
+        &pod(&DrmGemClose {
+            handle: fresh,
+            pad: 0,
+        }),
+    ));
+
+    // gamescope closes its importer handle right after ADDFB2 (orphan GEM).
+    ok(&call(
+        d,
+        DRM_IOCTL_GEM_CLOSE,
+        &pod(&DrmGemClose { handle, pad: 0 }),
+    ));
+
+    // Modeset + flip, then tear the plane down so RMFB is allowed.
+    let sets = modeset_sets(d, blob, fb);
+    let req = atomic_req(
+        &sets,
+        DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_PAGE_FLIP_EVENT,
+        0xF00D,
+    );
+    ok(&call(d, DRM_IOCTL_MODE_ATOMIC, &req));
+    assert!(
+        !wait_flip(d, 2000).is_empty(),
+        "churn frame must emit its flip event"
+    );
+    let zero = [
+        (
+            PLANE_PRIMARY_ID,
+            find_prop_id(PLANE_PRIMARY_ID, "FB_ID").unwrap(),
+            0,
+        ),
+        (
+            PLANE_PRIMARY_ID,
+            find_prop_id(PLANE_PRIMARY_ID, "CRTC_ID").unwrap(),
+            0,
+        ),
+        (CRTC_ID, find_prop_id(CRTC_ID, "ACTIVE").unwrap(), 0),
+        (CRTC_ID, find_prop_id(CRTC_ID, "MODE_ID").unwrap(), 0),
+        (
+            CONNECTOR_ID,
+            find_prop_id(CONNECTOR_ID, "CRTC_ID").unwrap(),
+            0,
+        ),
+    ];
+    ok(&call(
+        d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(&zero, DRM_MODE_ATOMIC_ALLOW_MODESET, 0),
+    ));
+    ok(&call(d, DRM_IOCTL_MODE_RMFB, &pod(&fb)));
+    ok(&call(
+        d,
+        DRM_IOCTL_MODE_DESTROYPROPBLOB,
+        &pod(&DrmModeDestroyBlob { blob_id: blob }),
+    ));
+
+    // Sync-object churn (gamescope's always-signalled in-fence object).
+    let r = call(
+        d,
+        DRM_IOCTL_SYNCOBJ_CREATE,
+        &pod(&DrmSyncobjCreate {
+            handle: 0,
+            flags: DRM_SYNCOBJ_CREATE_SIGNALED,
+        }),
+    );
+    ok(&r);
+    let sh = pod_read::<DrmSyncobjCreate>(&r.body).unwrap().handle;
+    ok(&call(
+        d,
+        DRM_IOCTL_SYNCOBJ_DESTROY,
+        &pod(&DrmSyncobjDestroy { handle: sh, pad: 0 }),
+    ));
+
+    // SAFETY: caller's fd (the daemon holds its own dup).
+    unsafe { libc::close(fd) };
+}
+
+/// The leak regression: many frames of `commit + ADDFB2 + RMFB + import +
+/// close` must not grow any id space. Before the fix each frame advanced the
+/// monotonic GEM/FB/blob/syncobj counters by one (freed ids were never
+/// reused), so the 0x1000-wide GEM handle space ran out after a few thousand
+/// frames and `alloc_gem`'s `assert!` aborted the whole app.
+#[test]
+fn churn_keeps_id_spaces_bounded() {
+    let mut d = dev();
+    // Warm up so every space reaches its steady-state high-water mark.
+    for _ in 0..32 {
+        churn_one_frame(&mut d);
+    }
+    let warm = d.id_watermarks();
+    // A long run (well past the 0x1000 handle space, so the old code would
+    // have aborted) must not advance any high-water mark.
+    for _ in 0..3000 {
+        churn_one_frame(&mut d);
+    }
+    let after = d.id_watermarks();
+    assert_eq!(
+        after, warm,
+        "id spaces grew across 3000 churn frames: {warm:?} -> {after:?}"
+    );
+    // Watermarks are the next *unallocated* id, so growth is measured above
+    // each space's base (1, 0x1000, 0x2000, 0x4000). The steady-state working
+    // set is tiny; the old code advanced these by one per allocation, i.e.
+    // ~1 per frame, without bound.
+    let bases = [1u32, 0x1000, 0x2000, 0x4000];
+    let used: Vec<u32> = warm.iter().zip(bases).map(|(&w, b)| w - b).collect();
+    assert!(
+        used.iter().all(|&u| u < 8),
+        "steady-state id usage must be small, got {used:?} (watermarks {warm:?})"
+    );
+}
+
+/// Exhaustion is an errno, not an abort: filling the FB id space must make the
+/// next ADDFB2 return `-ENOSPC` and leave the device usable — where the old
+/// `assert!` would have SIGABRT'd the host app.
+#[test]
+fn fb_space_exhaustion_returns_enospc_not_abort() {
+    let mut d = dev();
+    let fd = memfd(1280 * 720 * 4);
+    let r = call_fd(
+        &mut d,
+        DRM_IOCTL_PRIME_FD_TO_HANDLE,
+        &pod(&DrmPrimeHandle::default()),
+        fd,
+    );
+    let handle = pod_read::<DrmPrimeHandle>(&r.body).unwrap().handle;
+    let cmd = DrmModeFbCmd2 {
+        width: 1280,
+        height: 720,
+        pixel_format: DRM_FORMAT_XRGB8888,
+        handles: [handle, 0, 0, 0],
+        pitches: [1280 * 4, 0, 0, 0],
+        offsets: [0; 4],
+        modifier: [0; 4],
+        ..Default::default()
+    };
+    // Fill the whole fb id space (0x1000..0x2000) with the same buffer.
+    let mut allocated = 0u32;
+    loop {
+        let r = call(&mut d, DRM_IOCTL_MODE_ADDFB2, &pod(&cmd));
+        if r.ret == -errno::ENOSPC {
+            break;
+        }
+        ok(&r);
+        allocated += 1;
+        assert!(allocated < 0x2000, "ADDFB2 never reported exhaustion");
+    }
+    assert_eq!(
+        allocated, 0x1000,
+        "the fb id space is exactly 0x1000 ids wide"
+    );
+    // Still usable: the failed ADDFB2 did not abort the process or wedge it.
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_GEM_CLOSE,
+        &pod(&DrmGemClose { handle, pad: 0 }),
+    ));
+    // SAFETY: caller's fd.
+    unsafe { libc::close(fd) };
+}
+
+/// A presenter that panics on its first publish, to prove the commit worker's
+/// panic barrier keeps the host process alive.
+struct PanicPresenter;
+
+impl Presenter for PanicPresenter {
+    fn publish(
+        &mut self,
+        _fb: &Framebuffer,
+        _plane: &PlaneState,
+        _ino: Option<u64>,
+        _live_inos: &HashSet<u64>,
+        fence: Option<RawFd>,
+    ) -> FlipHandle {
+        if let Some(fd) = fence {
+            // SAFETY: the mock owns the fence the device handed it.
+            unsafe { libc::close(fd) };
+        }
+        panic!("presenter exploded (containment test)");
+    }
+}
+
+/// A panic on the commit worker must be reported and must stop only that
+/// subsystem: the device (and therefore the host app) stays alive and keeps
+/// serving ioctls. Without the barrier this panic would unwind out of the
+/// worker; with `panic = "abort"` it would SIGABRT the whole app.
+#[test]
+fn commit_worker_panic_is_contained_and_non_fatal() {
+    let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&logs);
+    let mut d = Device::new(PanelDesc::default(), Box::new(PanicPresenter));
+    d.set_clock(Box::new(|| (1000, 500)));
+    d.set_logger(Box::new(move |m: &str| {
+        sink.lock().unwrap().push(m.to_string());
+    }));
+
+    let blob = create_mode_blob(&mut d).0;
+    let (handle, fb, fd) = import_fb(&mut d);
+    let sets = modeset_sets(&d, blob, fb);
+    let req = atomic_req(
+        &sets,
+        DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_PAGE_FLIP_EVENT,
+        1,
+    );
+    ok(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req));
+
+    // The worker panics inside the presenter; the barrier reports it.
+    let mut seen = false;
+    for _ in 0..2000 {
+        if logs.lock().unwrap().iter().any(|l| l.contains("PANICKED")) {
+            seen = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(seen, "the worker panic must be reported");
+
+    // The device is still alive and serving ioctls on this (app) thread.
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_VERSION,
+        &pod(&DrmVersion::default()),
+    ));
+
+    let _ = (handle, blob);
+    // SAFETY: caller's fd.
+    unsafe { libc::close(fd) };
+}
+
+// ---------------------------------------------------------------------------
 // A6/A7: atomic commits
 // ---------------------------------------------------------------------------
 

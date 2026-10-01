@@ -82,7 +82,11 @@ fn now_ms() -> u32 {
 /// `GameNativeDrm.nativeInjectorStart(xdgRuntimeDir, waylandDisplay)`.
 /// Idempotent; returns 0 or a negative code.
 pub fn start(runtime_dir: String, display: String) -> i32 {
-    let mut slot = INJECTOR.lock().expect("injector poisoned");
+    // Poison-tolerant: a panic elsewhere must not turn this lock into a
+    // process-killing panic on the next JNI call (see lib.rs containment).
+    let mut slot = INJECTOR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if slot.is_some() {
         return 0;
     }
@@ -94,11 +98,20 @@ pub fn start(runtime_dir: String, display: String) -> i32 {
     let handle = thread::Builder::new()
         .name("gndrm-input".into())
         .spawn(move || {
-            run(&thread_path, &rx, &thread_stop);
+            // The injector is a subsystem: a panic on its thread (a wayland
+            // protocol error, a poisoned lock) is reported and ends the
+            // thread, never the app process.
+            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(&thread_path, &rx, &thread_stop);
+            })) {
+                crate::report_panic("gndrm-input", e.as_ref());
+            }
         });
     match handle {
         Ok(t) => {
-            *INPUT_TX.lock().expect("input tx poisoned") = Some(tx);
+            *INPUT_TX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
             *slot = Some(InjectorHandle {
                 stop,
                 thread: Some(t),
@@ -115,9 +128,14 @@ pub fn start(runtime_dir: String, display: String) -> i32 {
 
 /// `GameNativeDrm.nativeInjectorStop()`.
 pub fn stop() {
-    let handle = INJECTOR.lock().expect("injector poisoned").take();
+    let handle = INJECTOR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
     let Some(mut handle) = handle else { return };
-    *INPUT_TX.lock().expect("input tx poisoned") = None;
+    *INPUT_TX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     handle.stop.store(true, Ordering::SeqCst);
     if let Some(t) = handle.thread.take() {
         let _ = t.join();
@@ -126,7 +144,11 @@ pub fn stop() {
 }
 
 fn post(ev: InputEvent) {
-    if let Some(tx) = INPUT_TX.lock().expect("input tx poisoned").as_ref() {
+    if let Some(tx) = INPUT_TX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
         // If the injector thread died, sending fails — drop silently.
         let _ = tx.send(ev);
     }

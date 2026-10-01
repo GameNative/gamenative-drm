@@ -108,9 +108,10 @@ struct gndrm_scanout_req {
     uint32_t width;
     uint32_t height;
     uint32_t format;
+    uint64_t len;
 } __attribute__((packed));
-_Static_assert(sizeof(struct gndrm_scanout_req) == 16,
-               "ScanoutAllocReq is 16 bytes on the wire");
+_Static_assert(sizeof(struct gndrm_scanout_req) == 24,
+               "ScanoutAllocReq is 24 bytes on the wire");
 
 struct gndrm_scanout_resp {
     uint32_t magic;
@@ -697,10 +698,14 @@ static void ext_copy_array(struct ext_reader *r, uintptr_t user_ptr,
  * allocation to an AHardwareBuffer is what lets the daemon hand the very buffer
  * gamescope rendered into to SurfaceFlinger, with no copy on either side.
  *
- * DMA_HEAP_IOCTL_ALLOC carries a length only, so the geometry comes from the
- * connector mode list the shim already marshals: a scan-out allocation is
- * exactly w * h * 4. Anything that does not match a known mode is left to the
- * kernel untouched, which keeps non-frame heap users unaffected.
+ * DMA_HEAP_IOCTL_ALLOC carries a length only. When that length matches a
+ * connector mode the shim already marshals, the geometry is that mode (a
+ * scan-out allocation is exactly w * h * 4). When it matches no mode - a game
+ * rendering at 800x600 into the mode-sized output - the length is sent alone
+ * and the daemon resolves it against the geometries it can serve: its modes,
+ * the framebuffer sizes the client committed, and its pool keys. A length the
+ * daemon cannot resolve (too small to be a frame, or not a geometry it knows)
+ * is left to the kernel untouched, which keeps non-frame heap users unaffected.
  */
 #ifndef GNDRM_IOCTL_DMAHEAP_ALLOC
 #define GNDRM_IOCTL_DMAHEAP_ALLOC 0xc0184800u /* _IOWR('H', 0, alloc_data) */
@@ -817,7 +822,7 @@ static void scanout_chan_drop(void)
  * on success *resp holds the reply and *fd_out the received descriptor.
  * Called with g_scanout_lock held.
  */
-static int scanout_exchange(uint32_t w, uint32_t h,
+static int scanout_exchange(uint32_t w, uint32_t h, uint64_t len,
                             struct gndrm_scanout_resp *resp, int *fd_out)
 {
     struct gndrm_scanout_req req = {
@@ -825,6 +830,7 @@ static int scanout_exchange(uint32_t w, uint32_t h,
         .width = w,
         .height = h,
         .format = GNDRM_SCANOUT_FORMAT_BGRA_8888,
+        .len = len,
     };
     struct iovec iov = { .iov_base = &req, .iov_len = sizeof(req) };
     struct msghdr msg = { 0 };
@@ -876,8 +882,10 @@ static int scanout_exchange(uint32_t w, uint32_t h,
 }
 
 /*
- * Ask the daemon for one scan-out buffer of w x h. 0 on success with *out_fd
- * owned by the caller. The channel is re-established (with a bounded backoff)
+ * Ask the daemon for one scan-out buffer: w x h when the shim matched a mode,
+ * or the bare `len` (w = h = 0) for the daemon to resolve to a geometry it
+ * knows. 0 on success with *out_fd owned by the caller. The channel is
+ * re-established (with a bounded backoff)
  * only when it could not be connected or when it is genuinely dead; a reply
  * timeout leaves it in place, because a timeout does not mean the socket died
  * and reconnecting on it is what splits the two sides onto different fds. On
@@ -885,7 +893,7 @@ static int scanout_exchange(uint32_t w, uint32_t h,
  * and the whole time spent inside this call, so the shim line can be aligned
  * with the daemon's request log.
  */
-static int scanout_request(uint32_t w, uint32_t h, int *out_fd,
+static int scanout_request(uint32_t w, uint32_t h, uint64_t len, int *out_fd,
                            uint64_t *out_ino, uint32_t *out_stride,
                            int *out_attempts, long *out_elapsed_ms)
 {
@@ -907,7 +915,7 @@ static int scanout_request(uint32_t w, uint32_t h, int *out_fd,
             struct gndrm_scanout_resp resp;
             int fd = -1;
             memset(&resp, 0, sizeof(resp));
-            rc = scanout_exchange(w, h, &resp, &fd);
+            rc = scanout_exchange(w, h, len, &resp, &fd);
             bool timed_out = (rc != 0) && scanout_err_timeout(rc);
             if (rc == 0 && resp.ret != 0)
                 rc = resp.ret; /* daemon refusal: the channel is healthy */
@@ -983,6 +991,80 @@ static void scanout_seed_from_env(void)
 }
 
 /*
+ * Smallest allocation length treated as a possible scan-out frame. A frame is
+ * exactly w * h * 4 and cannot be tiny: the 4096-byte scratch allocations
+ * gamescope makes are far below this and stay with the kernel, so no request is
+ * ever sent for them. Every window size a game renders into is well above it.
+ */
+#define GNDRM_SCANOUT_MIN_LEN ((uint64_t)128 * 128 * 4)
+
+/*
+ * Ask the daemon for one buffer and, on success, hand its descriptor back to
+ * gamescope as this heap allocation. `w`/`h` are the geometry when the shim
+ * matched a connector mode, or 0 for a length-only request the daemon resolves;
+ * `len` is the allocation length and is always sent. 0 on success, -1 to fall
+ * through to the kernel ioctl.
+ */
+static int scanout_hand_out(struct gndrm_dmaheap_alloc *a,
+                            uint32_t w, uint32_t h, uint64_t len)
+{
+    int fd = -1;
+    uint64_t ino = 0;
+    uint32_t stride = 0;
+    int attempts = 0;
+    long elapsed_ms = 0;
+    int rc = scanout_request(w, h, len, &fd, &ino, &stride, &attempts, &elapsed_ms);
+    if (rc != 0) {
+        /* No buffer means no publishable frame; falling through leaves the
+         * allocation a plain heap buffer, which is the pre-redirect behaviour
+         * rather than a broken one. Name the fault rather than reporting a bare
+         * errno: a request that ran out its reply budget, a full pool, an
+         * allocator failure, an unsupported geometry or a daemon that is
+         * unreachable. The elapsed time and attempt number are logged so this
+         * line can be aligned with the daemon's "received (seq=)" receipt (or
+         * its absence). */
+        const char *why = "allocation failure";
+        if (rc == -EAGAIN || rc == -ETIMEDOUT)
+            why = "request timed out waiting for a reply";
+        else if (rc == -ENOSPC)
+            why = "daemon pool exhausted";
+        else if (rc == -ENOSYS)
+            why = "daemon presenter disabled";
+        else if (rc == -EINVAL)
+            why = "unsupported geometry/format";
+        else if (rc == -ECONNREFUSED)
+            why = "allocator channel unreachable";
+        else if (rc == -EPROTO)
+            why = "malformed daemon reply";
+        if (rate_ok(2)) {
+            if (w && h)
+                LOG("scanout: daemon allocated no %ux%u buffer: %s "
+                    "(elapsed=%ldms attempt=%d/%d) (errno %d %s)\n",
+                    w, h, why, elapsed_ms, attempts, GNDRM_SCANOUT_ATTEMPTS,
+                    -rc, strerror(-rc));
+            else
+                LOG("scanout: daemon allocated no %llu B buffer: %s "
+                    "(elapsed=%ldms attempt=%d/%d) (errno %d %s)\n",
+                    (unsigned long long)len, why, elapsed_ms, attempts,
+                    GNDRM_SCANOUT_ATTEMPTS, -rc, strerror(-rc));
+        }
+        return -1;
+    }
+    if (a->fd_flags & O_CLOEXEC)
+        syscall(SYS_fcntl, fd, F_SETFD, FD_CLOEXEC);
+    a->fd = (uint32_t)fd;
+    a->heap_flags = 0;
+    if (w && h)
+        LOG("scanout: heap alloc %llu B -> daemon buffer %ux%u fd=%d ino=%llu stride=%u\n",
+            (unsigned long long)len, w, h, fd, (unsigned long long)ino, stride);
+    else
+        LOG("scanout: heap alloc %llu B -> daemon buffer (by length) "
+            "fd=%d ino=%llu stride=%u\n",
+            (unsigned long long)len, fd, (unsigned long long)ino, stride);
+    return 0;
+}
+
+/*
  * 0 = redirected to a daemon-owned buffer, -1 = not a scan-out allocation (the
  * caller then lets the real kernel ioctl handle it).
  */
@@ -992,64 +1074,26 @@ static int scanout_redirect(void *arg)
     if (!a)
         return -1;
     scanout_seed_from_env();
-    if (g_scan_nmodes == 0) {
-        if (rate_ok(5))
-            LOG("scanout: heap alloc %llu B before any mode was seen\n",
-                (unsigned long long)a->len);
+    /* Not a frame: too small (the 4096-byte scratch allocations) or not
+     * 4-byte-per-pixel sized. Leave it to the kernel without a round trip. */
+    if (a->len < GNDRM_SCANOUT_MIN_LEN || (a->len & 3u))
         return -1;
-    }
+    /* A connector mode the shim already knows names the geometry outright;
+     * sending it unchanged keeps the mode-matched path exactly as it was. */
     for (int i = 0; i < g_scan_nmodes; i++) {
         uint32_t w = g_scan_modes[i][0], h = g_scan_modes[i][1];
-        uint64_t want = (uint64_t)w * h * 4;
-        if (a->len != want)
-            continue;
-        int fd = -1;
-        uint64_t ino = 0;
-        uint32_t stride = 0;
-        int attempts = 0;
-        long elapsed_ms = 0;
-        int rc = scanout_request(w, h, &fd, &ino, &stride, &attempts, &elapsed_ms);
-        if (rc != 0) {
-            /* No buffer means no publishable frame; falling through leaves the
-             * allocation a plain heap buffer, which is the pre-redirect
-             * behaviour rather than a broken one. Name the fault rather than
-             * reporting a bare errno: a request that ran out its reply budget,
-             * a full pool, an allocator failure, an unsupported geometry or a
-             * daemon that is unreachable. The elapsed time and attempt number
-             * are logged so this line can be aligned with the daemon's
-             * "received (seq=)" receipt (or its absence). */
-            const char *why = "allocation failure";
-            if (rc == -EAGAIN || rc == -ETIMEDOUT)
-                why = "request timed out waiting for a reply";
-            else if (rc == -ENOSPC)
-                why = "daemon pool exhausted";
-            else if (rc == -ENOSYS)
-                why = "daemon presenter disabled";
-            else if (rc == -EINVAL)
-                why = "unsupported geometry/format";
-            else if (rc == -ECONNREFUSED)
-                why = "allocator channel unreachable";
-            else if (rc == -EPROTO)
-                why = "malformed daemon reply";
-            if (rate_ok(2))
-                LOG("scanout: daemon allocated no %ux%u buffer: %s "
-                    "(elapsed=%ldms attempt=%d/%d) (errno %d %s)\n",
-                    w, h, why, elapsed_ms, attempts, GNDRM_SCANOUT_ATTEMPTS,
-                    -rc, strerror(-rc));
-            return -1;
-        }
-        if (a->fd_flags & O_CLOEXEC)
-            syscall(SYS_fcntl, fd, F_SETFD, FD_CLOEXEC);
-        a->fd = (uint32_t)fd;
-        a->heap_flags = 0;
-        LOG("scanout: heap alloc %llu B -> daemon buffer %ux%u fd=%d ino=%llu stride=%u\n",
-            (unsigned long long)want, w, h, fd, (unsigned long long)ino, stride);
-        return 0;
+        if (a->len == (uint64_t)w * h * 4)
+            return scanout_hand_out(a, w, h, a->len);
     }
-    if (rate_ok(5))
-        LOG("scanout: heap alloc %llu B not redirected (modes=%d)\n",
-            (unsigned long long)a->len, g_scan_nmodes);
-    return -1;
+    /* No mode matches: send the length alone and let the daemon resolve it
+     * against the geometries it can serve - the connector modes it advertises,
+     * the framebuffer sizes the client committed, and its pool keys. A game
+     * rendering at 800x600 into the mode-sized output lands here, so its
+     * buffers become pool-owned like the mode-sized ones rather than being
+     * scanned out as bare client dma-bufs the presenter cannot publish. A
+     * length the daemon cannot resolve comes back EINVAL and is left to the
+     * kernel, which is the "not a scan-out allocation" pass-through. */
+    return scanout_hand_out(a, 0, 0, a->len);
 }
 
 static int drm_ioctl(int fd, unsigned long req, void *arg)

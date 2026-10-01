@@ -36,6 +36,8 @@ unsafe extern "C" {
         surface: jni::sys::jobject,
     ) -> *mut ANativeWindow;
     pub fn ANativeWindow_release(window: *mut ANativeWindow);
+    pub fn ANativeWindow_getWidth(window: *mut ANativeWindow) -> i32;
+    pub fn ANativeWindow_getHeight(window: *mut ANativeWindow) -> i32;
 }
 
 // -------------------------------------------------- AHardwareBuffer (AHB)

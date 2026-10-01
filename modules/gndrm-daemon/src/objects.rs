@@ -16,15 +16,17 @@
 //! | range        | kind                        |
 //! |--------------|-----------------------------|
 //! | 1..=0xFFF    | GEM handles                 |
-//! | 0x1000..     | FB ids                      |
-//! | 0x2000..     | property-blob ids           |
-//! | 0x3000..     | property ids                |
+//! | 0x1000..0x1FFF | FB ids                    |
+//! | 0x2000..0x2FFF | property-blob ids         |
+//! | 0x3000..0x3FFF | property ids            |
+//! | 0x4000..0x4FFF | syncobj handles         |
 //! | 0x40..=0x4F  | static topology object ids  |
 
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 
 use gndrm_uapi::mode::*;
+use gndrm_uapi::wire::errno;
 
 pub const CONNECTOR_ID: u32 = 0x40;
 pub const ENCODER_ID: u32 = 0x41;
@@ -33,9 +35,20 @@ pub const PLANE_PRIMARY_ID: u32 = 0x43;
 pub const PLANE_CURSOR_ID: u32 = 0x44;
 
 const FIRST_GEM_HANDLE: u32 = 1;
+/// Exclusive end of the GEM handle space (== `FIRST_FB_ID`).
+const END_GEM_HANDLE: u32 = 0x1000;
 const FIRST_FB_ID: u32 = 0x1000;
+/// Exclusive end of the FB id space (== `FIRST_BLOB_ID`).
+const END_FB_ID: u32 = 0x2000;
 const FIRST_BLOB_ID: u32 = 0x2000;
-const FIRST_SYNCOBJ_HANDLE: u32 = 0x3000;
+/// Exclusive end of the blob id space (property ids start at 0x3000).
+const END_BLOB_ID: u32 = 0x3000;
+// Sync objects get their own space: the old 0x3000 base collided with the
+// property ids (also 0x3000), which the module's "an id identifies its kind"
+// rule does not allow.
+const FIRST_SYNCOBJ_HANDLE: u32 = 0x4000;
+/// Exclusive end of the syncobj handle space.
+const END_SYNCOBJ_HANDLE: u32 = 0x5000;
 
 /// Physical panel description, supplied by the Android side (surface size +
 /// refresh) — phase 3 wires this to `ANativeWindow` metrics.
@@ -179,6 +192,16 @@ pub struct Stores {
     pub gems_closed: HashMap<u32, GemObject>,
     pub fbs: HashMap<u32, Framebuffer>,
     pub blobs: HashMap<u32, Blob>,
+    /// Freed ids, one list per space, handed back out before the monotonic
+    /// counter advances. Without this the space is bounded by the number of
+    /// ids *ever* allocated, so a game churning framebuffers (Nidhogg) runs it
+    /// out and every later allocation fails — the on-device abort after ~216 s.
+    /// With it the space is bounded by the number of *simultaneously-live*
+    /// objects.
+    free_gems: Vec<u32>,
+    free_fbs: Vec<u32>,
+    free_blobs: Vec<u32>,
+    free_syncobjs: Vec<u32>,
     next_gem: u32,
     next_fb: u32,
     next_blob: u32,
@@ -194,6 +217,10 @@ impl Default for Stores {
             gems_closed: HashMap::new(),
             fbs: HashMap::new(),
             blobs: HashMap::new(),
+            free_gems: Vec::new(),
+            free_fbs: Vec::new(),
+            free_blobs: Vec::new(),
+            free_syncobjs: Vec::new(),
             next_gem: FIRST_GEM_HANDLE,
             next_fb: FIRST_FB_ID,
             next_blob: FIRST_BLOB_ID,
@@ -203,29 +230,101 @@ impl Default for Stores {
 }
 
 impl Stores {
-    pub fn alloc_gem(&mut self) -> u32 {
-        let h = self.next_gem;
-        self.next_gem += 1;
-        assert!(self.next_gem < FIRST_FB_ID, "GEM handle space exhausted");
-        h
+    /// Next-never-allocated id per space (`[gem, fb, blob, syncobj]`): the
+    /// high-water mark of what the session needed at once. A resource leak
+    /// shows up here as an unbounded rise across churn.
+    #[must_use]
+    pub fn watermarks(&self) -> [u32; 4] {
+        [
+            self.next_gem,
+            self.next_fb,
+            self.next_blob,
+            self.next_syncobj,
+        ]
     }
 
-    pub fn alloc_fb(&mut self) -> u32 {
-        let id = self.next_fb;
-        self.next_fb += 1;
-        assert!(self.next_fb < FIRST_BLOB_ID, "FB id space exhausted");
-        id
+    /// Allocate a GEM handle, reusing a freed id when one is available.
+    ///
+    /// # Errors
+    /// `ENOSPC` when every id in the space is live (the client is not closing
+    /// handles). Returning the errno keeps the app alive; the old `assert!`
+    /// aborted the whole process.
+    pub fn alloc_gem(&mut self) -> Result<u32, i32> {
+        alloc_within(&mut self.free_gems, &mut self.next_gem, END_GEM_HANDLE)
     }
 
-    pub fn alloc_syncobj(&mut self) -> u32 {
-        let id = self.next_syncobj;
-        self.next_syncobj += 1;
-        id
+    /// Return `h` to the GEM handle space. Call only once the object it named
+    /// is truly gone (closed and unreferenced, or its last FB removed).
+    pub fn free_gem(&mut self, h: u32) {
+        free_within(&mut self.free_gems, h, FIRST_GEM_HANDLE..END_GEM_HANDLE);
     }
 
-    pub fn alloc_blob(&mut self) -> u32 {
-        let id = self.next_blob;
-        self.next_blob += 1;
-        id
+    /// Allocate an FB id, reusing a freed id when one is available.
+    ///
+    /// # Errors
+    /// `ENOSPC` when every fb id is live.
+    pub fn alloc_fb(&mut self) -> Result<u32, i32> {
+        alloc_within(&mut self.free_fbs, &mut self.next_fb, END_FB_ID)
+    }
+
+    /// Return `id` to the FB id space (called by `RMFB`).
+    pub fn free_fb(&mut self, id: u32) {
+        free_within(&mut self.free_fbs, id, FIRST_FB_ID..END_FB_ID);
+    }
+
+    /// Allocate a sync-object handle, reusing a freed id when one is available.
+    ///
+    /// # Errors
+    /// `ENOSPC` when every syncobj handle is live.
+    pub fn alloc_syncobj(&mut self) -> Result<u32, i32> {
+        alloc_within(
+            &mut self.free_syncobjs,
+            &mut self.next_syncobj,
+            END_SYNCOBJ_HANDLE,
+        )
+    }
+
+    /// Return `id` to the syncobj handle space (`SYNCOBJ_DESTROY`).
+    pub fn free_syncobj(&mut self, id: u32) {
+        free_within(
+            &mut self.free_syncobjs,
+            id,
+            FIRST_SYNCOBJ_HANDLE..END_SYNCOBJ_HANDLE,
+        );
+    }
+
+    /// Allocate a property-blob id, reusing a freed id when one is available.
+    ///
+    /// # Errors
+    /// `ENOSPC` when every blob id is live.
+    pub fn alloc_blob(&mut self) -> Result<u32, i32> {
+        alloc_within(&mut self.free_blobs, &mut self.next_blob, END_BLOB_ID)
+    }
+
+    /// Return `id` to the blob id space (`DESTROYPROPBLOB`).
+    pub fn free_blob(&mut self, id: u32) {
+        free_within(&mut self.free_blobs, id, FIRST_BLOB_ID..END_BLOB_ID);
+    }
+}
+
+/// Take a freed id if one is queued, else mint the next never-used one.
+/// `ENOSPC` once the space is exhausted — never a panic.
+fn alloc_within(free: &mut Vec<u32>, next: &mut u32, end: u32) -> Result<u32, i32> {
+    if let Some(id) = free.pop() {
+        return Ok(id);
+    }
+    if *next >= end {
+        return Err(errno::ENOSPC);
+    }
+    let id = *next;
+    *next += 1;
+    Ok(id)
+}
+
+/// Queue `id` for reuse, ignoring anything outside the space (a foreign id must
+/// never poison the free list and be handed out as a live object id).
+fn free_within(free: &mut Vec<u32>, id: u32, range: core::ops::Range<u32>) {
+    if range.contains(&id) {
+        free.push(id);
     }
 }
