@@ -46,6 +46,9 @@ fn run_probe(s: &Scenario) -> (i32, String, String) {
     // driven entirely by the env each scenario declares.
     cmd.env_clear();
     cmd.env("LD_LIBRARY_PATH", &dir);
+    // These scenarios assert on the shim's `gn-vkshim:` diagnostics, which are
+    // gated off by default; turn the gate on for the child under test.
+    cmd.env("GNDRM_LOG_VKSHIM", "1");
     for (k, v) in &s.env {
         cmd.env(k, v);
     }

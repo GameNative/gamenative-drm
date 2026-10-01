@@ -158,7 +158,7 @@ static uint32_t g_in_fence_prop; /* discovered at init, 0 = unsupported */
 
 #define LOG(...)                       \
     do {                               \
-        if (getenv("GNDRM_SHIM_DEBUG")) \
+        if (getenv("GNDRM_LOG_SHIM"))  \
             fprintf(stderr, "[gndrm-shim] " __VA_ARGS__); \
     } while (0)
 
@@ -208,7 +208,7 @@ _Static_assert(GNDRM_IOCTL_SYNCOBJ_FD_TO_HANDLE ==
 #endif
 
 /*
- * Output-path diagnostics (GNDRM_SHIM_DEBUG=1). The KMS scan-out gate is an
+ * Output-path diagnostics (GNDRM_LOG_SHIM=1). The KMS scan-out gate is an
  * exact (format, modifier) match, so a rejected ADDFB2 is only diagnosable
  * from its arguments; and the ATOMIC stream is the compositor's flip loop, so
  * a rate-limited line there doubles as a liveness heartbeat that stops when
@@ -225,6 +225,38 @@ static int rate_ok(long every_sec)
         return 0;
     g_hb_last = ts.tv_sec ? ts.tv_sec : 1;
     return 1;
+}
+
+/*
+ * Rate gates for the per-allocation scan-out decision lines. Deliberately not
+ * rate_ok(): that timer is shared with the ATOMIC heartbeat, so a burst of
+ * heap allocations would silence the heartbeat it is supposed to be read
+ * alongside. A session logs its first frame-sized allocations in full (enough
+ * to see every swapchain image of the startup burst), then samples; the
+ * small-heap gate is separate and coarser, so gamescope's scratch churn cannot
+ * starve the frame-sized lines that carry the decisions that matter.
+ */
+static unsigned long g_alloc_small, g_alloc_frame;
+
+static int small_alloc_log_ok(void)
+{
+    unsigned long n = ++g_alloc_small;
+    return n <= 8 || (n % 256) == 0;
+}
+
+static int alloc_log_ok(void)
+{
+    unsigned long n = ++g_alloc_frame;
+    return n <= 64 || (n % 64) == 0;
+}
+
+/* `st_ino` of `fd`, the identity a dma-buf is registered and resolved under. */
+static uint64_t fd_ino(int fd)
+{
+    struct stat st;
+    if (fstat(fd, &st) != 0)
+        return 0;
+    return (uint64_t)st.st_ino;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1075,15 +1107,28 @@ static int scanout_redirect(void *arg)
         return -1;
     scanout_seed_from_env();
     /* Not a frame: too small (the 4096-byte scratch allocations) or not
-     * 4-byte-per-pixel sized. Leave it to the kernel without a round trip. */
-    if (a->len < GNDRM_SCANOUT_MIN_LEN || (a->len & 3u))
+     * 4-byte-per-pixel sized. Leave it to the kernel without a round trip.
+     * Logged, because this is exactly where a scan-out allocation the shim did
+     * NOT recognise would disappear: the caller's later fstat of the resulting
+     * fd is the only other place its inode appears. */
+    if (a->len < GNDRM_SCANOUT_MIN_LEN || (a->len & 3u)) {
+        if (small_alloc_log_ok())
+            LOG("scanout: alloc len=%llu left to kernel (below %llu B or not "
+                "4-byte-per-pixel)\n",
+                (unsigned long long)a->len,
+                (unsigned long long)GNDRM_SCANOUT_MIN_LEN);
         return -1;
+    }
     /* A connector mode the shim already knows names the geometry outright;
      * sending it unchanged keeps the mode-matched path exactly as it was. */
     for (int i = 0; i < g_scan_nmodes; i++) {
         uint32_t w = g_scan_modes[i][0], h = g_scan_modes[i][1];
-        if (a->len == (uint64_t)w * h * 4)
+        if (a->len == (uint64_t)w * h * 4) {
+            if (alloc_log_ok())
+                LOG("scanout: alloc len=%llu -> mode-matched %ux%u\n",
+                    (unsigned long long)a->len, w, h);
             return scanout_hand_out(a, w, h, a->len);
+        }
     }
     /* No mode matches: send the length alone and let the daemon resolve it
      * against the geometries it can serve - the connector modes it advertises,
@@ -1093,6 +1138,9 @@ static int scanout_redirect(void *arg)
      * scanned out as bare client dma-bufs the presenter cannot publish. A
      * length the daemon cannot resolve comes back EINVAL and is left to the
      * kernel, which is the "not a scan-out allocation" pass-through. */
+    if (alloc_log_ok())
+        LOG("scanout: alloc len=%llu -> length-only request\n",
+            (unsigned long long)a->len);
     return scanout_hand_out(a, 0, 0, a->len);
 }
 
@@ -1525,5 +1573,20 @@ int ioctl(int fd, unsigned long req, ...)
     if (is_our_fd(fd))
         return drm_ioctl(fd, req_l, arg);
 
-    return syscall(SYS_ioctl, fd, req_l, arg);
+    int ret = syscall(SYS_ioctl, fd, req_l, arg);
+    /*
+     * A frame-sized dma-heap allocation the shim did not redirect: name it and
+     * its resulting inode. Without this an unredirected scan-out-sized
+     * allocation leaves no trace at all, which is what makes a presenter miss
+     * ("no AHardwareBuffer for dma-buf ino N; re-publishing ...") impossible to
+     * attribute to the allocation that caused it.
+     */
+    if (req_l == GNDRM_IOCTL_DMAHEAP_ALLOC && ret == 0) {
+        struct gndrm_dmaheap_alloc *a = arg;
+        if (a && a->len >= GNDRM_SCANOUT_MIN_LEN && alloc_log_ok())
+            LOG("scanout: alloc len=%llu left to kernel -> fd ino=%llu\n",
+                (unsigned long long)a->len,
+                (unsigned long long)fd_ino((int)a->fd));
+    }
+    return ret;
 }

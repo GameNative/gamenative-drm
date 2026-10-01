@@ -220,6 +220,12 @@ impl Presenter for NullPresenter {
 type ClockFn = Box<dyn Fn() -> (u32, u32) + Send>;
 /// Diagnostics sink for rejections (see `Device::set_logger`).
 pub type LogFn = Box<dyn Fn(&str) + Send>;
+/// Sink for a framebuffer geometry the client registered (`ADDFB2`), so a
+/// length-only scan-out request can resolve a window geometry the pool has
+/// never owned (see `Device::set_addfb_geometry`). Called on the serve thread
+/// with `(width, height)`; the presentation layer notes it in its pool under
+/// the pool's own BGRA layout, never the DRM fourcc.
+pub type AddFbGeometryFn = Box<dyn Fn(u32, u32) + Send>;
 
 /// The emulated device (one per connected client / open file description).
 pub struct Device {
@@ -267,6 +273,9 @@ pub struct Device {
     /// before `set_logger` runs and must observe it (a withheld latch is a
     /// diagnostic, not a rejection, but it belongs in the same channel).
     logger: Arc<Mutex<Option<LogFn>>>,
+    /// Optional sink for framebuffer geometries (`ADDFB2`); see
+    /// [`Device::set_addfb_geometry`]. Called on the serve thread only.
+    addfb_geometry: Option<AddFbGeometryFn>,
     /// `stat.st_ino` of every eventfd handed out as an always-signalled
     /// sync-object fence (see [`Device::is_emulated_fence`]).
     emulated_fences: HashSet<u64>,
@@ -336,6 +345,7 @@ impl Device {
             shutdown,
             worker,
             logger,
+            addfb_geometry: None,
             emulated_fences: HashSet::new(),
             seen_ioctls: Vec::new(),
             logged_exhaustion: Vec::new(),
@@ -347,6 +357,16 @@ impl Device {
     /// Install a diagnostics logger (rejections only; see commit.rs).
     pub fn set_logger(&mut self, logger: LogFn) {
         *self.logger.lock().unwrap_or_else(PoisonError::into_inner) = Some(logger);
+    }
+
+    /// Install a sink for framebuffer geometries the client registers
+    /// (`ADDFB2`). The scan-out pool resolves a length-only allocation against
+    /// geometries it knows, and a window-sized buffer the client allocates
+    /// before its first commit is resolvable only once the pool has been told
+    /// that geometry; this is where the daemon learns it. The sink runs on the
+    /// serve thread and must not block (see the Android glue).
+    pub fn set_addfb_geometry(&mut self, addfb_geometry: AddFbGeometryFn) {
+        self.addfb_geometry = Some(addfb_geometry);
     }
 
     /// The id-space high-water marks (`[gem, fb, blob, syncobj]`), for tests
@@ -1254,6 +1274,17 @@ impl Device {
                 modifier: cmd.modifier,
             },
         );
+        // Teach the presentation layer this geometry, so a length-only scan-out
+        // request of the same pixel size resolves to it. Only a 32-bpp
+        // framebuffer is a buffer of the pixel size the pool serves; the pool's
+        // own BGRA layout is noted, never the DRM fourcc (the length index is
+        // keyed by `(alloc_len, format)`, so a fourcc entry would poison a BGRA
+        // lookup).
+        if bpp == 32 {
+            if let Some(note) = &self.addfb_geometry {
+                note(cmd.width, cmd.height);
+            }
+        }
         let mut body = Vec::new();
         pod_write(&mut body, &cmd);
         DispatchResult::ok(body)

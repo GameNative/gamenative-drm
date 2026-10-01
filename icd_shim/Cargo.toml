@@ -21,3 +21,8 @@ path = "src/bin/icd_probe.rs"
 
 [dependencies]
 libc = "0.2"
+# Wire types only (ScanoutAllocReq/ScanoutAllocResp and the pool format), reused
+# verbatim so the ICD's scan-out client speaks the same protocol as the
+# LD_PRELOAD shim's — a second, hand-mirrored set of structs is how the two
+# sides drift apart.
+gndrm-uapi = { path = "../modules/gndrm-uapi" }

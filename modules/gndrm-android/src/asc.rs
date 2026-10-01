@@ -377,11 +377,12 @@ impl ScanoutPool {
         Ok((geom.width, geom.height, reservation))
     }
 
-    /// Record a committed framebuffer's geometry, so a later length-only
-    /// request for the same window size resolves to it. `publish` is the one
-    /// place the presenter sees the framebuffer table, and it is where the
-    /// window-sized geometries the shim cannot name become resolvable.
-    fn note_framebuffer(&mut self, width: u32, height: u32) {
+    /// Record a framebuffer's geometry, so a length-only request for the same
+    /// window size resolves to it. Fed from two places: `publish` (every
+    /// committed framebuffer the presenter sees) and the daemon's `ADDFB2`
+    /// path, which reaches this sooner and for framebuffers that are never
+    /// published as the primary plane.
+    pub(crate) fn note_framebuffer(&mut self, width: u32, height: u32) {
         self.cache.note_geometry(Geometry {
             width,
             height,
@@ -758,6 +759,13 @@ impl AscState {
                     log_warn!(
                         "asc: no AHardwareBuffer for dma-buf ino {ino}; frame dropped (misses={misses})"
                     );
+                    log_warn!(
+                        "asc: unregistered framebuffer: {}x{} fmt={:#x} pitch={} (ino {ino})",
+                        fb.width,
+                        fb.height,
+                        fb.pixel_format,
+                        fb.pitches[0]
+                    );
                 }
                 close_fence(fence);
                 FlipHandle::latched_now()
@@ -820,6 +828,13 @@ impl AscState {
                         self.logged_stale.push(ino);
                         log_warn!(
                             "asc: no AHardwareBuffer for dma-buf ino {ino}; re-publishing ino {published_ino} (misses={misses})"
+                        );
+                        log_warn!(
+                            "asc: unregistered framebuffer: {}x{} fmt={:#x} pitch={} (ino {ino})",
+                            fb.width,
+                            fb.height,
+                            fb.pixel_format,
+                            fb.pitches[0]
                         );
                     }
                     match build_show(&api, self.sc, ahb, ctx, src, dst, fence) {

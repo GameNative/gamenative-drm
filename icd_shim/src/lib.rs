@@ -40,20 +40,43 @@
 // pure noise. Sizes are always fn-pointer-sized.
 #![allow(clippy::missing_transmute_annotations)]
 
+/// Emit a `gn-vkshim:` line to stderr, unless `GNDRM_LOG_VKSHIM` is off
+/// (unset, `""` or `"0"` — the default). The format arguments are only
+/// evaluated when the gate is on.
 #[macro_export]
 macro_rules! logf {
     ($fmt:literal $(, $($arg:tt)*)?) => {
-        eprintln!("gn-vkshim: {}", format_args!($fmt $(, $($arg)*)?))
+        if $crate::vkshim_enabled() {
+            eprintln!("gn-vkshim: {}", format_args!($fmt $(, $($arg)*)?));
+        }
     };
 }
 
+/// `GNDRM_LOG_VKSHIM` gate, resolved once and cached.
+pub fn vkshim_enabled() -> bool {
+    // 0 = unresolved, 1 = off, 2 = on.
+    static GATE: AtomicU8 = AtomicU8::new(0);
+    match GATE.load(Ordering::Relaxed) {
+        2 => true,
+        1 => false,
+        _ => {
+            let on = std::env::var_os("GNDRM_LOG_VKSHIM")
+                .is_some_and(|v| !v.is_empty() && v != OsStr::new("0"));
+            GATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 pub mod proxy;
+pub mod scanout;
 pub mod thunk;
 pub mod vk;
 pub mod wlproto;
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString, OsStr};
 use std::ptr;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Once;
 use vk::{GipaFn, PFN_vkVoidFunction, VkExtensionProperties, VkInstance, VkResult, VK_SUCCESS};
 

@@ -2012,12 +2012,9 @@ const SCANOUT_SWAPCHAIN_FORMAT: VkFormat = VK_FORMAT_B8G8R8A8_UNORM;
 /// Whether the proxy offers (and accepts) `VK_FORMAT_R8G8B8A8_UNORM` in
 /// addition to `B8G8R8A8_UNORM`. **Off by default.**
 ///
-/// This is measured, not stylistic. The guest's swapchain buffers are handed
-/// out by the gndrm daemon's scan-out pool whenever their geometry matches the
-/// panel mode — the shim's own `dma_heap_alloc` is intercepted
-/// (`[gndrm-shim] scanout: heap alloc 4915200 B -> daemon buffer 1280x960 …
-/// ino=…`) — and that pool allocates
-/// `AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM`. A guest that picks RGBA
+/// This is measured, not stylistic. The scan-out pool allocates
+/// `AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM`, so a guest surface the pool owns
+/// must be that same layout. A guest that picks RGBA
 /// (Nidhogg did: `proxy swapchain … 1280x960 fmt 37 -> fourcc 0x34324258`)
 /// renders R,G,B,X into a buffer the daemon then publishes to SurfaceFlinger
 /// *as* BGRA, exchanging red and blue: Nidhogg's yellow/red art reached the
@@ -2308,7 +2305,31 @@ unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
                 libc::close((*s).fd);
             }
         }
-        (*s).fd = dma_heap_alloc((*s).stride as usize * (*sc).extent.height as usize);
+        // The swapchain image must be a buffer the daemon owns: the presenter
+        // can only publish one of its own `AHardwareBuffer`s. Ask for it over
+        // the scan-out channel explicitly rather than relying on the
+        // LD_PRELOAD shim to intercept this process's heap allocation. The
+        // returned stride is authoritative for the image this fd backs.
+        match crate::scanout::allocate((*sc).extent.width, (*sc).extent.height) {
+            Some(buf) => {
+                (*s).fd = buf.fd;
+                if buf.stride != 0 {
+                    (*s).stride = buf.stride;
+                }
+                crate::logf!(
+                    "proxy slot: pool buffer fd={} ino={} stride={}",
+                    buf.fd,
+                    buf.ino,
+                    (*s).stride
+                );
+            }
+            None => {
+                // No daemon channel, or it refused: a local system-heap
+                // allocation, the pre-existing behaviour, which the LD_PRELOAD
+                // shim may still redirect.
+                (*s).fd = dma_heap_alloc((*s).stride as usize * (*sc).extent.height as usize);
+            }
+        }
         if (*s).fd < 0 {
             return VK_ERROR_INITIALIZATION_FAILED;
         }

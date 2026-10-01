@@ -29,5 +29,5 @@ done
 
 LD_PRELOAD="$OUT/libgndrm_shim.so" \
 GAMENATIVE_DRM_SOCKET="$SOCK" \
-GNDRM_SHIM_DEBUG=1 \
+GNDRM_LOG_SHIM=1 \
     "$OUT/b9_client"

@@ -26,6 +26,7 @@ pub mod ffi;
 mod injector;
 #[macro_use]
 mod log;
+mod log_policy;
 
 use std::io;
 use std::os::fd::RawFd;
@@ -183,6 +184,9 @@ fn server_thread_inner(
     // thread must never take the publish state's lock, which the presenter
     // holds across its blocking SurfaceFlinger round-trip.
     let pool = asc_state.lock().expect("asc state poisoned").pool();
+    // The scan-out thread takes the pool Arc below, so the ADDFB2 geometry
+    // sink installed further down needs its own clone.
+    let addfb_pool = Arc::clone(&pool);
     // The spare-buffer worker keeps a pre-allocated buffer ready so a scan-out
     // request never has to call AHardwareBuffer_allocate on the reply path (a
     // gralloc allocation has no latency bound). It waits on the doorbell, never
@@ -315,8 +319,19 @@ fn server_thread_inner(
 
     // 4. Serve until the peer closes or nativeStop shuts the fds down.
     let mut dev = Device::new(panel, presenter);
-    dev.set_logger(Box::new(|msg| log_info!("{msg}")));
-    let log = |msg: &str| log_info!("server: {msg}");
+    dev.set_logger(Box::new(crate::log::daemon_info));
+    // Teach the pool the geometry of every framebuffer the client registers,
+    // so a length-only scan-out request for a window-sized buffer resolves
+    // even before that buffer is first published. This takes the pool's own
+    // lock, never `AscState`'s: the presenter holds the latter across the
+    // blocking SurfaceFlinger apply, while ADDFB2 runs here on the serve
+    // thread. The lock is held for one map insert.
+    dev.set_addfb_geometry(Box::new(move |width, height| {
+        addfb_pool
+            .lock(diag::Role::Commit)
+            .note_framebuffer(width, height);
+    }));
+    let log = |msg: &str| crate::log::daemon_info(&format!("server: {msg}"));
     server::serve(&mut dev, rpc, event, &log);
 
     // 5. Teardown. Wake and join the scan-out acceptor first (it may be parked
