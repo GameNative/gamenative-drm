@@ -187,7 +187,10 @@ pub type VkSurfaceTransformFlagBitsKHR = u32;
 pub const VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR: VkSurfaceTransformFlagBitsKHR = 1;
 
 pub type VkCompositeAlphaFlagBitsKHR = u32;
-pub const VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR: VkCompositeAlphaFlagBitsKHR = 1;
+pub const VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR: VkCompositeAlphaFlagBitsKHR = 0x1;
+pub const VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR: VkCompositeAlphaFlagBitsKHR = 0x2;
+pub const VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR: VkCompositeAlphaFlagBitsKHR = 0x4;
+pub const VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR: VkCompositeAlphaFlagBitsKHR = 0x8;
 
 pub type VkPresentModeKHR = i32;
 pub const VK_PRESENT_MODE_IMMEDIATE_KHR: VkPresentModeKHR = 0;

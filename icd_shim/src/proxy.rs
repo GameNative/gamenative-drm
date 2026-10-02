@@ -365,6 +365,12 @@ pub const fn gn_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
 }
 pub const GN_DRM_FORMAT_XRGB8888: u32 = gn_fourcc(b'X', b'R', b'2', b'4');
 pub const GN_DRM_FORMAT_XBGR8888: u32 = gn_fourcc(b'X', b'B', b'2', b'4');
+// Alpha-carrying siblings of the two X-formats above: same red/green/blue byte
+// order, but the fourth byte is real alpha the compositor must honour instead
+// of ignore. A guest swapchain buffer genuinely has that channel (BGRA/RGBA),
+// so describing it as an X-format would force the compositor to discard it.
+pub const GN_DRM_FORMAT_ARGB8888: u32 = gn_fourcc(b'A', b'R', b'2', b'4');
+pub const GN_DRM_FORMAT_ABGR8888: u32 = gn_fourcc(b'A', b'B', b'2', b'4');
 pub const GN_DRM_MOD_LINEAR: u64 = 0;
 // Qualcomm scanout layouts (DRM_FORMAT_MOD_QCOM_*): COMPRESSED is UBWC, TILED3
 // the same macrotile layout without compression. Either names the layout of a
@@ -1709,7 +1715,19 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
             maxImageArrayLayers: 1,
             supportedTransforms: VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
             currentTransform: VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
-            supportedCompositeAlpha: VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+            // The same set Mesa/turnip's WSI advertises on the X11 arm. There is
+            // no delegate surface to forward from: the proxy owns the wayland
+            // presentation contract and the driver exports no WSI entry points
+            // (see the xlib-surface and present-modes notes above), and
+            // `RealDevFns` carries no surface-capability query. Advertising
+            // OPAQUE alone let DXVK force every present opaque, which covered
+            // the window's own GDI surface. INHERIT is the honest default for a
+            // compositor-managed surface; the pre/post forms let a guest pick
+            // its own blending.
+            supportedCompositeAlpha: VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR
+                | VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR
+                | VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR
+                | VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
             // Exactly what the pool's AHardwareBuffer backs, no more. The pool
             // allocates GPU_SAMPLED_IMAGE | GPU_COLOR_OUTPUT | COMPOSER_OVERLAY
             // | CPU_READ_OFTEN and the guest renders straight into it, so
@@ -2168,10 +2186,15 @@ unsafe extern "C" fn gn_vkGetDeviceQueue2(
 
 fn vk_format_to_fourcc(format: VkFormat) -> u32 {
     match format {
-        // DRM fourccs name the LE 32-bit word: XRGB8888 = 0xXXRRGGBB, i.e.
-        // memory bytes B,G,R,X — VK_FORMAT_B8G8R8A8_UNORM's layout.
-        VK_FORMAT_B8G8R8A8_UNORM => GN_DRM_FORMAT_XRGB8888,
-        VK_FORMAT_R8G8B8A8_UNORM => GN_DRM_FORMAT_XBGR8888,
+        // DRM fourccs name the LE 32-bit word: ARGB8888 = 0xAARRGGBB, i.e.
+        // memory bytes B,G,R,A — VK_FORMAT_B8G8R8A8_UNORM's layout. Both of
+        // these Vulkan formats carry a real alpha channel, so they map to the
+        // alpha-bearing A-formats, not XRGB8888/XBGR8888: the X byte is
+        // *ignored* by the compositor, which is what forced a guest's frame
+        // opaque. The daemon already reports the same buffer as AR24
+        // (`PRIMARY_FORMATS`), so this keeps the two descriptions in agreement.
+        VK_FORMAT_B8G8R8A8_UNORM => GN_DRM_FORMAT_ARGB8888,
+        VK_FORMAT_R8G8B8A8_UNORM => GN_DRM_FORMAT_ABGR8888,
         _ => 0,
     }
 }
@@ -3961,16 +3984,19 @@ mod tests {
     use super::*;
 
     /// The two layouts the proxy knows must map to the DRM fourcc of their
-    /// memory order: BGRA memory is XRGB8888, RGBA memory is XBGR8888.
+    /// memory order: BGRA memory is ARGB8888, RGBA memory is ABGR8888. The
+    /// alpha-bearing A-formats are deliberate — both Vulkan formats have a real
+    /// alpha channel, and an X-format would make the compositor ignore it and
+    /// composite the frame opaque.
     #[test]
     fn format_to_fourcc_names_the_memory_order() {
         assert_eq!(
             vk_format_to_fourcc(VK_FORMAT_B8G8R8A8_UNORM),
-            GN_DRM_FORMAT_XRGB8888
+            GN_DRM_FORMAT_ARGB8888
         );
         assert_eq!(
             vk_format_to_fourcc(VK_FORMAT_R8G8B8A8_UNORM),
-            GN_DRM_FORMAT_XBGR8888
+            GN_DRM_FORMAT_ABGR8888
         );
         assert_eq!(
             vk_format_to_fourcc(37 + 1000),
