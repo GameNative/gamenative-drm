@@ -48,6 +48,7 @@
 #endif
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -104,6 +105,24 @@ struct gndrm_resp {
 #define GNDRM_SCANOUT_TIMEOUT_US 250000
 #define GNDRM_SCANOUT_ATTEMPTS 3
 
+/*
+ * Reply budget for one request on the RPC channel (the ioctl channel).
+ *
+ * The RPC exchange is synchronous: `rpc()` writes one frame and blocks in
+ * `recvmsg()` until the daemon answers. Without a bound, ANY request the
+ * daemon does not answer (a render-channel request it cannot serve, a daemon
+ * that has stopped reading, a half-paired render connection) blocks the caller
+ * forever — and a caller blocked inside the first glamor ioctl means Xwayland
+ * never reaches XWM and the session hangs with nothing logged.
+ *
+ * Generous on purpose: a healthy daemon answers in microseconds (it queues
+ * commits and replies inline), so 5 s can only fire when the request is
+ * genuinely lost. On a timeout the channel is retired (see rpc()), which turns
+ * an unanswered request into a fast, visible failure on every subsequent call:
+ * glamor's probe fails, Xwayland falls back and XWM still starts.
+ */
+#define GNDRM_RPC_TIMEOUT_SEC 5
+
 struct gndrm_scanout_req {
     uint32_t magic;
     uint32_t width;
@@ -133,18 +152,38 @@ _Static_assert(GNDRM_SCANOUT_FORMAT_BGRA_8888 == 5u,
 static int g_rpc_fd = -1;    /* hidden request/response channel */
 static int g_event_fd = -1;  /* fd handed to the app (event channel) */
 /*
- * Scan-out allocator channel (third connection, see scanout_request). Its own
- * socket because it is a request/response exchange that carries a descriptor,
- * not an ioctl frame: mixing it into the framed RPC stream would desynchronise
- * the ioctl responses. A daemon restart closes it, so it is re-established on
- * demand rather than at the one-time init.
+ * Set once an RPC exchange times out or the channel dies. Retiring the channel
+ * (rather than reconnecting under the caller) is deliberate: a timed-out
+ * request may still be answered later, and that stale reply would be read as
+ * the answer to whatever request came next. Once dead, every rpc() fails
+ * immediately with ENOTCONN, so a caller that keeps issuing ioctls fails fast
+ * and visibly instead of blocking on a channel that will never answer.
+ */
+static bool g_rpc_dead;
+/*
+ * Scan-out allocator channel (a further connection, see scanout_request). Its
+ * own socket because it is a request/response exchange that carries a
+ * descriptor, not an ioctl frame: mixing it into the framed RPC stream would
+ * desynchronise the ioctl responses. A daemon restart closes it, so it is
+ * re-established on demand rather than at the one-time init. Only a card node
+ * (gamescope) ever uses it; a render node never scans out.
  */
 static int g_scanout_fd = -1;
 static pthread_mutex_t g_scanout_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_seq;
 static pthread_mutex_t g_rpc_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
+/*
+ * Connection setup is lazy and node-type aware (not pthread_once): a render
+ * node (Xwayland) must connect to the daemon's dedicated render listener and
+ * must NOT connect to the card listener, whose contract reserves every
+ * post-primary connection for gamescope's scan-out channel — connecting there
+ * is what made a render-node open come back EPIPE on device. The first
+ * intercepted open fixes the kind for the process's lifetime (one node per
+ * process).
+ */
+static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_init_ok;
+static int g_node_kind = -1; /* the kind this process connected as */
 static uint32_t g_in_fence_prop; /* discovered at init, 0 = unsupported */
 
 /*
@@ -164,6 +203,28 @@ static uint32_t g_in_fence_prop; /* discovered at init, 0 = unsupported */
         if (getenv("GNDRM_LOG_SHIM"))  \
             fprintf(stderr, "[gndrm-shim] " __VA_ARGS__); \
     } while (0)
+
+/*
+ * Render-channel trace: name the first occurrence of each DRM request a client
+ * issues on one of our fds (GNDRM_LOG_SHIM=1). The daemon logs the same
+ * first-occurrence line per connection, so with both gates on the last request
+ * a stalled client reached is visible from both sides — which is what tells a
+ * request that never arrived from one that arrived and was never answered.
+ * Bounded and once-per-number, so it cannot flood a session log.
+ */
+static uint32_t g_seen_reqs[16];
+static unsigned g_n_seen_reqs;
+
+static void trace_req(uint32_t req)
+{
+    for (unsigned i = 0; i < g_n_seen_reqs; i++) {
+        if (g_seen_reqs[i] == req)
+            return;
+    }
+    if (g_n_seen_reqs < sizeof(g_seen_reqs) / sizeof(g_seen_reqs[0]))
+        g_seen_reqs[g_n_seen_reqs++] = req;
+    LOG("ioctl first 0x%08x\n", req);
+}
 
 /*
  * Sync-object ioctl numbers are spelled out rather than taken from
@@ -191,6 +252,52 @@ _Static_assert(sizeof(struct gndrm_syncobj_handle) == 24,
 #define GNDRM_IOCTL_SYNCOBJ_DESTROY 0xc00864c0u
 #define GNDRM_IOCTL_SYNCOBJ_HANDLE_TO_FD 0xc01864c1u
 #define GNDRM_IOCTL_SYNCOBJ_FD_TO_HANDLE 0xc01864c2u
+
+/* ------------------------------------------------------------------ */
+/* render-node surface                                                 */
+/* ------------------------------------------------------------------ */
+/*
+ * The same daemon serves two node types. gamescope opens the KMS card node
+ * (/dev/dri/cardN); Xwayland's glamor/dri3/drm opens a render node
+ * (/dev/dri/renderDN). Both are intercepted to the daemon, but a render-node
+ * connection is told apart from a card one: `open()` on a renderD path
+ * declares it with the connection-setup frame below, and the daemon then
+ * applies the kernel's DRM_RENDER_ALLOW gating (no modesetting, no master) and
+ * serves the GEM/PRIME/syncobj surface glamor needs.
+ */
+#define GNDRM_IOCTL_NODE_KIND 0x474e0001u /* daemon contract (GNDRM_IOCTL_NODE_KIND) */
+#define GNDRM_NODE_KIND_CARD 0u
+#define GNDRM_NODE_KIND_RENDER 1u
+
+/* Legacy generic GEM ioctls (dropped from modern drm.h, so literals):
+ * `_IOWR('d', 0x1b, struct drm_gem_create[16])` and
+ * `_IOWR('d', 0x1e, struct drm_gem_mmap[24])`. */
+#define GNDRM_IOCTL_GEM_CREATE 0xc010641bu
+#define GNDRM_IOCTL_GEM_MMAP 0xc018641eu
+
+struct gndrm_gem_create {
+    uint64_t size;
+    uint32_t handle;
+    uint32_t flags;
+};
+_Static_assert(sizeof(struct gndrm_gem_create) == 16,
+               "drm_gem_create is 16 bytes on the wire");
+
+struct gndrm_gem_mmap {
+    uint32_t handle;
+    uint32_t pad;
+    uint64_t offset;
+    uint64_t size;
+};
+_Static_assert(sizeof(struct gndrm_gem_mmap) == 24,
+               "drm_gem_mmap is 24 bytes on the wire");
+
+/* The high half of a GEM_MMAP offset is this token; the low bits carry the GEM
+ * handle. `mmap()` on the device fd recognises it and maps the handle's
+ * dma-buf, so the legacy handle→offset→mmap sequence works over a socket. */
+#define GNDRM_GEM_MMAP_OFFSET_BASE 0x474e000000000000ull
+#define GNDRM_GEM_MMAP_HANDLE_MASK 0x0000ffffffffffffull
+
 
 /* On a host the system <drm/drm.h> is current, so cross-check the literals
  * above against it there. The NDK's copy is older (see above) and cannot be
@@ -299,12 +406,46 @@ static int connect_one(const char *path)
 static void discover_in_fence_prop(void);
 static int scanout_chan_init(void);
 
-static void init_shim(void)
+/* The socket a node kind connects to. A card node uses the configured socket;
+ * a render node uses the daemon's dedicated render listener (main + "-render"),
+ * so it never lands on the card listener, whose post-primary connections are
+ * all gamescope's scan-out allocator channel. Both sides derive the name the
+ * same way (see the daemon's `render_socket_name`). */
+static const char *socket_path_for(int node_kind)
 {
     const char *path = getenv("GAMENATIVE_DRM_SOCKET");
-    if (!path || !*path) {
+    if (!path || !*path)
+        return NULL;
+    if (node_kind != GNDRM_NODE_KIND_RENDER)
+        return path;
+    static char render_path[256];
+    snprintf(render_path, sizeof(render_path), "%s-render", path);
+    return render_path;
+}
+
+/*
+ * Connect as `node_kind`, once per process. Returns true when the process is
+ * connected as that kind; false when the socket is unset/unreachable or the
+ * process is already connected as a different kind (one node per process).
+ *
+ * Lazily (on the first intercepted open) rather than at library load: a
+ * render-node process must not touch the card listener at all, or its
+ * connections become the card listener's scan-out channel and the render-node
+ * open it is about to make comes back EPIPE.
+ */
+static bool ensure_init(int node_kind)
+{
+    pthread_mutex_lock(&g_init_lock);
+    if (g_init_ok) {
+        bool same = (g_node_kind == node_kind);
+        pthread_mutex_unlock(&g_init_lock);
+        return same;
+    }
+    const char *path = socket_path_for(node_kind);
+    if (!path) {
         LOG("GAMENATIVE_DRM_SOCKET not set\n");
-        return;
+        pthread_mutex_unlock(&g_init_lock);
+        return false;
     }
     /* First connection = RPC, second = event channel (wire contract). */
     g_rpc_fd = connect_one(path);
@@ -316,24 +457,43 @@ static void init_shim(void)
         if (g_event_fd >= 0)
             close(g_event_fd);
         g_rpc_fd = g_event_fd = -1;
-        return;
+        pthread_mutex_unlock(&g_init_lock);
+        return false;
     }
+    /*
+     * Bound the synchronous RPC exchange. The fd stays blocking, so a healthy
+     * request is unaffected; the timeout only fires when the daemon never
+     * answers, which must fail the caller rather than freeze it (see
+     * GNDRM_RPC_TIMEOUT_SEC).
+     *
+     * The event channel is handed to the app as its "DRM fd" and is read/recv'd
+     * on to observe flip/event completion. SOCK_SEQPACKET honours
+     * SO_RCVTIMEO/SO_SNDTIMEO, so the same bound applies there: an absent or
+     * stalled event producer yields EAGAIN for the caller to retry instead of a
+     * permanent block on the app's own thread.
+     */
+    struct timeval rpc_tv = { .tv_sec = GNDRM_RPC_TIMEOUT_SEC, .tv_usec = 0 };
+    setsockopt(g_rpc_fd, SOL_SOCKET, SO_RCVTIMEO, &rpc_tv, sizeof(rpc_tv));
+    setsockopt(g_rpc_fd, SOL_SOCKET, SO_SNDTIMEO, &rpc_tv, sizeof(rpc_tv));
+    setsockopt(g_event_fd, SOL_SOCKET, SO_RCVTIMEO, &rpc_tv, sizeof(rpc_tv));
+    setsockopt(g_event_fd, SOL_SOCKET, SO_SNDTIMEO, &rpc_tv, sizeof(rpc_tv));
+    g_rpc_dead = false;
+    g_node_kind = node_kind;
     g_init_ok = 1;
-    /* Third connection: the scan-out allocator channel. Connected here, in
-     * order, because the daemon accepts the first two inline and everything
-     * after as an allocator client. A failure is not fatal: the channel is
-     * re-established on demand, and the daemon may not be listening yet. */
-    if (scanout_chan_init() != 0)
-        LOG("scanout channel connect failed: %s\n", strerror(errno));
-    discover_in_fence_prop();
+    if (node_kind == GNDRM_NODE_KIND_CARD) {
+        /* Third connection: the scan-out allocator channel. Connected here, in
+         * order, because the card daemon accepts the first two inline and
+         * everything after as an allocator client. A failure is not fatal: the
+         * channel is re-established on demand, and the daemon may not be
+         * listening yet. A render node never scans out, so it never opens one. */
+        if (scanout_chan_init() != 0)
+            LOG("scanout channel connect failed: %s\n", strerror(errno));
+        discover_in_fence_prop();
+    }
     LOG("connected to %s (rpc=%d event=%d scanout=%d) in_fence prop=%u\n",
         path, g_rpc_fd, g_event_fd, g_scanout_fd, g_in_fence_prop);
-}
-
-static bool ensure_init(void)
-{
-    pthread_once(&g_init_once, init_shim);
-    return g_init_ok != 0;
+    pthread_mutex_unlock(&g_init_lock);
+    return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -410,20 +570,53 @@ static int recv_frame(uint8_t *buf, uint32_t cap, uint32_t *len_io, int *fd_out,
 }
 
 /*
+ * Whether an exchange error means the RPC channel can never be trusted again.
+ *
+ * A reply timeout is fatal to the *synchronous* exchange, unlike on the
+ * scan-out channel: the caller has already been failed, and a reply arriving
+ * later would be read as the answer to some later request. A malformed or
+ * truncated reply is equally unusable. Retiring the channel on these makes
+ * every subsequent request fail immediately instead of re-blocking.
+ */
+static bool rpc_err_fatal(int e)
+{
+    e = -e;
+    return e == EAGAIN || e == EWOULDBLOCK || e == ETIMEDOUT ||
+           e == EPIPE || e == ECONNRESET || e == ECONNABORTED ||
+           e == ENOTCONN || e == EBADF || e == EPROTO || e == EMSGSIZE;
+}
+
+/*
  * Full round trip. `out` receives the frame body (response struct +
  * linearized extensions); *out_len set on success. Returns 0 or -errno.
  * `out` is always the g_resp_buf scratch (g_rpc_lock serializes), so its
  * capacity is a compile-time constant here.
+ *
+ * Once the channel is dead every call returns -ENOTCONN without touching the
+ * socket, so a caller that keeps issuing ioctls after a lost request fails
+ * fast and visibly rather than blocking on a channel that will never answer.
  */
 static int rpc(uint32_t ioctl_nr, const void *in, uint32_t in_len,
                uint8_t *out, uint32_t *out_len, int fd_send, int *fd_recv)
 {
     int ret;
     pthread_mutex_lock(&g_rpc_lock);
+    if (g_rpc_dead) {
+        pthread_mutex_unlock(&g_rpc_lock);
+        return -ENOTCONN;
+    }
     uint64_t seq = ++g_seq;
     ret = send_frame(ioctl_nr, in, in_len, fd_send, seq);
     if (ret == 0)
         ret = recv_frame(out, GNDRM_SCRATCH_CAP, out_len, fd_recv, seq);
+    if (ret != 0 && rpc_err_fatal(ret)) {
+        if (g_rpc_fd >= 0)
+            syscall(SYS_close, g_rpc_fd);
+        g_rpc_fd = -1;
+        g_rpc_dead = true;
+        LOG("RPC channel retired (err=%d %s); further ioctls fail fast\n",
+            -ret, strerror(-ret));
+    }
     pthread_mutex_unlock(&g_rpc_lock);
     return ret;
 }
@@ -484,6 +677,18 @@ static bool is_drm_card_path(const char *path)
     return path && strncmp(path, "/dev/dri/card", 13) == 0;
 }
 
+/* A render node (/dev/dri/renderDN) is the node Xwayland's glamor/dri3 opens;
+ * it is served by the same daemon but declares NODE_KIND_RENDER on connect. */
+static bool is_drm_render_path(const char *path)
+{
+    return path && strncmp(path, "/dev/dri/renderD", 16) == 0;
+}
+
+static bool is_drm_node_path(const char *path)
+{
+    return is_drm_card_path(path) || is_drm_render_path(path);
+}
+
 /* App-facing fds: the event fd handed out by open_common plus every dup of
  * it. Real KMS fds survive dup() (libliftoff's liftoff_device_create dups
  * the DRM fd and issues ioctls on the copy — day-two on-device finding), so
@@ -536,15 +741,31 @@ static void our_fd_release(int fd)
  * path matches a DRM card *and* GAMENATIVE_DRM_SOCKET is set; real opens
  * never see card paths in that configuration.
  */
-static int open_common(void)
+static int open_common(int node_kind)
 {
-    if (!ensure_init()) {
+    if (!ensure_init(node_kind)) {
         errno = ECONNREFUSED;
         return -1;
     }
     if (g_opened) {
         errno = EBUSY;
         return -1;
+    }
+    if (node_kind == GNDRM_NODE_KIND_RENDER) {
+        /* Declare the node type before any real ioctl. A failure to reach the
+         * daemon here is a failed render-node open, like a real open() on a
+         * node the process cannot use. */
+        uint32_t kind = GNDRM_NODE_KIND_RENDER;
+        uint32_t out_len = 0;
+        int fd_recv = -1;
+        int ret = rpc(GNDRM_IOCTL_NODE_KIND, &kind, sizeof(kind), g_resp_buf,
+                      &out_len, -1, &fd_recv);
+        if (ret != 0) {
+            LOG("render-node handshake (NODE_KIND) failed: %s\n", strerror(-ret));
+            errno = -ret;
+            return -1;
+        }
+        LOG("render-node handshake (NODE_KIND) accepted\n");
     }
     g_opened = true;
     our_fd_add(g_event_fd);
@@ -561,20 +782,26 @@ static int open_common(void)
  */
 int gamenative_drm_connect(void)
 {
-    return open_common();
+    return open_common(GNDRM_NODE_KIND_CARD);
 }
 
 /*
- * Interception rule: a card path + configured socket ⇒ always intercept
- * (even on hosts with a real /dev/dri, e.g. the CI box). Without the env
- * var, fall through to the real open untouched.
+ * Interception rule: a card or render-node path + configured socket ⇒ always
+ * intercept (even on hosts with a real /dev/dri, e.g. the CI box). Without the
+ * env var, fall through to the real open untouched.
  */
 static bool should_intercept(const char *path)
 {
-    if (!is_drm_card_path(path))
+    if (!is_drm_node_path(path))
         return false;
     const char *sock = getenv("GAMENATIVE_DRM_SOCKET");
     return sock && *sock;
+}
+
+/* The node kind an intercepted open() impersonates, from its path. */
+static int node_kind_for_path(const char *path)
+{
+    return is_drm_render_path(path) ? GNDRM_NODE_KIND_RENDER : GNDRM_NODE_KIND_CARD;
 }
 
 int open(const char *path, int flags, ...)
@@ -587,7 +814,7 @@ int open(const char *path, int flags, ...)
         va_end(ap);
     }
     if (should_intercept(path))
-        return open_common();
+        return open_common(node_kind_for_path(path));
     return syscall(SYS_openat, AT_FDCWD, path, flags, mode);
 }
 
@@ -601,7 +828,7 @@ int open64(const char *path, int flags, ...)
         va_end(ap);
     }
     if (should_intercept(path))
-        return open_common();
+        return open_common(node_kind_for_path(path));
     return syscall(SYS_openat, AT_FDCWD, path, flags, mode);
 }
 
@@ -615,7 +842,7 @@ int openat(int dirfd, const char *path, int flags, ...)
         va_end(ap);
     }
     if (should_intercept(path))
-        return open_common();
+        return open_common(node_kind_for_path(path));
     return syscall(SYS_openat, dirfd, path, flags, mode);
 }
 
@@ -687,6 +914,55 @@ int fcntl(int fd, int cmd, ...)
     if (ret >= 0 && (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) && is_our_fd(fd))
         our_fd_add(ret);
     return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* mmap family: map a GEM object through its dma-buf                   */
+/* ------------------------------------------------------------------ */
+/*
+ * The device fd is a socket and cannot be mapped. The legacy sequence is
+ * GEM_MMAP (which mints an offset carrying the GEM handle) followed by
+ * mmap(dev_fd, offset); this hook recognises the minted offset and maps the
+ * handle's dma-buf instead, so a libdrm client that maps a GEM object the
+ * legacy way works unchanged. Any other mmap on one of our fds is meaningless
+ * and refused, exactly as mapping a socket would be.
+ */
+static void *gndrm_mmap(void *addr, size_t length, int prot, int flags, int fd,
+                        off_t offset)
+{
+    if (!is_our_fd(fd))
+        return (void *)syscall(SYS_mmap, addr, length, prot, flags, fd, offset);
+
+    if (((uint64_t)offset & GNDRM_GEM_MMAP_OFFSET_BASE) !=
+        GNDRM_GEM_MMAP_OFFSET_BASE) {
+        errno = EINVAL;
+        return MAP_FAILED;
+    }
+    uint32_t handle = (uint32_t)((uint64_t)offset & GNDRM_GEM_MMAP_HANDLE_MASK);
+    struct drm_prime_handle ph = { .handle = handle, .flags = 0, .fd = -1 };
+    uint32_t out_len = 0;
+    int fd_recv = -1;
+    int ret = rpc(DRM_IOCTL_PRIME_HANDLE_TO_FD, &ph, sizeof(ph), g_resp_buf,
+                  &out_len, -1, &fd_recv);
+    if (ret != 0 || fd_recv < 0) {
+        errno = ret ? -ret : EINVAL;
+        return MAP_FAILED;
+    }
+    /* The dma-buf mapping lives on after the fd is closed (mmap holds its own
+     * reference), so close immediately and hand back only the mapping. */
+    void *p = (void *)syscall(SYS_mmap, addr, length, prot, flags, fd_recv, 0);
+    close(fd_recv);
+    return p;
+}
+
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+{
+    return gndrm_mmap(addr, length, prot, flags, fd, offset);
+}
+
+void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off64_t offset)
+{
+    return gndrm_mmap(addr, length, prot, flags, fd, (off_t)offset);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1154,6 +1430,8 @@ static int drm_ioctl(int fd, unsigned long req, void *arg)
     uint32_t out_len = 0;
     uint32_t in_len = 0;
 
+    trace_req((uint32_t)req);
+
     switch (req) {
     case DRM_IOCTL_VERSION: {
         struct drm_version v = *(struct drm_version *)arg;
@@ -1188,6 +1466,8 @@ static int drm_ioctl(int fd, unsigned long req, void *arg)
     case DRM_IOCTL_GET_CAP:
     case DRM_IOCTL_SET_CLIENT_CAP:
     case DRM_IOCTL_GEM_CLOSE:
+    case GNDRM_IOCTL_GEM_CREATE:
+    case GNDRM_IOCTL_GEM_MMAP:
     case DRM_IOCTL_MODE_RMFB:
     case DRM_IOCTL_MODE_DESTROYPROPBLOB:
     case DRM_IOCTL_MODE_GETENCODER:
@@ -1537,10 +1817,29 @@ static int drm_ioctl(int fd, unsigned long req, void *arg)
         ret = rpc(req, &v, sizeof(v), g_resp_buf, &out_len, (int)v.fd, &fd_recv);
         break;
     }
-    default:
-        LOG("unhandled ioctl 0x%lx -> ENOSYS\n", req);
-        ret = -EOPNOTSUPP;
+    default: {
+        /*
+         * Generic forward. Every DRM request the switch above does not
+         * specially marshal still goes to the daemon, which owns the answer
+         * for it (a real errno for the requests it does not model). This is
+         * what keeps the render-node contract total: a request Mesa's
+         * gbm/glamor path issues but the shim has no bespoke arity for is no
+         * longer answered by the shim inventing EOPNOTSUPP, and the daemon log
+         * names it. `_IOC_SIZE(req)` bytes are the whole fixed struct; the
+         * pointer-carrying arities are handled by the cases above.
+         */
+        size_t len = _IOC_SIZE(req);
+        if (len > sizeof(g_req_buf)) {
+            ret = -EINVAL;
+            break;
+        }
+        ret = rpc(req, arg, (uint32_t)len, g_resp_buf, &out_len, -1, &fd_recv);
+        if (ret == 0 && out_len) {
+            uint32_t n = out_len < len ? out_len : (uint32_t)len;
+            memcpy(arg, g_resp_buf, n);
+        }
         break;
+    }
     }
 
     if (ret < 0) {

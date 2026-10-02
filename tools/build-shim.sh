@@ -30,6 +30,18 @@ if pkg-config --exists libdrm; then
     cc -Wall -Wextra -Werror -O2 -o "$OUT/b9_client" \
         "$ROOT/modules/gndrm-shim/test_client.c" $(pkg-config --cflags --libs libdrm)
     echo "host:   $OUT/b9_client"
+    # shellcheck disable=SC2046
+    cc -Wall -Wextra -Werror -O2 -o "$OUT/render_node_client" \
+        "$ROOT/modules/gndrm-shim/render_node_client.c" $(pkg-config --cflags --libs libdrm)
+    echo "host:   $OUT/render_node_client"
+    # shellcheck disable=SC2046
+    cc -Wall -Wextra -Werror -O2 -o "$OUT/render_blame" \
+        "$ROOT/modules/gndrm-shim/render_blame.c" $(pkg-config --cflags --libs libdrm)
+    echo "host:   $OUT/render_blame"
+    # shellcheck disable=SC2046
+    cc -Wall -Wextra -Werror -O2 -o "$OUT/event_fd_read_client" \
+        "$ROOT/modules/gndrm-shim/event_fd_read_client.c" $(pkg-config --cflags --libs libdrm)
+    echo "host:   $OUT/event_fd_read_client"
 fi
 
 # --- android ---------------------------------------------------------------

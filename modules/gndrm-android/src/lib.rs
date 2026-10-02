@@ -43,7 +43,7 @@ use jni::JNIEnv;
 
 use gndrm_daemon::diag;
 use gndrm_daemon::server;
-use gndrm_daemon::{Device, PanelDesc};
+use gndrm_daemon::{Device, NullPresenter, PanelDesc};
 
 /// Return codes are negative errno-style values (`0` = success).
 const E_BUSY: jint = -16;
@@ -81,6 +81,13 @@ unsafe impl Send for WindowPtr {}
 struct Runtime {
     name: String,
     listener: RawFd,
+    /// Dedicated render-node listener (`name + "-render"`): Xwayland's
+    /// glamor/dri3 open is served here, one Device per client, so it never
+    /// becomes a scan-out channel on `listener` (see `server` module docs).
+    render_listener: RawFd,
+    /// Stops the render-listener loop in [`stop`].
+    render_stop: RawFd,
+    render_thread: Option<thread::JoinHandle<()>>,
     fds: Arc<Mutex<AcceptedFds>>,
     window: WindowPtr,
     thread: Option<thread::JoinHandle<()>>,
@@ -428,6 +435,38 @@ fn start(
         }
     };
 
+    // Dedicated render-node listener for Xwayland's glamor/dri3 open. It must
+    // NOT share the card listener: every post-primary connection there is the
+    // scan-out allocator channel, so a render-node client on it would be
+    // adopted and closed (the on-device EPIPE). Served by the same
+    // `server::serve_render_listener` the host harness runs.
+    let render_name = server::render_socket_name(&name);
+    let render_listener = match server::listen_seqpacket(&render_name) {
+        Ok(fd) => fd,
+        Err(e) => {
+            log_error!("listen({render_name}): {e}");
+            // SAFETY: listener/window acquired above; nothing else holds them.
+            unsafe {
+                libc::close(listener);
+                ffi::ANativeWindow_release(window.0);
+            }
+            return E_IO;
+        }
+    };
+    let render_stop = match server::new_stop_eventfd() {
+        Ok(fd) => fd,
+        Err(e) => {
+            log_error!("render stop eventfd: {e}");
+            // SAFETY: listener/render_listener/window acquired above.
+            unsafe {
+                libc::close(listener);
+                libc::close(render_listener);
+                ffi::ANativeWindow_release(window.0);
+            }
+            return E_IO;
+        }
+    };
+
     // The window is the authority on the size actually presented into: the
     // caller's width/height can predate layout (a view measured before its
     // insets apply), which would size the emulated mode differently from the
@@ -455,6 +494,36 @@ fn start(
         event: -1,
         scanout: -1,
     }));
+
+    // Render-node clients (Xwayland) on their own thread, served by the shared
+    // device-side loop. A render node has no scan-out, so a `NullPresenter` is
+    // exactly right: the render Device only ever serves GEM/PRIME/syncobj and
+    // the DRM_RENDER_ALLOW gate.
+    let render_log: server::SharedLog = Arc::new(crate::log::daemon_info);
+    let render_handle = thread::Builder::new()
+        .name("gndrm-render".into())
+        .spawn(move || {
+            server::serve_render_listener(
+                render_listener,
+                render_stop,
+                Arc::new(move || Device::new(panel, Box::<NullPresenter>::default())),
+                render_log,
+            );
+        });
+    let render_handle = match render_handle {
+        Ok(h) => h,
+        Err(e) => {
+            log_error!("render thread spawn: {e}");
+            // SAFETY: nothing else can own these now.
+            unsafe {
+                libc::close(listener);
+                libc::close(render_listener);
+                libc::close(render_stop);
+                ffi::ANativeWindow_release(window.0);
+            }
+            return E_IO;
+        }
+    };
     let (tx, rx) = mpsc::channel();
     let thread_fds = Arc::clone(&fds);
     let handle = thread::Builder::new()
@@ -464,11 +533,18 @@ fn start(
         Ok(h) => h,
         Err(e) => {
             log_error!("spawn: {e}");
+            // Stop the render thread already started above, then reclaim.
+            server::signal_stop(render_stop);
             // SAFETY: nothing else can own these now.
             unsafe {
+                libc::shutdown(render_listener, libc::SHUT_RDWR);
                 libc::close(listener);
-                ffi::ANativeWindow_release(window.0);
+                libc::close(render_listener);
+                libc::close(render_stop);
             }
+            let _ = render_handle.join();
+            // SAFETY: render thread is joined; the window is ours again.
+            unsafe { ffi::ANativeWindow_release(window.0) };
             return E_IO;
         }
     };
@@ -482,11 +558,17 @@ fn start(
             }
             // Thread already exited (or is exiting); reclaim everything.
             let _ = handle.join();
-            // SAFETY: server thread is gone; listener/window still owned.
+            server::signal_stop(render_stop);
+            // SAFETY: server thread is gone; listener/window/render still owned.
             unsafe {
+                libc::shutdown(render_listener, libc::SHUT_RDWR);
                 libc::close(listener);
-                ffi::ANativeWindow_release(window.0);
+                libc::close(render_listener);
+                libc::close(render_stop);
             }
+            let _ = render_handle.join();
+            // SAFETY: render thread is joined; the window is ours again.
+            unsafe { ffi::ANativeWindow_release(window.0) };
             return E_IO;
         }
     }
@@ -496,6 +578,9 @@ fn start(
     *slot = Some(Runtime {
         name,
         listener,
+        render_listener,
+        render_stop,
+        render_thread: Some(render_handle),
         fds,
         window,
         thread: Some(handle),
@@ -513,6 +598,25 @@ fn stop() {
     unsafe {
         libc::shutdown(rt.listener, libc::SHUT_RDWR);
         libc::close(rt.listener);
+    }
+    // Stop the render-node listener too: signal its poll, then shut the
+    // listener down (it unblocks accept and, on the way out, shuts down every
+    // live render client so its serve loop returns).
+    server::signal_stop(rt.render_stop);
+    // SAFETY: the render thread owns the accept side but only reads the
+    // listener; shutdown unblocks it and the thread closes any accepted fds.
+    unsafe {
+        libc::shutdown(rt.render_listener, libc::SHUT_RDWR);
+    }
+    if let Some(t) = rt.render_thread.take() {
+        if t.join().is_err() {
+            log_error!("render thread panicked");
+        }
+    }
+    // SAFETY: the render thread is joined; nothing else uses these now.
+    unsafe {
+        libc::close(rt.render_listener);
+        libc::close(rt.render_stop);
     }
     if let Ok(f) = rt.fds.lock() {
         // SAFETY: as above; thread closes after serve() returns.

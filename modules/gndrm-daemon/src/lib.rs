@@ -238,6 +238,13 @@ pub struct Device {
     cap_universal_planes: bool,
     cap_writeback: bool,
 
+    /// Which node type this connection impersonates. A card node carries the
+    /// full KMS surface (gamescope); a render node carries only the
+    /// rendering-capable ioctls (Xwayland's glamor/dri3/drm). Set once by the
+    /// shim's connection-setup frame; defaults to card for direct/legacy
+    /// clients and tests.
+    node_kind: u32,
+
     // live software state
     conn_crtc_id: u32,
     crtc: CrtcState,
@@ -335,6 +342,7 @@ impl Device {
             cap_atomic: false,
             cap_universal_planes: false,
             cap_writeback: false,
+            node_kind: NODE_KIND_CARD,
             conn_crtc_id: 0,
             crtc: CrtcState::default(),
             primary: PlaneState::default(),
@@ -372,6 +380,25 @@ impl Device {
     /// serve thread and must not block (see the Android glue).
     pub fn set_addfb_geometry(&mut self, addfb_geometry: AddFbGeometryFn) {
         self.addfb_geometry = Some(addfb_geometry);
+    }
+
+    /// Declare which node type this connection impersonates (`NODE_KIND_CARD`
+    /// or `NODE_KIND_RENDER`). Idempotent; the last value wins, matching a
+    /// re-declaring client.
+    pub fn set_node_kind(&mut self, kind: u32) {
+        self.node_kind = kind;
+    }
+
+    /// The node type this connection impersonates.
+    #[must_use]
+    pub fn node_kind(&self) -> u32 {
+        self.node_kind
+    }
+
+    /// Whether this connection is a render node (only render-capable ioctls).
+    #[must_use]
+    pub fn is_render_node(&self) -> bool {
+        self.node_kind == NODE_KIND_RENDER
     }
 
     /// The id-space high-water marks (`[gem, fb, blob, syncobj]`), for tests
@@ -536,35 +563,51 @@ impl Device {
                 ioctl_name(ioctl_nr)
             ));
         }
-        let mut result = match ioctl_nr {
-            DRM_IOCTL_VERSION => self.ioctl_version(payload),
-            DRM_IOCTL_GET_CAP => self.ioctl_get_cap(payload),
-            DRM_IOCTL_SET_CLIENT_CAP => self.ioctl_set_client_cap(payload),
-            DRM_IOCTL_SET_MASTER | DRM_IOCTL_DROP_MASTER => DispatchResult::ok(Vec::new()),
-            DRM_IOCTL_MODE_GETRESOURCES => self.ioctl_get_resources(payload),
-            DRM_IOCTL_MODE_GETCRTC => self.ioctl_get_crtc(payload),
-            DRM_IOCTL_MODE_GETCONNECTOR => self.ioctl_get_connector(payload),
-            DRM_IOCTL_MODE_GETENCODER => self.ioctl_get_encoder(payload),
-            DRM_IOCTL_MODE_GETPLANERESOURCES => self.ioctl_get_plane_res(payload),
-            DRM_IOCTL_MODE_GETPLANE => self.ioctl_get_plane(payload),
-            DRM_IOCTL_MODE_OBJ_GETPROPERTIES => self.ioctl_obj_get_properties(payload),
-            DRM_IOCTL_MODE_GETPROPERTY => self.ioctl_get_property(payload),
-            DRM_IOCTL_MODE_OBJ_SETPROPERTY => DispatchResult::err(errno::EINVAL),
-            DRM_IOCTL_MODE_CREATEPROPBLOB => self.ioctl_create_blob(payload),
-            DRM_IOCTL_MODE_GETPROPBLOB => self.ioctl_get_blob(payload),
-            DRM_IOCTL_MODE_DESTROYPROPBLOB => self.ioctl_destroy_blob(payload),
-            DRM_IOCTL_PRIME_FD_TO_HANDLE => self.ioctl_prime_fd_to_handle(payload, fd_in.take()),
-            DRM_IOCTL_PRIME_HANDLE_TO_FD => self.ioctl_prime_handle_to_fd(payload),
-            DRM_IOCTL_GEM_CLOSE => self.ioctl_gem_close(payload),
-            DRM_IOCTL_MODE_ADDFB2 => self.ioctl_addfb2(payload),
-            DRM_IOCTL_MODE_GETFB2 => self.ioctl_getfb2(payload),
-            DRM_IOCTL_MODE_RMFB => self.ioctl_rmfb(payload),
-            DRM_IOCTL_SYNCOBJ_CREATE => self.ioctl_syncobj_create(payload),
-            DRM_IOCTL_SYNCOBJ_DESTROY => self.ioctl_syncobj_destroy(payload),
-            DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD => self.ioctl_syncobj_handle_to_fd(payload),
-            DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE => self.ioctl_syncobj_fd_to_handle(payload),
-            DRM_IOCTL_MODE_ATOMIC => self.ioctl_atomic(payload, fd_in.take()),
-            _ => DispatchResult::err(errno::EINVAL),
+        let mut result = if self.node_kind == NODE_KIND_RENDER && !render_node_allows(ioctl_nr) {
+            // A render node exposes only the render-capable ioctls. Refusing
+            // modesetting/master here is what a real kernel node does, and it
+            // is the observable signal that this connection is a render node.
+            self.diag(&format!(
+                "render node: refused {} (0x{ioctl_nr:08x})",
+                ioctl_name(ioctl_nr)
+            ));
+            DispatchResult::err(errno::EACCES)
+        } else {
+            match ioctl_nr {
+                GNDRM_IOCTL_NODE_KIND => self.ioctl_node_kind(payload),
+                DRM_IOCTL_VERSION => self.ioctl_version(payload),
+                DRM_IOCTL_GET_CAP => self.ioctl_get_cap(payload),
+                DRM_IOCTL_SET_CLIENT_CAP => self.ioctl_set_client_cap(payload),
+                DRM_IOCTL_SET_MASTER | DRM_IOCTL_DROP_MASTER => DispatchResult::ok(Vec::new()),
+                DRM_IOCTL_MODE_GETRESOURCES => self.ioctl_get_resources(payload),
+                DRM_IOCTL_MODE_GETCRTC => self.ioctl_get_crtc(payload),
+                DRM_IOCTL_MODE_GETCONNECTOR => self.ioctl_get_connector(payload),
+                DRM_IOCTL_MODE_GETENCODER => self.ioctl_get_encoder(payload),
+                DRM_IOCTL_MODE_GETPLANERESOURCES => self.ioctl_get_plane_res(payload),
+                DRM_IOCTL_MODE_GETPLANE => self.ioctl_get_plane(payload),
+                DRM_IOCTL_MODE_OBJ_GETPROPERTIES => self.ioctl_obj_get_properties(payload),
+                DRM_IOCTL_MODE_GETPROPERTY => self.ioctl_get_property(payload),
+                DRM_IOCTL_MODE_OBJ_SETPROPERTY => DispatchResult::err(errno::EINVAL),
+                DRM_IOCTL_MODE_CREATEPROPBLOB => self.ioctl_create_blob(payload),
+                DRM_IOCTL_MODE_GETPROPBLOB => self.ioctl_get_blob(payload),
+                DRM_IOCTL_MODE_DESTROYPROPBLOB => self.ioctl_destroy_blob(payload),
+                DRM_IOCTL_GEM_CREATE => self.ioctl_gem_create(payload),
+                DRM_IOCTL_GEM_MMAP => self.ioctl_gem_mmap(payload),
+                DRM_IOCTL_PRIME_FD_TO_HANDLE => {
+                    self.ioctl_prime_fd_to_handle(payload, fd_in.take())
+                }
+                DRM_IOCTL_PRIME_HANDLE_TO_FD => self.ioctl_prime_handle_to_fd(payload),
+                DRM_IOCTL_GEM_CLOSE => self.ioctl_gem_close(payload),
+                DRM_IOCTL_MODE_ADDFB2 => self.ioctl_addfb2(payload),
+                DRM_IOCTL_MODE_GETFB2 => self.ioctl_getfb2(payload),
+                DRM_IOCTL_MODE_RMFB => self.ioctl_rmfb(payload),
+                DRM_IOCTL_SYNCOBJ_CREATE => self.ioctl_syncobj_create(payload),
+                DRM_IOCTL_SYNCOBJ_DESTROY => self.ioctl_syncobj_destroy(payload),
+                DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD => self.ioctl_syncobj_handle_to_fd(payload),
+                DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE => self.ioctl_syncobj_fd_to_handle(payload),
+                DRM_IOCTL_MODE_ATOMIC => self.ioctl_atomic(payload, fd_in.take()),
+                _ => DispatchResult::err(errno::EINVAL),
+            }
         };
         // Drop an unclaimed fd exactly like an ioctl that ignores it would
         // (the kernel simply doesn't consume the reference — but the wire
@@ -608,6 +651,10 @@ impl Device {
         };
         c.value = match c.capability {
             DRM_CAP_DUMB_BUFFER => 1,
+            // Export and import are both real: GEM objects carry dma-buf fds
+            // out (HANDLE_TO_FD) and in (FD_TO_HANDLE). Mesa's GBM and
+            // glamor's device probe read this cap before allocating.
+            DRM_CAP_PRIME => DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT,
             DRM_CAP_TIMESTAMP_MONOTONIC => 1,
             DRM_CAP_CURSOR_WIDTH | DRM_CAP_CURSOR_HEIGHT => 64,
             // Advertised: gamescope's DRM backend creates an always-signalled
@@ -616,6 +663,11 @@ impl Device {
             // and never commits at all, which is a black screen, not a
             // fallback.
             DRM_CAP_SYNCOBJ => 1,
+            // Not supported, and a kernel reports that as value 0 with success
+            // (not an error). Xwayland's `xwl_gbm_supports_syncobjs` reads this
+            // cap first; answering it the kernel's way keeps explicit sync off
+            // without a spurious error.
+            DRM_CAP_SYNCOBJ_TIMELINE => 0,
             // Explicit modifiers accepted (LINEAR only; see IN_FORMATS).
             DRM_CAP_ADDFB2_MODIFIERS => 1,
             _ => return DispatchResult::err(errno::EINVAL),
@@ -638,6 +690,19 @@ impl Device {
             DRM_CLIENT_CAP_WRITEBACK_CONNECTORS => self.cap_writeback = c.value == 1,
             _ => return DispatchResult::err(errno::EINVAL),
         }
+        DispatchResult::ok(Vec::new())
+    }
+
+    /// Connection setup (not a kernel ioctl): record whether this connection
+    /// impersonates the card node or a render node.
+    fn ioctl_node_kind(&mut self, payload: &[u8]) -> DispatchResult {
+        let Some(kind) = pod_read::<u32>(payload) else {
+            return DispatchResult::err(errno::EINVAL);
+        };
+        if kind != NODE_KIND_CARD && kind != NODE_KIND_RENDER {
+            return DispatchResult::err(errno::EINVAL);
+        }
+        self.node_kind = kind;
         DispatchResult::ok(Vec::new())
     }
 
@@ -1003,6 +1068,76 @@ impl Device {
     // -----------------------------------------------------------------
     // GEM / FB lifecycle (task A5)
     // -----------------------------------------------------------------
+
+    /// `drm_gem_create`: allocate a buffer object and return a handle.
+    ///
+    /// The buffer is a real, CPU-mappable allocation (an anonymous memfd) that
+    /// the daemon owns and can export as a dma-buf, so a GEM created here is
+    /// indistinguishable from one imported through `PRIME_FD_TO_HANDLE`: both
+    /// live in the same store, dedup by `st_ino`, and resolve to the same
+    /// `HANDLE_TO_FD`/`ADDFB2` behaviour. This is the primitive a render-node
+    /// client (Mesa/GBM, glamor) allocates with before it maps or exports.
+    fn ioctl_gem_create(&mut self, payload: &[u8]) -> DispatchResult {
+        let Some(mut c) = pod_read::<DrmGemCreate>(payload) else {
+            return DispatchResult::err(errno::EINVAL);
+        };
+        if c.size == 0 {
+            return DispatchResult::err(errno::EINVAL);
+        }
+        let Some(fd) = new_anonymous_buffer(c.size) else {
+            return DispatchResult::err(errno::ENOMEM);
+        };
+        let Some((ino, size)) = fstat_fd(fd) else {
+            close_fd(fd);
+            return DispatchResult::err(errno::EIO);
+        };
+        // A memfd is inode-unique, so an accidental `st_ino` collision with an
+        // imported dma-buf cannot alias an unrelated object.
+        if self.stores.gem_by_ino.contains_key(&ino) {
+            close_fd(fd);
+            return DispatchResult::err(errno::EINVAL);
+        }
+        let handle = match self.stores.alloc_gem() {
+            Ok(h) => h,
+            Err(_) => {
+                close_fd(fd);
+                return DispatchResult::err(self.note_exhausted("GEM handle space"));
+            }
+        };
+        self.stores
+            .gems
+            .insert(handle, objects::GemObject { fd, ino, size });
+        self.stores.gem_by_ino.insert(ino, handle);
+        c.handle = handle;
+        let mut body = Vec::new();
+        pod_write(&mut body, &c);
+        DispatchResult::ok(body)
+    }
+
+    /// `drm_gem_mmap`: hand back the offset the client passes to `mmap`.
+    ///
+    /// A socket cannot be mapped, so the offset is a device-minted token that
+    /// carries the GEM handle ([`GEM_MMAP_OFFSET_BASE`] in the high half). The
+    /// shim recognises the token and maps the handle's dma-buf in place of the
+    /// device fd, so the legacy `GEM_MMAP` + `mmap` sequence works unchanged.
+    fn ioctl_gem_mmap(&mut self, payload: &[u8]) -> DispatchResult {
+        let Some(mut m) = pod_read::<DrmGemMmap>(payload) else {
+            return DispatchResult::err(errno::EINVAL);
+        };
+        let Some(gem) = self
+            .stores
+            .gems
+            .get(&m.handle)
+            .or_else(|| self.stores.gems_closed.get(&m.handle))
+        else {
+            return DispatchResult::err(errno::ENOENT);
+        };
+        m.size = gem.size;
+        m.offset = GEM_MMAP_OFFSET_BASE | u64::from(m.handle);
+        let mut body = Vec::new();
+        pod_write(&mut body, &m);
+        DispatchResult::ok(body)
+    }
 
     fn ioctl_prime_fd_to_handle(&mut self, payload: &[u8], fd_in: Option<RawFd>) -> DispatchResult {
         if pod_read::<DrmPrimeHandle>(payload).is_none() {
@@ -1688,6 +1823,33 @@ fn new_eventfd(count: u32) -> Option<RawFd> {
     (fd >= 0).then_some(fd)
 }
 
+/// A fresh anonymous, sized, CPU-mappable buffer (memfd) for `GEM_CREATE`. The
+/// fd is mappable and exportable as a dma-buf, exactly like the buffers the
+/// scan-out allocator hands out. `MFD_CLOEXEC` keeps it from leaking into a
+/// child across exec (the daemon and its clients do not share an address
+/// space anyway, but the flag matches the fd hygiene of the rest of the
+/// module).
+fn new_anonymous_buffer(size: u64) -> Option<RawFd> {
+    // SAFETY: memfd_create takes a NUL-terminated name and a flags word; it
+    // returns a fresh descriptor this path owns, or -1 with errno set.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create,
+            c"gndrm-gem".as_ptr(),
+            libc::MFD_CLOEXEC,
+        ) as RawFd
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is a live memfd this path owns; ftruncate sets its size.
+    if unsafe { libc::ftruncate(fd, size as libc::off_t) } != 0 {
+        close_fd(fd);
+        return None;
+    }
+    Some(fd)
+}
+
 /// Write one to `fd`, waking any `poll` on it. Used by the worker to signal
 /// that a flip event is queued.
 fn write_eventfd(fd: RawFd) {
@@ -1729,10 +1891,13 @@ fn close_fd(fd: RawFd) {
 fn ioctl_name(nr: u32) -> &'static str {
     match nr {
         DRM_IOCTL_VERSION => "VERSION",
+        GNDRM_IOCTL_NODE_KIND => "GNDRM_NODE_KIND",
         DRM_IOCTL_GET_CAP => "GET_CAP",
         DRM_IOCTL_SET_CLIENT_CAP => "SET_CLIENT_CAP",
         DRM_IOCTL_SET_MASTER => "SET_MASTER",
         DRM_IOCTL_DROP_MASTER => "DROP_MASTER",
+        DRM_IOCTL_GEM_CREATE => "GEM_CREATE",
+        DRM_IOCTL_GEM_MMAP => "GEM_MMAP",
         DRM_IOCTL_MODE_GETRESOURCES => "MODE_GETRESOURCES",
         DRM_IOCTL_MODE_GETCRTC => "MODE_GETCRTC",
         DRM_IOCTL_MODE_GETCONNECTOR => "MODE_GETCONNECTOR",
@@ -1757,5 +1922,181 @@ fn ioctl_name(nr: u32) -> &'static str {
         DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD => "SYNCOBJ_HANDLE_TO_FD",
         DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE => "SYNCOBJ_FD_TO_HANDLE",
         _ => "UNKNOWN",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev() -> Device {
+        Device::new(PanelDesc::default(), Box::<NullPresenter>::default())
+    }
+
+    /// Encode a payload the way the shim's `rpc()` does for a fixed struct.
+    fn body_of<T: Copy>(v: &T) -> Vec<u8> {
+        let mut b = Vec::new();
+        pod_write(&mut b, v);
+        b
+    }
+
+    fn get_cap(dev: &mut Device, cap: u64) -> u64 {
+        let mut c = DrmGetCap {
+            capability: cap,
+            value: 0,
+        };
+        let r = dev.dispatch(DRM_IOCTL_GET_CAP, &body_of(&c), None);
+        assert_eq!(r.ret, 0, "GET_CAP 0x{cap:x} failed");
+        c = pod_read::<DrmGetCap>(&r.body).expect("GET_CAP body");
+        c.value
+    }
+
+    /// The node-kind setup frame is what makes a connection a render node, and
+    /// a render node refuses modesetting/master exactly like the kernel.
+    #[test]
+    fn node_kind_marks_a_render_connection_and_gates_modeset() {
+        let mut d = dev();
+        assert!(!d.is_render_node());
+        assert_eq!(d.node_kind(), NODE_KIND_CARD);
+
+        // Declare render node.
+        let r = d.dispatch(GNDRM_IOCTL_NODE_KIND, &NODE_KIND_RENDER.to_le_bytes(), None);
+        assert_eq!(r.ret, 0);
+        assert!(d.is_render_node());
+
+        // Identification still works on a render node.
+        let mut v = DrmVersion {
+            name_len: 0,
+            ..Default::default()
+        };
+        let r = d.dispatch(DRM_IOCTL_VERSION, &body_of(&v), None);
+        assert_eq!(r.ret, 0);
+        v = pod_read::<DrmVersion>(&r.body).expect("VERSION body");
+        assert_eq!(v.version_major, DRIVER_VERSION.0);
+        assert!(v.name_len > 0);
+
+        // Modesetting and master are refused with EACCES.
+        let res = DrmModeCardRes::default();
+        let r = d.dispatch(DRM_IOCTL_MODE_GETRESOURCES, &body_of(&res), None);
+        assert_eq!(r.ret, -errno::EACCES);
+        assert!(r.body.is_empty(), "a refused ioctl carries no body");
+        assert_eq!(
+            d.dispatch(DRM_IOCTL_SET_MASTER, &[], None).ret,
+            -errno::EACCES
+        );
+
+        // An invalid kind is rejected and leaves the node type unchanged.
+        assert_eq!(
+            d.dispatch(GNDRM_IOCTL_NODE_KIND, &7u32.to_le_bytes(), None)
+                .ret,
+            -errno::EINVAL
+        );
+        assert!(d.is_render_node());
+    }
+
+    /// GET_CAP reports PRIME import+export, which is what Mesa/GBM probe.
+    #[test]
+    fn get_cap_reports_prime_import_and_export() {
+        let mut d = dev();
+        assert_eq!(
+            get_cap(&mut d, DRM_CAP_PRIME),
+            DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT
+        );
+        assert_eq!(get_cap(&mut d, DRM_CAP_DUMB_BUFFER), 1);
+        // An unadvertised cap must be an error, not a silent zero.
+        let r = d.dispatch(
+            DRM_IOCTL_GET_CAP,
+            &body_of(&DrmGetCap {
+                capability: 0x9999,
+                value: 0,
+            }),
+            None,
+        );
+        assert_eq!(r.ret, -errno::EINVAL);
+    }
+
+    /// GEM_CREATE allocates a real, exportable buffer; GEM_MMAP mints the
+    /// handle-carrying offset; PRIME_HANDLE_TO_FD hands out its dma-buf;
+    /// GEM_CLOSE releases the handle.
+    #[test]
+    fn gem_create_mmap_and_prime_export_form_a_lifecycle() {
+        let mut d = dev();
+        d.set_node_kind(NODE_KIND_RENDER);
+
+        let req = DrmGemCreate {
+            size: 4096,
+            handle: 0,
+            flags: 0,
+        };
+        let r = d.dispatch(DRM_IOCTL_GEM_CREATE, &body_of(&req), None);
+        assert_eq!(r.ret, 0, "GEM_CREATE failed");
+        let created = pod_read::<DrmGemCreate>(&r.body).expect("GEM_CREATE body");
+        assert!(created.handle > 0, "GEM_CREATE must return a handle");
+        assert_eq!(created.size, 4096);
+
+        // GEM_MMAP echoes the object size and a token carrying the handle.
+        let mut m = DrmGemMmap {
+            handle: created.handle,
+            pad: 0,
+            offset: 0,
+            size: 0,
+        };
+        let r = d.dispatch(DRM_IOCTL_GEM_MMAP, &body_of(&m), None);
+        assert_eq!(r.ret, 0, "GEM_MMAP failed");
+        m = pod_read::<DrmGemMmap>(&r.body).expect("GEM_MMAP body");
+        assert_eq!(m.size, 4096);
+        assert_eq!(m.offset & GEM_MMAP_OFFSET_BASE, GEM_MMAP_OFFSET_BASE);
+        assert_eq!(m.offset & GEM_MMAP_HANDLE_MASK, u64::from(created.handle));
+
+        // PRIME_HANDLE_TO_FD exports a real fd.
+        let h = DrmPrimeHandle {
+            handle: created.handle,
+            flags: 0,
+            fd: -1,
+        };
+        let r = d.dispatch(DRM_IOCTL_PRIME_HANDLE_TO_FD, &body_of(&h), None);
+        assert_eq!(r.ret, 0, "PRIME_HANDLE_TO_FD failed");
+        let exported = r.fd_out.expect("export must attach an fd");
+        assert!(exported >= 0);
+        // It is a real, sized file: fstat succeeds and reports the size.
+        assert_eq!(fstat_fd(exported).map(|(_, sz)| sz), Some(4096));
+        close_fd(exported);
+
+        // GEM_CLOSE drops the handle; a second export then finds nothing.
+        let c = DrmGemClose {
+            handle: created.handle,
+            pad: 0,
+        };
+        assert_eq!(d.dispatch(DRM_IOCTL_GEM_CLOSE, &body_of(&c), None).ret, 0);
+        assert_eq!(
+            d.dispatch(DRM_IOCTL_PRIME_HANDLE_TO_FD, &body_of(&h), None)
+                .ret,
+            -errno::ENOENT
+        );
+    }
+
+    /// GEM_CREATE rejects a zero-sized request and an unknown handle for MMAP.
+    #[test]
+    fn gem_create_and_mmap_reject_bad_input() {
+        let mut d = dev();
+        let zero = DrmGemCreate {
+            size: 0,
+            handle: 0,
+            flags: 0,
+        };
+        assert_eq!(
+            d.dispatch(DRM_IOCTL_GEM_CREATE, &body_of(&zero), None).ret,
+            -errno::EINVAL
+        );
+        let missing = DrmGemMmap {
+            handle: 0xDEAD,
+            pad: 0,
+            offset: 0,
+            size: 0,
+        };
+        assert_eq!(
+            d.dispatch(DRM_IOCTL_GEM_MMAP, &body_of(&missing), None).ret,
+            -errno::ENOENT
+        );
     }
 }

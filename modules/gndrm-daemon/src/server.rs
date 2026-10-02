@@ -1,9 +1,24 @@
 //! Blocking SEQPACKET socket server shared by `gndrm-hostd` (host tests,
 //! B9 harness) and `gndrm-android` (in-app daemon).
 //!
-//! Connection contract: the first accepted connection is the RPC channel,
-//! the second is the event channel (matches `gndrm-shim`'s connect order).
-//! One client at a time.
+//! Two listeners, matching the two node types the shim impersonates:
+//!
+//! - **card node** — the main socket ([`listen_seqpacket`]'s name). Connection
+//!   contract: the first accepted connection is the RPC channel, the second is
+//!   the event channel (matches `gndrm-shim`'s connect order); every later
+//!   connection is the single scan-out allocator channel (newest wins). One
+//!   card client at a time — gamescope.
+//! - **render node** — [`render_socket_name`] (the main name + `-render`).
+//!   Served by [`serve_render_listener`], one [`Device`] per RPC/event pair,
+//!   for as many concurrent clients as connect. Xwayland's glamor/dri3/drm
+//!   opens `/dev/dri/renderDN` here; a render node never scans out, so it has
+//!   no allocator channel.
+//!
+//! Keeping the render node on its own listener is what lets a second DRM client
+//! process (Xwayland) coexist with gamescope: on the card listener any
+//! post-primary connection is the scan-out channel, so a render-node client
+//! there would be adopted as a (bad) scan-out channel and closed — which is
+//! exactly the `EPIPE`/`Broken pipe` a render-node `open` used to see on device.
 //!
 //! Address convention (must match `gndrm-shim`'s `connect_one`):
 //! - `"/abs/path"` → filesystem socket (unlinked first)
@@ -12,8 +27,11 @@
 //! Both sides always pass a full-`sizeof(sockaddr_un)` addrlen, so abstract
 //! names compare identically padded.
 
+use std::collections::HashMap;
 use std::io;
 use std::os::fd::RawFd;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use gndrm_uapi::wire::{ReqHdr, RespHdr, MAX_FRAME_LEN, REQ_HDR_LEN, RESP_HDR_LEN};
 
@@ -24,6 +42,21 @@ use crate::{close_fd, Device, DispatchResult};
 /// Log sink: `eprintln` adapter on host, `__android_log_write` on Android.
 /// Cold paths only — the per-frame hot path never logs.
 pub type Log<'a> = &'a dyn Fn(&str);
+
+/// A log sink that can be shared with the per-client threads
+/// [`serve_render_listener`] spawns (`Log` borrows, so it cannot cross a
+/// thread boundary on its own).
+pub type SharedLog = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// The dedicated render-node listener name for a card socket `main`.
+///
+/// Both the daemon and `gndrm-shim` derive it the same way, so a render-node
+/// client reaches a listener that serves it as a render node instead of the
+/// card listener's scan-out allocator.
+#[must_use]
+pub fn render_socket_name(main: &str) -> String {
+    format!("{main}-render")
+}
 
 /// Resolve `name` into a bound + listening `SOCK_SEQPACKET` fd.
 ///
@@ -134,6 +167,193 @@ pub fn accept_newest(listener: RawFd) -> io::Result<RawFd> {
     // socket must keep them for the acceptor's own blocking poll/accept.
     unsafe { libc::fcntl(listener, libc::F_SETFL, flags) };
     Ok(newest)
+}
+
+/// Create an `EFD_CLOEXEC` eventfd used to stop a listener loop (see
+/// [`serve_render_listener`]).
+pub fn new_stop_eventfd() -> io::Result<RawFd> {
+    // SAFETY: eventfd takes a count and flags word; it returns a fresh
+    // descriptor this caller owns, or -1 with errno set.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// Wake a loop parked on a stop eventfd created by [`new_stop_eventfd`].
+pub fn signal_stop(stop_fd: RawFd) {
+    let one: u64 = 1;
+    // SAFETY: an 8-byte counter write to an eventfd the caller owns.
+    unsafe { libc::write(stop_fd, (&raw const one).cast(), 8) };
+}
+
+/// The peer process id of a connected Unix socket (`SO_PEERCRED`), or `-1`.
+///
+/// [`serve_render_listener`] uses it to pair each client's RPC and event
+/// connections: they are opened back to back by one process, so they share a
+/// pid and can be paired even if two clients' connects interleave.
+fn peer_pid(fd: RawFd) -> i32 {
+    // SAFETY: getsockopt writes at most sizeof(ucred) into `cred`, whose length
+    // is passed explicitly; a failure leaves the zeroed value (pid 0).
+    unsafe {
+        let mut cred: libc::ucred = core::mem::zeroed();
+        let mut len = core::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        if libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast(),
+            &mut len,
+        ) != 0
+        {
+            return -1;
+        }
+        cred.pid
+    }
+}
+
+/// Serve render-node clients on the dedicated render listener until `stop_fd`
+/// is signalled (or the listener is closed).
+///
+/// Every accepted connection is one half of a client: the shim opens the RPC
+/// channel and then the event channel back to back, so two connections from the
+/// same peer pid form one client. Each pair gets its own [`Device`], built by
+/// `make_device` (a factory so the Android half can inject its presenter and
+/// geometry sink while the host harness and `gndrm-hostd` run the identical
+/// serve loop), and is served on its own thread — a render node has no scan-out
+/// and never touches the presenter.
+///
+/// This is the device-side path `libgamenative_drm.so` runs for Xwayland's
+/// glamor/dri3 open, factored out of the Android glue so the host harness
+/// exercises exactly the same code.
+pub fn serve_render_listener(
+    listener: RawFd,
+    stop_fd: RawFd,
+    make_device: Arc<dyn Fn() -> Device + Send + Sync>,
+    log: SharedLog,
+) {
+    // RPC connections awaiting their event partner, keyed by peer pid.
+    let mut pending: HashMap<i32, RawFd> = HashMap::new();
+    // Live clients (`rpc`, `event`), so teardown can unblock and reap them.
+    let clients: Arc<Mutex<Vec<(RawFd, RawFd)>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
+    let mut next_id = 0usize;
+    loop {
+        let mut pfds = [
+            libc::pollfd {
+                fd: listener,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stop_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: two valid pollfds waited on indefinitely.
+        let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            log(&format!("render listener poll: {e}"));
+            break;
+        }
+        if pfds[1].revents != 0 {
+            log("render listener stopping");
+            break;
+        }
+        if pfds[0].revents == 0 {
+            continue;
+        }
+        let fd = match accept(listener) {
+            Ok(fd) => fd,
+            Err(e) => {
+                log(&format!("render listener accept: {e}"));
+                break;
+            }
+        };
+        let pid = peer_pid(fd);
+        match pending.remove(&pid) {
+            Some(rpc) => {
+                // Second half of this client: its event channel. Serve the pair.
+                log(&format!("render client paired (pid {pid})"));
+                clients
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((rpc, fd));
+                let make_device = Arc::clone(&make_device);
+                let thread_log = Arc::clone(&log);
+                let thread_clients = Arc::clone(&clients);
+                let name = format!("gndrm-rn{next_id}");
+                next_id += 1;
+                let spawned = thread::Builder::new().name(name).spawn(move || {
+                    let mut dev = make_device();
+                    let sink = Arc::clone(&thread_log);
+                    dev.set_logger(Box::new(move |m: &str| sink(m)));
+                    let lend: &dyn Fn(&str) = &*thread_log;
+                    serve(&mut dev, rpc, fd, lend);
+                    // SAFETY: this thread accepted neither fd but is its only
+                    // reader/writer; the acceptor's registry entry is removed
+                    // first so teardown cannot double-shutdown a closed fd.
+                    if let Ok(mut c) = thread_clients.lock() {
+                        c.retain(|(r, e)| !(*r == rpc && *e == fd));
+                    }
+                    unsafe {
+                        libc::close(rpc);
+                        libc::close(fd);
+                    }
+                });
+                match spawned {
+                    Ok(h) => handles.push(h),
+                    Err(e) => {
+                        log(&format!("render client spawn: {e}"));
+                        if let Ok(mut c) = clients.lock() {
+                            c.retain(|(r, ev)| !(*r == rpc && *ev == fd));
+                        }
+                        // SAFETY: nothing else owns these.
+                        unsafe {
+                            libc::shutdown(rpc, libc::SHUT_RDWR);
+                            libc::shutdown(fd, libc::SHUT_RDWR);
+                            libc::close(rpc);
+                            libc::close(fd);
+                        }
+                    }
+                }
+            }
+            None => {
+                // First half of this client: its RPC channel. Until its event
+                // half arrives this descriptor is read by nobody, so a client
+                // whose event connection never follows would block on its first
+                // request with nothing on either side to say why. The line is
+                // the daemon half of that handshake.
+                log(&format!(
+                    "render client rpc accepted (pid {pid}), awaiting event channel"
+                ));
+                pending.insert(pid, fd);
+            }
+        }
+    }
+    // Teardown: unblock every live serve loop, then close the RPC halves whose
+    // event partner never arrived.
+    for (rpc, event) in clients.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        // SAFETY: shutdown only unblocks a recvmsg/poll; the client thread
+        // remains the owner that closes the descriptors.
+        unsafe {
+            libc::shutdown(*rpc, libc::SHUT_RDWR);
+            libc::shutdown(*event, libc::SHUT_RDWR);
+        }
+    }
+    for (_, rpc) in pending.drain() {
+        // SAFETY: the RPC half was accepted here and has no client thread.
+        unsafe { libc::close(rpc) };
+    }
+    for h in handles {
+        let _ = h.join();
+    }
 }
 
 /// Blocking dispatch loop: one frame in → one frame out, plus flip events the
@@ -416,5 +636,122 @@ mod tests {
             libc::close(adopted);
             libc::close(listener);
         }
+    }
+
+    /// Build one request frame (`ReqHdr` + payload) the way the shim does.
+    fn req(ioctl_nr: u32, payload: &[u8], seq: u64) -> Vec<u8> {
+        let hdr = ReqHdr {
+            total_len: (REQ_HDR_LEN + payload.len()) as u32,
+            ioctl_nr,
+            flags: 0,
+            seq,
+        };
+        let mut f = hdr.encode().to_vec();
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// Send one frame and read its response: `(ret, body)`.
+    fn exchange(fd: RawFd, frame: &[u8]) -> (i32, Vec<u8>) {
+        // SAFETY: valid socket and buffer; SOCK_SEQPACKET preserves the frame.
+        let sent = unsafe { libc::send(fd, frame.as_ptr().cast(), frame.len(), 0) };
+        assert_eq!(
+            sent as usize,
+            frame.len(),
+            "send: {}",
+            io::Error::last_os_error()
+        );
+        let mut buf = vec![0u8; MAX_FRAME_LEN];
+        // SAFETY: valid socket and a MAX_FRAME_LEN buffer.
+        let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        assert!(n > 0, "recv: {}", io::Error::last_os_error());
+        let n = n as usize;
+        let hdr = RespHdr::decode(&buf[..n]).expect("response header");
+        (hdr.ret, buf[RESP_HDR_LEN..n].to_vec())
+    }
+
+    /// `serve_render_listener` serves a render-node client the way the device
+    /// daemon serves Xwayland: the RPC/event pair is paired by peer pid, the
+    /// node kind is declared over the wire, GEM_CREATE works and modesetting is
+    /// gated — all through the shared device-side loop.
+    #[test]
+    fn render_listener_serves_a_render_client_end_to_end() {
+        use crate::pod::pod_read;
+        use gndrm_uapi::drm::{
+            DrmGemCreate, DRM_IOCTL_GEM_CREATE, DRM_IOCTL_SET_MASTER, GNDRM_IOCTL_NODE_KIND,
+            NODE_KIND_RENDER,
+        };
+        use gndrm_uapi::wire::errno;
+
+        let name = unique_name();
+        let listener = listen_seqpacket(&name).expect("listen");
+        let stop_fd = new_stop_eventfd().expect("stop eventfd");
+        let log: SharedLog = Arc::new(|_| {});
+        let acceptor = thread::spawn(move || {
+            serve_render_listener(
+                listener,
+                stop_fd,
+                Arc::new(|| {
+                    crate::Device::new(
+                        crate::PanelDesc::default(),
+                        Box::<crate::NullPresenter>::default(),
+                    )
+                }),
+                log,
+            );
+        });
+
+        // One client = an RPC connection then the event connection, from this
+        // process (same peer pid — the pairing key).
+        let rpc = client_connect(&name);
+        let event = client_connect(&name);
+
+        // Declare a render node over the wire.
+        let (ret, _) = exchange(
+            rpc,
+            &req(GNDRM_IOCTL_NODE_KIND, &NODE_KIND_RENDER.to_le_bytes(), 1),
+        );
+        assert_eq!(ret, 0, "NODE_KIND_RENDER must be accepted");
+
+        // GEM_CREATE is render-capable: it succeeds and returns a handle.
+        let mut body = Vec::new();
+        pod_write(
+            &mut body,
+            &DrmGemCreate {
+                size: 4096,
+                handle: 0,
+                flags: 0,
+            },
+        );
+        let (ret, out) = exchange(rpc, &req(DRM_IOCTL_GEM_CREATE, &body, 2));
+        assert_eq!(ret, 0, "GEM_CREATE on a render node");
+        let created: DrmGemCreate = pod_read(&out).expect("GEM_CREATE body");
+        assert!(created.handle > 0, "GEM_CREATE returned a handle");
+
+        // Modesetting is refused on a render node (DRM_RENDER_ALLOW gate).
+        let (ret, _) = exchange(rpc, &req(DRM_IOCTL_SET_MASTER, &[], 3));
+        assert_eq!(
+            ret,
+            -errno::EACCES,
+            "SET_MASTER must be gated on a render node"
+        );
+
+        // SAFETY: both client descriptors were created here and are closed once.
+        unsafe {
+            libc::close(rpc);
+            libc::close(event);
+        }
+
+        // Stop and reap: proves the loop exits cleanly on its stop eventfd.
+        signal_stop(stop_fd);
+        acceptor.join().expect("render acceptor thread");
+    }
+
+    /// The render listener name the shim and the daemon must agree on.
+    #[test]
+    fn render_socket_name_is_the_main_name_plus_render() {
+        assert_eq!(render_socket_name("/tmp/x.sock"), "/tmp/x.sock-render");
+        assert_eq!(render_socket_name("gndrm"), "gndrm-render");
+        assert_eq!(render_socket_name("@gndrm"), "@gndrm-render");
     }
 }
