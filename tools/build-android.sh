@@ -37,10 +37,10 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-args=-Wl,-z,max-pag
 cargo build $PROFILE --target aarch64-linux-android -p gndrm-android
 
 # ICD shim + smoke-test clients (gamescope/android C sources, ported):
-# libadrenotools_icd.so links libwayland-client from the gamescope termux
+# libadrenotools_gamescope.so links libwayland-client from the gamescope termux
 # prefix (build.rs reads GAMESCOPE_TERMUX_PREFIX); the test binaries also
 # link libvulkan from there.
-cargo build $PROFILE --target aarch64-linux-android -p adrenotools_icd -p gn-utils
+cargo build $PROFILE --target aarch64-linux-android -p adrenotools_gamescope -p gn-utils
 
 SO="$ROOT/target/aarch64-linux-android/$DIR/libgamenative_drm.so"
 REL="$ROOT/target/aarch64-linux-android/$DIR"
@@ -56,7 +56,7 @@ SYSROOT="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linu
 BIONIC=("$SYSROOT/libc.so" "$SYSROOT/libdl.so")
 bash "$ROOT/tools/check-elf-deps.sh" "$REL/libgamenative_drm.so" \
     "${BIONIC[@]}" "$SYSROOT/liblog.so" "$SYSROOT/libandroid.so"
-bash "$ROOT/tools/check-elf-deps.sh" "$REL/libadrenotools_icd.so" \
+bash "$ROOT/tools/check-elf-deps.sh" "$REL/libadrenotools_gamescope.so" \
     "${BIONIC[@]}" "$DEPS/lib/libwayland-client.so" \
     "$DEPS/lib/libxcb.so" "$DEPS/lib/libxcb-dri3.so" "$DEPS/lib/libxcb-present.so" \
     "$DEPS/lib/libxcb-sync.so"
@@ -73,7 +73,7 @@ bash "$ROOT/tools/build-xtree-probe.sh"
 
 file "$SO"
 echo "built:  $SO (NDK ${NDK##*/}, API 28)"
-echo "built:  $REL/libadrenotools_icd.so"
+echo "built:  $REL/libadrenotools_gamescope.so"
 echo "built:  $REL/gn-dmabuf-test"
 echo "built:  $REL/gn-wsi-test"
 echo "built:  $REL/gn-xtree-probe"

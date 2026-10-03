@@ -31,8 +31,6 @@
 //! The loader-ICD interface surface is the minimal negotiated-v5 set:
 //! vk_icdNegotiateLoaderICDInterfaceVersion, vk_icdGetInstanceProcAddr,
 //! vk_icdGetPhysicalDeviceProcAddr. Everything else resolves through GIPA.
-//!
-//! Rust port of gamescope/android/icd-shim/adrenotools_icd.c.
 
 #![allow(clippy::missing_safety_doc)]
 // A Vulkan ICD's whole job is punning resolved symbols into typed proc

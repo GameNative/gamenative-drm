@@ -27,10 +27,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-cargo build -p adrenotools_icd --bin icd_probe --quiet
+cargo build -p adrenotools_gamescope --bin icd_probe --quiet
 cargo build -p mock-vkdriver -p mock-adrenotools -p mock-freedreno --quiet
 
-LIB="$ROOT/target/debug/libadrenotools_icd.so"
+LIB="$ROOT/target/debug/libadrenotools_gamescope.so"
 PROBE="$ROOT/target/debug/icd_probe"
 DIR="$ROOT/target/debug"
 [ -f "$LIB" ] || { echo "FAIL: $LIB not built" >&2; exit 1; }

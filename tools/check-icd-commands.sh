@@ -17,15 +17,15 @@
 # `driver_sym(c"…")`, or a `resolve!` literal).
 #
 # Usage:
-#   tools/check-icd-commands.sh [path-to-libadrenotools_icd.so]
+#   tools/check-icd-commands.sh [path-to-libadrenotools_gamescope.so]
 #
-# Default artefact: target/aarch64-linux-android/release/libadrenotools_icd.so.
+# Default artefact: target/aarch64-linux-android/release/libadrenotools_gamescope.so.
 # Exit: 0 = every required command present; 1 = one or more missing.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SO="${1:-$ROOT/target/aarch64-linux-android/release/libadrenotools_icd.so}"
+SO="${1:-$ROOT/target/aarch64-linux-android/release/libadrenotools_gamescope.so}"
 
 if [ ! -f "$SO" ]; then
     echo "FAIL: ICD not found: $SO" >&2

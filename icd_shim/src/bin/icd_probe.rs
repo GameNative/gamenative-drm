@@ -1,6 +1,6 @@
 //! icd_probe — loader-side harness for the adrenotools ICD shim.
 //!
-//! Dlopens a built `libadrenotools_icd.so` exactly like the Khronos loader
+//! Dlopens a built `libadrenotools_gamescope.so` exactly like the Khronos loader
 //! would (negotiated-v5 interface) and drives instance creation end to end.
 //! Every stage prints a `PROBE`-prefixed line; the exit code identifies the
 //! first failing stage so host tests and on-device runs can assert without
@@ -15,7 +15,7 @@
 //!   7  vkCreateInstance failed
 //!   8  vkEnumeratePhysicalDevices failed / zero devices
 //!
-//! Usage: icd_probe [--comm <name>] <path-to-libadrenotools_icd.so>
+//! Usage: icd_probe [--comm <name>] <path-to-libadrenotools_gamescope.so>
 //!
 //! `--comm` renames the calling thread via prctl(PR_SET_NAME) BEFORE the
 //! dlopen, which is what the shim's /proc/self/comm gamescope detection
@@ -24,7 +24,7 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
 
-use adrenotools_icd::vk;
+use adrenotools_gamescope::vk;
 
 type NegotiateFn = unsafe extern "C" fn(*mut u32) -> vk::VkResult;
 

@@ -13,9 +13,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-cargo build -p adrenotools_icd
+cargo build -p adrenotools_gamescope
 
-LIB="$ROOT/target/debug/libadrenotools_icd.so"
+LIB="$ROOT/target/debug/libadrenotools_gamescope.so"
 [ -f "$LIB" ] || { echo "FAIL: $LIB not built" >&2; exit 1; }
 
 fail=0

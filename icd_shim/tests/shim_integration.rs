@@ -26,7 +26,7 @@ fn target_dir() -> PathBuf {
 }
 
 fn shim_so() -> PathBuf {
-    let p = target_dir().join("libadrenotools_icd.so");
+    let p = target_dir().join("libadrenotools_gamescope.so");
     assert!(p.exists(), "shim cdylib not built: {}", p.display());
     p
 }
@@ -100,7 +100,7 @@ fn ensure_fixtures() {
                 "build",
                 "--offline",
                 "-p",
-                "adrenotools_icd",
+                "adrenotools_gamescope",
                 "-p",
                 "mock-vkdriver",
                 "-p",
