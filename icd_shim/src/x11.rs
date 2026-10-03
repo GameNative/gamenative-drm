@@ -1014,4 +1014,121 @@ mod tests {
             xcb_disconnect(conn);
         }
     }
+
+    fn open_fd_count() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("/proc/self/fd")
+            .count()
+    }
+
+    /// The per-frame present path must acquire no descriptor per frame. On the
+    /// X11 route the only fd it ever touches is the slot's dma-buf, duped once
+    /// by `make_pixmap` and consumed by libxcb when the request is sent (the
+    /// C probe `tools/…`/this test's own loop shows the count is flat). This
+    /// drives the same per-frame sequence the worker performs - a pixmap and a
+    /// fence made once per slot, then present + fence poll per frame - and
+    /// asserts the descriptor count does not grow. Skips without DRI3/Present.
+    #[test]
+    fn present_loop_is_fd_neutral() {
+        let conn = unsafe { xcb_connect(ptr::null(), ptr::null_mut()) };
+        if conn.is_null() || unsafe { xcb_connection_has_error(conn) } != 0 {
+            eprintln!("skip: no X server (DISPLAY unreachable)");
+            return;
+        }
+        let Some((root, depth)) = (unsafe { host_root(conn) }) else {
+            eprintln!("skip: no X server (no screen in setup)");
+            unsafe { xcb_disconnect(conn) };
+            return;
+        };
+        let window = unsafe { xcb_generate_id(conn) };
+        unsafe {
+            xcb_create_window(
+                conn,
+                depth,
+                window,
+                root,
+                0,
+                0,
+                64,
+                48,
+                0,
+                WINDOW_CLASS_INPUT_OUTPUT,
+                COPY_FROM_PARENT,
+                0,
+                ptr::null(),
+            );
+            xcb_flush(conn);
+        }
+        let mut present = match unsafe { X11Present::new(window) } {
+            Ok(p) => p,
+            Err(why) => {
+                eprintln!("skip: host X server has no DRI3/Present ({})", why.reason());
+                unsafe {
+                    xcb_destroy_window(conn, window);
+                    xcb_disconnect(conn);
+                }
+                return;
+            }
+        };
+
+        // A slot-backed descriptor stand-in. The server may or may not accept
+        // it as a pixmap; either way the shim's own descriptor accounting is
+        // what is under test, and a refused import is the retried case.
+        let name = c"gn-slot";
+        let slot_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(
+            slot_fd >= 0,
+            "memfd_create: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(unsafe { libc::ftruncate(slot_fd, 64 * 48 * 4) }, 0);
+
+        let mut xpix = 0u32;
+        let mut xfence = 0u32;
+        // Warm up the once-per-slot resources, exactly as the worker does.
+        for _ in 0..2 {
+            if xpix == 0 {
+                if let Some(p) = unsafe { present.make_pixmap(slot_fd, 64, 48, 256, 0) } {
+                    xpix = p;
+                }
+            }
+            if xfence == 0 {
+                if let Some(f) = unsafe { present.make_fence() } {
+                    xfence = f;
+                }
+            }
+        }
+
+        let before = open_fd_count();
+        const N: usize = 1000;
+        for _ in 0..N {
+            if xpix == 0 {
+                if let Some(p) = unsafe { present.make_pixmap(slot_fd, 64, 48, 256, 0) } {
+                    xpix = p;
+                }
+            }
+            if xpix != 0 {
+                let _ = unsafe { present.present(xpix, xfence) };
+            }
+            if xfence != 0 {
+                let _ = unsafe { present.fence_idle(xfence) };
+            }
+        }
+        let after = open_fd_count();
+        eprintln!(
+            "DEBUG present-loop: fds before={before} after={after} N={N} xpix={xpix} xfence={xfence}"
+        );
+        assert!(
+            after <= before + 1,
+            "the present path acquired descriptors per frame: {before} -> {after} over {N} frames"
+        );
+
+        unsafe { libc::close(slot_fd) };
+        drop(present);
+        unsafe {
+            xcb_destroy_window(conn, window);
+            xcb_flush(conn);
+            xcb_disconnect(conn);
+        }
+    }
 }

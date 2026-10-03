@@ -401,16 +401,21 @@ impl ScanoutPool {
     }
 
     /// Record a framebuffer's geometry, so a length-only request for the same
-    /// window size resolves to it. Fed from two places: `publish` (every
-    /// committed framebuffer the presenter sees) and the daemon's `ADDFB2`
-    /// path, which reaches this sooner and for framebuffers that are never
-    /// published as the primary plane.
-    pub(crate) fn note_framebuffer(&mut self, width: u32, height: u32) {
-        self.cache.note_geometry(Geometry {
-            width,
-            height,
-            format: SCANOUT_FORMAT_BGRA_8888,
-        });
+    /// window size resolves to it. `alloc_len` is the backing GEM's real
+    /// allocation length (`st_size`): row-padded and page-rounded, which is the
+    /// length the shim's `DMA_HEAP_IOCTL_ALLOC` request actually carries. Fed
+    /// from the daemon's `ADDFB2` path, which reaches this for every
+    /// registered framebuffer — including those never published as the primary
+    /// plane — and earlier than any commit.
+    pub(crate) fn note_framebuffer(&mut self, width: u32, height: u32, alloc_len: u64) {
+        self.cache.note_geometry(
+            Geometry {
+                width,
+                height,
+                format: SCANOUT_FORMAT_BGRA_8888,
+            },
+            alloc_len,
+        );
     }
 
     /// Put a reused buffer back after its client descriptor could not be
@@ -673,10 +678,11 @@ impl AscState {
         // so a mode-sized scan-out allocation resolves by length even before a
         // framebuffer of that size is committed.
         if panel_w > 0 && panel_h > 0 {
-            state
-                .pool
-                .lock(Role::Commit)
-                .note_framebuffer(panel_w as u32, panel_h as u32);
+            state.pool.lock(Role::Commit).note_framebuffer(
+                panel_w as u32,
+                panel_h as u32,
+                panel_w as u64 * panel_h as u64 * 4,
+            );
         }
         state.republish_last();
         state
@@ -755,10 +761,6 @@ impl AscState {
         // reply behind slow work.
         let (resolved, removed, misses) = {
             let mut pool = self.pool.lock(Role::Commit);
-            // Teach the pool this framebuffer's geometry so a later
-            // length-only scan-out request for the same window size resolves to
-            // it — the window geometries the shim cannot name arrive this way.
-            pool.note_framebuffer(fb.width, fb.height);
             let removed = pool.retire(live_inos, keep);
             // Resolve the buffer this commit publishes. Both lookups copy out
             // the payload, so neither borrow outlives its statement and the

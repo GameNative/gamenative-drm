@@ -25,9 +25,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// Bytes per pixel of the pool's single scan-out format. A scan-out
-/// `DMA_HEAP_IOCTL_ALLOC` length is exactly `width * height * 4`, which is what
-/// makes a bare length resolvable against a known geometry.
+/// Bytes per pixel of the pool's single scan-out format. [`Geometry::alloc_len`]
+/// is the *tight* byte size `width * height * 4`; a real scan-out allocation is
+/// row-padded and longer, so the length index is authoritative only when keyed
+/// on the allocation's own length (the GEM `st_size`, supplied by the `ADDFB2`
+/// feed). This tight size is the fallback for a geometry whose tight size is
+/// already page-aligned (every connector mode).
 const SCANOUT_BPP: u64 = 4;
 
 /// Geometry a pooled buffer can serve. A free buffer only matches a request of
@@ -43,8 +46,10 @@ pub struct Geometry {
 }
 
 impl Geometry {
-    /// The dma-heap allocation length a scan-out buffer of this geometry is
-    /// requested with, for resolving a length-only request.
+    /// The tight byte size of this geometry (`width * height * 4`), used as the
+    /// length key when the pool commits a geometry it owns. A real scan-out
+    /// allocation is row-padded and longer than this; the exact length is
+    /// supplied by the `ADDFB2` feed, which reads it from the GEM's `st_size`.
     #[must_use]
     pub fn alloc_len(self) -> u64 {
         u64::from(self.width) * u64::from(self.height) * SCANOUT_BPP
@@ -187,16 +192,17 @@ impl<T: Copy> ReusePool<T> {
 
     /// Record a geometry a length-only request may be resolved against: a
     /// connector mode the daemon advertises, or a framebuffer geometry the
-    /// client committed. Keyed by length *and* format, so a request is never
-    /// answered with a geometry of a different layout. Where two geometries
-    /// share both, the first note wins.
-    pub fn note_geometry(&mut self, geom: Geometry) {
+    /// client registered. `alloc_len` is the **real** allocation length of a
+    /// buffer of this geometry — the row-padded, page-rounded size the client
+    /// allocated with, which is what a length-only request carries and what the
+    /// `ADDFB2` feed reads from the GEM's `st_size`. Keyed by length *and*
+    /// format, so a request is never answered with a geometry of a different
+    /// layout. Where two geometries share both, the first note wins.
+    pub fn note_geometry(&mut self, geom: Geometry, alloc_len: u64) {
         if geom.width == 0 || geom.height == 0 {
             return;
         }
-        self.by_len
-            .entry((geom.alloc_len(), geom.format))
-            .or_insert(geom);
+        self.by_len.entry((alloc_len, geom.format)).or_insert(geom);
     }
 
     /// Resolve an allocation length and format to a geometry the daemon can
@@ -289,8 +295,10 @@ impl<T: Copy> ReusePool<T> {
             self.reserved = self.reserved.saturating_sub(1);
         }
         // A committed geometry is one the pool can serve again, so a later
-        // length-only request for the same window size resolves to it.
-        self.note_geometry(geom);
+        // length-only request for the same window size resolves to it. The pool
+        // knows only the tight size here; a row-padded allocation's real length
+        // is supplied by the `ADDFB2` feed, which sees the GEM's `st_size`.
+        self.note_geometry(geom, geom.alloc_len());
         self.live
             .insert(
                 ino,
@@ -449,8 +457,8 @@ mod tests {
             format: 0x3432_4258,
         };
         assert_eq!(bgra.alloc_len(), xbgr.alloc_len());
-        pool.note_geometry(bgra);
-        pool.note_geometry(xbgr);
+        pool.note_geometry(bgra, bgra.alloc_len());
+        pool.note_geometry(xbgr, xbgr.alloc_len());
         assert_eq!(pool.resolve_len(bgra.alloc_len(), bgra.format), Some(bgra));
         assert_eq!(pool.resolve_len(xbgr.alloc_len(), xbgr.format), Some(xbgr));
         // An unrelated format at the same length resolves to nothing.
@@ -722,8 +730,8 @@ mod tests {
         // Unknown until the daemon learns it: from a connector mode or from a
         // framebuffer the client commits.
         assert_eq!(pool.resolve_len(window.alloc_len(), window.format), None);
-        pool.note_geometry(mode);
-        pool.note_geometry(window);
+        pool.note_geometry(mode, mode.alloc_len());
+        pool.note_geometry(window, window.alloc_len());
 
         // A bare length now resolves to the exact geometry, and a length-only
         // request behaves exactly like a geometry one.
@@ -743,6 +751,29 @@ mod tests {
             "4096 B is not a frame length"
         );
         assert!(pool.begin_len(4096, 5).is_none());
+    }
+
+    /// A real scan-out allocation is row-padded, so the length a length-only
+    /// request carries is the padded, page-rounded size — never the tight
+    /// `width * height * 4`. The index must be keyed on that real length (what
+    /// the `ADDFB2` feed reads from the GEM's `st_size`), or the layer is
+    /// refused and re-publishes a stale buffer.
+    #[test]
+    fn padded_allocation_length_resolves_to_its_geometry() {
+        let mut pool = ReusePool::<Id>::new(4);
+        // 251x570 with pitch 1024: 1024*570 rounds up to 585728 at a 4096-byte
+        // page, which is neither 251*570*4 (572280) nor page-aligned tight.
+        let g = geom(251, 570);
+        let padded = 585_728u64;
+        assert_ne!(padded, g.alloc_len());
+        assert_eq!(pool.resolve_len(padded, g.format), None);
+        pool.note_geometry(g, padded);
+        assert_eq!(pool.resolve_len(padded, g.format), Some(g));
+        assert_eq!(
+            pool.resolve_len(g.alloc_len(), g.format),
+            None,
+            "the tight length is not what the allocation reported"
+        );
     }
 
     /// A commit teaches the pool its geometry, so a window size first seen as a
@@ -771,7 +802,7 @@ mod tests {
         let mut pool = ReusePool::<Id>::new(CAP);
         let geoms = [geom(1280, 960), geom(960, 600), geom(800, 600)];
         for g in geoms {
-            pool.note_geometry(g);
+            pool.note_geometry(g, g.alloc_len());
         }
 
         let mut next_id: Id = 100;

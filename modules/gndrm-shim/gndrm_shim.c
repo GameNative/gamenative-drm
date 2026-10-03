@@ -29,6 +29,7 @@
  * No glibc-isms; builds with bionic (NDK) and glibc.
  */
 #define _GNU_SOURCE
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -187,15 +188,28 @@ static int g_node_kind = -1; /* the kind this process connected as */
 static uint32_t g_in_fence_prop; /* discovered at init, 0 = unsupported */
 
 /*
- * Pass-throughs use raw syscalls, never dlsym(RTLD_NEXT) pointers: with
- * LD_PRELOAD the shim also captures libc's *own* calls (e.g. the
- * open/close inside __system_properties_init → PropertyInfoAreaFile::
- * LoadPath), which run during libc's constructor — BEFORE any shim init
- * could populate a dlsym-resolved pointer, so the pass-through would call
- * address 0 (observed on-device 2026-09-24: SIGSEGV at pc=0 in
- * PropertyInfoAreaFile::LoadPath, before main()). Syscalls need no libc
- * state and are safe at any init stage. bionic's open/open64 are plain
- * openat(AT_FDCWD, …) wrappers on arm64, so the mapping is exact.
+ * close/ioctl pass through with raw syscalls and must keep doing so: under
+ * LD_PRELOAD this shim also sees libc's *own* early calls (e.g. the
+ * close inside __system_properties_init → PropertyInfoAreaFile::LoadPath),
+ * which run during libc's constructor — BEFORE any shim init could populate
+ * a dlsym-resolved pointer, so such a pointer is address 0 there (observed
+ * on-device 2026-09-24: SIGSEGV at pc=0 in PropertyInfoAreaFile::LoadPath,
+ * before main()). Syscalls need no libc state and are safe at any init
+ * stage. bionic's open/open64 are plain openat(AT_FDCWD, …) wrappers on
+ * arm64, so the fallback mapping is exact.
+ *
+ * The PATH-bearing pass-throughs are the exception: they must NOT go to a
+ * raw syscall. The session also loads a bionic redirect shim (wine's
+ * preload_replace_bionic_wx) that maps wine's baked-in /apex/…/lib/wine and
+ * …/share/wine paths into the shared tree, partly by rewriting the openat
+ * syscall sites inside libc.so IN PLACE. A shim that defines open/open64/
+ * openat and sends non-matching paths straight to syscall(SYS_openat, …)
+ * bypasses those patched sites, so the redirect never runs and wine cannot
+ * load its NLS/DLL payload (measured on-device: wineserver "failed to load
+ * l_intl.nls", then the server dies). So the non-DRM pass-throughs chain to
+ * the NEXT open/open64/openat, resolved lazily on first use (well past
+ * libc's constructor), with a raw-syscall fallback if the symbol cannot be
+ * resolved or is not yet available.
  */
 
 #define LOG(...)                       \
@@ -804,6 +818,44 @@ static int node_kind_for_path(const char *path)
     return is_drm_render_path(path) ? GNDRM_NODE_KIND_RENDER : GNDRM_NODE_KIND_CARD;
 }
 
+/*
+ * Lazily-resolved next implementations for the non-DRM pass-throughs, so a
+ * path open reaches the redirect shim (or libc) loaded after us instead of a
+ * raw syscall site the redirect cannot see. Resolved on first use; falls back
+ * to the raw syscall while unresolved. See the note above. The /dev/dri
+ * interception path below does not use these.
+ */
+static int (*g_next_open)(const char *path, int flags, ...);
+static int (*g_next_open64)(const char *path, int flags, ...);
+static int (*g_next_openat)(int dirfd, const char *path, int flags, ...);
+
+static int pass_open(const char *path, int flags, mode_t mode)
+{
+    if (!g_next_open)
+        g_next_open = (int (*)(const char *, int, ...))dlsym(RTLD_NEXT, "open");
+    if (g_next_open)
+        return g_next_open(path, flags, mode);
+    return (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
+}
+
+static int pass_open64(const char *path, int flags, mode_t mode)
+{
+    if (!g_next_open64)
+        g_next_open64 = (int (*)(const char *, int, ...))dlsym(RTLD_NEXT, "open64");
+    if (g_next_open64)
+        return g_next_open64(path, flags, mode);
+    return (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
+}
+
+static int pass_openat(int dirfd, const char *path, int flags, mode_t mode)
+{
+    if (!g_next_openat)
+        g_next_openat = (int (*)(int, const char *, int, ...))dlsym(RTLD_NEXT, "openat");
+    if (g_next_openat)
+        return g_next_openat(dirfd, path, flags, mode);
+    return (int)syscall(SYS_openat, dirfd, path, flags, mode);
+}
+
 int open(const char *path, int flags, ...)
 {
     mode_t mode = 0;
@@ -815,7 +867,7 @@ int open(const char *path, int flags, ...)
     }
     if (should_intercept(path))
         return open_common(node_kind_for_path(path));
-    return syscall(SYS_openat, AT_FDCWD, path, flags, mode);
+    return pass_open(path, flags, mode);
 }
 
 int open64(const char *path, int flags, ...)
@@ -829,7 +881,7 @@ int open64(const char *path, int flags, ...)
     }
     if (should_intercept(path))
         return open_common(node_kind_for_path(path));
-    return syscall(SYS_openat, AT_FDCWD, path, flags, mode);
+    return pass_open64(path, flags, mode);
 }
 
 int openat(int dirfd, const char *path, int flags, ...)
@@ -843,7 +895,7 @@ int openat(int dirfd, const char *path, int flags, ...)
     }
     if (should_intercept(path))
         return open_common(node_kind_for_path(path));
-    return syscall(SYS_openat, dirfd, path, flags, mode);
+    return pass_openat(dirfd, path, flags, mode);
 }
 
 int close(int fd)

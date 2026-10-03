@@ -947,11 +947,37 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     for inited in 0..n_slots as usize {
         let res = unsafe { slot_init(scp, sc.slots.as_mut_ptr().add(inited)) };
         if res != VK_SUCCESS {
-            for j in (0..inited).rev() {
+            // `inited` is the slot that just failed; release it too, or its
+            // dma-buf fd, image and memory (allocated before the failing step)
+            // leak with the swapchain that is being abandoned.
+            for j in (0..=inited).rev() {
                 unsafe { slot_release(scp, sc.slots.as_mut_ptr().add(j)) };
             }
             crate::logf!("proxy: slot init failed: {res}");
             return res;
+        }
+    }
+    // What the guest was told the surface can be, next to what the slot images
+    // actually are. One line, once: a disagreement here names a guest that
+    // sized its viewport to a different image than the shim renders into.
+    if !CAPS_COMPARE_LOGGED.swap(true, Ordering::Relaxed) {
+        if let Ok(adv) = ADVERTISED_CAPS.lock() {
+            if let Some(a) = *adv {
+                let stride = sc.slots.first().map_or(0, |s| s.stride);
+                crate::routef!(
+                    "x11 caps vs slot: advertised current={}x{} min={}x{} max={}x{} -> image {}x{} stride={} slots={}",
+                    a.current.0,
+                    a.current.1,
+                    a.min.0,
+                    a.min.1,
+                    a.max.0,
+                    a.max.1,
+                    ci.imageExtent.width,
+                    ci.imageExtent.height,
+                    stride,
+                    sc.slots.len()
+                );
+            }
         }
     }
     let sc_addr = scp as usize;
@@ -1682,7 +1708,9 @@ const LOG_IMAGE_FIRST_N: usize = 48;
 // flip the image, yet a quad under a flipped viewport is not culled. DXVK
 // renders D3D content with a flipped viewport, so its culling is inverted
 // relative to what it asks for. Compensate by flipping frontFace on pipelines
-// that cull. GN_VKSHIM_FLIP_FRONT_FACE=1 enables it.
+// that cull. This is unconditional: every client this shim fronts reaches the
+// driver through the same flipped-viewport D3D path, and the compensated
+// winding is the shim's one behaviour (no env gate).
 unsafe extern "C" fn gn_vkCreateGraphicsPipelines(
     device: VkDevice,
     cache: VkPipelineCache,
@@ -1697,7 +1725,7 @@ unsafe extern "C" fn gn_vkCreateGraphicsPipelines(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let real = unsafe { (*gd).f.create_pipelines.unwrap() };
-    if std::env::var_os("GN_VKSHIM_FLIP_FRONT_FACE").is_none() || cis.is_null() {
+    if cis.is_null() {
         return unsafe { real((*gd).real, cache, count, cis, alloc, out) };
     }
     // Copy the create infos and the rasterization state we need to change:
@@ -1873,14 +1901,26 @@ fn slot_note(s: Option<(*mut GnSwapchain, usize)>) -> String {
     }
 }
 
-/// Extent of the first copy region (does the transfer cover the frame or a
-/// sub-rectangle?).
+/// A transfer region's extent, as a log field.
+fn extent_note(e: VkExtent3D) -> String {
+    format!("r0={}x{}", e.width, e.height)
+}
+
+/// Extent of the first copy region of a v1 `VkImageCopy` array (does the
+/// transfer cover the frame or a sub-rectangle?).
 fn copy_extent(n: u32, regions: *const VkImageCopy) -> String {
     if n == 0 || regions.is_null() {
         return String::new();
     }
-    let e = unsafe { (*regions).extent };
-    format!("r0={}x{}", e.width, e.height)
+    extent_note(unsafe { (*regions).extent })
+}
+
+/// Extent of the first copy region of a v2 `VkImageCopy2` array.
+fn copy_extent2(n: u32, regions: *const VkImageCopy2) -> String {
+    if n == 0 || regions.is_null() {
+        return String::new();
+    }
+    extent_note(unsafe { (*regions).extent })
 }
 
 /// Extent of the first blit region's destination.
@@ -1981,6 +2021,259 @@ unsafe extern "C" fn gn_vkCreateFramebuffer(
     res
 }
 
+// ---- viewport / scissor trace (bounded one-shot, always on) --------------
+// The drawn geometry never lands while clears and copies do; a viewport whose
+// extent is zero, or whose rect lies outside the swapchain image, clips every
+// draw while leaving a loadOp clear intact. Log the first non-empty values and
+// any change thereafter, bounded, with the running call count. Always on
+// (routef!), silent once the budget is spent.
+const VS_LOG_N: usize = 6;
+static VP_CALLS: AtomicUsize = AtomicUsize::new(0);
+static VP_LOGGED: AtomicUsize = AtomicUsize::new(0);
+static VP_LAST: Mutex<Option<[u32; 6]>> = Mutex::new(None);
+static SC_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SC_LOGGED: AtomicUsize = AtomicUsize::new(0);
+static SC_LAST: Mutex<Option<[i32; 4]>> = Mutex::new(None);
+
+fn trace_viewports(name: &str, count: u32, vps: *const VkViewport) {
+    let n = VP_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count == 0 || vps.is_null() {
+        return;
+    }
+    let v = unsafe { &*vps };
+    let key = [
+        v.x.to_bits(),
+        v.y.to_bits(),
+        v.width.to_bits(),
+        v.height.to_bits(),
+        v.minDepth.to_bits(),
+        v.maxDepth.to_bits(),
+    ];
+    let Ok(mut last) = VP_LAST.lock() else {
+        return;
+    };
+    if last.as_ref() == Some(&key) || VP_LOGGED.load(Ordering::Relaxed) >= VS_LOG_N {
+        return;
+    }
+    *last = Some(key);
+    VP_LOGGED.fetch_add(1, Ordering::Relaxed);
+    crate::routef!(
+        "x11 {name}: call={n} count={count} vp0 x={} y={} w={} h={} depth={}..{}",
+        v.x,
+        v.y,
+        v.width,
+        v.height,
+        v.minDepth,
+        v.maxDepth
+    );
+}
+
+fn trace_scissors(name: &str, count: u32, rects: *const VkRect2D) {
+    let n = SC_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count == 0 || rects.is_null() {
+        return;
+    }
+    let r = unsafe { &*rects };
+    let key = [
+        r.offset.x,
+        r.offset.y,
+        r.extent.width as i32,
+        r.extent.height as i32,
+    ];
+    let Ok(mut last) = SC_LAST.lock() else {
+        return;
+    };
+    if last.as_ref() == Some(&key) || SC_LOGGED.load(Ordering::Relaxed) >= VS_LOG_N {
+        return;
+    }
+    *last = Some(key);
+    SC_LOGGED.fetch_add(1, Ordering::Relaxed);
+    crate::routef!(
+        "x11 {name}: call={n} count={count} sc0 off=({},{}) ext={}x{}",
+        r.offset.x,
+        r.offset.y,
+        r.extent.width,
+        r.extent.height
+    );
+}
+
+unsafe extern "C" fn gn_vkCmdSetViewport(
+    cmd: VkCommandBuffer,
+    first: u32,
+    count: u32,
+    vps: *const VkViewport,
+) {
+    trace_seen("vkCmdSetViewport");
+    trace_viewports("vkCmdSetViewport", count, vps);
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    call_cmd!(gd, cmd_set_viewport, "vkCmdSetViewport", |f| f(
+        rcmd, first, count, vps
+    ));
+}
+
+unsafe extern "C" fn gn_vkCmdSetViewportWithCount(
+    cmd: VkCommandBuffer,
+    count: u32,
+    vps: *const VkViewport,
+) {
+    trace_seen("vkCmdSetViewportWithCount");
+    trace_viewports("vkCmdSetViewportWithCount", count, vps);
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    call_cmd!(
+        gd,
+        cmd_set_viewport_with_count,
+        "vkCmdSetViewportWithCount",
+        |f| f(rcmd, count, vps)
+    );
+}
+
+unsafe extern "C" fn gn_vkCmdSetScissor(
+    cmd: VkCommandBuffer,
+    first: u32,
+    count: u32,
+    rects: *const VkRect2D,
+) {
+    trace_seen("vkCmdSetScissor");
+    trace_scissors("vkCmdSetScissor", count, rects);
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    call_cmd!(gd, cmd_set_scissor, "vkCmdSetScissor", |f| f(
+        rcmd, first, count, rects
+    ));
+}
+
+unsafe extern "C" fn gn_vkCmdSetScissorWithCount(
+    cmd: VkCommandBuffer,
+    count: u32,
+    rects: *const VkRect2D,
+) {
+    trace_seen("vkCmdSetScissorWithCount");
+    trace_scissors("vkCmdSetScissorWithCount", count, rects);
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    call_cmd!(
+        gd,
+        cmd_set_scissor_with_count,
+        "vkCmdSetScissorWithCount",
+        |f| f(rcmd, count, rects)
+    );
+}
+
+// ---- render-pass load/store capture (bounded, always on) -----------------
+// vkCmdBeginRenderPass names a VkRenderPass; its attachments' loadOp/storeOp
+// live in the render pass object, not the begin info. Record each render pass's
+// subpass-0 colour attachment ops so the begin trace can name them (a
+// storeOp=DONT_CARE discards draws while a loadOp clear still shows).
+/// Subpass-0 colour (loadOp, storeOp) pairs of one render pass.
+type RenderPassOps = Vec<(i32, i32)>;
+/// Render pass handle -> its subpass-0 colour (loadOp, storeOp) pairs.
+type RenderPassOpsMap = HashMap<u64, RenderPassOps>;
+static RP_OPS: Mutex<Option<RenderPassOpsMap>> = Mutex::new(None);
+
+/// Subpass-0 colour attachment (loadOp, storeOp) pairs. `u32::MAX` is
+/// VK_ATTACHMENT_UNUSED; the pair `(-1, -1)` marks one.
+unsafe fn render_pass_ops(ci: &VkRenderPassCreateInfo) -> RenderPassOps {
+    let mut out = Vec::new();
+    if ci.subpassCount == 0 || ci.pSubpasses.is_null() {
+        return out;
+    }
+    let sp = unsafe { &*ci.pSubpasses };
+    let n = sp.colorAttachmentCount as usize;
+    for k in 0..n {
+        if sp.pColorAttachments.is_null() {
+            break;
+        }
+        let r = unsafe { &*sp.pColorAttachments.add(k) };
+        if r.attachment == u32::MAX || r.attachment as usize >= ci.attachmentCount as usize {
+            out.push((-1, -1));
+            continue;
+        }
+        let a = unsafe { &*ci.pAttachments.add(r.attachment as usize) };
+        out.push((a.loadOp, a.storeOp));
+    }
+    out
+}
+
+/// The subpass-0 colour (loadOp, storeOp) pairs of a render pass the shim
+/// recorded, as a log field; `?` when it was never created through the shim.
+fn rp_ops_note(rp: u64) -> String {
+    let ops = RP_OPS
+        .lock()
+        .ok()
+        .and_then(|m| m.as_ref().and_then(|m| m.get(&rp).cloned()));
+    match ops {
+        Some(v) if !v.is_empty() => v
+            .iter()
+            .map(|(l, s)| format!("{l}/{s}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        _ => "?".into(),
+    }
+}
+
+unsafe extern "C" fn gn_vkCreateRenderPass(
+    device: VkDevice,
+    ci: *const VkRenderPassCreateInfo,
+    alloc: *const VkAllocationCallbacks,
+    out: *mut u64,
+) -> VkResult {
+    let gd = unsafe { find_device(device) };
+    let f = unsafe { gd.as_ref() }.and_then(|d| d.f.create_render_pass);
+    let f = match f {
+        Some(f) => Some(f),
+        None if gd.is_null() => unsafe { driver_sym(c"vkCreateRenderPass".as_ptr()) }
+            .map(|p| unsafe { std::mem::transmute(p) }),
+        None => None,
+    };
+    let Some(f) = f else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    let real_dev = if gd.is_null() {
+        device
+    } else {
+        unsafe { (*gd).real }
+    };
+    let res = unsafe { f(real_dev, ci, alloc, out) };
+    if res == VK_SUCCESS && !ci.is_null() {
+        let ops = unsafe { render_pass_ops(&*ci) };
+        if let Ok(mut m) = RP_OPS.lock() {
+            let m = m.get_or_insert_with(HashMap::new);
+            if m.len() < 4096 {
+                m.insert(unsafe { *out }, ops);
+            }
+        }
+    }
+    res
+}
+
+/// vkCreateSamplerYcbcrConversion is a device-level command whose handle the
+/// shim wraps. Intercepted so it is never handed to the guest as the driver's
+/// raw entry point: called with a shim device wrapper, Turnip's own
+/// implementation faults on the wrapper (gamescope resolves this at Vulkan
+/// device init, before any window exists). Forward with the real device.
+unsafe extern "C" fn gn_vkCreateSamplerYcbcrConversion(
+    device: VkDevice,
+    ci: *const c_void,
+    alloc: *const VkAllocationCallbacks,
+    out: *mut VkSamplerYcbcrConversion,
+) -> VkResult {
+    let gd = unsafe { find_device(device) };
+    let f = unsafe { gd.as_ref() }.and_then(|d| d.f.create_sampler_ycbcr_conversion);
+    let f = match f {
+        Some(f) => Some(f),
+        None if gd.is_null() => unsafe { driver_sym(c"vkCreateSamplerYcbcrConversion".as_ptr()) }
+            .map(|p| unsafe { std::mem::transmute(p) }),
+        None => None,
+    };
+    let Some(f) = f else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    let real_dev = if gd.is_null() {
+        device
+    } else {
+        unsafe { (*gd).real }
+    };
+    unsafe { f(real_dev, ci, alloc, out) }
+}
+
 /// Resolve a framebuffer handle to the swapchain slots its attachments use.
 unsafe fn fb_slots(gd: *mut GnDevice, fb: u64) -> Vec<usize> {
     let mut out = Vec::new();
@@ -2041,8 +2334,8 @@ unsafe extern "C" fn gn_vkCmdBeginRendering(cmd: VkCommandBuffer, info: *const V
                 };
                 let c = a.clearValue.float32;
                 parts.push(format!(
-                    "a{k}[{note} layout={} load={} clear=({},{},{},{})]",
-                    a.imageLayout, a.loadOp, c[0], c[1], c[2], c[3]
+                    "a{k}[{note} layout={} load={} store={} clear=({},{},{},{})]",
+                    a.imageLayout, a.loadOp, a.storeOp, c[0], c[1], c[2], c[3]
                 ));
             }
             crate::routef!(
@@ -2077,7 +2370,7 @@ unsafe extern "C" fn gn_vkCmdBeginRenderPass2(
                 [0f32; 4]
             };
             crate::routef!(
-                "x11 rpb2 {n}: {}x{} off=({},{}) fb={:#x} rp={:#x} clears={} clear0=({},{},{},{}) slots={slots:?}",
+                "x11 rpb2 {n}: {}x{} off=({},{}) fb={:#x} rp={:#x} clears={} clear0=({},{},{},{}) rpOps={} slots={slots:?}",
                 bi.renderArea.extent.width,
                 bi.renderArea.extent.height,
                 bi.renderArea.offset.x,
@@ -2085,7 +2378,8 @@ unsafe extern "C" fn gn_vkCmdBeginRenderPass2(
                 bi.framebuffer as usize,
                 bi.renderPass as usize,
                 bi.clearValueCount,
-                c[0], c[1], c[2], c[3]
+                c[0], c[1], c[2], c[3],
+                rp_ops_note(bi.renderPass)
             );
         }
     }
@@ -2112,7 +2406,7 @@ unsafe extern "C" fn gn_vkCmdBeginRenderPass(
             };
             let slots = unsafe { fb_slots(gd, bi.framebuffer) };
             crate::routef!(
-                "x11 rpb {n}: {}x{} off=({},{}) fb={:#x} rp={:#x} clears={} clear0=({},{},{},{}) contents={contents} slots={slots:?}",
+                "x11 rpb {n}: {}x{} off=({},{}) fb={:#x} rp={:#x} clears={} clear0=({},{},{},{}) contents={contents} rpOps={} slots={slots:?}",
                 bi.renderArea.extent.width,
                 bi.renderArea.extent.height,
                 bi.renderArea.offset.x,
@@ -2120,7 +2414,8 @@ unsafe extern "C" fn gn_vkCmdBeginRenderPass(
                 bi.framebuffer as usize,
                 bi.renderPass as usize,
                 bi.clearValueCount,
-                c[0], c[1], c[2], c[3]
+                c[0], c[1], c[2], c[3],
+                rp_ops_note(bi.renderPass)
             );
         }
     }
@@ -2239,7 +2534,7 @@ unsafe extern "C" fn gn_vkCmdCopyImage2(cmd: VkCommandBuffer, info: *const VkCop
                     ci.srcImageLayout,
                     ci.dstImageLayout,
                     ci.regionCount,
-                    copy_extent(ci.regionCount, ci.pRegions)
+                    copy_extent2(ci.regionCount, ci.pRegions)
                 ),
             );
         }
@@ -2941,6 +3236,80 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ) -> VkResult,
         )
     }),
+    // Dynamic-state trace: the viewport/scissor the guest sets (core 1.0 and
+    // the 1.3/EXT WithCount forms), and the render pass whose load/store ops
+    // the begin-render-pass trace names.
+    (c"vkCmdSetViewport", unsafe {
+        std::mem::transmute(
+            gn_vkCmdSetViewport
+                as unsafe extern "C" fn(VkCommandBuffer, u32, u32, *const VkViewport),
+        )
+    }),
+    (c"vkCmdSetViewportWithCount", unsafe {
+        std::mem::transmute(
+            gn_vkCmdSetViewportWithCount
+                as unsafe extern "C" fn(VkCommandBuffer, u32, *const VkViewport),
+        )
+    }),
+    (c"vkCmdSetViewportWithCountEXT", unsafe {
+        std::mem::transmute(
+            gn_vkCmdSetViewportWithCount
+                as unsafe extern "C" fn(VkCommandBuffer, u32, *const VkViewport),
+        )
+    }),
+    (c"vkCmdSetScissor", unsafe {
+        std::mem::transmute(
+            gn_vkCmdSetScissor as unsafe extern "C" fn(VkCommandBuffer, u32, u32, *const VkRect2D),
+        )
+    }),
+    (c"vkCmdSetScissorWithCount", unsafe {
+        std::mem::transmute(
+            gn_vkCmdSetScissorWithCount
+                as unsafe extern "C" fn(VkCommandBuffer, u32, *const VkRect2D),
+        )
+    }),
+    (c"vkCmdSetScissorWithCountEXT", unsafe {
+        std::mem::transmute(
+            gn_vkCmdSetScissorWithCount
+                as unsafe extern "C" fn(VkCommandBuffer, u32, *const VkRect2D),
+        )
+    }),
+    (c"vkCreateRenderPass", unsafe {
+        std::mem::transmute(
+            gn_vkCreateRenderPass
+                as unsafe extern "C" fn(
+                    VkDevice,
+                    *const VkRenderPassCreateInfo,
+                    *const VkAllocationCallbacks,
+                    *mut u64,
+                ) -> VkResult,
+        )
+    }),
+    // A wrapped-handle device command: intercepted so the guest never reaches
+    // the driver's raw entry point with a shim device wrapper (gamescope
+    // resolves this at Vulkan device init, before any window exists).
+    (c"vkCreateSamplerYcbcrConversion", unsafe {
+        std::mem::transmute(
+            gn_vkCreateSamplerYcbcrConversion
+                as unsafe extern "C" fn(
+                    VkDevice,
+                    *const c_void,
+                    *const VkAllocationCallbacks,
+                    *mut VkSamplerYcbcrConversion,
+                ) -> VkResult,
+        )
+    }),
+    (c"vkCreateSamplerYcbcrConversionKHR", unsafe {
+        std::mem::transmute(
+            gn_vkCreateSamplerYcbcrConversion
+                as unsafe extern "C" fn(
+                    VkDevice,
+                    *const c_void,
+                    *const VkAllocationCallbacks,
+                    *mut VkSamplerYcbcrConversion,
+                ) -> VkResult,
+        )
+    }),
 ];
 
 /// Interception table: the instance table is consulted for GIPA and GPDPA
@@ -3005,6 +3374,48 @@ unsafe extern "C" fn gn_vkGetDeviceProcAddr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The device-level commands whose handles the shim wraps must stay in the
+    /// interception table: resolving one of these through `device_func` is what
+    /// keeps the guest from being handed the driver's raw entry point (see the
+    /// `gn_vkCreateSamplerYcbcrConversion` note). This is the class of command
+    /// the gamescope-at-device-init crash regressed on.
+    #[test]
+    fn required_device_commands_are_intercepted() {
+        let required: [&CStr; 13] = [
+            c"vkCreateSamplerYcbcrConversion",
+            c"vkCreateSamplerYcbcrConversionKHR",
+            c"vkCmdSetViewport",
+            c"vkCmdSetViewportWithCount",
+            c"vkCmdSetViewportWithCountEXT",
+            c"vkCmdSetScissor",
+            c"vkCmdSetScissorWithCount",
+            c"vkCmdSetScissorWithCountEXT",
+            c"vkCreateRenderPass",
+            c"vkQueueSubmit",
+            c"vkQueueSubmit2",
+            c"vkQueuePresentKHR",
+            c"vkCreateSwapchainKHR",
+        ];
+        for name in required {
+            assert!(
+                device_func(name).is_some(),
+                "device_func({}) is empty: the shim no longer intercepts it",
+                name.to_str().unwrap()
+            );
+        }
+    }
+
+    /// The command table is a static slice, so it has no capacity to overflow or
+    /// displace an entry: adding a name can only add. Assert the two commands the
+    /// regression lost and gained are both present, and that the slice carries
+    /// exactly the number of entries the table declares.
+    #[test]
+    fn command_table_is_unbounded() {
+        assert!(device_func(c"vkCreateSamplerYcbcrConversion").is_some());
+        assert!(instance_func(c"vkGetDeviceProcAddr").is_some());
+        assert!(G_DEV_FUNCS.len() >= 46);
+    }
 
     /// The two layouts the proxy knows must map to the DRM fourcc of their
     /// memory order: BGRA memory is ARGB8888, RGBA memory is ABGR8888. The
@@ -3244,6 +3655,17 @@ pub struct RealDevFns {
     pub cmd_begin_rendering: Option<PFN_vkCmdBeginRendering>,
     pub create_image_view: Option<PFN_vkCreateImageView>,
     pub create_framebuffer: Option<PFN_vkCreateFramebuffer>,
+    // Dynamic-state trace: the viewport/scissor the guest sets (bounded
+    // one-shot), plus the render pass created ahead of vkCmdBeginRenderPass so
+    // the attachment loadOp/storeOp can be named.
+    pub cmd_set_viewport: Option<PFN_vkCmdSetViewport>,
+    pub cmd_set_viewport_with_count: Option<PFN_vkCmdSetViewportWithCount>,
+    pub cmd_set_scissor: Option<PFN_vkCmdSetScissor>,
+    pub cmd_set_scissor_with_count: Option<PFN_vkCmdSetScissorWithCount>,
+    pub create_render_pass: Option<PFN_vkCreateRenderPass>,
+    // Device-level command whose handle the shim wraps: resolved so the shim can
+    // forward with the real device instead of letting the guest reach Turnip raw.
+    pub create_sampler_ycbcr_conversion: Option<PFN_vkCreateSamplerYcbcrConversion>,
 }
 
 pub struct GnInstance {
@@ -4423,6 +4845,18 @@ unsafe extern "C" fn gn_vkDestroySurfaceKHR(
 // loader-wrapped surface objects their VK_EXT_headless_surface path never
 // produces (the ICD-level mesa surface's first word is its object-type
 // enum, not a dispatch table).
+// The advertised surface capabilities (the first query's answer), kept so the
+// swapchain slot images the shim creates can be compared against the dimensions
+// the guest was told. One line, once, at the first swapchain creation.
+#[derive(Clone, Copy)]
+struct AdvertisedCaps {
+    current: (u32, u32),
+    min: (u32, u32),
+    max: (u32, u32),
+}
+static ADVERTISED_CAPS: Mutex<Option<AdvertisedCaps>> = Mutex::new(None);
+static CAPS_COMPARE_LOGGED: AtomicBool = AtomicBool::new(false);
+
 unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     _pd: VkPhysicalDevice,
     surface: VkSurfaceKHR,
@@ -4432,58 +4866,66 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
         crate::logf!("proxy surface caps query: {surface:#x} not one of ours");
         return VK_ERROR_SURFACE_LOST_KHR;
     }
-    unsafe {
-        *caps = VkSurfaceCapabilitiesKHR {
-            minImageCount: 2,
-            maxImageCount: max_swapchain_images(),
-            currentExtent: VkExtent2D {
-                width: u32::MAX,
-                height: u32::MAX,
-            }, // wayland: app picks
-            minImageExtent: VkExtent2D {
-                width: 1,
-                height: 1,
-            },
-            maxImageExtent: VkExtent2D {
-                width: 8192,
-                height: 8192,
-            },
-            maxImageArrayLayers: 1,
-            supportedTransforms: VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
-            currentTransform: VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
-            // The same set Mesa/turnip's WSI advertises on the X11 arm. There is
-            // no delegate surface to forward from: the proxy owns the wayland
-            // presentation contract and the driver exports no WSI entry points
-            // (see the xlib-surface and present-modes notes above), and
-            // `RealDevFns` carries no surface-capability query. Advertising
-            // OPAQUE alone let DXVK force every present opaque, which covered
-            // the window's own GDI surface. INHERIT is the honest default for a
-            // compositor-managed surface; the pre/post forms let a guest pick
-            // its own blending.
-            supportedCompositeAlpha: VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR
-                | VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR
-                | VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR
-                | VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-            // Exactly what the pool's AHardwareBuffer backs, no more. The pool
-            // allocates GPU_SAMPLED_IMAGE | GPU_COLOR_OUTPUT | COMPOSER_OVERLAY
-            // | CPU_READ_OFTEN and the guest renders straight into it, so
-            // SAMPLED_BIT comes with the first flag and COLOR_ATTACHMENT_BIT
-            // with the second. The transfer bits are on every image the proxy
-            // creates (`GnSwapchain::usage`) and the WSI smoke client actually
-            // exercises them: its present readback copies a swapchain image to
-            // host memory (TRANSFER_SRC) and its clear scene clears one in
-            // TRANSFER_DST_OPTIMAL (TRANSFER_DST). COMPOSER_OVERLAY and
-            // CPU_READ_OFTEN are SurfaceFlinger/host usages with no Vulkan
-            // equivalent. No STORAGE_BIT: an AHardwareBuffer grants that only
-            // through AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER, which this pool
-            // does not set, so advertising it would promise a capability the
-            // scan-out buffer cannot back.
-            supportedUsageFlags: VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-                | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                | VK_IMAGE_USAGE_SAMPLED_BIT,
-        };
+    let out = VkSurfaceCapabilitiesKHR {
+        minImageCount: 2,
+        maxImageCount: max_swapchain_images(),
+        currentExtent: VkExtent2D {
+            width: u32::MAX,
+            height: u32::MAX,
+        }, // wayland: app picks
+        minImageExtent: VkExtent2D {
+            width: 1,
+            height: 1,
+        },
+        maxImageExtent: VkExtent2D {
+            width: 8192,
+            height: 8192,
+        },
+        maxImageArrayLayers: 1,
+        supportedTransforms: VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+        currentTransform: VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+        // The same set Mesa/turnip's WSI advertises on the X11 arm. There is
+        // no delegate surface to forward from: the proxy owns the wayland
+        // presentation contract and the driver exports no WSI entry points
+        // (see the xlib-surface and present-modes notes above), and
+        // `RealDevFns` carries no surface-capability query. Advertising
+        // OPAQUE alone let DXVK force every present opaque, which covered
+        // the window's own GDI surface. INHERIT is the honest default for a
+        // compositor-managed surface; the pre/post forms let a guest pick
+        // its own blending.
+        supportedCompositeAlpha: VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR
+            | VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR
+            | VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR
+            | VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+        // Exactly what the pool's AHardwareBuffer backs, no more. The pool
+        // allocates GPU_SAMPLED_IMAGE | GPU_COLOR_OUTPUT | COMPOSER_OVERLAY
+        // | CPU_READ_OFTEN and the guest renders straight into it, so
+        // SAMPLED_BIT comes with the first flag and COLOR_ATTACHMENT_BIT
+        // with the second. The transfer bits are on every image the proxy
+        // creates (`GnSwapchain::usage`) and the WSI smoke client actually
+        // exercises them: its present readback copies a swapchain image to
+        // host memory (TRANSFER_SRC) and its clear scene clears one in
+        // TRANSFER_DST_OPTIMAL (TRANSFER_DST). COMPOSER_OVERLAY and
+        // CPU_READ_OFTEN are SurfaceFlinger/host usages with no Vulkan
+        // equivalent. No STORAGE_BIT: an AHardwareBuffer grants that only
+        // through AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER, which this pool
+        // does not set, so advertising it would promise a capability the
+        // scan-out buffer cannot back.
+        supportedUsageFlags: VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+            | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+            | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+            | VK_IMAGE_USAGE_SAMPLED_BIT,
+    };
+    if let Ok(mut a) = ADVERTISED_CAPS.lock() {
+        if a.is_none() {
+            *a = Some(AdvertisedCaps {
+                current: (out.currentExtent.width, out.currentExtent.height),
+                min: (out.minImageExtent.width, out.minImageExtent.height),
+                max: (out.maxImageExtent.width, out.maxImageExtent.height),
+            });
+        }
     }
+    unsafe { *caps = out };
     VK_SUCCESS
 }
 
@@ -4786,6 +5228,15 @@ unsafe extern "C" fn gn_vkCreateDevice(
     resolve!(cmd_begin_rendering, "vkCmdBeginRendering");
     resolve!(create_image_view, "vkCreateImageView");
     resolve!(create_framebuffer, "vkCreateFramebuffer");
+    resolve!(cmd_set_viewport, "vkCmdSetViewport");
+    resolve!(cmd_set_viewport_with_count, "vkCmdSetViewportWithCount");
+    resolve!(cmd_set_scissor, "vkCmdSetScissor");
+    resolve!(cmd_set_scissor_with_count, "vkCmdSetScissorWithCount");
+    resolve!(create_render_pass, "vkCreateRenderPass");
+    resolve!(
+        create_sampler_ycbcr_conversion,
+        "vkCreateSamplerYcbcrConversion"
+    );
     let qf = if ci.pQueueCreateInfos.is_null() {
         0
     } else {
@@ -4951,6 +5402,26 @@ fn swapchain_format_allowed(format: VkFormat, allow_rgba: bool) -> bool {
 unsafe fn slot_release(sc: *mut GnSwapchain, s: *mut GnSlot) {
     let gd = (*sc).dev;
     unsafe {
+        // The X11 route's pixmap and idle fence are X server resources, one
+        // pair per slot. Free them with the slot or every destroyed swapchain
+        // leaks them for the process's life (`destroy_pixmap`/`destroy_fence`
+        // otherwise have no caller). A pending present keeps the server's own
+        // pixmap reference; `xcb_free_pixmap` only drops ours. The worker has
+        // been joined before this runs, so the connection is not in use.
+        let surf = (*sc).surf;
+        if !surf.is_null() {
+            let x11 = (*surf).x11;
+            if !x11.is_null() {
+                if (*s).xpix != 0 {
+                    (*x11).destroy_pixmap((*s).xpix);
+                    (*s).xpix = 0;
+                }
+                if (*s).xfence != 0 {
+                    (*x11).destroy_fence((*s).xfence);
+                    (*s).xfence = 0;
+                }
+            }
+        }
         if !(*s).buf.is_null() {
             wlproto::wl_proxy_destroy((*s).buf);
             (*s).buf = ptr::null_mut();
@@ -5143,11 +5614,12 @@ unsafe fn slot_init_tiled(sc: *mut GnSwapchain, s: *mut GnSlot, modifier: u64) -
             image: (*s).image,
             buffer: 0,
         };
+        let import_fd = unsafe { libc::dup((*s).fd) };
         let imp = VkImportMemoryFdInfoKHR {
             sType: VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
             pNext: &ded as *const _ as *const c_void,
             handleType: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-            fd: unsafe { libc::dup((*s).fd) },
+            fd: import_fd,
         };
         let mai = VkMemoryAllocateInfo {
             sType: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -5158,6 +5630,10 @@ unsafe fn slot_init_tiled(sc: *mut GnSwapchain, s: *mut GnSlot, modifier: u64) -
         res = unsafe { f.alloc_mem.unwrap()(dev, &mai, ptr::null(), &mut (*s).mem) };
         if res == VK_SUCCESS {
             res = unsafe { f.bind_mem.unwrap()(dev, (*s).image, (*s).mem, 0) };
+        } else {
+            // A failed import does not consume the descriptor (the driver keeps
+            // nothing): close the dup or it leaks with the abandoned slot.
+            unsafe { libc::close(import_fd) };
         }
         if res != VK_SUCCESS {
             crate::logf!("proxy slot: modifier {modifier:#x} memory: {res}");
@@ -5305,11 +5781,12 @@ unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
             image: (*s).image,
             buffer: 0,
         };
+        let import_fd = unsafe { libc::dup((*s).fd) };
         let imp = VkImportMemoryFdInfoKHR {
             sType: VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
             pNext: &ded as *const _ as *const c_void,
             handleType: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-            fd: unsafe { libc::dup((*s).fd) },
+            fd: import_fd,
         };
         let mai = VkMemoryAllocateInfo {
             sType: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -5320,6 +5797,10 @@ unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
         let mut res = unsafe { f.alloc_mem.unwrap()(dev, &mai, ptr::null(), &mut (*s).mem) };
         if res == VK_SUCCESS {
             res = unsafe { f.bind_mem.unwrap()(dev, (*s).image, (*s).mem, 0) };
+        } else {
+            // A failed import does not consume the descriptor (the driver keeps
+            // nothing): close the dup or it leaks with the abandoned slot.
+            unsafe { libc::close(import_fd) };
         }
         if res != VK_SUCCESS {
             crate::logf!("proxy import memory failed: {res}");

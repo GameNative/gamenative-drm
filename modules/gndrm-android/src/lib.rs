@@ -334,10 +334,10 @@ fn server_thread_inner(
     // lock, never `AscState`'s: the presenter holds the latter across the
     // blocking SurfaceFlinger apply, while ADDFB2 runs here on the serve
     // thread. The lock is held for one map insert.
-    dev.set_addfb_geometry(Box::new(move |width, height| {
+    dev.set_addfb_geometry(Box::new(move |width, height, alloc_len| {
         addfb_pool
             .lock(diag::Role::Commit)
-            .note_framebuffer(width, height);
+            .note_framebuffer(width, height, alloc_len);
     }));
     let log = |msg: &str| crate::log::daemon_info(&format!("server: {msg}"));
     server::serve(&mut dev, rpc, event, &log);

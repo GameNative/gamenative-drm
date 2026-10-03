@@ -126,7 +126,7 @@ pub const VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2: VkStructureType = 1000059002;
 pub const VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR: VkStructureType = 1000001000;
 pub const VK_STRUCTURE_TYPE_PRESENT_INFO_KHR: VkStructureType = 1000001001;
 pub const VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR: VkStructureType = 1000006000;
-pub const VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR: VkStructureType = 1000004004;
+pub const VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR: VkStructureType = 1000004000;
 pub const VK_STRUCTURE_TYPE_ACQUIRE_NEXT_IMAGE_INFO_KHR: VkStructureType = 1000060010;
 pub const VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: VkStructureType = 1000072001;
 pub const VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO: VkStructureType = 1000072002;
@@ -911,7 +911,11 @@ pub struct VkBufferImageCopy {
     pub bufferOffset: VkDeviceSize,
     pub bufferRowLength: u32,
     pub bufferImageHeight: u32,
-    pub imageSubresource: VkImageSubresource,
+    /// Four fields (`VkImageSubresourceLayers`), not the three-field
+    /// `VkImageSubresource`: the copy target names a layer *count* as well as a
+    /// base layer, and typing it short makes `layerCount` read whatever follows
+    /// the struct.
+    pub imageSubresource: VkImageSubresourceLayers,
     pub imageOffset: VkOffset3D,
     pub imageExtent: VkExtent3D,
 }
@@ -1013,6 +1017,35 @@ pub struct VkImageBlit {
     pub dstOffsets: [VkOffset3D; 2],
 }
 
+/// v2 form of [`VkImageCopy`]: the same region preceded by `sType`/`pNext`.
+/// [`VkCopyImageInfo2`]`::pRegions` points at an array of these, never at
+/// [`VkImageCopy`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkImageCopy2 {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub srcSubresource: VkImageSubresourceLayers,
+    pub srcOffset: VkOffset3D,
+    pub dstSubresource: VkImageSubresourceLayers,
+    pub dstOffset: VkOffset3D,
+    pub extent: VkExtent3D,
+}
+
+/// v2 form of [`VkImageBlit`]: the same source and destination regions preceded
+/// by `sType`/`pNext`. [`VkBlitImageInfo2`]`::pRegions` points at an array of
+/// these, never at [`VkImageBlit`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkImageBlit2 {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub srcSubresource: VkImageSubresourceLayers,
+    pub srcOffsets: [VkOffset3D; 2],
+    pub dstSubresource: VkImageSubresourceLayers,
+    pub dstOffsets: [VkOffset3D; 2],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct VkCopyImageInfo2 {
@@ -1023,7 +1056,7 @@ pub struct VkCopyImageInfo2 {
     pub dstImage: VkImage,
     pub dstImageLayout: VkImageLayout,
     pub regionCount: u32,
-    pub pRegions: *const VkImageCopy,
+    pub pRegions: *const VkImageCopy2,
 }
 
 #[repr(C)]
@@ -1036,7 +1069,7 @@ pub struct VkBlitImageInfo2 {
     pub dstImage: VkImage,
     pub dstImageLayout: VkImageLayout,
     pub regionCount: u32,
-    pub pRegions: *const VkImageBlit,
+    pub pRegions: *const VkImageBlit2,
     pub filter: i32,
 }
 
@@ -1106,6 +1139,8 @@ pub struct VkImageMemoryBarrier2 {
     pub srcAccessMask: u64,
     pub dstStageMask: u64,
     pub dstAccessMask: u64,
+    pub oldLayout: VkImageLayout,
+    pub newLayout: VkImageLayout,
     pub srcQueueFamilyIndex: u32,
     pub dstQueueFamilyIndex: u32,
     pub image: VkImage,
@@ -1248,3 +1283,91 @@ pub struct VkSubpassBeginInfo {
 }
 pub type PFN_vkCmdBeginRenderPass2 =
     unsafe extern "C" fn(VkCommandBuffer, *const VkRenderPassBeginInfo, *const VkSubpassBeginInfo);
+
+// ------------------------------- dynamic state (viewport / scissor) trace
+// Intercepted only to report the values the guest sets: a viewport whose
+// extent is zero, or whose rect lies outside the swapchain image, clips every
+// draw while leaving a loadOp clear intact, which is exactly the
+// clears-land-draws-do-not shape being diagnosed.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkViewport {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub minDepth: f32,
+    pub maxDepth: f32,
+}
+pub type PFN_vkCmdSetViewport = unsafe extern "C" fn(VkCommandBuffer, u32, u32, *const VkViewport);
+pub type PFN_vkCmdSetViewportWithCount =
+    unsafe extern "C" fn(VkCommandBuffer, u32, *const VkViewport);
+pub type PFN_vkCmdSetScissor = unsafe extern "C" fn(VkCommandBuffer, u32, u32, *const VkRect2D);
+pub type PFN_vkCmdSetScissorWithCount = unsafe extern "C" fn(VkCommandBuffer, u32, *const VkRect2D);
+
+// ------------------------------- render-pass load/store capture
+// vkCmdBeginRenderPass names a VkRenderPass, and the attachment loadOp/storeOp
+// live in that render pass's subpass description, not in the begin info; the
+// shim records them at create time so the begin trace can name them.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkAttachmentDescription {
+    pub flags: u32,
+    pub format: i32,
+    pub samples: u32,
+    pub loadOp: i32,
+    pub storeOp: i32,
+    pub stencilLoadOp: i32,
+    pub stencilStoreOp: i32,
+    pub initialLayout: i32,
+    pub finalLayout: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkAttachmentReference {
+    pub attachment: u32,
+    pub layout: i32,
+}
+#[repr(C)]
+pub struct VkSubpassDescription {
+    pub flags: u32,
+    pub pipelineBindPoint: i32,
+    pub inputAttachmentCount: u32,
+    pub pInputAttachments: *const VkAttachmentReference,
+    pub colorAttachmentCount: u32,
+    pub pColorAttachments: *const VkAttachmentReference,
+    pub pResolveAttachments: *const VkAttachmentReference,
+    pub pDepthStencilAttachment: *const VkAttachmentReference,
+    pub preserveAttachmentCount: u32,
+    pub pPreserveAttachments: *const u32,
+}
+#[repr(C)]
+pub struct VkRenderPassCreateInfo {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub attachmentCount: u32,
+    pub pAttachments: *const VkAttachmentDescription,
+    pub subpassCount: u32,
+    pub pSubpasses: *const VkSubpassDescription,
+    pub dependencyCount: u32,
+    pub pDependencies: *const c_void,
+}
+pub type PFN_vkCreateRenderPass = unsafe extern "C" fn(
+    VkDevice,
+    *const VkRenderPassCreateInfo,
+    *const VkAllocationCallbacks,
+    *mut u64,
+) -> VkResult;
+
+// ------------------------------- sampler YCbCr conversion
+// VK_KHR_sampler_ycbcr_conversion (core 1.1). vkCreateSamplerYcbcrConversion is a
+// device-level command whose handle the shim wraps; the create-info is passed to
+// the driver verbatim, so it is typed opaquely here.
+pub type VkSamplerYcbcrConversion = u64;
+pub type PFN_vkCreateSamplerYcbcrConversion = unsafe extern "C" fn(
+    VkDevice,
+    *const c_void,
+    *const VkAllocationCallbacks,
+    *mut VkSamplerYcbcrConversion,
+) -> VkResult;

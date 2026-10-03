@@ -223,9 +223,11 @@ pub type LogFn = Box<dyn Fn(&str) + Send>;
 /// Sink for a framebuffer geometry the client registered (`ADDFB2`), so a
 /// length-only scan-out request can resolve a window geometry the pool has
 /// never owned (see `Device::set_addfb_geometry`). Called on the serve thread
-/// with `(width, height)`; the presentation layer notes it in its pool under
-/// the pool's own BGRA layout, never the DRM fourcc.
-pub type AddFbGeometryFn = Box<dyn Fn(u32, u32) + Send>;
+/// with `(width, height, alloc_len)`, where `alloc_len` is the backing GEM's
+/// real allocation length (`st_size`) — row-padded and page-rounded, the exact
+/// length a length-only request carries. The presentation layer notes it in its
+/// pool under the pool's own BGRA layout, never the DRM fourcc.
+pub type AddFbGeometryFn = Box<dyn Fn(u32, u32, u64) + Send>;
 
 /// The emulated device (one per connected client / open file description).
 pub struct Device {
@@ -1422,7 +1424,7 @@ impl Device {
         // lookup).
         if bpp == 32 {
             if let Some(note) = &self.addfb_geometry {
-                note(cmd.width, cmd.height);
+                note(cmd.width, cmd.height, gem_size);
             }
         }
         let mut body = Vec::new();
