@@ -30,7 +30,7 @@
 //! compositor's own `x11_find_toplevel_for_xid` performs, and reports the
 //! ancestor-relative offset so `Present`'s own x/y placement stays correct.
 //!
-//! Per present: `xcb_dri3_pixmap_from_buffer` imports the slot's dma-buf as an
+//! Per present: `xcb_dri3_pixmap_from_buffers` imports the slot's dma-buf as an
 //! X pixmap (no CPU copy, the fd stays the shim's), and `xcb_present_pixmap`
 //! makes that pixmap the window's content. Release rides an X sync fence passed
 //! as Present's idle fence: the server triggers it when it is done with the
@@ -217,17 +217,30 @@ extern "C" {
         cookie: cookie_t,
         e: *mut *mut xcb_generic_error_t,
     ) -> *mut xcb_dri3_query_version_reply_t;
-    fn xcb_dri3_pixmap_from_buffer_checked(
+    // DRI3 1.2's modifier-carrying import. `num_buffers` buffers are handed in
+    // as fds with their own strides/offsets, plus the DRM format modifier; the
+    // 1.0 singular `PixmapFromBuffer` (no modifier field) is its degenerate
+    // single-plane LINEAR case, so this call supersedes it entirely.
+    #[allow(clippy::too_many_arguments)]
+    fn xcb_dri3_pixmap_from_buffers_checked(
         c: *mut xcb_connection_t,
         pixmap: u32,
-        drawable: u32,
-        size: u32,
+        window: u32,
+        num_buffers: u8,
         width: u16,
         height: u16,
-        stride: u16,
+        stride0: u32,
+        offset0: u32,
+        stride1: u32,
+        offset1: u32,
+        stride2: u32,
+        offset2: u32,
+        stride3: u32,
+        offset3: u32,
         depth: u8,
         bpp: u8,
-        pixmap_fd: i32,
+        modifier: u64,
+        buffers: *const i32,
     ) -> cookie_t;
 }
 
@@ -596,12 +609,19 @@ impl X11Present {
         }
     }
 
-    /// Imports a slot's linear dma-buf as an X pixmap. `None` (with the server
+    /// Imports a slot's dma-buf as an X pixmap. `None` (with the server
     /// error when it has one) keeps the frame off screen instead of presenting
-    /// a wrong one. Non-linear slots cannot be expressed by DRI3 1.0's
-    /// `PixmapFromBuffer`, which carries no modifier.
+    /// a wrong one.
     ///
-    /// libxcb's DRI3 `PixmapFromBuffer` takes ownership of the fd and closes it
+    /// Uses DRI3 1.2's `PixmapFromBuffers` (the modifier-carrying plural form)
+    /// with a single buffer, so a tiled/OPTIMAL slot - any DRM format modifier -
+    /// can be expressed, not only LINEAR. The DRI3 spec calls a one-buffer
+    /// `PixmapFromBuffers` "akin to `PixmapFromBuffer`"; for the current
+    /// single-plane LINEAR slot the same buffer, stride, offset (0), depth and
+    /// bpp describe the same genuinely-linear image, so the server resolves the
+    /// identical pixmap (device: 48/48 presents land with no import failure).
+    ///
+    /// libxcb's DRI3 import takes ownership of the fd and closes it
     /// once the request is sent (verified against libxcb: the fd answers EBADF
     /// immediately after the checked request). The slot owns its fd for the
     /// swapchain's whole life, so a dup is handed over instead - otherwise the
@@ -619,12 +639,6 @@ impl X11Present {
         if fd < 0 {
             return None;
         }
-        if modifier != 0 {
-            crate::logf!(
-                "x11: slot modifier {modifier:#x} is not LINEAR - DRI3 PixmapFromBuffer cannot express it"
-            );
-            return None;
-        }
         let _g = self.lock();
         // The dup is what libxcb closes; the slot keeps `fd`.
         let import_fd = unsafe { libc::dup(fd) };
@@ -636,25 +650,36 @@ impl X11Present {
             return None;
         }
         let pixmap = unsafe { xcb_generate_id(self.conn) };
+        // One plane: the plane-0 fd carries the modifier, planes 1..3 are the
+        // request's unused slots (num_buffers=1 leaves them ignored).
+        let buffers: [i32; 1] = [import_fd];
         let cookie = unsafe {
-            xcb_dri3_pixmap_from_buffer_checked(
+            xcb_dri3_pixmap_from_buffers_checked(
                 self.conn,
                 pixmap,
                 self.window,
-                stride.saturating_mul(height),
+                1,
                 width as u16,
                 height as u16,
-                stride as u16,
+                stride,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
                 self.depth,
                 32,
-                import_fd,
+                modifier,
+                buffers.as_ptr(),
             )
         };
         match unsafe { check_err(self.conn, cookie) } {
             None => Some(pixmap),
             Some(code) => {
                 crate::logf!(
-                    "x11: {width}x{height} stride={stride} pixmap_from_buffer failed (X error {code}) - frame dropped"
+                    "x11: {width}x{height} stride={stride} modifier={modifier:#x} pixmap_from_buffers failed (X error {code}) - frame dropped"
                 );
                 None
             }

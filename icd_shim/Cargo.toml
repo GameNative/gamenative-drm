@@ -20,6 +20,13 @@ crate-type = ["cdylib", "rlib"]
 name = "icd_probe"
 path = "src/bin/icd_probe.rs"
 
+[features]
+# Round-v removable diagnostic: install the chaining SIGSEGV/SIGBUS register
+# dump (src/segv.rs) at ICD init. Off by default — the shipped payload only
+# enables it when explicitly asked for, so a normal build installs no signal
+# handler at all.
+segv_dump = []
+
 [dependencies]
 libc = "0.2"
 # Wire types only (ScanoutAllocReq/ScanoutAllocResp and the pool format), reused

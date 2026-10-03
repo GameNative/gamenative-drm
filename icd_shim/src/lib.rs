@@ -83,6 +83,7 @@ pub fn vkshim_enabled() -> bool {
 
 pub mod proxy;
 pub mod scanout;
+pub mod segv;
 pub mod thunk;
 pub mod vk;
 pub mod vk_dispatch_gen;
@@ -331,6 +332,10 @@ fn dlerror_str() -> String {
 }
 
 fn init_once() {
+    // Round-v diagnostic: install the chaining SIGSEGV/SIGBUS register dump
+    // before any driver code runs, so it sits in front of wine's SEH handler.
+    #[cfg(feature = "segv_dump")]
+    crate::segv::install();
     if is_gamescope_process() {
         let h = unsafe {
             libc::dlopen(

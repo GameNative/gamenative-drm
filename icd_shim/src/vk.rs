@@ -143,6 +143,20 @@ pub const VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT: VkSt
     1000158003;
 pub const VK_STRUCTURE_TYPE_SUBMIT_INFO_2: VkStructureType = 1000314004;
 pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO: VkStructureType = 1000314006;
+// Physical-device image-format query (the modifier-support instrument):
+// VkPhysicalDeviceImageFormatInfo2 / VkImageFormatProperties2 and the DRM
+// format-modifier pNext. Read-only diagnostics — nothing in the create path
+// consults these; they exist so a session can record the driver's answer.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2: VkStructureType = 1000059004;
+pub const VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2: VkStructureType = 1000059003;
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT: VkStructureType =
+    1000158002;
+// The driver's answer for the modifier of an image created with
+// VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT: `vkGetImageDrmFormatModifierPropertiesEXT`.
+// Valid usage (VUID-vkGetImageDrmFormatModifierPropertiesEXT-image-02272) requires
+// the image to have been created with that tiling — which is exactly why the slot
+// image uses the DRM tiling form rather than plain VK_IMAGE_TILING_OPTIMAL.
+pub const VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT: VkStructureType = 1000158005;
 
 pub const VK_LAYER_LINK_INFO: i32 = 0; // VkLayerFunction
 
@@ -241,6 +255,7 @@ pub type VkSemaphoreImportFlags = u32;
 pub type VkDeviceSize = u64;
 pub type VkMemoryPropertyFlags = u32;
 pub type VkMemoryHeapFlags = u32;
+pub const VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT: VkMemoryPropertyFlags = 0x1;
 
 pub const VK_KHR_SURFACE_EXTENSION_NAME: &str = "VK_KHR_surface";
 pub const VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME: &str = "VK_KHR_wayland_surface";
@@ -787,6 +802,53 @@ pub struct VkFormatProperties2 {
     pub formatProperties: [u8; 12], // VkFormatProperties (unused fields)
 }
 
+// ---- physical-device image-format query (modifier-support instrument) ----
+// Only ever populated/read by the read-only `modq` probe; the image-create
+// path does not consult any of these.
+
+/// `VkPhysicalDeviceImageFormatInfo2` pNext entry naming a DRM format
+/// modifier the caller wants the driver to consider.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkPhysicalDeviceImageDrmFormatModifierInfoEXT {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub drmFormatModifier: u64,
+    pub sharingMode: VkSharingMode,
+    pub queueFamilyIndexCount: u32,
+    pub pQueueFamilyIndices: *const u32,
+}
+
+/// Input to `vkGetPhysicalDeviceImageFormatProperties2`. `type_` is the
+/// Vulkan `type` field (`type` is a Rust keyword; the C layout is unchanged).
+#[repr(C)]
+pub struct VkPhysicalDeviceImageFormatInfo2 {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub format: VkFormat,
+    pub type_: VkImageType,
+    pub tiling: VkImageTiling,
+    pub usage: VkImageUsageFlags,
+    pub flags: VkImageCreateFlags,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkImageFormatProperties {
+    pub maxExtent: VkExtent3D,
+    pub maxMipLevels: u32,
+    pub maxArrayLayers: u32,
+    pub sampleCounts: VkSampleCountFlagBits,
+    pub maxResourceSize: VkDeviceSize,
+}
+
+#[repr(C)]
+pub struct VkImageFormatProperties2 {
+    pub sType: VkStructureType,
+    pub pNext: *mut c_void,
+    pub imageFormatProperties: VkImageFormatProperties,
+}
+
 // ----------------------------------------------------- function pointers
 pub type PFN_vkVoidFunction = PfnVkVoidFunction;
 pub type GipaFn = unsafe extern "C" fn(VkInstance, *const c_char) -> PFN_vkVoidFunction;
@@ -873,6 +935,23 @@ pub type PFN_vkQueueSubmit2 =
 pub type PFN_vkQueueWaitIdle = unsafe extern "C" fn(VkQueue) -> VkResult;
 pub type PFN_vkDeviceWaitIdle = unsafe extern "C" fn(VkDevice) -> VkResult;
 pub type PFN_vkDestroyDevice = unsafe extern "C" fn(VkDevice, *const VkAllocationCallbacks);
+
+// Physical-device queries used only by the read-only image-path instrument.
+pub type PFN_vkGetPhysicalDeviceImageFormatProperties2 = unsafe extern "C" fn(
+    VkPhysicalDevice,
+    *const VkPhysicalDeviceImageFormatInfo2,
+    *mut VkImageFormatProperties2,
+) -> VkResult;
+pub type PFN_vkGetPhysicalDeviceMemoryProperties =
+    unsafe extern "C" fn(VkPhysicalDevice, *mut VkPhysicalDeviceMemoryProperties);
+
+// `vkGetPhysicalDeviceFormatProperties2` enumerates a format's DRM format
+// modifiers through a `VkDrmFormatModifierPropertiesListEXT` out-chain. Used to
+// learn which modifiers the driver advertises for a swapchain format, so the
+// slot image can offer the driver its own set (the driver then picks its
+// preferred layout) instead of a modifier the shim names.
+pub type PFN_vkGetPhysicalDeviceFormatProperties2 =
+    unsafe extern "C" fn(VkPhysicalDevice, VkFormat, *mut VkFormatProperties2);
 
 // ------------------------------------------- driver read-back (bring-up probe)
 //

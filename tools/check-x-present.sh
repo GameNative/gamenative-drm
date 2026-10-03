@@ -3,7 +3,7 @@
 #
 # Builds tools/xpresent-check.c and runs it against the host X server. The
 # harness performs exactly the shim's `crate::x11` sequence - import a linear
-# dma-buf with DRI3 PixmapFromBuffer, make it the window's content with
+# dma-buf with DRI3 PixmapFromBuffers, make it the window's content with
 # Present, release the slot off the present's X sync idle fence - against a
 # real Xwayland and a real GPU, then reads the window back with XGetImage.
 #

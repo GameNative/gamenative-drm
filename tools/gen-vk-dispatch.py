@@ -44,12 +44,158 @@ DEVICE_ARG0 = {"VkDevice", "VkQueue", "VkCommandBuffer"}
 LEVELS = ["Global", "Instance", "PhysicalDevice", "Device"]
 ARG0S = ["None", "Instance", "PhysicalDevice", "Device", "Queue", "CommandBuffer", "Other"]
 
+# The handle types the shim wraps (it substitutes the driver's real handle for
+# these). Nested translation is limited to them, because they are the only
+# handles a guest can hold as a shim pointer. Map: registry type -> enum name.
+WRAPPED_HANDLES = {
+    "VkDevice": "Device",
+    "VkQueue": "Queue",
+    "VkCommandBuffer": "CommandBuffer",
+}
+
 
 def command_name(c):
     if c.get("name"):
         return c.get("name")
     n = c.find("proto/name")
     return n.text if n is not None else None
+
+
+def struct_members(root):
+    """Registry struct/union member tables: name -> {"alias", "members"} with
+    each member a dict of name/type/ptr/const/len. Alias structs carry no
+    members of their own and are resolved on lookup."""
+    structs = {}
+    for t in root.findall("types/type"):
+        if t.get("category") not in ("struct", "union"):
+            continue
+        name = t.get("name")
+        if name is None:
+            continue
+        if t.get("alias"):
+            structs[name] = {"alias": t.get("alias"), "members": []}
+            continue
+        members = []
+        for m in t.findall("member"):
+            mt = m.find("type")
+            mn = m.find("name")
+            if mt is None or mn is None:
+                continue
+            text = "".join(m.itertext())
+            members.append(
+                {
+                    "name": mn.text,
+                    "type": mt.text,
+                    "ptr": "*" in text,
+                    "const": "const" in text,
+                    "len": m.get("len"),
+                }
+            )
+        structs[name] = {"alias": None, "members": members}
+    return structs
+
+
+def members_of(structs, sname, seen=None):
+    """Members of `sname`, following struct aliases transitively."""
+    seen = seen or set()
+    if sname in seen or sname not in structs:
+        return []
+    d = structs[sname]
+    if d["alias"]:
+        return members_of(structs, d["alias"], seen | {sname})
+    return d["members"]
+
+
+def walk_struct_handles(structs, sname):
+    """Wrapped-handle inputs reachable inside `sname` through a counted pointer
+    array. Returns `(kind, counted, hops)` where each hop describes one array
+    level: the byte offset of the child pointer, its element stride, and the
+    byte offset of its `uint32_t` count (`None` = a single handle value).
+
+    A pointer member that is not `const` is an output and is skipped; a member
+    that is a `const` pointer to a handle array is counted. Terminal by-value
+    handle members are a single value per element."""
+    out = []
+    for m in members_of(structs, sname):
+        mt = m["type"]
+        if mt in WRAPPED_HANDLES:
+            if m["ptr"] and not m["const"]:
+                continue  # array of handles the command writes (an output)
+            if m["ptr"]:
+                out.append(
+                    (
+                        WRAPPED_HANDLES[mt],
+                        True,
+                        [
+                            {
+                                "off": (sname, m["name"]),
+                                "stride": ("handle",),
+                                "count_off": (sname, m["len"]) if m["len"] else None,
+                            }
+                        ],
+                    )
+                )
+            else:
+                out.append(
+                    (
+                        WRAPPED_HANDLES[mt],
+                        False,
+                        [
+                            {
+                                "off": (sname, m["name"]),
+                                "stride": None,
+                                "count_off": None,
+                            }
+                        ],
+                    )
+                )
+        elif mt in structs and m["ptr"] and m["const"]:
+            head = {
+                "off": (sname, m["name"]),
+                "stride": ("struct", mt),
+                "count_off": (sname, m["len"]) if m["len"] else None,
+            }
+            for kind, counted, sub in walk_struct_handles(structs, mt):
+                out.append((kind, True or counted, [head] + sub))
+    return out
+
+
+def command_nested(c, params, structs):
+    """Registry-derived nested wrapped-handle *inputs* a command consumes
+    through at least one counted pointer array — the pCommandBuffers-style
+    forwarding hazard. Returns a list of
+    `(param, count_param, kind, elem_stride, hops)`."""
+    def param_index(name):
+        if not name:
+            return 255
+        for i, p in enumerate(params):
+            pn = p.find("name")
+            if pn is not None and pn.text == name:
+                return i
+        return 255
+
+    out = []
+    for i, p in enumerate(params):
+        pt = p.find("type")
+        pn = p.find("name")
+        if pt is None or pn is None:
+            continue
+        ptype = pt.text
+        text = "".join(p.itertext())
+        ptr = "*" in text
+        const = "const" in text
+        cp = param_index(p.get("len"))
+        if ptype in WRAPPED_HANDLES:
+            # A by-value or non-const pointer handle parameter is not a nested
+            # array hazard; only a `const` pointer to a handle array is.
+            if ptr and const:
+                out.append((i, cp, WRAPPED_HANDLES[ptype], ("handle",), []))
+        elif ptype in structs and ptr and const:
+            for kind, counted, hops in walk_struct_handles(structs, ptype):
+                if counted or cp != 255:
+                    out.append((i, cp, kind, ("struct", ptype), hops))
+    return out
+
 
 
 def arg0_type(c):
@@ -132,10 +278,64 @@ def build(xml_path):
             aliases.append((n, c.get("alias")))
     entries.sort()
     aliases.sort()
-    return hdr, sha, entries, aliases
+
+    # Nested wrapped-handle inputs, per command. Alias commands carry no
+    # prototype of their own, so they inherit the target's set transitively.
+    structs = struct_members(root)
+    nested = {}
+    for n, c in cmds.items():
+        if c.get("alias"):
+            continue
+        e = command_nested(c, c.findall("param"), structs)
+        if e:
+            nested[n] = e
+
+    def nested_of(n, seen=None):
+        seen = seen or set()
+        if n in nested:
+            return nested[n]
+        if n in seen:
+            return []
+        c = cmds.get(n)
+        if c is None or c.get("alias") is None:
+            return []
+        return nested_of(c.get("alias"), seen | {n})
+
+    for n, c in cmds.items():
+        if c.get("alias"):
+            e = nested_of(n)
+            if e:
+                nested[n] = e
+
+    return hdr, sha, entries, aliases, nested
 
 
-def render(xml_path, hdr, sha, entries, aliases):
+def emit_path(elem):
+    if elem[0] == "handle":
+        return "std::mem::size_of::<crate::vk::VkCommandBuffer>()"
+    return f"std::mem::size_of::<crate::vk::{elem[1]}>()"
+
+
+def emit_hop_stride(stride):
+    if stride is None:
+        return "0"
+    return emit_path(stride)
+
+
+def emit_hop(hop):
+    sname, mname = hop["off"]
+    off = f"std::mem::offset_of!(crate::vk::{sname}, {mname})"
+    stride = emit_hop_stride(hop["stride"])
+    co = hop["count_off"]
+    count_off = (
+        f"std::mem::offset_of!(crate::vk::{co[0]}, {co[1]})" if co else "usize::MAX"
+    )
+    return (
+        f"Hop {{ off: {off}, stride: {stride}, count_off: {count_off} }}"
+    )
+
+
+def render(xml_path, hdr, sha, entries, aliases, nested):
     b = io.StringIO()
     w = b.write
     w("// Generated by tools/gen-vk-dispatch.py from the Vulkan registry — do not edit.\n")
@@ -196,6 +396,62 @@ def render(xml_path, hdr, sha, entries, aliases):
     w("        return Some(VK_ALIASES[i].1);\n")
     w("    }\n")
     w("    VK_ALIASES.iter().find(|(_, t)| *t == name).map(|(n, _)| *n)\n")
+    w("}\n\n")
+    w("/// A wrapped-handle type the shim substitutes for the driver's real\n")
+    w("/// handle when it forwards a command.\n")
+    w("#[derive(Clone, Copy, PartialEq, Eq, Debug)]\n")
+    w("pub enum HandleKind {\n")
+    w("    Device,\n")
+    w("    Queue,\n")
+    w("    CommandBuffer,\n")
+    w("}\n\n")
+    w("/// One array level on the way to a nested handle value. `off` is the byte\n")
+    w("/// offset, within the enclosing element, of the pointer to the child array\n")
+    w("/// (or of a single handle value when `count_off` is `usize::MAX`); `stride`\n")
+    w("/// is the child's element stride (`0` for a single value); `count_off` is\n")
+    w("/// the byte offset of the child's `uint32_t` count.\n")
+    w("#[derive(Clone, Copy, PartialEq, Eq, Debug)]\n")
+    w("pub struct Hop {\n")
+    w("    pub off: usize,\n")
+    w("    pub stride: usize,\n")
+    w("    pub count_off: usize,\n")
+    w("}\n\n")
+    w("/// A shim-wrapped handle a command consumes in a nested position. `param`\n")
+    w("/// is the parameter index; when `count_param` is `255` the parameter is a\n")
+    w("/// single value, otherwise it is an array of `elem_stride`-byte elements\n")
+    w("/// counted by parameter `count_param`. Each element is walked through\n")
+    w("/// `hops`; an empty path means the element *is* a handle value.\n")
+    w("#[derive(Clone, Copy, PartialEq, Eq, Debug)]\n")
+    w("pub struct NestedHandle {\n")
+    w("    pub param: u8,\n")
+    w("    pub count_param: u8,\n")
+    w("    pub kind: HandleKind,\n")
+    w("    pub elem_stride: usize,\n")
+    w("    pub hops: &'static [Hop],\n")
+    w("}\n\n")
+    w("// One row per command that consumes a wrapped handle through a counted\n")
+    w("// pointer array; sorted by name for the binary search in `nested_handles`.\n")
+    w("// Kept single-line so the table stays grep-friendly.\n")
+    w("#[rustfmt::skip]\n")
+    w("pub static VK_NESTED_HANDLES: &[(&str, &[NestedHandle])] = &[\n")
+    for n in sorted(nested):
+        w(f'    ("{n}", &[\n')
+        for (param, cp, kind, elem, hops) in nested[n]:
+            hs = ", ".join(emit_hop(h) for h in hops)
+            w(
+                f"        NestedHandle {{ param: {param}, count_param: {cp}, "
+                f"kind: HandleKind::{kind}, elem_stride: {emit_path(elem)}, "
+                f"hops: &[{hs}] }},\n"
+            )
+        w("    ]),\n")
+    w("];\n\n")
+    w("/// Registry-derived nested wrapped handles for `name`; empty when the\n")
+    w("/// command consumes none.\n")
+    w("pub fn nested_handles(name: &str) -> &'static [NestedHandle] {\n")
+    w("    match VK_NESTED_HANDLES.binary_search_by(|(n, _)| n.cmp(&name)) {\n")
+    w("        Ok(i) => VK_NESTED_HANDLES[i].1,\n")
+    w("        Err(_) => &[],\n")
+    w("    }\n")
     w("}\n")
     return b.getvalue()
 
@@ -208,8 +464,8 @@ def main():
                     help="verify the committed output is up to date; do not write")
     args = ap.parse_args()
 
-    hdr, sha, entries, aliases = build(args.xml)
-    text = render(args.xml, hdr, sha, entries, aliases)
+    hdr, sha, entries, aliases, nested = build(args.xml)
+    text = render(args.xml, hdr, sha, entries, aliases, nested)
 
     if args.check:
         try:

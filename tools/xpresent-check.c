@@ -4,7 +4,8 @@
  * Reproduces exactly what the shim's `crate::x11` route does with the guest's
  * dma-buf, against a real X server (Xwayland on the dev box) and a real GPU:
  *
- *   xcb_dri3_pixmap_from_buffer(fd, size, w, h, stride, depth, bpp)
+ *   xcb_dri3_pixmap_from_buffers(fd, num_buffers=1, w, h, stride, offset=0,
+ *                                depth, bpp, modifier)
  *     -> xcb_present_pixmap(window, pixmap, serial, ..., idle_fence)
  *     -> an X sync fence reports when the server is done with the pixmap
  *        (the slot-reuse contract the shim's slot release rides)
@@ -176,20 +177,28 @@ int main(void) {
 
     xcb_pixmap_t pa = xcb_generate_id(c);
     xcb_pixmap_t pb = xcb_generate_id(c);
+    /* num_buffers=1, plane 0 at offset 0 with the bo's own modifier: exactly
+     * the shim's DRI3 1.2 import for a single-plane slot. */
+    int fda = a.fd, fdb = b.fd;
+    fprintf(stderr,
+            "xpresent-check: import A stride=%u modifier=%#llx  B stride=%u "
+            "modifier=%#llx\n",
+            a.stride, (unsigned long long)a.modifier, b.stride,
+            (unsigned long long)b.modifier);
     xcb_generic_error_t *err =
-        xcb_request_check(c, xcb_dri3_pixmap_from_buffer_checked(
-                                c, pa, win, a.stride * H, W, H, a.stride,
-                                root->root_depth, 32, a.fd));
+        xcb_request_check(c, xcb_dri3_pixmap_from_buffers_checked(
+                                c, pa, win, 1, W, H, a.stride, 0, 0, 0, 0, 0, 0,
+                                0, root->root_depth, 32, a.modifier, &fda));
     if (err) {
-        printf("FAIL: PixmapFromBuffer import failed (X error %d) - Xwayland "
+        printf("FAIL: PixmapFromBuffers import failed (X error %d) - Xwayland "
                "cannot import this dma-buf\n",
                err->error_code);
         return 1;
     }
-    if (xcb_request_check(c, xcb_dri3_pixmap_from_buffer_checked(
-                                 c, pb, win, b.stride * H, W, H, b.stride,
-                                 root->root_depth, 32, b.fd))) {
-        printf("FAIL: second PixmapFromBuffer import failed\n");
+    if (xcb_request_check(c, xcb_dri3_pixmap_from_buffers_checked(
+                                 c, pb, win, 1, W, H, b.stride, 0, 0, 0, 0, 0, 0,
+                                 0, root->root_depth, 32, b.modifier, &fdb))) {
+        printf("FAIL: second PixmapFromBuffers import failed\n");
         return 1;
     }
 
@@ -253,7 +262,7 @@ int main(void) {
         printf("FAIL: the first present's idle fence never triggered\n");
         ok = 0;
     }
-    printf("%s: DRI3 PixmapFromBuffer + Present reached the X window and the "
+    printf("%s: DRI3 PixmapFromBuffers + Present reached the X window and the "
            "idle fence released the slot\n",
            ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

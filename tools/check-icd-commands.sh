@@ -47,6 +47,7 @@ REQUIRED=(
     vkAllocateCommandBuffers
     vkAllocateMemory
     vkBindImageMemory
+    vkCmdExecuteCommands
     vkCmdSetLineStippleEXT
     vkCreateDevice
     vkCreateFence
@@ -174,5 +175,23 @@ awk '/pub fn entrypoint_handler/{f=1} f&&/return None;/{ok=1} f&&/^}/{f=0} END{e
     || fail "entrypoint_handler must return None when the proxy is inactive"
 [ "$(grep -c 'proxy::entrypoint_handler(' "$LIB")" -ge 2 ] \
     || fail "both ICD entry points must gate their handler lookup on the proxy"
+
+# --- 8. nested wrapped-handle translation is registry-driven -----------------
+# Command-buffer wrappers nested in submit/execute arrays are translated by the
+# generated plan (`VK_NESTED_HANDLES`) — not by a hand-maintained list. Assert
+# the plan covers the three paths round-W named and that the shim intercepts
+# every command it has a plan for.
+grep -q 'pub static VK_NESTED_HANDLES' "$GEN" || fail "VK_NESTED_HANDLES missing from the generated table"
+grep -q 'pub fn nested_handles' "$GEN" || fail "nested_handles() lookup missing from the generated table"
+for member in 'VkSubmitInfo, pCommandBuffers' \
+              'VkSubmitInfo2, pCommandBufferInfos' \
+              'VkCommandBufferSubmitInfo, commandBuffer'; do
+    grep -qF "$member" "$GEN" || fail "nested-handle plan does not cover $member"
+done
+grep -qF '("vkCmdExecuteCommands"' "$GEN" || fail "vkCmdExecuteCommands has no nested plan"
+grep -q 'fn translate_nested' "$PROXY" || fail "translate_nested applier missing from proxy.rs"
+grep -qF 'c"vkCmdExecuteCommands", HandlerScope::Always' "$PROXY" \
+    || fail "vkCmdExecuteCommands is not intercepted (the round-W storm path)"
+echo "nested handles: plan covers the command-buffer submit/execute paths"
 
 echo "PASS: generated dispatch covers every required command and the policy is single"

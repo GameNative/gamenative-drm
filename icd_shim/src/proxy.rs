@@ -42,6 +42,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 static LOG_ACQ: AtomicUsize = AtomicUsize::new(0);
 static LOG_PRESENT: AtomicUsize = AtomicUsize::new(0);
 static LOG_SUBMIT: AtomicUsize = AtomicUsize::new(0);
+// Always-on, bounded proof that the guest's submit/present reached the shim
+// handlers at all. The `logf!` counters above are invisible in a real session
+// (the guest env does not set GNDRM_LOG_VKSHIM); these two say "the path is
+// live" without one line per frame.
+static LOUD_SUBMIT: AtomicUsize = AtomicUsize::new(0);
+static LOUD_SUBMIT2: AtomicUsize = AtomicUsize::new(0);
+static LOUD_PRESENT: AtomicUsize = AtomicUsize::new(0);
+static LOUD_INSTANCE: AtomicBool = AtomicBool::new(false);
 
 // ------------------------------------------------ bring-up diagnostics (strip)
 // An entry point that never returns means the fault is inside that call: wine
@@ -910,7 +918,16 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         format: ci.imageFormat,
         extent: ci.imageExtent,
         fourcc,
-        usage: ci.imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        // The slot image carries exactly the usage the guest asked for. The
+        // present path needs no image usage of its own: the X11 route wraps the
+        // slot's dma-buf in a DRI3 pixmap, the wayland route in a linux-dmabuf
+        // wl_buffer, and every shim-side read of a slot is a CPU `mmap` of that
+        // dma-buf — no `vkCmdCopy*`/`vkCmdBlit*` ever sources or targets a slot,
+        // so neither TRANSFER_SRC nor TRANSFER_DST is required by the shim. The
+        // two transfer bits the shim used to force OR-in are therefore dropped;
+        // a guest that needs one (DXVK's swapchain clears use TRANSFER_DST)
+        // already requests it in `ci.imageUsage`.
+        usage: ci.imageUsage,
         slots: Vec::new(),
         worker: None,
         shared: Mutex::new(ScShared {
@@ -1306,9 +1323,28 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
         unsafe { (*gq).gd }
     };
     if gd.is_null() {
+        // A queue the shim never wrapped here is not fatal on its own: the
+        // present still runs against the device table head, but say so, because
+        // an unrecognised queue is the same wrong-handle class as submit.
+        let (first, n) = unsafe { device_table() };
+        loud(
+            "present.queue_miss",
+            format!(
+                "proxy: gn_vkQueuePresentKHR QUEUE MISS q={:#x} {}",
+                queue as usize,
+                unsafe { handle_note(false, queue as usize, first, n) }
+            ),
+        );
         gd = G.lock().unwrap().devices;
     }
     if gd.is_null() {
+        loud(
+            "present.device_miss",
+            format!(
+                "proxy: gn_vkQueuePresentKHR DEVICE MISS q={:#x} — no device wrapper at all",
+                queue as usize
+            ),
+        );
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let real_q = if gq.is_null() {
@@ -1414,6 +1450,14 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
         if LOG_PRESENT.fetch_add(1, Ordering::Relaxed) < LOG_FIRST_N {
             crate::logf!("proxy present: sc={sc:?} idx={} {}", indices[i], counters());
         }
+        if LOUD_PRESENT.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::routef!(
+                "proxy: present flow pid={} sc={sc:?} idx={} {}",
+                std::process::id(),
+                indices[i],
+                counters()
+            );
+        }
     }
     VK_SUCCESS
 }
@@ -1449,38 +1493,52 @@ unsafe fn submit_impl(
 ) -> VkResult {
     let gq = unsafe { find_queue(queue) };
     if gq.is_null() {
+        // No queue wrapper: the guest's VkQueue is not one `gn_vkGetDeviceQueue`
+        // produced, so the batch has no device to reach the driver through.
+        let (first, n) = unsafe { device_table() };
+        loud(
+            "submit.miss",
+            format!(
+                "proxy: vkQueueSubmit QUEUE MISS q={:#x} {} — submitting guest CBs directly",
+                queue as usize,
+                unsafe { handle_note(false, queue as usize, first, n) }
+            ),
+        );
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let gd = unsafe { (*gq).gd };
-    let mut copy = unsafe { slice_or_empty(submits, count as usize).to_vec() };
-    // One slot per submit entry: an entry with no command buffers must not
-    // shift the translated buffers of the entries after it.
-    let mut swapped: Vec<Option<Vec<VkCommandBuffer>>> = Vec::with_capacity(copy.len());
-    for si in copy.iter_mut() {
-        let ncmd = si.commandBufferCount as usize;
-        if ncmd == 0 {
-            swapped.push(None);
-            continue;
-        }
-        let pcs = unsafe { slice_or_empty(si.pCommandBuffers, ncmd) };
-        let rc: Vec<VkCommandBuffer> = pcs.iter().map(|&c| unsafe { real_cmd(c) }).collect();
-        swapped.push(Some(rc));
-    }
-    for (i, si) in copy.iter_mut().enumerate() {
-        if let Some(rc) = &swapped[i] {
-            si.pCommandBuffers = rc.as_ptr();
-        }
-    }
-    {
-        let seq = LOG_SUBMIT.fetch_add(1, Ordering::Relaxed);
-        crate::logf!(
-            "proxy submit #{seq}: n={count} q={queue:?} entries={:?} fence={fence:?}",
-            copy.iter()
+    // Nested wrapped command buffers are translated from the registry plan
+    // (`VK_NESTED_HANDLES`); the stage owns the copies the driver reads.
+    let mut stage = NestedStage::new();
+    let mut args = [
+        queue as usize,
+        count as usize,
+        submits as usize,
+        fence as usize,
+        0,
+        0,
+    ];
+    unsafe { translate_nested("vkQueueSubmit", &mut args, &mut stage) };
+    let seq = LOG_SUBMIT.fetch_add(1, Ordering::Relaxed);
+    crate::logf!(
+        "proxy submit #{seq}: n={count} q={queue:?} entries={:?} fence={fence:?}",
+        unsafe { slice_or_empty(submits, count as usize) }
+            .iter()
+            .map(|s| s.commandBufferCount)
+            .collect::<Vec<_>>()
+    );
+    if LOUD_SUBMIT.fetch_add(1, Ordering::Relaxed) < 4 {
+        crate::routef!(
+            "proxy: submit flow #{seq} pid={} q={queue:?} real_q={:?} n={count} ncmd={:?}",
+            std::process::id(),
+            unsafe { (*gq).real },
+            unsafe { slice_or_empty(submits, count as usize) }
+                .iter()
                 .map(|s| s.commandBufferCount)
                 .collect::<Vec<_>>()
         );
     }
-    unsafe { (*gd).f.submit.unwrap()((*gq).real, count, copy.as_ptr(), fence) }
+    unsafe { (*gd).f.submit.unwrap()((*gq).real, count, args[2] as *const VkSubmitInfo, fence) }
 }
 
 /// GPU waits. The guest blocks here when submitted work never completes, so log
@@ -1558,6 +1616,15 @@ unsafe fn submit2_impl(
 ) -> VkResult {
     let gq = unsafe { find_queue(queue) };
     if gq.is_null() {
+        let (first, n) = unsafe { device_table() };
+        loud(
+            "submit2.miss",
+            format!(
+                "proxy: vkQueueSubmit2 QUEUE MISS q={:#x} {} — batch dropped",
+                queue as usize,
+                unsafe { handle_note(false, queue as usize, first, n) }
+            ),
+        );
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let gd = unsafe { (*gq).gd };
@@ -1566,25 +1633,30 @@ unsafe fn submit2_impl(
     let Some(real_fn) = (unsafe { (*gd).f.submit2 }) else {
         return VK_ERROR_FEATURE_NOT_PRESENT;
     };
-    let mut copy = unsafe { slice_or_empty(submits, count as usize).to_vec() };
-    let mut swapped: Vec<Option<Vec<VkCommandBufferSubmitInfo>>> = Vec::with_capacity(copy.len());
-    for si in copy.iter_mut() {
-        let ncmd = si.commandBufferInfoCount as usize;
-        if ncmd == 0 {
-            swapped.push(None);
-            continue;
-        }
-        let pcs = unsafe { slice_or_empty(si.pCommandBufferInfos, ncmd) };
-        let mut rc: Vec<VkCommandBufferSubmitInfo> = pcs.to_vec();
-        for c in rc.iter_mut() {
-            c.commandBuffer = unsafe { real_cmd(c.commandBuffer) };
-        }
-        swapped.push(Some(rc));
-    }
-    for (i, si) in copy.iter_mut().enumerate() {
-        if let Some(rc) = &swapped[i] {
-            si.pCommandBufferInfos = rc.as_ptr();
-        }
+    // Nested wrapped command buffers (VkCommandBufferSubmitInfo::commandBuffer)
+    // are translated from the registry plan (`VK_NESTED_HANDLES`); the stage
+    // owns the copies the driver reads.
+    let mut stage = NestedStage::new();
+    let mut args = [
+        queue as usize,
+        count as usize,
+        submits as usize,
+        fence as usize,
+        0,
+        0,
+    ];
+    unsafe { translate_nested("vkQueueSubmit2", &mut args, &mut stage) };
+    let translated = args[2] as *const VkSubmitInfo2;
+    if LOUD_SUBMIT2.fetch_add(1, Ordering::Relaxed) < 4 {
+        crate::routef!(
+            "proxy: submit2 flow pid={} q={queue:?} real_q={:?} n={count} ncmd={:?}",
+            std::process::id(),
+            unsafe { (*gq).real },
+            unsafe { slice_or_empty(submits, count as usize) }
+                .iter()
+                .map(|s| s.commandBufferInfoCount)
+                .collect::<Vec<_>>()
+        );
     }
     {
         // Every submit, terse: the faulting call is the last line before the
@@ -1621,10 +1693,12 @@ unsafe fn submit2_impl(
             for (i, si) in originals.iter().enumerate() {
                 let n = si.commandBufferInfoCount as usize;
                 let pcs = unsafe { slice_or_empty(si.pCommandBufferInfos, n) };
+                let ti = unsafe { &*translated.add(i) };
+                let newpcs = unsafe { slice_or_empty(ti.pCommandBufferInfos, n) };
                 for (j, c) in pcs.iter().enumerate().take(4) {
-                    match swapped.get(i).and_then(|s| s.as_ref()) {
+                    match newpcs.get(j) {
                         Some(rc) => {
-                            cbs.push(format!("{:?}->{:?}", c.commandBuffer, rc[j].commandBuffer))
+                            cbs.push(format!("{:?}->{:?}", c.commandBuffer, rc.commandBuffer))
                         }
                         None => cbs.push(format!("{:?}->?", c.commandBuffer)),
                     }
@@ -1634,12 +1708,13 @@ unsafe fn submit2_impl(
         crate::logf!(
             "proxy submit2 #{seq}: n={count} q={queue:?} real_q={:?} entries={:?} cbs={cbs:?} sems={sems:?} fence={fence:?}",
             unsafe { (*gq).real },
-            copy.iter()
+            unsafe { slice_or_empty(submits, count as usize) }
+                .iter()
                 .map(|s| s.commandBufferInfoCount)
                 .collect::<Vec<_>>()
         );
     }
-    unsafe { real_fn((*gq).real, count, copy.as_ptr(), fence) }
+    unsafe { real_fn((*gq).real, count, translated, fence) }
 }
 
 // Command buffers handed to the app are shim wrappers (same scratch-prefix
@@ -1659,6 +1734,14 @@ unsafe extern "C" fn gn_vkAllocateCommandBuffers(
     let ci = unsafe { &*ci };
     let gd = unsafe { find_device(device) };
     if gd.is_null() {
+        let (first, n) = unsafe { device_table() };
+        loud(
+            "alloc_cmd.miss",
+            format!(
+                "proxy: vkAllocateCommandBuffers DEVICE MISS {} — guest CBs will be driver-raw",
+                unsafe { handle_note(false, device as usize, first, n) }
+            ),
+        );
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let mut rc = vec![ptr::null_mut::<c_void>(); ci.commandBufferCount as usize];
@@ -1775,16 +1858,20 @@ unsafe extern "C" fn gn_vkCreateImage(
         let mut seen = SEEN_IMAGE.lock().unwrap();
         if seen.len() < LOG_IMAGE_FIRST_N && !seen.contains(&key) {
             seen.push(key);
+            let pnext = unsafe { pnext_image_create_summary(ci_ref.pNext) };
             crate::logf!(
-                "guest image: fmt={} {}x{} mips={} layers={} samples={:#x} tiling={} usage={:#x}",
+                "guest image: fmt={} {}x{}x{} type={} mips={} layers={} samples={:#x} tiling={} usage={:#x} flags={:#x} pNext=[{pnext}]",
                 ci_ref.format,
                 ci_ref.extent.width,
                 ci_ref.extent.height,
+                ci_ref.extent.depth,
+                ci_ref.imageType,
                 ci_ref.mipLevels,
                 ci_ref.arrayLayers,
                 ci_ref.samples,
                 ci_ref.tiling,
-                ci_ref.usage
+                ci_ref.usage,
+                ci_ref.flags
             );
         }
     }
@@ -2738,6 +2825,37 @@ unsafe extern "C" fn gn_vkCmdPipelineBarrier(
     ));
 }
 
+// Command buffers the shim wraps can arrive at the driver nested in
+// `pCommandBuffers`; translate them (registry table) before forwarding, or the
+// driver walks a 72-byte `GnCmd` wrapper as its own command buffer.
+unsafe extern "C" fn gn_vkCmdExecuteCommands(
+    cmd: VkCommandBuffer,
+    count: u32,
+    cmds: *const VkCommandBuffer,
+) {
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    if gd.is_null() {
+        // The primary command buffer is not a shim wrapper, so the shim has no
+        // device to route the driver export through and no way to translate the
+        // secondary handles. Forwarding raw is what fed the driver wrapper
+        // pointers before; dropping it is silent. Say it happened.
+        loud(
+            "exec_cmds.miss",
+            format!(
+                "proxy: vkCmdExecuteCommands CB MISS cmd={:#x} count={count} — secondaries not translated",
+                cmd as usize
+            ),
+        );
+        return;
+    }
+    let mut stage = NestedStage::new();
+    let mut args = [cmd as usize, count as usize, cmds as usize, 0, 0, 0];
+    unsafe { translate_nested("vkCmdExecuteCommands", &mut args, &mut stage) };
+    if let Some(f) = unsafe { (*gd).f.execute_commands } {
+        unsafe { f(rcmd, count, args[2] as *const VkCommandBuffer) };
+    }
+}
+
 unsafe extern "C" fn gn_vkFreeCommandBuffers(
     device: VkDevice,
     pool: VkCommandPool,
@@ -3035,6 +3153,12 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
                 as unsafe extern "C" fn(VkQueue, u32, *const VkSubmitInfo2, VkFence) -> VkResult,
         )
     }),
+    (c"vkQueueSubmit2KHR", HandlerScope::Always, unsafe {
+        std::mem::transmute(
+            gn_vkQueueSubmit2
+                as unsafe extern "C" fn(VkQueue, u32, *const VkSubmitInfo2, VkFence) -> VkResult,
+        )
+    }),
     (c"vkWaitSemaphoresKHR", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkWaitSemaphores
@@ -3061,6 +3185,12 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
         std::mem::transmute(
             gn_vkFreeCommandBuffers
                 as unsafe extern "C" fn(VkDevice, VkCommandPool, u32, *const VkCommandBuffer),
+        )
+    }),
+    (c"vkCmdExecuteCommands", HandlerScope::Always, unsafe {
+        std::mem::transmute(
+            gn_vkCmdExecuteCommands
+                as unsafe extern "C" fn(VkCommandBuffer, u32, *const VkCommandBuffer),
         )
     }),
     (c"vkCreateGraphicsPipelines", HandlerScope::Always, unsafe {
@@ -3648,6 +3778,87 @@ mod tests {
         }
     }
 
+    /// The thunk swaps the wrapper for the real handle at a fixed offset
+    /// (`GN_HANDLE_SCRATCH * 8`); a struct-layout drift here would make every
+    /// device-level call reach the driver with a garbage device.
+    #[test]
+    fn device_wrapper_real_offset_matches_thunk_swap() {
+        use std::mem::offset_of;
+        assert_eq!(offset_of!(GnDevice, scratch), 0);
+        assert_eq!(offset_of!(GnDevice, real), GN_HANDLE_SCRATCH * 8);
+        assert_eq!(offset_of!(GnQueue, scratch), 0);
+        assert_eq!(offset_of!(GnQueue, real), GN_HANDLE_SCRATCH * 8);
+        assert_eq!(offset_of!(GnCmd, scratch), 0);
+        assert_eq!(offset_of!(GnCmd, real), GN_HANDLE_SCRATCH * 8);
+    }
+
+    /// The generated nested-handle table is what `translate_nested` walks, so
+    /// it must record the command-buffer arrays the submit and execute
+    /// commands consume, with the struct offsets read from the same headers
+    /// (`offset_of!`) so a struct-layout drift fails here.
+    #[test]
+    fn nested_handles_cover_command_buffer_arrays() {
+        use crate::vk_dispatch_gen::{nested_handles, HandleKind};
+        use std::mem::offset_of;
+
+        let e = nested_handles("vkCmdExecuteCommands");
+        assert_eq!(e.len(), 1, "vkCmdExecuteCommands plan");
+        assert_eq!(e[0].param, 2);
+        assert_eq!(e[0].count_param, 1);
+        assert_eq!(e[0].kind, HandleKind::CommandBuffer);
+        assert!(e[0].hops.is_empty(), "the parameter is the handle array");
+
+        let s = nested_handles("vkQueueSubmit");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].param, 2);
+        assert_eq!(s[0].count_param, 1);
+        assert_eq!(
+            s[0].elem_stride,
+            std::mem::size_of::<crate::vk::VkSubmitInfo>()
+        );
+        assert_eq!(s[0].hops.len(), 1);
+        assert_eq!(
+            s[0].hops[0].off,
+            offset_of!(crate::vk::VkSubmitInfo, pCommandBuffers)
+        );
+        assert_eq!(
+            s[0].hops[0].count_off,
+            offset_of!(crate::vk::VkSubmitInfo, commandBufferCount)
+        );
+
+        // VkSubmitInfo2 -> pCommandBufferInfos -> VkCommandBufferSubmitInfo::commandBuffer.
+        let s2 = nested_handles("vkQueueSubmit2");
+        assert_eq!(s2[0].hops.len(), 2);
+        assert_eq!(
+            s2[0].hops[0].off,
+            offset_of!(crate::vk::VkSubmitInfo2, pCommandBufferInfos)
+        );
+        assert_eq!(
+            s2[0].hops[1].off,
+            offset_of!(crate::vk::VkCommandBufferSubmitInfo, commandBuffer)
+        );
+        assert_eq!(s2[0].hops[1].count_off, usize::MAX);
+        // The KHR spelling inherits the target's plan.
+        assert_eq!(nested_handles("vkQueueSubmit2KHR"), s2);
+
+        // A command carrying no wrapped handle has no plan.
+        assert!(nested_handles("vkCmdDraw").is_empty());
+    }
+
+    /// Every command the registry records a nested wrapped-handle input for
+    /// must be served by a shim handler: a name served by the arg0-only thunk
+    /// would forward the nested wrapper untranslated — the round-W storm.
+    #[test]
+    fn every_nested_handle_command_is_intercepted() {
+        for (name, _) in crate::vk_dispatch_gen::VK_NESTED_HANDLES {
+            let c = CString::new(*name).unwrap();
+            assert!(
+                device_func(&c).is_some(),
+                "{name} carries a nested wrapped handle but is not intercepted"
+            );
+        }
+    }
+
     /// The policy is decided from the name + entry point alone — never from the
     /// handle — so a device-level name is always swapped (in device context) and
     /// an instance- or physical-device-level name never is. This is the
@@ -3900,24 +4111,6 @@ pub const GN_DRM_FORMAT_XBGR8888: u32 = gn_fourcc(b'X', b'B', b'2', b'4');
 pub const GN_DRM_FORMAT_ARGB8888: u32 = gn_fourcc(b'A', b'R', b'2', b'4');
 pub const GN_DRM_FORMAT_ABGR8888: u32 = gn_fourcc(b'A', b'B', b'2', b'4');
 pub const GN_DRM_MOD_LINEAR: u64 = 0;
-// Qualcomm scanout layouts (DRM_FORMAT_MOD_QCOM_*): COMPRESSED is UBWC, TILED3
-// the same macrotile layout without compression. Either names the layout of a
-// present image outright, instead of the explicit-LINEAR export the shim
-// otherwise has to force (a LINEAR export is the only layout it can map and
-// read, and the only one the driver cannot silently replace with a compressed
-// payload). GN_VKSHIM_SC_MOD picks the candidates, LINEAR always last.
-pub const GN_DRM_MOD_QCOM_COMPRESSED: u64 = 0x0500_0000_0000_0001;
-pub const GN_DRM_MOD_QCOM_TILED3: u64 = 0x0500_0000_0000_0003;
-
-fn sc_modifiers() -> &'static [u64] {
-    match std::env::var("GN_VKSHIM_SC_MOD").as_deref() {
-        Ok("compressed") => &[GN_DRM_MOD_QCOM_COMPRESSED],
-        Ok("tiled3") => &[GN_DRM_MOD_QCOM_TILED3],
-        Ok("auto") => &[GN_DRM_MOD_QCOM_COMPRESSED, GN_DRM_MOD_QCOM_TILED3],
-        _ => &[],
-    }
-}
-
 fn max_swapchain_images() -> u32 {
     match std::env::var("WRAPPER_MAX_IMAGE_COUNT")
         .ok()
@@ -3956,7 +4149,6 @@ pub struct RealDevFns {
         Option<unsafe extern "C" fn(VkDevice, *const VkSemaphoreWaitInfo, u64) -> VkResult>,
     pub destroy_image: Option<PFN_vkDestroyImage>,
     pub get_mem_reqs: Option<PFN_vkGetImageMemoryRequirements>,
-    pub get_layout: Option<PFN_vkGetImageSubresourceLayout>,
     pub alloc_mem: Option<PFN_vkAllocateMemory>,
     pub free_mem: Option<PFN_vkFreeMemory>,
     pub bind_mem: Option<PFN_vkBindImageMemory>,
@@ -3969,6 +4161,11 @@ pub struct RealDevFns {
     pub alloc_cmd: Option<PFN_vkAllocateCommandBuffers>,
     pub free_cmd: Option<PFN_vkFreeCommandBuffers>,
     pub submit: Option<PFN_vkQueueSubmit>,
+    // Secondary command buffers the shim wraps arrive nested in
+    // `vkCmdExecuteCommands::pCommandBuffers`; resolved so the command can be
+    // forwarded with the driver's real handles (see `translate_nested`).
+    pub execute_commands:
+        Option<unsafe extern "C" fn(VkCommandBuffer, u32, *const VkCommandBuffer)>,
     pub wait_idle: Option<PFN_vkDeviceWaitIdle>,
     pub queue_wait_idle: Option<PFN_vkQueueWaitIdle>,
     pub destroy_device: Option<PFN_vkDestroyDevice>,
@@ -4016,16 +4213,29 @@ pub struct GnInstance {
 
 pub const GN_HANDLE_SCRATCH: usize = 6;
 
+/// `repr(C)` is REQUIRED: the wrapper-swapping thunks (`thunk::emit`) load the
+/// real handle from a fixed byte offset (`GN_HANDLE_SCRATCH * 8`) derived from
+/// this declaration order. With the default `repr(Rust)` layout rustc reorders
+/// fields, which silently moved `scratch`/`real` and made every thunked
+/// device-level call reach the driver with a garbage device.
+#[repr(C)]
 pub struct GnDevice {
     pub scratch: [usize; GN_HANDLE_SCRATCH],
     pub real: VkDevice,
     pub inst: *mut GnInstance,
+    // The physical device this device was created from, and its memory
+    // properties, captured once at create time. Read-only: used only by the
+    // image-path instrument (`modq` probe, and the memory-type line after a
+    // swapchain image import). Neither field participates in creation logic.
+    pub pd: VkPhysicalDevice,
+    pub mem_props: VkPhysicalDeviceMemoryProperties,
     pub f: RealDevFns,
     pub queues: *mut GnQueue, // wrapper list
     pub cmds: *mut GnCmd,     // wrapper list
     pub next: *mut GnDevice,
 }
 
+#[repr(C)]
 pub struct GnQueue {
     pub scratch: [usize; GN_HANDLE_SCRATCH],
     pub real: VkQueue,
@@ -4033,6 +4243,7 @@ pub struct GnQueue {
     pub next: *mut GnQueue,
 }
 
+#[repr(C)]
 pub struct GnCmd {
     pub scratch: [usize; GN_HANDLE_SCRATCH],
     pub real: VkCommandBuffer,
@@ -4411,6 +4622,49 @@ fn was_wrapper(p: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// A dropped call must never be invisible. `logf!` is gated on
+/// `GNDRM_LOG_VKSHIM`, which the guest process does not set, so every silent
+/// early-return used `logf!` and was unobservable in a real session — a call
+/// the shim dropped looked identical to one the guest never made. These lines
+/// go out unconditionally (`routef!`), bounded per site so a storm of misses
+/// cannot flood logcat.
+const LOUD_MAX: u32 = 6;
+fn loud(site: &'static str, msg: String) {
+    static SEEN: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new());
+    if let Ok(mut v) = SEEN.lock() {
+        match v.iter_mut().find(|(s, _)| *s == site) {
+            Some((_, c)) if *c >= LOUD_MAX => return,
+            Some((_, c)) => *c += 1,
+            None => v.push((site, 1)),
+        }
+    }
+    crate::routef!("{msg}");
+}
+
+/// A handle the shim could not resolve, against the wrapper table it searched,
+/// so a wrong-handle miss names both values in one line.
+unsafe fn handle_note(found: bool, searched: usize, first_wrapper: usize, n: usize) -> String {
+    format!(
+        "found={found} searched={searched:#x} wrappers={n} first={first_wrapper:#x} pid={}",
+        std::process::id()
+    )
+}
+
+/// First wrapper in the device table (0 when empty) and the table size.
+unsafe fn device_table() -> (usize, usize) {
+    let g = G.lock().unwrap();
+    let mut p = g.devices;
+    let n = {
+        let mut n = 0;
+        while !p.is_null() {
+            n += 1;
+            p = unsafe { (*p).next };
+        }
+        n
+    };
+    (g.devices as usize, n)
+}
+
 unsafe fn find_cmd_any(cmd: VkCommandBuffer) -> *mut GnCmd {
     let g = G.lock().unwrap();
     let mut d = g.devices;
@@ -4441,6 +4695,179 @@ unsafe fn real_cmd(cmd: VkCommandBuffer) -> VkCommandBuffer {
         crate::logf!("proxy: BUG submit carries an untracked wrapper CB {cmd:?}");
     }
     cmd
+}
+
+// ------------------------------------------- nested wrapped-handle translation
+//
+// A command's parameters can carry wrapped handles nested inside structs and
+// arrays (`VkSubmitInfo::pCommandBuffers`,
+// `VkSubmitInfo2::pCommandBufferInfos[].commandBuffer`,
+// `vkCmdExecuteCommands::pCommandBuffers`). Argument-0 swapping cannot reach
+// them, so the driver would walk a shim wrapper as if it were its own object.
+// Which fields these are is a registry property, generated into
+// `vk_dispatch_gen::VK_NESTED_HANDLES`; `translate_nested` applies that one
+// plan uniformly, replacing every wrapper with the driver's real handle.
+
+/// Owns the translated copies for the duration of a driver call. Pointers into
+/// a `Box`'s heap allocation stay valid across `bufs` growth, so a copy already
+/// published through an argument word does not move.
+pub struct NestedStage {
+    bufs: Vec<Box<[u8]>>,
+}
+
+impl Default for NestedStage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NestedStage {
+    pub fn new() -> Self {
+        Self { bufs: Vec::new() }
+    }
+
+    /// Copy `len` bytes from `src` into a stage-owned buffer and return its
+    /// stable pointer.
+    unsafe fn copy(&mut self, src: *const u8, len: usize) -> *mut u8 {
+        let mut v = vec![0u8; len].into_boxed_slice();
+        unsafe { ptr::copy_nonoverlapping(src, v.as_mut_ptr(), len) };
+        let p = v.as_mut_ptr();
+        self.bufs.push(v);
+        p
+    }
+}
+
+/// The driver's real handle for a shim wrapper of `kind`. A value the shim
+/// never wrapped is already the driver's own and passes through unchanged.
+unsafe fn map_handle(kind: crate::vk_dispatch_gen::HandleKind, h: usize) -> usize {
+    use crate::vk_dispatch_gen::HandleKind;
+    let h = h as *mut c_void;
+    match kind {
+        HandleKind::CommandBuffer => unsafe { real_cmd(h) as usize },
+        HandleKind::Queue => {
+            let gq = unsafe { find_queue(h as VkQueue) };
+            if gq.is_null() {
+                h as usize
+            } else {
+                unsafe { (*gq).real as usize }
+            }
+        }
+        HandleKind::Device => {
+            let gd = unsafe { find_device(h as VkDevice) };
+            if gd.is_null() {
+                h as usize
+            } else {
+                unsafe { (*gd).real as usize }
+            }
+        }
+    }
+}
+
+/// Translate, in place, the wrapped handles `name`'s generated plan marks
+/// inside the parameter words `args`, staging every copy in `stage`. Returns
+/// the number of handles replaced.
+pub unsafe fn translate_nested(
+    name: &str,
+    args: &mut [usize; 6],
+    stage: &mut NestedStage,
+) -> usize {
+    let mut done = 0usize;
+    for nh in crate::vk_dispatch_gen::nested_handles(name) {
+        let p = args[nh.param as usize];
+        if p == 0 {
+            continue;
+        }
+        if nh.count_param == 255 {
+            args[nh.param as usize] = unsafe { map_handle(nh.kind, p) };
+            done += 1;
+            continue;
+        }
+        let n = args[nh.count_param as usize];
+        if n == 0 {
+            continue;
+        }
+        if nh.hops.is_empty() {
+            let copy = unsafe { stage.copy(p as *const u8, n * nh.elem_stride) } as *mut usize;
+            for i in 0..n {
+                let v = unsafe { *copy.add(i) };
+                unsafe { *copy.add(i) = map_handle(nh.kind, v) };
+            }
+            args[nh.param as usize] = copy as usize;
+            done += n;
+        } else {
+            let copy = unsafe { stage.copy(p as *const u8, n * nh.elem_stride) };
+            for i in 0..n {
+                let elem = unsafe { copy.add(i * nh.elem_stride) };
+                done += unsafe { hop_translate(nh.hops, elem, nh.kind, stage) };
+            }
+            args[nh.param as usize] = copy as usize;
+        }
+    }
+    if done > 0 {
+        note_nested(name, done);
+    }
+    done
+}
+
+/// Walk one hop chain from a top-level element, translating the handle array it
+/// reaches. `hops[0]` locates the child pointer, or a single handle value when
+/// `count_off` is `usize::MAX`.
+unsafe fn hop_translate(
+    hops: &[crate::vk_dispatch_gen::Hop],
+    elem: *mut u8,
+    kind: crate::vk_dispatch_gen::HandleKind,
+    stage: &mut NestedStage,
+) -> usize {
+    let h = hops[0];
+    if h.count_off == usize::MAX {
+        // A single handle value per element (VkCommandBufferSubmitInfo).
+        let slot = unsafe { elem.add(h.off) as *mut usize };
+        let v = unsafe { *slot };
+        if v == 0 {
+            return 0;
+        }
+        unsafe { *slot = map_handle(kind, v) };
+        return 1;
+    }
+    let child = unsafe { *(elem.add(h.off) as *const usize) };
+    let cnt = unsafe { *(elem.add(h.count_off) as *const u32) } as usize;
+    if child == 0 || cnt == 0 {
+        return 0;
+    }
+    if hops.len() == 1 {
+        let copy = unsafe { stage.copy(child as *const u8, cnt * h.stride) } as *mut usize;
+        for i in 0..cnt {
+            let v = unsafe { *copy.add(i) };
+            unsafe { *copy.add(i) = map_handle(kind, v) };
+        }
+        unsafe { *(elem.add(h.off) as *mut usize) = copy as usize };
+        cnt
+    } else {
+        let copy = unsafe { stage.copy(child as *const u8, cnt * h.stride) };
+        let mut done = 0usize;
+        for i in 0..cnt {
+            let e = unsafe { copy.add(i * h.stride) };
+            done += unsafe { hop_translate(&hops[1..], e, kind, stage) };
+        }
+        unsafe { *(elem.add(h.off) as *mut usize) = copy as usize };
+        done
+    }
+}
+
+/// Log the first translation of each command name (bounded: one line per name),
+/// so a session shows the nested policy engaging.
+fn note_nested(name: &str, n: usize) {
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    if let Ok(mut v) = SEEN.lock() {
+        if v.len() < 32 && !v.iter().any(|s| s == name) {
+            v.push(name.to_string());
+            // Always on: "the guest reached the shim's submit/execute path and
+            // the shim translated nested wrapper handles" is the fact that
+            // settles whether the submit path is live, and the guest process
+            // does not set GNDRM_LOG_VKSHIM. Bounded to one line per name.
+            crate::routef!("proxy nested translate: {name} ({n} handle(s))");
+        }
+    }
 }
 
 unsafe fn find_cmd(gd: *mut GnDevice, cmd: VkCommandBuffer) -> *mut GnCmd {
@@ -4842,6 +5269,14 @@ unsafe extern "C" fn gn_vkCreateInstance(
     crate::logf!("proxy instance {:?} (headless WSI backing)", unsafe {
         *out
     });
+    if !LOUD_INSTANCE.swap(true, Ordering::Relaxed) {
+        crate::routef!(
+            "proxy: instance created pid={} real={:?} npds={}",
+            std::process::id(),
+            unsafe { *out },
+            unsafe { (*gi).n_pds }
+        );
+    }
     VK_SUCCESS
 }
 
@@ -5390,6 +5825,13 @@ unsafe extern "C" fn gn_vkCreateDevice(
     let ci = unsafe { &*ci };
     let gi = unsafe { find_instance_by_pd(pd) };
     if gi.is_null() || unsafe { (*gi).f.create_device.is_none() } {
+        loud(
+            "create_device.noinst",
+            format!(
+                "proxy: vkCreateDevice NO INSTANCE pd={:#x} gi={} — guest device will be driver-raw (wrong-handle class)",
+                pd as usize, gi.is_null()
+            ),
+        );
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     const ADD_EXTS: [&CStr; 4] = [
@@ -5477,10 +5919,18 @@ unsafe extern "C" fn gn_vkCreateDevice(
     if res != VK_SUCCESS {
         return res;
     }
+    // Read-only capture for the image-path instrument: the physical device and
+    // its memory properties, so a later slot import can name the heap the
+    // driver placed the image in. `vkGetPhysicalDeviceMemoryProperties` is a
+    // pure query; its result is never consulted by any creation decision.
+    let mem_props = unsafe { fetch_mem_props(gi, pd) };
+    unsafe { log_mem_props_once(pd, &mem_props) };
     let mut gd = Box::new(GnDevice {
         scratch: [0; GN_HANDLE_SCRATCH],
         real: unsafe { *out },
         inst: gi,
+        pd,
+        mem_props,
         f: RealDevFns::default(),
         queues: ptr::null_mut(),
         cmds: ptr::null_mut(),
@@ -5514,7 +5964,6 @@ unsafe extern "C" fn gn_vkCreateDevice(
     resolve!(wait_semaphores, "vkWaitSemaphoresKHR");
     resolve!(destroy_image, "vkDestroyImage");
     resolve!(get_mem_reqs, "vkGetImageMemoryRequirements");
-    resolve!(get_layout, "vkGetImageSubresourceLayout");
     resolve!(alloc_mem, "vkAllocateMemory");
     resolve!(free_mem, "vkFreeMemory");
     resolve!(bind_mem, "vkBindImageMemory");
@@ -5527,6 +5976,7 @@ unsafe extern "C" fn gn_vkCreateDevice(
     resolve!(alloc_cmd, "vkAllocateCommandBuffers");
     resolve!(free_cmd, "vkFreeCommandBuffers");
     resolve!(submit, "vkQueueSubmit");
+    resolve!(execute_commands, "vkCmdExecuteCommands");
     resolve!(wait_idle, "vkDeviceWaitIdle");
     resolve!(queue_wait_idle, "vkQueueWaitIdle");
     resolve!(destroy_device, "vkDestroyDevice");
@@ -5629,6 +6079,18 @@ unsafe extern "C" fn gn_vkGetDeviceQueue(
 ) {
     let gd = unsafe { find_device(device) };
     if gd.is_null() {
+        // Never leave `*out` unwritten: the guest would hold an uninitialised
+        // queue and every later submit would be dropped against it. Name the
+        // handle that did not match and the table that was searched.
+        let (first, n) = unsafe { device_table() };
+        loud(
+            "get_device_queue.miss",
+            format!(
+                "proxy: gn_vkGetDeviceQueue DEVICE MISS family={family} index={index} {}",
+                unsafe { handle_note(false, device as usize, first, n) }
+            ),
+        );
+        unsafe { *out = ptr::null_mut() };
         return;
     }
     let mut gq = Box::new(GnQueue {
@@ -5650,7 +6112,7 @@ unsafe extern "C" fn gn_vkGetDeviceQueue(
             (*gd).queues = gq;
         }
     }
-    unsafe { *out = gq.cast::<c_void>() };
+    unsafe { *out = gq.cast::<c_void>() }
 }
 
 unsafe extern "C" fn gn_vkGetDeviceQueue2(
@@ -5660,6 +6122,14 @@ unsafe extern "C" fn gn_vkGetDeviceQueue2(
 ) {
     let gd = unsafe { find_device(device) };
     if gd.is_null() {
+        let (first, n) = unsafe { device_table() };
+        loud(
+            "get_device_queue2.miss",
+            format!("proxy: gn_vkGetDeviceQueue2 DEVICE MISS {}", unsafe {
+                handle_note(false, device as usize, first, n)
+            }),
+        );
+        unsafe { *out = ptr::null_mut() };
         return;
     }
     // Per device: these resolved entry points are bound to the device that
@@ -5847,29 +6317,306 @@ unsafe fn slot_init_sync(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
     res
 }
 
-unsafe fn slot_init_tiled(sc: *mut GnSwapchain, s: *mut GnSlot, modifier: u64) -> VkResult {
+// ------------------------------------------------- image-path instrument
+//
+// Measurement-only. Every function below is either a log or a read-only
+// physical-device query whose result is *discarded* — nothing here alters any
+// argument handed to the driver, so image/swapchain creation behaviour is
+// unchanged. The one-shot statics bound each trace to a single line per
+// process, independent of how many swapchain images the guest creates.
+static TRACE_IMAGE_CI_LINEAR: AtomicBool = AtomicBool::new(false);
+static TRACE_MOD_QUERY: AtomicBool = AtomicBool::new(false);
+static TRACE_MEM_PROPS: AtomicBool = AtomicBool::new(false);
+
+/// Human-readable walk of a `VkImageCreateInfo` pNext chain. Read-only; only
+/// the sType list plus the modifier/tiling/handleTypes fields are rendered.
+unsafe fn pnext_image_create_summary(mut p: *const c_void) -> String {
+    let mut out = String::new();
+    let mut n = 0;
+    while !p.is_null() && n < 8 {
+        let b = p.cast::<VkBaseOutStructure>();
+        let st = unsafe { (*b).sType };
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        match st {
+            VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO => {
+                let e = p.cast::<VkExternalMemoryImageCreateInfo>();
+                out.push_str(&format!(
+                    "ExternalMemoryImageCreateInfo{{handleTypes={:#x}}}",
+                    unsafe { (*e).handleTypes }
+                ));
+            }
+            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT => {
+                let e = p.cast::<VkImageDrmFormatModifierExplicitCreateInfoEXT>();
+                let m = unsafe { (*e).drmFormatModifier };
+                let cnt = unsafe { (*e).drmFormatModifierPlaneCount };
+                let pl = unsafe { (*e).pPlaneLayouts };
+                if !pl.is_null() && cnt > 0 {
+                    out.push_str(&format!(
+                        "ImageDrmFormatModifierExplicitCreateInfoEXT{{mod={m:#x}, planes={cnt}, plane0{{offset={}, rowPitch={}, size={}}}}}",
+                        unsafe { (*pl).offset },
+                        unsafe { (*pl).rowPitch },
+                        unsafe { (*pl).size }
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "ImageDrmFormatModifierExplicitCreateInfoEXT{{mod={m:#x}, planes={cnt}}}"
+                    ));
+                }
+            }
+            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT => {
+                let e = p.cast::<VkImageDrmFormatModifierListCreateInfoEXT>();
+                out.push_str(&format!(
+                    "ImageDrmFormatModifierListCreateInfoEXT{{count={}}}",
+                    unsafe { (*e).drmFormatModifierCount }
+                ));
+            }
+            _ => out.push_str(&format!("sType={st}")),
+        }
+        p = unsafe { (*b).pNext as *const c_void };
+        n += 1;
+    }
+    out
+}
+
+/// One-shot full dump of the `VkImageCreateInfo` about to be handed to
+/// `vkCreateImage` (format/tiling/modifier/usage/extent + pNext walk).
+unsafe fn trace_image_create(ci: &VkImageCreateInfo, tag: &str, shot: &AtomicBool) {
+    if shot.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let pnext = unsafe { pnext_image_create_summary(ci.pNext) };
+    crate::routef!(
+        "{tag}: vkCreateImage fmt={} {}x{}x{} mips={} layers={} samples={:#x} tiling={} usage={:#x} flags={:#x} pNext=[{pnext}]",
+        ci.format,
+        ci.extent.width,
+        ci.extent.height,
+        ci.extent.depth,
+        ci.mipLevels,
+        ci.arrayLayers,
+        ci.samples,
+        ci.tiling,
+        ci.usage,
+        ci.flags
+    );
+}
+
+/// Pure informational `vkGetPhysicalDeviceImageFormatProperties2` with a
+/// `VkPhysicalDeviceImageDrmFormatModifierInfoEXT{ LINEAR }` pNext. The
+/// `VkResult` and the returned properties are logged and then thrown away;
+/// no caller branches on them. Run for two `tiling` values: the one the
+/// create actually uses (LINEAR) and the only tiling for which the spec
+/// honours the modifier pNext (DRM_FORMAT_MODIFIER_EXT).
+unsafe fn query_linear_modifier_support(
+    gd: *mut GnDevice,
+    format: VkFormat,
+    usage: VkImageUsageFlags,
+    create_tiling: VkImageTiling,
+) {
+    if TRACE_MOD_QUERY.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let inst = unsafe { (*(*gd).inst).real };
+    let pd = unsafe { (*gd).pd };
+    let raw = unsafe { gn_real_inst_proc(inst, c"vkGetPhysicalDeviceImageFormatProperties2") };
+    let Some(_) = raw else {
+        crate::routef!(
+            "modq: vkGetPhysicalDeviceImageFormatProperties2 unresolved (driver/loader)"
+        );
+        return;
+    };
+    let query: PFN_vkGetPhysicalDeviceImageFormatProperties2 = unsafe { std::mem::transmute(raw) };
+    for tiling in [create_tiling, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT] {
+        let modinfo = VkPhysicalDeviceImageDrmFormatModifierInfoEXT {
+            sType: VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
+            pNext: ptr::null(),
+            drmFormatModifier: GN_DRM_MOD_LINEAR,
+            sharingMode: VK_SHARING_MODE_EXCLUSIVE,
+            queueFamilyIndexCount: 0,
+            pQueueFamilyIndices: ptr::null(),
+        };
+        let fmtinfo = VkPhysicalDeviceImageFormatInfo2 {
+            sType: VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+            pNext: &modinfo as *const _ as *const c_void,
+            format,
+            type_: VK_IMAGE_TYPE_2D,
+            tiling,
+            usage,
+            flags: 0,
+        };
+        let mut mods = [VkDrmFormatModifierPropertiesEXT {
+            drmFormatModifier: 0,
+            drmFormatModifierPlaneCount: 0,
+            drmFormatModifierTilingFeatures: 0,
+        }; 8];
+        let mut modlist = VkDrmFormatModifierPropertiesListEXT {
+            sType: VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+            pNext: ptr::null_mut(),
+            drmFormatModifierCount: mods.len() as u32,
+            pDrmFormatModifierProperties: mods.as_mut_ptr(),
+        };
+        let mut props = VkImageFormatProperties2 {
+            sType: VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+            pNext: &mut modlist as *mut _ as *mut c_void,
+            imageFormatProperties: VkImageFormatProperties {
+                maxExtent: VkExtent3D {
+                    width: 0,
+                    height: 0,
+                    depth: 0,
+                },
+                maxMipLevels: 0,
+                maxArrayLayers: 0,
+                sampleCounts: 0,
+                maxResourceSize: 0,
+            },
+        };
+        let res = unsafe { query(pd, &fmtinfo, &mut props) };
+        let ip = props.imageFormatProperties;
+        crate::routef!(
+            "modq: vkGetPhysicalDeviceImageFormatProperties2 fmt={format} type=2D tiling={tiling} usage={usage:#x} pNext=VkPhysicalDeviceImageDrmFormatModifierInfoEXT{{mod=LINEAR(0), sharing=EXCLUSIVE}} -> res={res} maxExtent={}x{}x{} maxMips={} maxLayers={} samples={:#x} maxRes={} modCount={} mod0={:#x} feat0={:#x} planes0={} [informational only: result not consulted]",
+            ip.maxExtent.width,
+            ip.maxExtent.height,
+            ip.maxExtent.depth,
+            ip.maxMipLevels,
+            ip.maxArrayLayers,
+            ip.sampleCounts,
+            ip.maxResourceSize,
+            modlist.drmFormatModifierCount,
+            mods[0].drmFormatModifier,
+            mods[0].drmFormatModifierTilingFeatures,
+            mods[0].drmFormatModifierPlaneCount
+        );
+    }
+}
+
+/// Read-only `vkGetPhysicalDeviceMemoryProperties` capture at device create.
+unsafe fn fetch_mem_props(
+    gi: *mut GnInstance,
+    pd: VkPhysicalDevice,
+) -> VkPhysicalDeviceMemoryProperties {
+    let mut mp: VkPhysicalDeviceMemoryProperties = unsafe { std::mem::zeroed() };
+    let inst = unsafe { (*gi).real };
+    let raw = unsafe { gn_real_inst_proc(inst, c"vkGetPhysicalDeviceMemoryProperties") };
+    if raw.is_some() {
+        let f: PFN_vkGetPhysicalDeviceMemoryProperties = unsafe { std::mem::transmute(raw) };
+        unsafe { f(pd, &mut mp) };
+    }
+    mp
+}
+
+/// One-shot summary of the memory types so the slot-import line below can be
+/// read against the heaps the driver actually exposes.
+unsafe fn log_mem_props_once(pd: VkPhysicalDevice, mp: &VkPhysicalDeviceMemoryProperties) {
+    let _ = pd;
+    if TRACE_MEM_PROPS.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let n = (mp.memoryTypeCount as usize).min(VK_MAX_MEMORY_TYPES);
+    let summary: Vec<String> = (0..n)
+        .map(|i| {
+            let t = mp.memoryTypes[i];
+            format!(
+                "t{i}:heap{}:flags{:#x}{}",
+                t.heapIndex,
+                t.propertyFlags,
+                if t.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT != 0 {
+                    ":LOCAL"
+                } else {
+                    ""
+                }
+            )
+        })
+        .collect();
+    let heaps: Vec<String> = (0..(mp.memoryHeapCount as usize).min(VK_MAX_MEMORY_HEAPS))
+        .map(|i| {
+            format!(
+                "h{i}:{}B:flags{:#x}",
+                mp.memoryHeaps[i].size, mp.memoryHeaps[i].flags
+            )
+        })
+        .collect();
+    crate::routef!(
+        "memprops: types={} [{}] heaps={} [{}]",
+        mp.memoryTypeCount,
+        summary.join(" "),
+        mp.memoryHeapCount,
+        heaps.join(" ")
+    );
+}
+
+/// Read-only description of a chosen `memoryTypeIndex` (heap + DEVICE_LOCAL).
+fn mem_type_desc(gd: *mut GnDevice, idx: u32) -> String {
+    let mp = unsafe { &(*gd).mem_props };
+    if (idx as usize) < mp.memoryTypeCount as usize {
+        let t = mp.memoryTypes[idx as usize];
+        let local = t.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT != 0;
+        format!(
+            "mem_type {idx} heap {} flags {:#x} DEVICE_LOCAL={}",
+            t.heapIndex,
+            t.propertyFlags,
+            if local { "yes" } else { "no" }
+        )
+    } else {
+        format!(
+            "mem_type {idx} (beyond memoryTypeCount {})",
+            mp.memoryTypeCount
+        )
+    }
+}
+
+/// Creates one swapchain slot image as a LINEAR, externally-exported image: the
+/// guest's `VK_IMAGE_TILING_LINEAR` is the layout contract on its own. No DRM
+/// format modifier is named or requested in the `pNext` chain — only
+/// `VkExternalMemoryImageCreateInfo{DMA_BUF}` — so the driver always produces
+/// plain scan-out pixels (LINEAR forbids UBWC outright) and DRI3 wayland
+/// present see a modifier of 0. The image is backed by a dma-buf the shim owns
+/// — the daemon's scan-out pool when that channel is up, a local system-heap
+/// allocation otherwise — and bound through the imported-fd path.
+unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
     let gd = (*sc).dev;
     let dev = unsafe { (*gd).real };
     let f = unsafe { (*gd).f };
-    let w = (*sc).extent.width;
+    (*s).fd = -1;
+    (*s).stride = ((*sc).extent.width * 4 + 255) & !255;
+    (*s).offset = 0;
+    (*s).modifier = GN_DRM_MOD_LINEAR;
     unsafe {
         if (*s).fd >= 0 {
             libc::close((*s).fd);
-            (*s).fd = -1;
         }
     }
-    (*s).stride = (w * 4 + 255) & !255;
-    (*s).offset = 0;
-    (*s).modifier = modifier;
-    let modlist = VkImageDrmFormatModifierListCreateInfoEXT {
-        sType: VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
-        pNext: ptr::null(),
-        drmFormatModifierCount: 1,
-        pDrmFormatModifiers: &modifier,
-    };
+    // The swapchain image must be a buffer the daemon owns: the presenter
+    // can only publish one of its own `AHardwareBuffer`s. Ask for it over
+    // the scan-out channel explicitly rather than relying on the
+    // LD_PRELOAD shim to intercept this process's heap allocation. The
+    // returned stride is authoritative for the image this fd backs.
+    match crate::scanout::allocate((*sc).extent.width, (*sc).extent.height) {
+        Some(buf) => {
+            (*s).fd = buf.fd;
+            if buf.stride != 0 {
+                (*s).stride = buf.stride;
+            }
+            crate::routef!(
+                "proxy slot: pool buffer fd={} ino={} stride={}",
+                buf.fd,
+                buf.ino,
+                (*s).stride
+            );
+        }
+        None => {
+            // No daemon channel, or it refused: a local system-heap
+            // allocation, the pre-existing behaviour, which the LD_PRELOAD
+            // shim may still redirect.
+            (*s).fd = dma_heap_alloc((*s).stride as usize * (*sc).extent.height as usize);
+        }
+    }
+    if (*s).fd < 0 {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     let ext_img = VkExternalMemoryImageCreateInfo {
         sType: VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-        pNext: &modlist as *const _ as *const c_void,
+        pNext: ptr::null(),
         handleTypes: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
     };
     let ici = VkImageCreateInfo {
@@ -5879,24 +6626,30 @@ unsafe fn slot_init_tiled(sc: *mut GnSwapchain, s: *mut GnSlot, modifier: u64) -
         imageType: VK_IMAGE_TYPE_2D,
         format: (*sc).format,
         extent: VkExtent3D {
-            width: w,
+            width: (*sc).extent.width,
             height: (*sc).extent.height,
             depth: 1,
         },
         mipLevels: 1,
         arrayLayers: 1,
         samples: VK_SAMPLE_COUNT_1_BIT,
-        tiling: VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+        // TILING_LINEAR forbids UBWC outright, so the fd is always plain
+        // scan-out pixels. No explicit DRM modifier is requested: the
+        // guest's LINEAR tiling is the layout contract on its own.
+        tiling: VK_IMAGE_TILING_LINEAR,
         usage: (*sc).usage,
         sharingMode: VK_SHARING_MODE_EXCLUSIVE,
         queueFamilyIndexCount: 0,
         pQueueFamilyIndices: ptr::null(),
         initialLayout: VK_IMAGE_LAYOUT_UNDEFINED,
     };
-    let mut res = unsafe { f.create_image.unwrap()(dev, &ici, ptr::null(), &mut (*s).image) };
+    // One-shot diagnostic dump of the exact create-info (pNext chain,
+    // tiling, modifier) plus a pure read-only modifier-support query.
+    unsafe { query_linear_modifier_support(gd, (*sc).format, (*sc).usage, VK_IMAGE_TILING_LINEAR) };
+    unsafe { trace_image_create(&ici, "img-create linear", &TRACE_IMAGE_CI_LINEAR) };
+    let res = unsafe { f.create_image.unwrap()(dev, &ici, ptr::null(), &mut (*s).image) };
     if res != VK_SUCCESS {
-        crate::logf!("proxy slot: modifier {modifier:#x} image create: {res}");
-        (*s).image = 0;
+        crate::logf!("proxy import image create failed: {res}");
         return res;
     }
     let mut reqs = VkMemoryRequirements {
@@ -5912,258 +6665,48 @@ unsafe fn slot_init_tiled(sc: *mut GnSwapchain, s: *mut GnSlot, modifier: u64) -
             break;
         }
     }
-    // The driver's own size: a compressed layout carries a metadata region
-    // past the pixels, and it is only known once the image exists.
-    (*s).fd = dma_heap_alloc(reqs.size as usize);
-    crate::logf!(
-        "proxy slot: modifier {modifier:#x} {}x{} reqs {} mem_type {mem_type} fd {} stride {}",
-        w,
+    if mem_type == u32::MAX {
+        crate::logf!("proxy import image: no memory type");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    crate::routef!(
+        "proxy slot: linear {}x{} reqs {} memTypeBits {:#x} {}",
+        (*sc).extent.width,
         (*sc).extent.height,
         reqs.size,
-        (*s).fd,
-        (*s).stride
+        reqs.memoryTypeBits,
+        mem_type_desc(gd, mem_type)
     );
-    if mem_type == u32::MAX || (*s).fd < 0 {
-        res = VK_ERROR_INITIALIZATION_FAILED;
+    let ded = VkMemoryDedicatedAllocateInfo {
+        sType: VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+        pNext: ptr::null(),
+        image: (*s).image,
+        buffer: 0,
+    };
+    let import_fd = unsafe { libc::dup((*s).fd) };
+    let imp = VkImportMemoryFdInfoKHR {
+        sType: VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+        pNext: &ded as *const _ as *const c_void,
+        handleType: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        fd: import_fd,
+    };
+    let mai = VkMemoryAllocateInfo {
+        sType: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        pNext: &imp as *const _ as *const c_void,
+        allocationSize: reqs.size,
+        memoryTypeIndex: mem_type,
+    };
+    let mut res = unsafe { f.alloc_mem.unwrap()(dev, &mai, ptr::null(), &mut (*s).mem) };
+    if res == VK_SUCCESS {
+        res = unsafe { f.bind_mem.unwrap()(dev, (*s).image, (*s).mem, 0) };
     } else {
-        let ded = VkMemoryDedicatedAllocateInfo {
-            sType: VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-            pNext: ptr::null(),
-            image: (*s).image,
-            buffer: 0,
-        };
-        let import_fd = unsafe { libc::dup((*s).fd) };
-        let imp = VkImportMemoryFdInfoKHR {
-            sType: VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
-            pNext: &ded as *const _ as *const c_void,
-            handleType: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-            fd: import_fd,
-        };
-        let mai = VkMemoryAllocateInfo {
-            sType: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            pNext: &imp as *const _ as *const c_void,
-            allocationSize: reqs.size,
-            memoryTypeIndex: mem_type,
-        };
-        res = unsafe { f.alloc_mem.unwrap()(dev, &mai, ptr::null(), &mut (*s).mem) };
-        if res == VK_SUCCESS {
-            res = unsafe { f.bind_mem.unwrap()(dev, (*s).image, (*s).mem, 0) };
-        } else {
-            // A failed import does not consume the descriptor (the driver keeps
-            // nothing): close the dup or it leaks with the abandoned slot.
-            unsafe { libc::close(import_fd) };
-        }
-        if res != VK_SUCCESS {
-            crate::logf!("proxy slot: modifier {modifier:#x} memory: {res}");
-        }
+        // A failed import does not consume the descriptor (the driver keeps
+        // nothing): close the dup or it leaks with the abandoned slot.
+        unsafe { libc::close(import_fd) };
     }
     if res != VK_SUCCESS {
-        unsafe {
-            if (*s).mem != 0 {
-                f.free_mem.unwrap()(dev, (*s).mem, ptr::null());
-            }
-            if (*s).image != 0 {
-                f.destroy_image.unwrap()(dev, (*s).image, ptr::null());
-            }
-            if (*s).fd >= 0 {
-                libc::close((*s).fd);
-            }
-        }
-        (*s).mem = 0;
-        (*s).image = 0;
-        (*s).fd = -1;
+        crate::logf!("proxy import memory failed: {res}");
         return res;
-    }
-    slot_init_sync(sc, s)
-}
-
-unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
-    // GN_VKSHIM_SC_MOD=auto|compressed|tiled3. Driver-chosen scanout layouts
-    // first; the explicit-LINEAR export below is always the fallback.
-    for &modifier in sc_modifiers() {
-        if unsafe { slot_init_tiled(sc, s, modifier) } == VK_SUCCESS {
-            return VK_SUCCESS;
-        }
-    }
-    let gd = (*sc).dev;
-    let dev = unsafe { (*gd).real };
-    let f = unsafe { (*gd).f };
-    (*s).fd = -1;
-    (*s).stride = ((*sc).extent.width * 4 + 255) & !255;
-    (*s).offset = 0;
-    (*s).modifier = GN_DRM_MOD_LINEAR;
-    let mut plane = VkSubresourceLayout {
-        offset: 0,
-        size: 0,
-        rowPitch: 0,
-        arrayPitch: 0,
-        depthPitch: 0,
-    };
-    for attempt in 0..2 {
-        unsafe {
-            if (*s).fd >= 0 {
-                libc::close((*s).fd);
-            }
-        }
-        // The swapchain image must be a buffer the daemon owns: the presenter
-        // can only publish one of its own `AHardwareBuffer`s. Ask for it over
-        // the scan-out channel explicitly rather than relying on the
-        // LD_PRELOAD shim to intercept this process's heap allocation. The
-        // returned stride is authoritative for the image this fd backs.
-        match crate::scanout::allocate((*sc).extent.width, (*sc).extent.height) {
-            Some(buf) => {
-                (*s).fd = buf.fd;
-                if buf.stride != 0 {
-                    (*s).stride = buf.stride;
-                }
-                crate::logf!(
-                    "proxy slot: pool buffer fd={} ino={} stride={}",
-                    buf.fd,
-                    buf.ino,
-                    (*s).stride
-                );
-            }
-            None => {
-                // No daemon channel, or it refused: a local system-heap
-                // allocation, the pre-existing behaviour, which the LD_PRELOAD
-                // shim may still redirect.
-                (*s).fd = dma_heap_alloc((*s).stride as usize * (*sc).extent.height as usize);
-            }
-        }
-        if (*s).fd < 0 {
-            return VK_ERROR_INITIALIZATION_FAILED;
-        }
-        plane.offset = 0;
-        plane.rowPitch = (*s).stride as u64;
-        let modexp = VkImageDrmFormatModifierExplicitCreateInfoEXT {
-            sType: VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
-            pNext: ptr::null(),
-            drmFormatModifier: GN_DRM_MOD_LINEAR,
-            drmFormatModifierPlaneCount: 1,
-            pPlaneLayouts: &plane,
-        };
-        let ext_img = VkExternalMemoryImageCreateInfo {
-            sType: VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-            pNext: &modexp as *const _ as *const c_void,
-            handleTypes: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-        };
-        let ici = VkImageCreateInfo {
-            sType: VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            pNext: &ext_img as *const _ as *const c_void,
-            flags: 0,
-            imageType: VK_IMAGE_TYPE_2D,
-            format: (*sc).format,
-            extent: VkExtent3D {
-                width: (*sc).extent.width,
-                height: (*sc).extent.height,
-                depth: 1,
-            },
-            mipLevels: 1,
-            arrayLayers: 1,
-            samples: VK_SAMPLE_COUNT_1_BIT,
-            // TILING_LINEAR forbids UBWC outright; OPTIMAL+explicit LINEAR
-            // modifier still lets turnip pick a compressed layout (the fd
-            // then holds a UBWC payload, not scan-out pixels).
-            tiling: VK_IMAGE_TILING_LINEAR,
-            usage: (*sc).usage,
-            sharingMode: VK_SHARING_MODE_EXCLUSIVE,
-            queueFamilyIndexCount: 0,
-            pQueueFamilyIndices: ptr::null(),
-            initialLayout: VK_IMAGE_LAYOUT_UNDEFINED,
-        };
-        let res = unsafe { f.create_image.unwrap()(dev, &ici, ptr::null(), &mut (*s).image) };
-        if res != VK_SUCCESS {
-            crate::logf!("proxy import image create failed: {res}");
-            return res;
-        }
-        let mut reqs = VkMemoryRequirements {
-            size: 0,
-            alignment: 0,
-            memoryTypeBits: 0,
-        };
-        unsafe { f.get_mem_reqs.unwrap()(dev, (*s).image, &mut reqs) };
-        let mut mem_type = u32::MAX;
-        for i in 0..32 {
-            if reqs.memoryTypeBits & (1 << i) != 0 {
-                mem_type = i;
-                break;
-            }
-        }
-        if mem_type == u32::MAX {
-            crate::logf!("proxy import image: no memory type");
-            return VK_ERROR_INITIALIZATION_FAILED;
-        }
-        let ded = VkMemoryDedicatedAllocateInfo {
-            sType: VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-            pNext: ptr::null(),
-            image: (*s).image,
-            buffer: 0,
-        };
-        let import_fd = unsafe { libc::dup((*s).fd) };
-        let imp = VkImportMemoryFdInfoKHR {
-            sType: VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
-            pNext: &ded as *const _ as *const c_void,
-            handleType: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-            fd: import_fd,
-        };
-        let mai = VkMemoryAllocateInfo {
-            sType: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            pNext: &imp as *const _ as *const c_void,
-            allocationSize: reqs.size,
-            memoryTypeIndex: mem_type,
-        };
-        let mut res = unsafe { f.alloc_mem.unwrap()(dev, &mai, ptr::null(), &mut (*s).mem) };
-        if res == VK_SUCCESS {
-            res = unsafe { f.bind_mem.unwrap()(dev, (*s).image, (*s).mem, 0) };
-        } else {
-            // A failed import does not consume the descriptor (the driver keeps
-            // nothing): close the dup or it leaks with the abandoned slot.
-            unsafe { libc::close(import_fd) };
-        }
-        if res != VK_SUCCESS {
-            crate::logf!("proxy import memory failed: {res}");
-            return res;
-        }
-        // Ground-truth the driver's plane layout: a driver honoring the
-        // explicit LINEAR modifier reports exactly the pitch handed in;
-        // anything else means the layout guess was wrong, so retry once
-        // with the reported pitch.
-        if let Some(get_layout) = f.get_layout {
-            let sub = VkImageSubresource {
-                aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
-                mipLevel: 0,
-                arrayLayer: 0,
-            };
-            let mut got = VkSubresourceLayout {
-                offset: 0,
-                size: 0,
-                rowPitch: 0,
-                arrayPitch: 0,
-                depthPitch: 0,
-            };
-            unsafe { get_layout(dev, (*s).image, &sub, &mut got) };
-            crate::logf!(
-                "proxy slot layout: pitch {} (asked {}), offset {}",
-                got.rowPitch,
-                (*s).stride,
-                got.offset
-            );
-            if got.rowPitch != 0
-                && got.rowPitch != (*s).stride as u64
-                && got.rowPitch < 65536
-                && attempt == 0
-            {
-                unsafe {
-                    f.destroy_image.unwrap()(dev, (*s).image, ptr::null());
-                    f.free_mem.unwrap()(dev, (*s).mem, ptr::null());
-                }
-                (*s).image = 0;
-                (*s).mem = 0;
-                (*s).stride = got.rowPitch as u32;
-                continue;
-            }
-        }
-        break;
     }
     slot_init_sync(sc, s)
 }

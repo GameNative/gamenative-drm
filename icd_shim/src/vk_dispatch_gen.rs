@@ -1035,3 +1035,69 @@ pub fn alias_of(name: &str) -> Option<&'static str> {
     }
     VK_ALIASES.iter().find(|(_, t)| *t == name).map(|(n, _)| *n)
 }
+
+/// A wrapped-handle type the shim substitutes for the driver's real
+/// handle when it forwards a command.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HandleKind {
+    Device,
+    Queue,
+    CommandBuffer,
+}
+
+/// One array level on the way to a nested handle value. `off` is the byte
+/// offset, within the enclosing element, of the pointer to the child array
+/// (or of a single handle value when `count_off` is `usize::MAX`); `stride`
+/// is the child's element stride (`0` for a single value); `count_off` is
+/// the byte offset of the child's `uint32_t` count.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Hop {
+    pub off: usize,
+    pub stride: usize,
+    pub count_off: usize,
+}
+
+/// A shim-wrapped handle a command consumes in a nested position. `param`
+/// is the parameter index; when `count_param` is `255` the parameter is a
+/// single value, otherwise it is an array of `elem_stride`-byte elements
+/// counted by parameter `count_param`. Each element is walked through
+/// `hops`; an empty path means the element *is* a handle value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NestedHandle {
+    pub param: u8,
+    pub count_param: u8,
+    pub kind: HandleKind,
+    pub elem_stride: usize,
+    pub hops: &'static [Hop],
+}
+
+// One row per command that consumes a wrapped handle through a counted
+// pointer array; sorted by name for the binary search in `nested_handles`.
+// Kept single-line so the table stays grep-friendly.
+#[rustfmt::skip]
+pub static VK_NESTED_HANDLES: &[(&str, &[NestedHandle])] = &[
+    ("vkCmdExecuteCommands", &[
+        NestedHandle { param: 2, count_param: 1, kind: HandleKind::CommandBuffer, elem_stride: std::mem::size_of::<crate::vk::VkCommandBuffer>(), hops: &[] },
+    ]),
+    ("vkFreeCommandBuffers", &[
+        NestedHandle { param: 3, count_param: 2, kind: HandleKind::CommandBuffer, elem_stride: std::mem::size_of::<crate::vk::VkCommandBuffer>(), hops: &[] },
+    ]),
+    ("vkQueueSubmit", &[
+        NestedHandle { param: 2, count_param: 1, kind: HandleKind::CommandBuffer, elem_stride: std::mem::size_of::<crate::vk::VkSubmitInfo>(), hops: &[Hop { off: std::mem::offset_of!(crate::vk::VkSubmitInfo, pCommandBuffers), stride: std::mem::size_of::<crate::vk::VkCommandBuffer>(), count_off: std::mem::offset_of!(crate::vk::VkSubmitInfo, commandBufferCount) }] },
+    ]),
+    ("vkQueueSubmit2", &[
+        NestedHandle { param: 2, count_param: 1, kind: HandleKind::CommandBuffer, elem_stride: std::mem::size_of::<crate::vk::VkSubmitInfo2>(), hops: &[Hop { off: std::mem::offset_of!(crate::vk::VkSubmitInfo2, pCommandBufferInfos), stride: std::mem::size_of::<crate::vk::VkCommandBufferSubmitInfo>(), count_off: std::mem::offset_of!(crate::vk::VkSubmitInfo2, commandBufferInfoCount) }, Hop { off: std::mem::offset_of!(crate::vk::VkCommandBufferSubmitInfo, commandBuffer), stride: 0, count_off: usize::MAX }] },
+    ]),
+    ("vkQueueSubmit2KHR", &[
+        NestedHandle { param: 2, count_param: 1, kind: HandleKind::CommandBuffer, elem_stride: std::mem::size_of::<crate::vk::VkSubmitInfo2>(), hops: &[Hop { off: std::mem::offset_of!(crate::vk::VkSubmitInfo2, pCommandBufferInfos), stride: std::mem::size_of::<crate::vk::VkCommandBufferSubmitInfo>(), count_off: std::mem::offset_of!(crate::vk::VkSubmitInfo2, commandBufferInfoCount) }, Hop { off: std::mem::offset_of!(crate::vk::VkCommandBufferSubmitInfo, commandBuffer), stride: 0, count_off: usize::MAX }] },
+    ]),
+];
+
+/// Registry-derived nested wrapped handles for `name`; empty when the
+/// command consumes none.
+pub fn nested_handles(name: &str) -> &'static [NestedHandle] {
+    match VK_NESTED_HANDLES.binary_search_by(|(n, _)| n.cmp(&name)) {
+        Ok(i) => VK_NESTED_HANDLES[i].1,
+        Err(_) => &[],
+    }
+}
