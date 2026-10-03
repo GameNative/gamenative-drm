@@ -57,15 +57,23 @@ BIONIC=("$SYSROOT/libc.so" "$SYSROOT/libdl.so")
 bash "$ROOT/tools/check-elf-deps.sh" "$REL/libgamenative_drm.so" \
     "${BIONIC[@]}" "$SYSROOT/liblog.so" "$SYSROOT/libandroid.so"
 bash "$ROOT/tools/check-elf-deps.sh" "$REL/libadrenotools_icd.so" \
-    "${BIONIC[@]}" "$DEPS/lib/libwayland-client.so"
+    "${BIONIC[@]}" "$DEPS/lib/libwayland-client.so" \
+    "$DEPS/lib/libxcb.so" "$DEPS/lib/libxcb-dri3.so" "$DEPS/lib/libxcb-present.so" \
+    "$DEPS/lib/libxcb-sync.so"
 bash "$ROOT/tools/check-elf-deps.sh" "$REL/gn-dmabuf-test" \
     "${BIONIC[@]}" "$DEPS/lib/libwayland-client.so" "$DEPS/lib/libvulkan.so"
 bash "$ROOT/tools/check-elf-deps.sh" "$REL/gn-wsi-test" \
     "${BIONIC[@]}" "$DEPS/lib/libwayland-client.so" "$DEPS/lib/libvulkan.so"
 bash "$ROOT/tools/check-elf-deps.sh" "$REL/icd_probe" "${BIONIC[@]}"
 
+# X11 window-tree probe (guest evidence client, ships in the gamescope payload
+# as bin/gn-xtree-probe). Same build/audit style as the other guest clients;
+# its own script keeps the NDK/clang wiring and the ELF dep audit.
+bash "$ROOT/tools/build-xtree-probe.sh"
+
 file "$SO"
 echo "built:  $SO (NDK ${NDK##*/}, API 28)"
 echo "built:  $REL/libadrenotools_icd.so"
 echo "built:  $REL/gn-dmabuf-test"
 echo "built:  $REL/gn-wsi-test"
+echo "built:  $REL/gn-xtree-probe"

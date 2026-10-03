@@ -39,6 +39,11 @@ struct Scenario {
 /// Runs icd_probe against the shim with the scenario's environment.
 /// Returns (exit_code, stdout, stderr).
 fn run_probe(s: &Scenario) -> (i32, String, String) {
+    run_probe_args(s, &[])
+}
+
+/// Runs icd_probe with extra argv after the scenario environment is applied.
+fn run_probe_args(s: &Scenario, extra: &[&str]) -> (i32, String, String) {
     ensure_fixtures();
     let dir = target_dir();
     let mut cmd = Command::new(dir.join("icd_probe"));
@@ -54,6 +59,9 @@ fn run_probe(s: &Scenario) -> (i32, String, String) {
     }
     if let Some(comm) = s.comm {
         cmd.arg("--comm").arg(comm);
+    }
+    for a in extra {
+        cmd.arg(a);
     }
     cmd.arg(shim_so());
     let out = cmd.output().expect("spawn icd_probe");
@@ -199,6 +207,41 @@ fn driver_refusing_instances_falls_back() {
     );
     assert!(
         err.contains("falling back to payload freedreno loaded"),
+        "stderr:\n{err}"
+    );
+}
+
+/// `vkCreateXlibSurfaceKHR` is the entry point winex11.drv actually reaches
+/// (winevulkan translates the app's VK_KHR_win32_surface to a host Xlib
+/// surface). The shim must intercept it and always report the route decision,
+/// gated or not: a session that shows nothing is otherwise indistinguishable
+/// from a route that never engaged. With a null XID the call must still
+/// succeed and leave the surface usable-but-dropping, never block the guest.
+#[test]
+fn xlib_surface_entry_point_is_intercepted_and_reports_route() {
+    let dir = target_dir();
+    let env = adrenotools_env(&dir); // headless driver -> the shim's proxy answers GIPA
+    let (code, out, err) = run_probe_args(&Scenario { comm: None, env }, &["--xlib-window", "0"]);
+    assert_ok(code, &out, &err);
+    assert!(out.contains("PROBE xlib_surface"), "stdout:\n{out}");
+    assert!(
+        err.contains("x11 route: XID 0x0 unavailable (null XID)"),
+        "the route decision must be reported unconditionally; stderr:\n{err}"
+    );
+}
+
+/// A non-null XID with no reachable X server must name that check (rather than
+/// going silent), which is the case the device session could not distinguish.
+#[test]
+fn xlib_surface_without_x_names_the_unreachable_check() {
+    let dir = target_dir();
+    let env = adrenotools_env(&dir);
+    // run_probe_args env_clears, so DISPLAY is unset for the child.
+    let (code, out, err) = run_probe_args(&Scenario { comm: None, env }, &["--xlib-window", "1"]);
+    assert_ok(code, &out, &err);
+    assert!(out.contains("PROBE xlib_surface"), "stdout:\n{out}");
+    assert!(
+        err.contains("x11 route: XID 0x1 unavailable (guest X server unreachable (DISPLAY))"),
         "stderr:\n{err}"
     );
 }

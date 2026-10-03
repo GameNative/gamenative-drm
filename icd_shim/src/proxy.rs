@@ -32,9 +32,9 @@
 use crate::thunk;
 use crate::vk::*;
 use crate::wlproto::{self, wl_display, wl_proxy};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // First-N diagnostics for the present pipeline handoffs (acquire ->
 // present -> worker commit -> compositor release). Bounded counters, so
@@ -115,6 +115,7 @@ fn report_abandoned(now_entry: Option<usize>) {
 
 fn enter(id: usize, args: [usize; 5]) -> usize {
     report_abandoned(Some(id));
+    ring_push(entry_name(id), args);
     let token = ENTRY_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
     if let Ok(mut v) = IN_FLIGHT.lock() {
         v.push(InFlight {
@@ -132,6 +133,69 @@ fn leave(token: usize) {
         v.retain(|e| e.token != token);
     }
 }
+
+// --------------------------------------- last-calls ring (bounded, always on)
+//
+// A tiny per-thread history of the last entry points the guest invoked, so
+// the call the guest made just before its threads park is named without a
+// diagnostic env knob. Always recording (cheap: one push per intercepted
+// call), but only *printed* once — when a stall is suspected — so a healthy
+// session stays silent. `routef!` (not the GNDRM_LOG_VKSHIM-gated `logf!`)
+// because this must work with every toggle off.
+struct RingEnt {
+    tid: u32,
+    name: &'static str,
+    args: [usize; 5],
+}
+const RING_CAP: usize = 48;
+static RING: Mutex<Vec<RingEnt>> = Mutex::new(Vec::new());
+static RING_DUMPED: AtomicBool = AtomicBool::new(false);
+
+fn ring_tid() -> u32 {
+    // gettid(2): the kernel thread id, matching what `wchan` dumps show.
+    unsafe { libc::gettid() as u32 }
+}
+
+fn ring_push(name: &'static str, args: [usize; 5]) {
+    let Ok(mut r) = RING.lock() else {
+        return;
+    };
+    if r.len() == RING_CAP {
+        r.remove(0);
+    }
+    r.push(RingEnt {
+        tid: ring_tid(),
+        name,
+        args,
+    });
+}
+
+/// Print the ring once (bounded one-shot) with the reason the stall is
+/// suspected. The tail of the ring is the park point.
+fn ring_dump(reason: &str) {
+    if RING_DUMPED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Ok(r) = RING.lock() else {
+        return;
+    };
+    crate::routef!("x11 stall ring ({reason}): last {} entry points:", r.len());
+    let n = r.len();
+    for (i, e) in r.iter().enumerate() {
+        crate::routef!(
+            "x11 stall ring [{}/{}] tid={} {} args={:x} {:x} {:x} {:x} {:x}",
+            i + 1,
+            n,
+            e.tid,
+            e.name,
+            e.args[0],
+            e.args[1],
+            e.args[2],
+            e.args[3],
+            e.args[4]
+        );
+    }
+}
 static LOG_COMMIT: AtomicUsize = AtomicUsize::new(0);
 static LOG_RELEASE: AtomicUsize = AtomicUsize::new(0);
 const LOG_FIRST_N: usize = 8;
@@ -146,6 +210,19 @@ static N_PRES: AtomicUsize = AtomicUsize::new(0);
 static N_REL: AtomicUsize = AtomicUsize::new(0);
 static N_COMMIT_OK: AtomicUsize = AtomicUsize::new(0);
 static N_STARVE: AtomicUsize = AtomicUsize::new(0);
+/// One named line the first time the X11 route drops a frame because no
+/// present could be made; later drops stay silent (a route that is down would
+/// otherwise print once per frame).
+static X11_DROP_LOGGED: AtomicBool = AtomicBool::new(false);
+/// Bounded one-shot trace of the guest's swapchain acquire/present indices and
+/// the slot content each present carries. Always on (not gated by a diagnostic
+/// env var) but bounded to the first `X11_TRACE_N` presents of each swapchain,
+/// so it names why a session shows nothing without spamming a healthy one.
+static ACQ_SEQ: AtomicUsize = AtomicUsize::new(0);
+const X11_TRACE_N: usize = 24;
+/// The two-view experiment (driver copy vs shim mmap) is heavier per present,
+/// so it is bounded to the first few presents only.
+const X11_VIEW_N: u32 = 3;
 static RATE_STALL: Mutex<Option<Instant>> = Mutex::new(None);
 static RATE_WAIT: Mutex<Option<Instant>> = Mutex::new(None);
 /// The last (semaphore, value) the guest asked us to *signal*. A GPU wait for a
@@ -274,7 +351,17 @@ static DUMP_DIR: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
 static DUMP_N: AtomicUsize = AtomicUsize::new(0);
 const DUMP_EVERY: usize = 30;
 
-fn dump_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) {
+/// One-shot dump core shared by both present routes: mmap a LINEAR slot's
+/// dma-buf, log an alpha census + probe pixels, and write a P6 PPM to
+/// `$GAMENATIVE_DUMP_DIR/gn-buf-latest.ppm` — the exact name/format/dir the
+/// wayland commit path has always used, so existing tooling keeps working.
+/// `tag` labels the log line, `n` is the caller's own accounting. The dump
+/// directory is read once from GAMENATIVE_DUMP_DIR; unset means the dumps are
+/// off. Never blocks: a failed mmap/write is logged and dropped.
+///
+/// Slots are LINEAR exports, so a plain mmap reads them correctly; the bytes
+/// are R,G,B,X for our XBGR8888 buffers (byte 2 is red).
+fn dump_slot_frame(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32, tag: &str, n: usize) {
     let Some(dir) = DUMP_DIR
         .get_or_init(|| std::env::var_os("GAMENATIVE_DUMP_DIR").filter(|v| !v.is_empty()))
         .as_ref()
@@ -284,10 +371,6 @@ fn dump_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) {
     if unsafe { (*s).modifier } != GN_DRM_MOD_LINEAR {
         static TILED: OnceLock<()> = OnceLock::new();
         TILED.get_or_init(|| crate::logf!("dump: tiled present image, CPU dump disabled"));
-        return;
-    }
-    let n = DUMP_N.fetch_add(1, Ordering::Relaxed);
-    if !n.is_multiple_of(DUMP_EVERY) {
         return;
     }
     unsafe {
@@ -305,7 +388,10 @@ fn dump_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) {
             0,
         );
         if base == libc::MAP_FAILED {
-            crate::logf!("dump {n}: mmap failed: {}", std::io::Error::last_os_error());
+            crate::logf!(
+                "dump {tag} {n}: mmap failed: {}",
+                std::io::Error::last_os_error()
+            );
             return;
         }
         let begin = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_START;
@@ -324,7 +410,7 @@ fn dump_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) {
             }
         }
         crate::logf!(
-            "dump {n} [shim {}]: slot={idx} {w}x{h} stride={stride} alpha0={a0}/{} px(w/16,h/8)={:?} px(centre)={:?} px(3w/4,3h/4)={:?}",
+            "dump {tag} {n} [shim {}]: slot={idx} {w}x{h} stride={stride} alpha0={a0}/{} px(w/16,h/8)={:?} px(centre)={:?} px(3w/4,3h/4)={:?}",
             crate::SHIM_BUILD,
             w * h,
             px(w / 16, h / 8),
@@ -344,2345 +430,318 @@ fn dump_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) {
         }
         let path = std::path::Path::new(dir).join("gn-buf-latest.ppm");
         match std::fs::write(&path, &out) {
-            Ok(()) => crate::logf!("dump {n}: wrote {}", path.display()),
-            Err(e) => crate::logf!("dump {n}: write failed: {e}"),
+            Ok(()) => crate::logf!("dump {tag} {n}: wrote {}", path.display()),
+            Err(e) => crate::logf!("dump {tag} {n}: write failed: {e}"),
         }
         let end = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END;
         libc::ioctl(fd, DMA_BUF_IOCTL_SYNC as _, &end);
         libc::munmap(base, len);
     }
 }
-use std::ptr;
-use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
-pub const GN_MAX_SC_IMAGES: usize = 8;
-pub const GN_MAX_PRESENT: usize = 8; // swapchainCount handled per vkQueuePresentKHR
-pub const GN_JOB_CAP: usize = 16;
-
-pub const fn gn_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
-    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
+/// Wayland route: rolling dump every DUMP_EVERY-th commit (existing behaviour).
+fn dump_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) {
+    let n = DUMP_N.fetch_add(1, Ordering::Relaxed);
+    if !n.is_multiple_of(DUMP_EVERY) {
+        return;
+    }
+    dump_slot_frame(sc, s, idx, "commit", n);
 }
-pub const GN_DRM_FORMAT_XRGB8888: u32 = gn_fourcc(b'X', b'R', b'2', b'4');
-pub const GN_DRM_FORMAT_XBGR8888: u32 = gn_fourcc(b'X', b'B', b'2', b'4');
-// Alpha-carrying siblings of the two X-formats above: same red/green/blue byte
-// order, but the fourth byte is real alpha the compositor must honour instead
-// of ignore. A guest swapchain buffer genuinely has that channel (BGRA/RGBA),
-// so describing it as an X-format would force the compositor to discard it.
-pub const GN_DRM_FORMAT_ARGB8888: u32 = gn_fourcc(b'A', b'R', b'2', b'4');
-pub const GN_DRM_FORMAT_ABGR8888: u32 = gn_fourcc(b'A', b'B', b'2', b'4');
-pub const GN_DRM_MOD_LINEAR: u64 = 0;
-// Qualcomm scanout layouts (DRM_FORMAT_MOD_QCOM_*): COMPRESSED is UBWC, TILED3
-// the same macrotile layout without compression. Either names the layout of a
-// present image outright, instead of the explicit-LINEAR export the shim
-// otherwise has to force (a LINEAR export is the only layout it can map and
-// read, and the only one the driver cannot silently replace with a compressed
-// payload). GN_VKSHIM_SC_MOD picks the candidates, LINEAR always last.
-pub const GN_DRM_MOD_QCOM_COMPRESSED: u64 = 0x0500_0000_0000_0001;
-pub const GN_DRM_MOD_QCOM_TILED3: u64 = 0x0500_0000_0000_0003;
 
-fn sc_modifiers() -> &'static [u64] {
-    match std::env::var("GN_VKSHIM_SC_MOD").as_deref() {
-        Ok("compressed") => &[GN_DRM_MOD_QCOM_COMPRESSED],
-        Ok("tiled3") => &[GN_DRM_MOD_QCOM_TILED3],
-        Ok("auto") => &[GN_DRM_MOD_QCOM_COMPRESSED, GN_DRM_MOD_QCOM_TILED3],
-        _ => &[],
+/// X11 route: bounded dump of a *rendered* frame. The route engages at the
+/// first present, so the earliest slots are the cleared/pre-title buffer and
+/// say nothing about the game. Wait out a warm-up (`X11_DUMP_AFTER` presents),
+/// then capture the next `X11_DUMP_COUNT` presents. Bounded by design — a
+/// diagnostic, not a knob: never per-frame, never blocking.
+const X11_DUMP_AFTER: u32 = 120;
+const X11_DUMP_COUNT: u32 = 3;
+/// After the early captures, keep sampling sparsely so the rolling file ends on
+/// a *recent* frame (a stuck-early dump would only ever show the loading
+/// screen). Bounded by `X11_DUMP_CAP`; never per-frame.
+const X11_DUMP_LATE_EVERY: u32 = 300;
+const X11_DUMP_CAP: u32 = 60;
+
+fn x11_dump_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) {
+    let seen = unsafe { (*sc).x11_presents };
+    unsafe { (*sc).x11_presents = seen + 1 };
+    if seen < X11_DUMP_AFTER {
+        return;
+    }
+    let dumped = unsafe { (*sc).x11_dumped };
+    if dumped >= X11_DUMP_CAP {
+        return;
+    }
+    let early = dumped < X11_DUMP_COUNT;
+    let late = seen.is_multiple_of(X11_DUMP_LATE_EVERY);
+    if !early && !late {
+        return;
+    }
+    unsafe { (*sc).x11_dumped = dumped + 1 };
+    dump_slot_frame(sc, s, idx, "x11", seen as usize);
+}
+/// Forces every real device queue idle — a true GPU-completion barrier —
+/// before the shim hands a slot to Xwayland or reads it on the CPU. The
+/// per-slot fence cannot serve this: the guest never waits on a shim fence, so
+/// it says nothing about whether the guest's render into the slot completed.
+unsafe fn gpu_idle(gd: *mut GnDevice) -> bool {
+    if gd.is_null() {
+        return false;
+    }
+    unsafe {
+        let mut any = false;
+        let mut q = (*gd).queues;
+        while !q.is_null() {
+            if let Some(wait) = (*gd).f.queue_wait_idle {
+                wait((*q).real);
+                any = true;
+            }
+            q = (*q).next;
+        }
+        if any {
+            return true;
+        }
+        if let Some(wait) = (*gd).f.wait_idle {
+            wait((*gd).real);
+            return true;
+        }
+        false
     }
 }
 
-/// Swapchain image ceiling from the container config (`WRAPPER_MAX_IMAGE_COUNT`,
-/// 0 = the wrapper's default). The proxy caps both the `maxImageCount` it
-/// advertises and its ring to the same value, so the guest's chosen image count
-/// and the pool it is handed agree. A value below minImageCount (2) is not a
-/// legal `maxImageCount` and is ignored.
-fn max_swapchain_images() -> u32 {
-    match std::env::var("WRAPPER_MAX_IMAGE_COUNT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-    {
-        Some(v) if v >= 2 => v.min(GN_MAX_SC_IMAGES as u32),
-        _ => GN_MAX_SC_IMAGES as u32,
-    }
-}
-
-/// Swapchain/WSI extensions the guest must not see. The proxy owns the
-/// swapchain and implements none of their entry points, so a guest that
-/// enabled one would call it through the wrapper-swapping thunk with a shim
-/// swapchain handle the driver has never seen — and a title pacing against a
-/// present_wait that never signals presents unfinished frames.
-fn unimplemented_wsi_ext(name: &CStr) -> bool {
-    name == c"VK_KHR_present_wait"
-        || name == c"VK_KHR_present_id"
-        || name == c"VK_EXT_swapchain_maintenance1"
-}
-
-// ---------------------------------------------------------------- objects
-
-#[derive(Default, Clone, Copy)]
-pub struct RealInstFns {
-    pub gdp: Option<PFN_vkGetDeviceProcAddr>,
-    pub enum_pds: Option<PFN_vkEnumeratePhysicalDevices>,
-    pub create_device: Option<PFN_vkCreateDevice>,
-    pub destroy_instance: Option<PFN_vkDestroyInstance>,
-}
-
-#[derive(Default, Clone, Copy)]
-pub struct RealDevFns {
-    pub gdp: Option<PFN_vkGetDeviceProcAddr>,
-    pub get_queue: Option<PFN_vkGetDeviceQueue>,
-    pub create_image: Option<PFN_vkCreateImage>,
-    pub create_pipelines: Option<PFN_vkCreateGraphicsPipelines>,
-    pub get_device_queue2: Option<PFN_vkGetDeviceQueue2>,
-    pub submit2: Option<PFN_vkQueueSubmit2>,
-    pub wait_semaphores:
-        Option<unsafe extern "C" fn(VkDevice, *const VkSemaphoreWaitInfo, u64) -> VkResult>,
-    pub destroy_image: Option<PFN_vkDestroyImage>,
-    pub get_mem_reqs: Option<PFN_vkGetImageMemoryRequirements>,
-    pub get_layout: Option<PFN_vkGetImageSubresourceLayout>,
-    pub alloc_mem: Option<PFN_vkAllocateMemory>,
-    pub free_mem: Option<PFN_vkFreeMemory>,
-    pub bind_mem: Option<PFN_vkBindImageMemory>,
-    pub create_fence: Option<PFN_vkCreateFence>,
-    pub destroy_fence: Option<PFN_vkDestroyFence>,
-    pub wait_fences: Option<PFN_vkWaitForFences>,
-    pub reset_fences: Option<PFN_vkResetFences>,
-    pub create_sem: Option<PFN_vkCreateSemaphore>,
-    pub destroy_sem: Option<PFN_vkDestroySemaphore>,
-    pub alloc_cmd: Option<PFN_vkAllocateCommandBuffers>,
-    pub free_cmd: Option<PFN_vkFreeCommandBuffers>,
-    pub submit: Option<PFN_vkQueueSubmit>,
-    pub wait_idle: Option<PFN_vkDeviceWaitIdle>,
-    pub destroy_device: Option<PFN_vkDestroyDevice>,
-}
-
-pub struct GnInstance {
-    pub real: VkInstance,
-    pub f: RealInstFns,
-    pub pds: [VkPhysicalDevice; 8],
-    pub n_pds: u32,
-    pub next: *mut GnInstance,
-}
-
-/// Scratch words at the top of every shim-owned dispatchable handle: the
-/// outer loader stamps its trampoline data over the handle's first words
-/// after creation, so the fields it may clobber must not hold anything.
-pub const GN_HANDLE_SCRATCH: usize = 6;
-
-#[repr(C)]
-pub struct GnDevice {
-    pub scratch: [usize; GN_HANDLE_SCRATCH],
-    pub real: VkDevice,
-    pub inst: *mut GnInstance,
-    pub f: RealDevFns,
-    pub queues: *mut GnQueue, // wrapper list
-    pub cmds: *mut GnCmd,     // wrapper list
-    pub next: *mut GnDevice,
-}
-
-#[repr(C)]
-pub struct GnQueue {
-    pub scratch: [usize; GN_HANDLE_SCRATCH],
-    pub real: VkQueue,
-    pub gd: *mut GnDevice,
-    pub next: *mut GnQueue,
-}
-
-#[repr(C)]
-pub struct GnCmd {
-    pub scratch: [usize; GN_HANDLE_SCRATCH],
-    pub real: VkCommandBuffer,
-    pub gd: *mut GnDevice,
-    pub next: *mut GnCmd,
-}
-
-pub struct GnSurface {
-    pub inst: *mut GnInstance,
-    pub dpy: *mut wl_display,         // winewayland's, or our own (X11 mode)
-    pub parent: *mut wl_proxy,        // commit target wl_surface
-    pub own_surface: *mut wl_proxy,   // X11 mode: shim-created wl_surface
-    pub swapchain_obj: *mut wl_proxy, // X11 mode: gamescope_swapchain
-    pub next: *mut GnSurface,
-}
-
-pub struct GnSlot {
-    pub owner: *mut GnSwapchain, // release listener -> slot free
-    pub image: VkImage,
-    pub mem: VkDeviceMemory,
-    pub fd: i32,
-    pub stride: u32,
-    pub offset: u32,
-    pub modifier: u64,
-    pub buf: *mut wl_proxy, // created on first present (worker thread)
-    pub fence: VkFence,
-    pub sem: VkSemaphore, // chains multi-swapchain presents
-    pub acquired: bool,   // owned by the app (acquire -> present)
-    pub in_flight: bool,  // committed, awaiting wl_buffer.release
-}
-
-/// Swapchain state shared by the app threads (acquire/present), the
-/// present worker and the wayland release listener — one mutex, two
-/// condvars (put = job queued, free = slot released), like the C.
-pub struct ScShared {
-    pub jobs: VecDeque<i32>,
-    pub stopping: bool,
-}
-
-pub struct GnSwapchain {
-    pub surf: *mut GnSurface,
-    pub dev: *mut GnDevice,
-    pub format: VkFormat,
-    pub extent: VkExtent2D,
-    pub fourcc: u32,
-    pub usage: VkImageUsageFlags,
-    pub slots: Vec<GnSlot>,
-    pub worker: Option<std::thread::JoinHandle<()>>,
-    pub shared: Mutex<ScShared>,
-    pub cv_put: Condvar,
-    pub cv_free: Condvar,
-    pub next: *mut GnSwapchain,
-}
-
-// ---------------------------------------------------------------- wayland
-
-pub struct GnWayland {
-    pub dpy: *mut wl_display, // winewayland's, or our own (X11 mode)
-    pub comp: *mut wl_proxy,
-    pub subcomp: *mut wl_proxy,
-    pub dmabuf: *mut wl_proxy,
-    pub swapchain_factory: *mut wl_proxy, // gamescope_swapchain_factory_v2
-    pub queue: *mut wlproto::wl_event_queue,
-    pub dispatch_started: bool,
-    pub own_dpy: bool, // X11 mode: we connected (WAYLAND_DISPLAY env)
-    pub ready: bool,
-    pub failed: bool,
-}
-
-// Touched from the setup thread, the dispatch thread and present workers
-// (raw wayland pointers — the C's locking model is kept verbatim).
-unsafe impl Send for GnWayland {}
-
-static G_WL: Mutex<GnWayland> = Mutex::new(GnWayland {
-    dpy: ptr::null_mut(),
-    comp: ptr::null_mut(),
-    subcomp: ptr::null_mut(),
-    dmabuf: ptr::null_mut(),
-    swapchain_factory: ptr::null_mut(),
-    queue: ptr::null_mut(),
-    dispatch_started: false,
-    own_dpy: false,
-    ready: false,
-    failed: false,
-});
-
-/// wl_registry.global handler (dispatch thread).
-extern "C" fn registry_global(
-    data: *mut c_void,
-    reg: *mut wl_proxy,
-    id: u32,
-    iface: *const c_char,
-    version: u32,
-) {
-    let w = data as *mut GnWayland;
-    let iface = unsafe { CStr::from_ptr(iface) }.to_bytes();
+/// Bounded one-shot: a cheap content signature of a LINEAR slot, read on the CPU
+/// (alpha=0 pixel count, non-zero byte count, first pixel RGBA). Used by the
+/// always-on acquire/present trace so an all-zero present can be attributed to
+/// the guest writing nothing rather than to the shim presenting a stale slot.
+unsafe fn slot_signature(sc: *mut GnSwapchain, s: *mut GnSlot) -> (usize, usize, [u8; 4]) {
     unsafe {
-        if iface == b"wl_compositor" && version >= 4 {
-            (*w).comp = wlproto::registry_bind(reg, id, &wlproto::wl_compositor_interface, 4);
-        } else if iface == b"wl_subcompositor" {
-            (*w).subcomp = wlproto::registry_bind(reg, id, &wlproto::wl_subcompositor_interface, 1);
-        } else if iface == b"zwp_linux_dmabuf_v1" && version >= 3 {
-            (*w).dmabuf =
-                wlproto::registry_bind(reg, id, &wlproto::ZWP_LINUX_DMABUF_V1_INTERFACE, 3);
-        } else if iface == b"gamescope_swapchain_factory_v2" {
-            (*w).swapchain_factory = wlproto::registry_bind(
-                reg,
-                id,
-                &wlproto::GAMESCOPE_SWAPCHAIN_FACTORY_V2_INTERFACE,
-                1,
-            );
+        if (*s).modifier != GN_DRM_MOD_LINEAR || (*s).fd < 0 {
+            return (0, 0, [0; 4]);
         }
-    }
-}
-
-extern "C" fn registry_remove(_data: *mut c_void, _reg: *mut wl_proxy, _id: u32) {}
-
-// Listener vtables: libwayland indexes them by event opcode. Stored as raw
-// fn pointers — wl_proxy_add_listener takes an untyped implementation array.
-type RawListenerFn = extern "C" fn();
-static REGISTRY_LISTENER: [RawListenerFn; 2] = [
-    unsafe {
-        std::mem::transmute::<
-            extern "C" fn(*mut c_void, *mut wl_proxy, u32, *const c_char, u32),
-            RawListenerFn,
-        >(registry_global)
-    },
-    unsafe {
-        std::mem::transmute::<extern "C" fn(*mut c_void, *mut wl_proxy, u32), RawListenerFn>(
-            registry_remove,
-        )
-    },
-];
-static BUFFER_LISTENER: [RawListenerFn; 1] = [unsafe {
-    std::mem::transmute::<extern "C" fn(*mut c_void, *mut wl_proxy), RawListenerFn>(
-        on_buffer_release,
-    )
-}];
-
-fn dispatch_main() {
-    let (dpy, queue) = {
-        let w = G_WL.lock().unwrap();
-        (w.dpy, w.queue)
-    };
-    let fd = unsafe { wlproto::wl_display_get_fd(dpy) };
-    let mut failed = false;
-    // Canonical multi-threaded libwayland read loop: flushes go through
-    // SEND_LOCK (never concurrent with another sender, see SEND_LOCK), the
-    // blocking poll happens with no lock held, and event dispatch runs
-    // lock-free on this thread. wl_display_dispatch_queue() cannot be used:
-    // its internal pre-poll flush races the present worker's marshal+flush.
-    'outer: loop {
-        {
-            let _sg = SEND_LOCK.lock().unwrap();
-            if unsafe { wlproto::wl_display_flush(dpy) } < 0
-                && std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN)
-            {
-                failed = true;
-                break;
-            }
-        }
-        loop {
-            let n = unsafe { wlproto::wl_display_dispatch_queue_pending(dpy, queue) };
-            if n <= 0 {
-                if n < 0 {
-                    failed = true;
-                }
-                break;
-            }
-        }
-        if failed {
-            break;
-        }
-        while unsafe { wlproto::wl_display_prepare_read_queue(dpy, queue) } != 0 {
-            if unsafe { wlproto::wl_display_dispatch_queue_pending(dpy, queue) } < 0 {
-                failed = true;
-                break 'outer;
-            }
-        }
-        let mut pfd = libc::pollfd {
+        let w = (*sc).extent.width as usize;
+        let h = (*sc).extent.height as usize;
+        let stride = (*s).stride as usize;
+        let fd = (*s).fd;
+        let len = stride * h;
+        let base = libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
             fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut pfd, 1, -1) } < 0 {
-            let e = std::io::Error::last_os_error().raw_os_error();
-            unsafe { wlproto::wl_display_cancel_read(dpy) };
-            if e == Some(libc::EINTR) {
-                continue;
+            0,
+        );
+        if base == libc::MAP_FAILED {
+            return (0, 0, [0; 4]);
+        }
+        let begin = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_START;
+        libc::ioctl(fd, DMA_BUF_IOCTL_SYNC as _, &begin);
+        let p = (base as *const u8).add((*s).offset as usize);
+        let mut a0 = 0usize;
+        let mut nz = 0usize;
+        for y in 0..h {
+            for x in 0..w {
+                let q = p.add(y * stride + x * 4);
+                let px = [*q, *q.add(1), *q.add(2), *q.add(3)];
+                if px[3] == 0 {
+                    a0 += 1;
+                }
+                if px != [0, 0, 0, 0] {
+                    nz += 1;
+                }
             }
-            failed = true;
-            break;
         }
-        if unsafe { wlproto::wl_display_read_events(dpy) } < 0 {
-            failed = true;
-            break;
-        }
+        let first = [*p, *p.add(1), *p.add(2), *p.add(3)];
+        let end = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END;
+        libc::ioctl(fd, DMA_BUF_IOCTL_SYNC as _, &end);
+        libc::munmap(base, len);
+        (a0, nz, first)
     }
-    let err = unsafe { wlproto::wl_display_get_error(dpy) };
-    G_WL.lock().unwrap().failed = true;
-    crate::logf!(
-        "wayland dispatch thread exited: {}",
-        if err != 0 {
-            std::io::Error::from_raw_os_error(err).to_string()
-        } else if failed {
-            std::io::Error::last_os_error().to_string()
-        } else {
-            "display closed".to_string()
-        }
-    );
 }
 
-/// Binds the globals the proxy needs on the gamescope connection (once per
-/// process) and starts the dispatch thread for our private event queue.
-/// `dpy` null means X11 mode: wine has no wayland display, so the shim opens
-/// its own connection (gamescope sets WAYLAND_DISPLAY for its children).
-/// wl_compositor >= 4 is required for wl_surface_damage_buffer.
-fn wl_setup(dpy: *mut wl_display) -> bool {
-    let mut w = G_WL.lock().unwrap();
-    if w.ready || w.failed {
-        return !w.failed;
+/// Bounded one-shot diagnostic: read the slot's *imported* device memory through
+/// `vkMapMemory` (the driver's own mapping of the same dma-buf), using the
+/// image's reported stride/offset. Independent of the shim's CPU mmap.
+/// Returns (alpha0, nonzero, first-pixel).
+unsafe fn slot_mem_signature(
+    sc: *mut GnSwapchain,
+    s: *mut GnSlot,
+) -> Option<(usize, usize, [u8; 4])> {
+    let gd = (*sc).dev;
+    if gd.is_null() || (*s).mem == 0 {
+        return None;
     }
-    let wptr: *mut GnWayland = &mut *w;
-    unsafe {
-        let dpy = if dpy.is_null() {
-            let c = wlproto::wl_display_connect(std::ptr::null());
-            if c.is_null() {
-                crate::logf!("proxy wayland connect failed (WAYLAND_DISPLAY unset?)");
-                (*wptr).failed = true;
+    let dev = (*gd).real;
+    let map = (*gd).f.map_mem?;
+    let unmap = (*gd).f.unmap_mem?;
+    let mut p: *mut c_void = ptr::null_mut();
+    if unsafe { map(dev, (*s).mem, 0, VK_WHOLE_SIZE, 0, &mut p) } != VK_SUCCESS || p.is_null() {
+        return None;
+    }
+    let base = p.cast::<u8>();
+    let w = (*sc).extent.width as usize;
+    let h = (*sc).extent.height as usize;
+    let stride = (*s).stride as usize;
+    let off = (*s).offset as usize;
+    let mut a0 = 0usize;
+    let mut nz = 0usize;
+    for y in 0..h {
+        for x in 0..w {
+            let q = unsafe { base.add(off + y * stride + x * 4) };
+            let px = unsafe { [*q, *q.add(1), *q.add(2), *q.add(3)] };
+            if px[3] == 0 {
+                a0 += 1;
+            }
+            if px != [0, 0, 0, 0] {
+                nz += 1;
+            }
+        }
+    }
+    let first = unsafe {
+        [
+            *base.add(off),
+            *base.add(off + 1),
+            *base.add(off + 2),
+            *base.add(off + 3),
+        ]
+    };
+    unsafe { unmap(dev, (*s).mem) };
+    Some((a0, nz, first))
+}
+
+/// X11 route: make the slot's dma-buf the window's content with DRI3 + Present.
+/// The pixmap and idle fence are created once per slot (worker thread); the
+/// slot stays in flight until the fence triggers (see `x11_reap`). Every
+/// failure is named and leaves the slot free, so the guest never waits on a
+/// frame that cannot be shown.
+unsafe fn x11_present_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) -> bool {
+    let present = (*(*sc).surf).x11;
+    if present.is_null() {
+        return false;
+    }
+    // Order the guest's GPU work ahead of the present. The present hands the
+    // slot to Xwayland and the bounded dump reads it on the CPU, so the render
+    // must be complete (and its writes visible) first; see `gpu_idle`.
+    if !unsafe { gpu_idle((*sc).dev) } {
+        crate::logf!("x11: slot {idx} present skipped - no GPU-completion wait available");
+        return false;
+    }
+    // Bounded one-shot (always on): record the presented index, the acquire
+    // sequence that filled the slot, and the slot's content signature after the
+    // GPU is idle. An all-zero signature here means the guest presented a frame
+    // whose contents are empty; a non-zero one means the guest did write.
+    let trace_n = unsafe { (*sc).x11_trace };
+    if (trace_n as usize) < X11_TRACE_N {
+        unsafe { (*sc).x11_trace = trace_n + 1 };
+        let (a0, nz, px) = unsafe { slot_signature(sc, s) };
+        let acq = unsafe { (*s).acq_seq };
+        crate::routef!(
+            "x11 trace {trace_n}: sc={sc:?} idx={idx} acq#{acq} {}x{} alpha0={a0}/{} nz={nz} px0=({},{},{},{})",
+            unsafe { (*sc).extent.width },
+            unsafe { (*sc).extent.height },
+            unsafe { (*sc).extent.width as usize * (*sc).extent.height as usize },
+            px[0],
+            px[1],
+            px[2],
+            px[3]
+        );
+        // Bounded one-shot two-view probe (first presents): the shim's own
+        // linear mmap above vs the driver's own mapping of the same dma-buf
+        // (vkMapMemory of the slot's imported memory). They only differ if the
+        // image's real layout/stride is not what the shim advertises/reads.
+        if trace_n < X11_VIEW_N {
+            if let Some((va0, vnz, vpx)) = unsafe { slot_mem_signature(sc, s) } {
+                crate::routef!(
+                    "x11 view {trace_n}: idx={idx} driver(mapmem) alpha0={va0}/{} nz={vnz} px0=({},{},{},{})",
+                    unsafe { (*sc).extent.width as usize * (*sc).extent.height as usize },
+                    vpx[0],
+                    vpx[1],
+                    vpx[2],
+                    vpx[3]
+                );
+            }
+        }
+    }
+    if unsafe { (*s).xpix } == 0 {
+        match unsafe {
+            (*present).make_pixmap(
+                (*s).fd,
+                (*sc).extent.width,
+                (*sc).extent.height,
+                (*s).stride,
+                (*s).modifier,
+            )
+        } {
+            Some(p) => unsafe { (*s).xpix = p },
+            None => {
+                crate::logf!("x11: slot {idx} has no pixmap - frame dropped");
                 return false;
             }
-            (*wptr).own_dpy = true;
-            c
-        } else {
-            dpy
-        };
-        (*wptr).dpy = dpy;
-        wlproto::wl_log_set_handler_client(gn_wl_log);
-        (*wptr).queue = wlproto::wl_display_create_queue(dpy);
-        let reg = wlproto::display_get_registry(dpy);
-        wlproto::wl_proxy_set_queue(reg, (*wptr).queue);
-        wlproto::wl_proxy_add_listener(reg, REGISTRY_LISTENER.as_ptr() as *mut _, wptr.cast());
-        if wlproto::wl_display_roundtrip_queue(dpy, (*wptr).queue) < 0 {
-            (*wptr).failed = true;
         }
-        wlproto::wl_proxy_destroy(reg);
-        if !(*wptr).failed && (*wptr).dmabuf.is_null() {
-            crate::logf!("compositor misses zwp_linux_dmabuf_v1 v3 — proxy cannot present");
-            (*wptr).failed = true;
+    }
+    if unsafe { (*s).xfence } == 0 {
+        match unsafe { (*present).make_fence() } {
+            Some(f) => unsafe { (*s).xfence = f },
+            None => return false,
         }
-        if !(*wptr).failed {
-            let spawned = std::thread::Builder::new()
-                .name("gn-wl-dispatch".into())
-                .spawn(dispatch_main);
-            if spawned.is_err() {
-                crate::logf!("failed to start wayland dispatch thread");
-                (*wptr).failed = true;
+    }
+    match unsafe { (*present).present((*s).xpix, (*s).xfence) } {
+        Some(serial) => {
+            fps_note_commit();
+            // Bounded one-shot frame dump (GAMENATIVE_DUMP_DIR): capture the
+            // first X11_DUMP_FIRST frames of this swapchain so what the route
+            // hands the compositor is inspectable — the X11 route has no
+            // wl_surface and so no daemon-side dump to compare against.
+            x11_dump_slot(sc, s, idx);
+            let n = LOG_COMMIT.fetch_add(1, Ordering::Relaxed);
+            if n < LOG_FIRST_N || n.is_multiple_of(120) {
+                crate::logf!(
+                    "x11 present: sc={sc:?} idx={idx} pix={} serial={serial} {}x{} {}",
+                    unsafe { (*s).xpix },
+                    unsafe { (*sc).extent.width },
+                    unsafe { (*sc).extent.height },
+                    counters()
+                );
             }
         }
-        (*wptr).ready = !(*wptr).failed;
-        !(*wptr).failed
-    }
-}
-
-/// wl_buffer.release handler (dispatch thread): the slot is reusable.
-extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
-    let slot = data as *mut GnSlot;
-    unsafe {
-        let sc = (*slot).owner;
-        if LOG_RELEASE.fetch_add(1, Ordering::Relaxed) < LOG_FIRST_N {
-            crate::logf!("proxy release: slot={slot:?}");
-        }
-        let _g = (*sc).shared.lock().unwrap();
-        (*slot).in_flight = false;
-        (*sc).cv_free.notify_all();
-        drop(_g);
-        N_REL.fetch_add(1, Ordering::Relaxed);
-        if rate_ok(&RATE_REL, RATE_EVERY) {
-            crate::logf!("gn-vkshim release: slot={slot:?} {}", slot_flags(sc));
-        }
-    }
-}
-
-// ------------------------------------------------------------- bookkeeping
-
-pub struct Globals {
-    pub real_gipa: Option<GipaFn>,
-    pub real_handle: *mut c_void,
-    pub instances: *mut GnInstance,
-    pub devices: *mut GnDevice,
-    pub surfaces: *mut GnSurface,
-    pub swapchains: *mut GnSwapchain,
-}
-
-// All list heads and the real-driver pointers sit behind one mutex (the
-// C's g_mtx); raw list pointers are only walked under it.
-unsafe impl Send for Globals {}
-
-pub static G: Mutex<Globals> = Mutex::new(Globals {
-    real_gipa: None,
-    real_handle: ptr::null_mut(),
-    instances: ptr::null_mut(),
-    devices: ptr::null_mut(),
-    surfaces: ptr::null_mut(),
-    swapchains: ptr::null_mut(),
-});
-
-pub fn set_real_gipa(gipa: GipaFn) {
-    G.lock().unwrap().real_gipa = Some(gipa);
-}
-
-pub fn set_real_handle(handle: *mut c_void) {
-    G.lock().unwrap().real_handle = handle;
-}
-
-unsafe fn find_instance(inst: VkInstance) -> *mut GnInstance {
-    let g = G.lock().unwrap();
-    let mut p = g.instances;
-    while !p.is_null() {
-        if (*p).real == inst {
-            return p;
-        }
-        p = (*p).next;
-    }
-    ptr::null_mut()
-}
-
-unsafe fn find_instance_by_pd(pd: VkPhysicalDevice) -> *mut GnInstance {
-    let g = G.lock().unwrap();
-    let mut p = g.instances;
-    while !p.is_null() {
-        for i in 0..(*p).n_pds as usize {
-            if (*p).pds[i] == pd {
-                return p;
-            }
-        }
-        p = (*p).next;
-    }
-    ptr::null_mut()
-}
-
-unsafe fn find_device(dev: VkDevice) -> *mut GnDevice {
-    let g = G.lock().unwrap();
-    let mut p = g.devices;
-    while !p.is_null() {
-        if p.cast::<c_void>() == dev {
-            return p;
-        }
-        p = (*p).next;
-    }
-    ptr::null_mut()
-}
-
-unsafe fn find_queue(q: VkQueue) -> *mut GnQueue {
-    let g = G.lock().unwrap();
-    let mut p = g.devices;
-    while !p.is_null() {
-        let mut gq = (*p).queues;
-        while !gq.is_null() {
-            if gq.cast::<c_void>() == q {
-                return gq;
-            }
-            gq = (*gq).next;
-        }
-        p = (*p).next;
-    }
-    ptr::null_mut()
-}
-
-/// Command buffers are looked up across every device, not just the queue's:
-/// a handle the shim never wrapped is passed through untouched, and a wrapper
-/// that belongs to another device still has to be translated (a miss would
-/// hand the driver a shim pointer).
-// Every command-buffer wrapper the shim ever handed out, so a lookup miss can
-// be classified: a handle that was a wrapper but is no longer in any list is a
-// shim bug (the driver would receive a shim pointer), while an unknown handle
-// is one the guest got from the driver itself and must be passed through.
-static WRAPPER_HISTORY: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-
-fn noted_wrapper(p: usize) {
-    if let Ok(mut v) = WRAPPER_HISTORY.lock() {
-        if v.len() < 4096 {
-            v.push(p);
-        }
-    }
-}
-
-fn was_wrapper(p: usize) -> bool {
-    WRAPPER_HISTORY
-        .lock()
-        .map(|v| v.contains(&p))
-        .unwrap_or(false)
-}
-
-unsafe fn find_cmd_any(cmd: VkCommandBuffer) -> *mut GnCmd {
-    let g = G.lock().unwrap();
-    let mut d = g.devices;
-    while !d.is_null() {
-        unsafe {
-            let mut gc = (*d).cmds;
-            while !gc.is_null() {
-                if gc.cast::<c_void>() == cmd {
-                    return gc;
-                }
-                gc = (*gc).next;
-            }
-            d = (*d).next;
-        }
-    }
-    ptr::null_mut()
-}
-
-unsafe fn real_cmd(cmd: VkCommandBuffer) -> VkCommandBuffer {
-    let gc = unsafe { find_cmd_any(cmd) };
-    if !gc.is_null() {
-        return unsafe { (*gc).real };
-    }
-    // Not in any device's list. Pass it through: a handle the shim never
-    // wrapped is the driver's own. But say so when it *was* a wrapper —
-    // that case hands the driver a shim pointer and faults inside it.
-    if was_wrapper(cmd as usize) {
-        crate::logf!("proxy: BUG submit carries an untracked wrapper CB {cmd:?}");
-    }
-    cmd
-}
-
-unsafe fn find_cmd(gd: *mut GnDevice, cmd: VkCommandBuffer) -> *mut GnCmd {
-    let mut gc = (*gd).cmds;
-    while !gc.is_null() {
-        if gc.cast::<c_void>() == cmd {
-            return gc;
-        }
-        gc = (*gc).next;
-    }
-    ptr::null_mut()
-}
-
-unsafe fn find_surface(surface: VkSurfaceKHR) -> *mut GnSurface {
-    let g = G.lock().unwrap();
-    let mut p = g.surfaces;
-    while !p.is_null() {
-        if p as usize as VkSurfaceKHR == surface {
-            return p;
-        }
-        p = (*p).next;
-    }
-    ptr::null_mut()
-}
-
-unsafe fn find_swapchain(sc: VkSwapchainKHR) -> *mut GnSwapchain {
-    let g = G.lock().unwrap();
-    let mut p = g.swapchains;
-    while !p.is_null() {
-        if p as usize as VkSwapchainKHR == sc {
-            return p;
-        }
-        p = (*p).next;
-    }
-    ptr::null_mut()
-}
-
-/// Resolves a real device-level function by name without touching the
-/// hooks' vkGetDeviceProcAddr (its unknown-name path tail-calls a poison
-/// slot). Order: the hooks' exported vk* entries, then the instance GIPA
-/// (falls through to the real driver's name tables — mesa resolves device
-/// functions from a live instance), then None. Both are safe to call with
-/// the hooks' handles because those handles are never handed to the outer
-/// loader: their first word keeps pointing at the hooks' own dispatch
-/// table (see "Handle ownership" above).
-/// Vulkan 1.4/maintenance core names the driver only exports under the
-/// extension spelling it implemented first.
-fn alias_of(name: &CStr) -> Option<&'static str> {
-    Some(match name.to_str().ok()? {
-        "vkMapMemory2" => "vkMapMemory2KHR",
-        "vkUnmapMemory2" => "vkUnmapMemory2KHR",
-        "vkGetImageSubresourceLayout2" => "vkGetImageSubresourceLayout2KHR",
-        "vkGetDeviceImageSubresourceLayout" => "vkGetDeviceImageSubresourceLayoutKHR",
-        "vkCopyMemoryToImage" => "vkCopyMemoryToImageEXT",
-        "vkCopyImageToMemory" => "vkCopyImageToMemoryEXT",
-        "vkCopyImageToImage" => "vkCopyImageToImageEXT",
-        "vkCmdBindIndexBuffer2" => "vkCmdBindIndexBuffer2KHR",
-        "vkCmdBindDescriptorSets2" => "vkCmdBindDescriptorSets2KHR",
-        "vkCmdPushConstants2" => "vkCmdPushConstants2KHR",
-        "vkCmdPushDescriptorSet" => "vkCmdPushDescriptorSetKHR",
-        "vkCmdPushDescriptorSet2" => "vkCmdPushDescriptorSet2KHR",
-        "vkCmdPushDescriptorSetWithTemplate" => "vkCmdPushDescriptorSetWithTemplateKHR",
-        "vkCmdPushDescriptorSetWithTemplate2" => "vkCmdPushDescriptorSetWithTemplate2KHR",
-        "vkCmdSetRenderingAttachmentLocations" => "vkCmdSetRenderingAttachmentLocationsKHR",
-        "vkCmdSetRenderingInputAttachmentIndices" => "vkCmdSetRenderingInputAttachmentIndicesKHR",
-        "vkGetRenderingAreaGranularity" => "vkGetRenderingAreaGranularityKHR",
-        "vkCmdSetLineStipple" => "vkCmdSetLineStippleEXT",
-        _ => return None,
-    })
-}
-
-unsafe fn gn_real_device_proc(gd: *mut GnDevice, name: &CStr) -> PFN_vkVoidFunction {
-    let (handle, gipa, inst) = {
-        let g = G.lock().unwrap();
-        let inst = if !gd.is_null() {
-            (*(*gd).inst).real
-        } else if !g.instances.is_null() {
-            (*g.instances).real
-        } else {
-            ptr::null_mut()
-        };
-        (g.real_handle, g.real_gipa, inst)
-    };
-    let mut fnptr: PFN_vkVoidFunction = None;
-    let mut via = "miss";
-    // Which handle a name resolves through decides whether the guest gets the
-    // driver's own implementation or the hooks' replacement. The copy/memory
-    // entry points are exactly where the guest's calls came back empty, so
-    // allow forcing the driver's own (GN_VKSHIM_PREFER_DRIVER_PROC=1).
-    let prefer_driver = std::env::var_os("GN_VKSHIM_PREFER_DRIVER_PROC").is_some();
-    if !handle.is_null() && !prefer_driver {
-        let sym = unsafe { libc::dlsym(handle, name.as_ptr()) };
-        if !sym.is_null() {
-            via = "dlsym";
-            fnptr =
-                Some(unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn()>(sym) });
-        }
-    }
-    if fnptr.is_none() && !inst.is_null() {
-        if let Some(gipa) = gipa {
-            fnptr = unsafe { gipa(inst, name.as_ptr()) };
-            if fnptr.is_some() {
-                via = "gipa";
-            }
-        }
-    }
-    // Core names the driver only exports under an extension spelling.
-    if fnptr.is_none() {
-        if let Some(alias) = alias_of(name) {
-            let c = std::ffi::CString::new(alias).unwrap();
-            fnptr = unsafe { gn_real_device_proc(gd, &c) };
-            if fnptr.is_some() {
-                via = "alias";
-            }
-        }
-    }
-    // The image/memory entry points are where the guest's calls silently do
-    // nothing, so record where each one came from.
-    if let Ok(mut seen) = REAL_PROC_SEEN.lock() {
-        let n = name.to_string_lossy().into_owned();
-        if seen.len() < 128
-            && !seen.iter().any(|s| s == &n)
-            && (n.contains("Copy")
-                || n.contains("Clear")
-                || n.contains("Bind")
-                || n.contains("Allocate")
-                || n.contains("Map")
-                || n.contains("CreateImage")
-                || n.contains("SubresourceLayout"))
-        {
-            crate::logf!("proxy: real proc {n} via {via}");
-            seen.push(n);
-        }
-    }
-    fnptr
-}
-
-/// Instance-level resolution likewise prefers the hooks' exported vk*
-/// entries: those are the same public entry points an app links against,
-/// accepting the static loader's object model. The instance GIPA's answers
-/// are internal trampolines that assume loader-wrapped surfaces (they read
-/// [surface] as a dispatch table); only fall back to it for names the hooks
-/// don't export (vkCreateHeadlessSurfaceEXT).
-unsafe fn gn_real_inst_proc(inst: VkInstance, name: &CStr) -> PFN_vkVoidFunction {
-    let (handle, gipa) = {
-        let g = G.lock().unwrap();
-        (g.real_handle, g.real_gipa)
-    };
-    if !handle.is_null() {
-        let sym = unsafe { libc::dlsym(handle, name.as_ptr()) };
-        if !sym.is_null() {
-            return Some(unsafe {
-                std::mem::transmute::<*mut c_void, unsafe extern "C" fn()>(sym)
-            });
-        }
-    }
-    if let Some(gipa) = gipa {
-        return unsafe { gipa(inst, name.as_ptr()) };
-    }
-    None
-}
-
-// Chain-link resolvers for the create-info we hand to the hooks. The outer
-// loader appends a VkLayer{Instance,Device}CreateInfo link to the pNext
-// chain; forwarded verbatim, the hooks initialize their dispatch tables
-// from it — resolving through the outer loader into THIS shim's entry
-// points, which lands our gn_* functions in their device/queue slots and
-// recurses (our QueueSubmit → hooks forwarder → our GetDeviceQueue → …)
-// until the stack overflows. Terminating the chain with resolvers confined
-// to the hooks' own namespace keeps every slot they initialize consistent
-// with their own CreateDevice.
-unsafe extern "C" fn gn_chain_gipa(
-    instance: VkInstance,
-    name: *const c_char,
-) -> PFN_vkVoidFunction {
-    let gipa = G.lock().unwrap().real_gipa;
-    match gipa {
-        Some(gipa) => unsafe { gipa(instance, name) },
-        None => None,
-    }
-}
-
-unsafe extern "C" fn gn_chain_gpdpa(
-    instance: VkInstance,
-    name: *const c_char,
-) -> PFN_vkVoidFunction {
-    unsafe { gn_chain_gipa(instance, name) }
-}
-
-unsafe extern "C" fn gn_chain_gdpa(_device: VkDevice, name: *const c_char) -> PFN_vkVoidFunction {
-    unsafe { gn_real_device_proc(ptr::null_mut(), CStr::from_ptr(name)) }
-}
-
-// Statics shared with the loader's chain links (contents never change).
-struct SyncLink<T>(T);
-unsafe impl<T> Sync for SyncLink<T> {}
-
-static G_CHAIN_INST_LINK: SyncLink<VkLayerInstanceLink> = SyncLink(VkLayerInstanceLink {
-    pNext: ptr::null_mut(),
-    pfnNextGetInstanceProcAddr: Some(unsafe {
-        std::mem::transmute::<
-            unsafe extern "C" fn(VkInstance, *const c_char) -> PFN_vkVoidFunction,
-            unsafe extern "C" fn(),
-        >(gn_chain_gipa)
-    }),
-    pfnNextGetPhysicalDeviceProcAddr: Some(unsafe {
-        std::mem::transmute::<
-            unsafe extern "C" fn(VkInstance, *const c_char) -> PFN_vkVoidFunction,
-            unsafe extern "C" fn(),
-        >(gn_chain_gpdpa)
-    }),
-});
-
-static G_CHAIN_DEV_LINK: SyncLink<VkLayerDeviceLink> = SyncLink(VkLayerDeviceLink {
-    pNext: ptr::null_mut(),
-    pfnNextGetInstanceProcAddr: Some(unsafe {
-        std::mem::transmute::<
-            unsafe extern "C" fn(VkInstance, *const c_char) -> PFN_vkVoidFunction,
-            unsafe extern "C" fn(),
-        >(gn_chain_gipa)
-    }),
-    pfnNextGetDeviceProcAddr: Some(unsafe {
-        std::mem::transmute::<
-            unsafe extern "C" fn(VkDevice, *const c_char) -> PFN_vkVoidFunction,
-            unsafe extern "C" fn(),
-        >(gn_chain_gdpa)
-    }),
-});
-
-/// from_raw_parts that tolerates the vulkan "NULL pointer with zero count"
-/// idiom (creating a slice from (NULL, 0) is UB in Rust even when never
-/// read — and the UB-checking debug build aborts on it).
-unsafe fn slice_or_empty<'a, T>(p: *const T, n: usize) -> &'a [T] {
-    if p.is_null() || n == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(p, n) }
-    }
-}
-
-// ------------------------------------------------------- prereq probe
-
-fn dev_exts_satisfied(
-    enum_de: PFN_vkEnumerateDeviceExtensionProperties,
-    pd: VkPhysicalDevice,
-) -> bool {
-    const WANT: [&CStr; 4] = [
-        c"VK_KHR_external_memory",
-        c"VK_KHR_external_memory_fd",
-        c"VK_EXT_external_memory_dma_buf",
-        c"VK_EXT_image_drm_format_modifier",
-    ];
-    let mut n: u32 = 0;
-    if unsafe { enum_de(pd, ptr::null(), &mut n, ptr::null_mut()) } != VK_SUCCESS {
-        return false;
-    }
-    let mut props = vec![
-        VkExtensionProperties {
-            extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
-            specVersion: 0,
-        };
-        n as usize
-    ];
-    if unsafe { enum_de(pd, ptr::null(), &mut n, props.as_mut_ptr()) } != VK_SUCCESS {
-        return false;
-    }
-    for want in WANT {
-        let found = props[..n as usize].iter().any(|p| {
-            let name = unsafe { CStr::from_ptr(p.extensionName.as_ptr()) };
-            name == want
-        });
-        if !found {
-            crate::logf!("proxy prereq: device lacks {}", want.to_str().unwrap());
+        None => {
+            crate::logf!("x11: slot {idx} present refused - frame dropped");
             return false;
         }
     }
     true
 }
 
-/// Probes the driver's first physical device (throwaway instance) for the
-/// device extensions the proxy's dma-buf export path needs.
-pub fn device_prereqs(gipa: GipaFn) -> bool {
-    let create_inst: Option<PFN_vkCreateInstance> =
-        unsafe { std::mem::transmute(gipa(ptr::null_mut(), c"vkCreateInstance".as_ptr())) };
-    let Some(create_inst) = create_inst else {
-        crate::logf!("proxy prereq: driver exposes no vkCreateInstance");
-        return false;
-    };
-    let app = VkApplicationInfo {
-        sType: VK_STRUCTURE_TYPE_APPLICATION_INFO,
-        pNext: ptr::null(),
-        pApplicationName: c"gn-vkshim-probe".as_ptr(),
-        applicationVersion: 0,
-        pEngineName: ptr::null(),
-        engineVersion: 0,
-        apiVersion: VK_API_VERSION_1_3,
-    };
-    let ci = VkInstanceCreateInfo {
-        sType: VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        pNext: ptr::null(),
-        flags: 0,
-        pApplicationInfo: &app,
-        enabledLayerCount: 0,
-        ppEnabledLayerNames: ptr::null(),
-        enabledExtensionCount: 0,
-        ppEnabledExtensionNames: ptr::null(),
-    };
-    let mut inst: VkInstance = ptr::null_mut();
-    let res = unsafe { create_inst(&ci, ptr::null(), &mut inst) };
-    if res != VK_SUCCESS {
-        crate::logf!("proxy prereq: probe vkCreateInstance failed ({res})");
-        return false;
-    }
-    // Instance-level procs must be fetched against a live instance: mesa
-    // resolves only global functions for a NULL instance.
-    let enum_pds: Option<PFN_vkEnumeratePhysicalDevices> =
-        unsafe { std::mem::transmute(gipa(inst, c"vkEnumeratePhysicalDevices".as_ptr())) };
-    let enum_de: Option<PFN_vkEnumerateDeviceExtensionProperties> = unsafe {
-        std::mem::transmute(gipa(inst, c"vkEnumerateDeviceExtensionProperties".as_ptr()))
-    };
-    let destroy_inst: Option<PFN_vkDestroyInstance> =
-        unsafe { std::mem::transmute(gipa(inst, c"vkDestroyInstance".as_ptr())) };
-    let mut ok = false;
-    match (enum_pds, enum_de, destroy_inst) {
-        (Some(enum_pds), Some(enum_de), _) => {
-            let mut n: u32 = 0;
-            if unsafe { enum_pds(inst, &mut n, ptr::null_mut()) } == VK_SUCCESS && n > 0 {
-                let mut pd: VkPhysicalDevice = ptr::null_mut();
-                let mut one: u32 = 1;
-                if unsafe { enum_pds(inst, &mut one, &mut pd) } == VK_SUCCESS {
-                    ok = dev_exts_satisfied(enum_de, pd);
-                }
-            } else {
-                crate::logf!("proxy prereq: no physical devices");
-            }
-        }
-        _ => crate::logf!("proxy prereq: instance-level procs unresolved"),
-    }
-    if let Some(destroy_inst) = destroy_inst {
-        unsafe { destroy_inst(inst, ptr::null()) };
-    }
-    ok
-}
-
-// ------------------------------------------------ instance-level functions
-
-unsafe extern "C" fn gn_vkCreateInstance(
-    ci: *const VkInstanceCreateInfo,
-    alloc: *const VkAllocationCallbacks,
-    out: *mut VkInstance,
-) -> VkResult {
-    let ci = unsafe { &*ci };
-    let gipa = G.lock().unwrap().real_gipa;
-    let Some(gipa) = gipa else {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    };
-    let real_create: Option<PFN_vkCreateInstance> =
-        unsafe { std::mem::transmute(gipa(ptr::null_mut(), c"vkCreateInstance".as_ptr())) };
-    let Some(real_create) = real_create else {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    };
-    let mut exts: [*const c_char; 32] = [ptr::null(); 32];
-    let mut n: usize = 0;
-    let names = unsafe {
-        slice_or_empty(
-            ci.ppEnabledExtensionNames,
-            ci.enabledExtensionCount as usize,
-        )
-    };
-    for &name in names {
-        let n_ = unsafe { CStr::from_ptr(name) };
-        if n_ == c"VK_KHR_wayland_surface" || n_ == c"VK_KHR_xlib_surface" {
-            continue; // proxied, not real
-        }
-        if n < exts.len() {
-            exts[n] = name;
-            n += 1;
-        }
-    }
-    let mut ci2 = VkInstanceCreateInfo { ..*ci };
-    ci2.enabledExtensionCount = n as u32;
-    ci2.ppEnabledExtensionNames = exts.as_ptr();
-    // Confine the loader's chain link to the hooks' namespace (see
-    // G_CHAIN_INST_LINK).
-    let mut p = ci2.pNext as *mut VkBaseOutStructure;
-    while !p.is_null() {
-        unsafe {
-            if (*p).sType == VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO {
-                let lci = p.cast::<VkLayerInstanceCreateInfo>();
-                if (*lci).function == VK_LAYER_LINK_INFO {
-                    (*lci).u.pLayerInfo = &raw const G_CHAIN_INST_LINK.0 as *mut _;
-                }
-            }
-            p = (*p).pNext;
-        }
-    }
-    let res = unsafe { real_create(&ci2, alloc, out) };
-    if res != VK_SUCCESS {
-        return res;
-    }
-    let gi = Box::new(GnInstance {
-        real: unsafe { *out },
-        f: RealInstFns {
-            gdp: unsafe { std::mem::transmute(gn_real_inst_proc(*out, c"vkGetDeviceProcAddr")) },
-            enum_pds: unsafe {
-                std::mem::transmute(gn_real_inst_proc(*out, c"vkEnumeratePhysicalDevices"))
-            },
-            create_device: unsafe {
-                std::mem::transmute(gn_real_inst_proc(*out, c"vkCreateDevice"))
-            },
-            destroy_instance: unsafe {
-                std::mem::transmute(gn_real_inst_proc(*out, c"vkDestroyInstance"))
-            },
-        },
-        pds: [ptr::null_mut(); 8],
-        n_pds: 0,
-        next: ptr::null_mut(),
-    });
-    let gi = Box::into_raw(gi);
-    unsafe {
-        if let Some(enum_pds) = (*gi).f.enum_pds {
-            let mut cnt: u32 = 0;
-            if enum_pds(*out, &mut cnt, ptr::null_mut()) == VK_SUCCESS && cnt > 0 {
-                if cnt > 8 {
-                    cnt = 8;
-                }
-                if enum_pds(*out, &mut cnt, (*gi).pds.as_mut_ptr()) == VK_SUCCESS {
-                    (*gi).n_pds = cnt;
-                }
-            }
-        }
-    }
-    {
-        let mut g = G.lock().unwrap();
-        unsafe {
-            (*gi).next = g.instances;
-            g.instances = gi;
-        }
-    }
-    crate::logf!("proxy instance {:?} (headless WSI backing)", unsafe {
-        *out
-    });
-    VK_SUCCESS
-}
-
-unsafe extern "C" fn gn_vkDestroyInstance(
-    instance: VkInstance,
-    alloc: *const VkAllocationCallbacks,
-) {
-    let gi = {
-        let mut g = G.lock().unwrap();
-        let mut pp: *mut *mut GnInstance = &raw mut g.instances;
-        unsafe {
-            while !(*pp).is_null() && (**pp).real != instance {
-                pp = &raw mut (**pp).next;
-            }
-            let gi = *pp;
-            if !gi.is_null() {
-                *pp = (*gi).next;
-            }
-            gi
-        }
-    };
-    if gi.is_null() {
+/// Frees every X11 slot whose idle fence has triggered - the server is done
+/// with its pixmap, the slot-reuse contract the wayland arm gets from
+/// wl_buffer.release.
+unsafe fn x11_reap(sc: *mut GnSwapchain) {
+    let present = (*(*sc).surf).x11;
+    if present.is_null() {
         return;
     }
-    unsafe {
-        if let Some(destroy) = (*gi).f.destroy_instance {
-            destroy(instance, alloc);
-        }
-        drop(Box::from_raw(gi));
-    }
-}
-
-unsafe extern "C" fn gn_vkEnumerateInstanceExtensionProperties(
-    layer: *const c_char,
-    pCount: *mut u32,
-    pProps: *mut VkExtensionProperties,
-) -> VkResult {
-    let gipa = G.lock().unwrap().real_gipa;
-    let Some(gipa) = gipa else {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    };
-    let real_enum: Option<PFN_vkEnumerateInstanceExtensionProperties> = unsafe {
-        std::mem::transmute(gipa(
-            ptr::null_mut(),
-            c"vkEnumerateInstanceExtensionProperties".as_ptr(),
-        ))
-    };
-    let Some(real_enum) = real_enum else {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    };
-    unsafe {
-        if pProps.is_null() {
-            let mut n: u32 = 0;
-            let res = real_enum(layer, &mut n, ptr::null_mut());
-            if res != VK_SUCCESS {
-                return res;
-            }
-            *pCount = n + 2;
-            return VK_SUCCESS;
-        }
-        let cap = *pCount;
-        if cap == 0 {
-            *pCount = 0;
-            return VK_INCOMPLETE;
-        }
-        let mut n = cap.saturating_sub(2);
-        let res = real_enum(layer, &mut n, pProps);
-        if res != VK_SUCCESS && res != VK_INCOMPLETE {
-            return res;
-        }
-        let total = n + 2;
-        if cap >= total {
-            // Both surface extensions are proxied: winewayland clients use
-            // the wayland one, winex11 clients (the gamescope path) the xlib
-            // one — the real driver never sees either.
-            for (i, name) in [
-                &b"VK_KHR_wayland_surface\0"[..],
-                &b"VK_KHR_xlib_surface\0"[..],
-            ]
-            .iter()
-            .enumerate()
-            {
-                let slot = &mut *pProps.add(n as usize + i);
-                slot.specVersion = 6;
-                slot.extensionName[..name.len()]
-                    .copy_from_slice(std::mem::transmute::<&[u8], &[c_char]>(name));
-            }
-            *pCount = total;
-            return VK_SUCCESS;
-        }
-        *pCount = total;
-        VK_INCOMPLETE
-    }
-}
-
-/// Forwards the driver's device-extension list minus the WSI extensions the
-/// proxy's client-side swapchain cannot honour. Without this the list passes
-/// through verbatim, and a guest that enabled e.g. VK_KHR_present_wait would
-/// call it through the wrapper-swapping thunk with a shim swapchain handle the
-/// driver has never seen.
-unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
-    pd: VkPhysicalDevice,
-    layer: *const c_char,
-    count: *mut u32,
-    props: *mut VkExtensionProperties,
-) -> VkResult {
-    let gipa = G.lock().unwrap().real_gipa;
-    let Some(gipa) = gipa else {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    };
-    // Instance-level function: mesa resolves it only against a live instance.
-    let gi = unsafe { find_instance_by_pd(pd) };
-    let inst = if gi.is_null() {
-        ptr::null_mut()
-    } else {
-        unsafe { (*gi).real }
-    };
-    let real: Option<PFN_vkEnumerateDeviceExtensionProperties> = unsafe {
-        std::mem::transmute(gipa(inst, c"vkEnumerateDeviceExtensionProperties".as_ptr()))
-    };
-    let Some(real) = real else {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    };
-    unsafe {
-        let mut n: u32 = 0;
-        let res = real(pd, layer, &mut n, ptr::null_mut());
-        if res != VK_SUCCESS {
-            return res;
-        }
-        let mut buf = vec![
-            VkExtensionProperties {
-                extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
-                specVersion: 0,
-            };
-            n as usize
-        ];
-        let mut got = n;
-        let res = real(pd, layer, &mut got, buf.as_mut_ptr());
-        if res != VK_SUCCESS && res != VK_INCOMPLETE {
-            return res;
-        }
-        let mut kept = 0usize;
-        for i in 0..got as usize {
-            if !unimplemented_wsi_ext(CStr::from_ptr(buf[i].extensionName.as_ptr())) {
-                buf[kept] = buf[i];
-                kept += 1;
-            }
-        }
-        if props.is_null() {
-            *count = kept as u32;
-            return VK_SUCCESS;
-        }
-        let n_copy = (*count as usize).min(kept);
-        ptr::copy_nonoverlapping(buf.as_ptr(), props, n_copy);
-        *count = n_copy as u32;
-        if n_copy < kept {
-            VK_INCOMPLETE
-        } else {
-            VK_SUCCESS
-        }
-    }
-}
-
-// ------------------------------------------------- wayland surface (proxy)
-
-unsafe extern "C" fn gn_vkCreateWaylandSurfaceKHR(
-    instance: VkInstance,
-    ci: *const VkWaylandSurfaceCreateInfoKHR,
-    _alloc: *const VkAllocationCallbacks,
-    out: *mut VkSurfaceKHR,
-) -> VkResult {
-    let ci = unsafe { &*ci };
-    let gi = unsafe { find_instance(instance) };
-    if gi.is_null() {
-        crate::logf!("proxy surface create FAILED: instance {instance:?} not one of ours");
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
-    if !wl_setup(ci.display.cast()) {
-        crate::logf!("proxy surface create FAILED: wayland setup failed");
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
-    let s = Box::new(GnSurface {
-        inst: gi,
-        dpy: ci.display.cast(),
-        parent: ci.surface.cast(),
-        own_surface: ptr::null_mut(),
-        swapchain_obj: ptr::null_mut(),
-        next: ptr::null_mut(),
-    });
-    let s = Box::into_raw(s);
-    {
-        let mut g = G.lock().unwrap();
-        unsafe {
-            (*s).next = g.surfaces;
-            g.surfaces = s;
-        }
-    }
-    unsafe {
-        *out = s as usize as VkSurfaceKHR;
-        crate::logf!(
-            "proxy surface {:?} (direct attach on wl_surface {:?})",
-            s,
-            ci.surface
-        );
-    }
-    VK_SUCCESS
-}
-
-// ------------------------------------------------- xlib surface (proxy, X11 mode)
-//
-// Under winex11.drv wine has no wl_surface for the window; the shim creates
-// its OWN wl_surface on its own gamescope connection and binds it to the X
-// window via the upstream gamescope_swapchain override mechanism: the
-// compositor then routes this surface's commits as the X window's content
-// (wlserver handle_override_window_content re-points the window's
-// x11_surface_info at our surface and drains g_PendingCommits for it).
-//
-// This is the only WSI provider in the stack: the Vulkan driver (turnip)
-// exports no xlib or wayland WSI entry points at all, so handing an X11
-// surface to it cannot work (its ICD carries no vkCreateXlibSurfaceKHR, and
-// surface setup then fails VK_ERROR_INITIALIZATION_FAILED). The shim must
-// present every window itself, so there is no driver-WSI fallback route.
-
-unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
-    instance: VkInstance,
-    ci: *const VkXlibSurfaceCreateInfoKHR,
-    _alloc: *const VkAllocationCallbacks,
-    out: *mut VkSurfaceKHR,
-) -> VkResult {
-    let ci = unsafe { &*ci };
-    let gi = unsafe { find_instance(instance) };
-    if gi.is_null() {
-        crate::logf!("proxy xlib surface create FAILED: instance {instance:?} not one of ours");
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
-    if !wl_setup(ptr::null_mut()) {
-        crate::logf!("proxy xlib surface create FAILED: wayland setup failed");
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
-    let (comp, factory, dpy) = {
-        let w = G_WL.lock().unwrap();
-        (w.comp, w.swapchain_factory, w.dpy)
-    };
-    if factory.is_null() {
-        crate::logf!("compositor misses gamescope_swapchain_factory_v2 — cannot bind XID");
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
-    unsafe {
-        let _sg = SEND_LOCK.lock().unwrap();
-        let surf = wlproto::compositor_create_surface(comp);
-        if surf.is_null() {
-            crate::logf!("proxy xlib surface create FAILED: wl_surface create failed");
-            return VK_ERROR_INITIALIZATION_FAILED;
-        }
-        let scobj = wlproto::swapchain_factory_create_swapchain(factory, surf);
-        // Single xwayland server (--xwayland-count 1) is always id 0.
-        wlproto::swapchain_override_window_content(scobj, 0, ci.window as u32);
-        wlproto::wl_display_flush(dpy);
-        drop(_sg);
-        let s = Box::new(GnSurface {
-            inst: gi,
-            dpy,
-            parent: surf,
-            own_surface: surf,
-            swapchain_obj: scobj,
-            next: ptr::null_mut(),
-        });
-        let s = Box::into_raw(s);
-        {
-            let mut g = G.lock().unwrap();
-            (*s).next = g.surfaces;
-            g.surfaces = s;
-        }
-        *out = s as usize as VkSurfaceKHR;
-        crate::logf!(
-            "proxy surface {:?} (own wl_surface {:?} bound to XID {:#x})",
-            s,
-            surf,
-            ci.window
-        );
-    }
-    VK_SUCCESS
-}
-
-unsafe extern "C" fn gn_vkGetPhysicalDeviceXlibPresentationSupportKHR(
-    _pd: VkPhysicalDevice,
-    _qf: u32,
-    _dpy: *mut c_void,
-    _visual: usize,
-) -> VkBool32 {
-    VK_TRUE
-}
-
-unsafe extern "C" fn gn_vkDestroySurfaceKHR(
-    _instance: VkInstance,
-    surface: VkSurfaceKHR,
-    _alloc: *const VkAllocationCallbacks,
-) {
-    let s = unsafe { find_surface(surface) };
-    if s.is_null() {
-        return;
-    }
-    {
-        let mut g = G.lock().unwrap();
-        let mut pp: *mut *mut GnSurface = &raw mut g.surfaces;
-        unsafe {
-            while !(*pp).is_null() && *pp != s {
-                pp = &raw mut (**pp).next;
-            }
-            if !(*pp).is_null() {
-                *pp = (*s).next;
-            }
-        }
-    }
-    unsafe {
-        let _sg = SEND_LOCK.lock().unwrap();
-        if !(*s).swapchain_obj.is_null() {
-            wlproto::wl_proxy_destroy((*s).swapchain_obj);
-        }
-        if !(*s).own_surface.is_null() {
-            wlproto::wl_proxy_destroy((*s).own_surface);
-        }
-        wlproto::wl_display_flush((*s).dpy);
-        drop(_sg);
-        drop(Box::from_raw(s));
-    }
-}
-
-// Surface queries are answered locally: the proxy owns the wayland
-// presentation contract, and the hooks' surface-query trampolines expect
-// loader-wrapped surface objects their VK_EXT_headless_surface path never
-// produces (the ICD-level mesa surface's first word is its object-type
-// enum, not a dispatch table).
-unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
-    _pd: VkPhysicalDevice,
-    surface: VkSurfaceKHR,
-    caps: *mut VkSurfaceCapabilitiesKHR,
-) -> VkResult {
-    if unsafe { find_surface(surface) }.is_null() {
-        crate::logf!("proxy surface caps query: {surface:#x} not one of ours");
-        return VK_ERROR_SURFACE_LOST_KHR;
-    }
-    unsafe {
-        *caps = VkSurfaceCapabilitiesKHR {
-            minImageCount: 2,
-            maxImageCount: max_swapchain_images(),
-            currentExtent: VkExtent2D {
-                width: u32::MAX,
-                height: u32::MAX,
-            }, // wayland: app picks
-            minImageExtent: VkExtent2D {
-                width: 1,
-                height: 1,
-            },
-            maxImageExtent: VkExtent2D {
-                width: 8192,
-                height: 8192,
-            },
-            maxImageArrayLayers: 1,
-            supportedTransforms: VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
-            currentTransform: VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
-            // The same set Mesa/turnip's WSI advertises on the X11 arm. There is
-            // no delegate surface to forward from: the proxy owns the wayland
-            // presentation contract and the driver exports no WSI entry points
-            // (see the xlib-surface and present-modes notes above), and
-            // `RealDevFns` carries no surface-capability query. Advertising
-            // OPAQUE alone let DXVK force every present opaque, which covered
-            // the window's own GDI surface. INHERIT is the honest default for a
-            // compositor-managed surface; the pre/post forms let a guest pick
-            // its own blending.
-            supportedCompositeAlpha: VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR
-                | VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR
-                | VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR
-                | VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-            // Exactly what the pool's AHardwareBuffer backs, no more. The pool
-            // allocates GPU_SAMPLED_IMAGE | GPU_COLOR_OUTPUT | COMPOSER_OVERLAY
-            // | CPU_READ_OFTEN and the guest renders straight into it, so
-            // SAMPLED_BIT comes with the first flag and COLOR_ATTACHMENT_BIT
-            // with the second. The transfer bits are on every image the proxy
-            // creates (`GnSwapchain::usage`) and the WSI smoke client actually
-            // exercises them: its present readback copies a swapchain image to
-            // host memory (TRANSFER_SRC) and its clear scene clears one in
-            // TRANSFER_DST_OPTIMAL (TRANSFER_DST). COMPOSER_OVERLAY and
-            // CPU_READ_OFTEN are SurfaceFlinger/host usages with no Vulkan
-            // equivalent. No STORAGE_BIT: an AHardwareBuffer grants that only
-            // through AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER, which this pool
-            // does not set, so advertising it would promise a capability the
-            // scan-out buffer cannot back.
-            supportedUsageFlags: VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-                | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                | VK_IMAGE_USAGE_SAMPLED_BIT,
+    for i in 0..unsafe { (*sc).slots.len() } {
+        let s = unsafe { (*sc).slots.as_mut_ptr().add(i) };
+        // in_flight is the app/worker handshake field: read and clear it under
+        // the same lock the wayland release listener uses.
+        let (fence, busy) = {
+            let _g = unsafe { (*sc).shared.lock().unwrap() };
+            unsafe { ((*s).xfence, (*s).in_flight) }
         };
-    }
-    VK_SUCCESS
-}
-
-unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceFormatsKHR(
-    _pd: VkPhysicalDevice,
-    surface: VkSurfaceKHR,
-    count: *mut u32,
-    formats: *mut VkSurfaceFormatKHR,
-) -> VkResult {
-    if unsafe { find_surface(surface) }.is_null() {
-        crate::logf!("proxy surface formats query: {surface:#x} not one of ours");
-        return VK_ERROR_SURFACE_LOST_KHR;
-    }
-    const K_FMTS: [VkSurfaceFormatKHR; 2] = [
-        VkSurfaceFormatKHR {
-            format: VK_FORMAT_B8G8R8A8_UNORM,
-            colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
-        },
-        VkSurfaceFormatKHR {
-            format: VK_FORMAT_R8G8B8A8_UNORM,
-            colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
-        },
-    ];
-    // BGRA_8888 only by default, so the guest renders in the scan-out pool's
-    // own layout (see `advertises_rgba` — offering RGBA let Nidhogg render
-    // R/B-exchanged into a daemon BGRA buffer, which reached the panel as
-    // cyan). RGBA is offered only under `GN_VKSHIM_ALLOW_RGBA`.
-    let n_formats = if advertises_rgba() { K_FMTS.len() } else { 1 };
-    unsafe {
-        if formats.is_null() {
-            *count = n_formats as u32;
-            return VK_SUCCESS;
-        }
-        let n = (*count).min(n_formats as u32) as usize;
-        ptr::copy_nonoverlapping(K_FMTS.as_ptr(), formats, n);
-        *count = n as u32;
-        if n < n_formats {
-            VK_INCOMPLETE
-        } else {
-            VK_SUCCESS
-        }
-    }
-}
-
-/// The present modes the proxy's client-side swapchain serves. The proxy owns
-/// the swapchain (a dma-buf ring published straight to the compositor) and
-/// never presents through the driver's WSI, so there is no surface on which the
-/// underlying driver's vkGetPhysicalDeviceSurfacePresentModesKHR could be
-/// asked: the shim's VkSurfaceKHR is a private pointer the driver has never
-/// seen, and this driver family carries no wayland WSI to build one with. Every
-/// mode here is served by the same publish path — presents never block on the
-/// compositor and a slot is reused on wl_buffer.release — so the guest may pick
-/// any of them; FIFO is always offered.
-const SERVED_PRESENT_MODES: [VkPresentModeKHR; 3] = [
-    VK_PRESENT_MODE_IMMEDIATE_KHR,
-    VK_PRESENT_MODE_MAILBOX_KHR,
-    VK_PRESENT_MODE_FIFO_KHR,
-];
-
-/// Parses MESA_VK_WSI_PRESENT_MODE exactly as mesa's wsi_common.c does: the four
-/// names are matched case-sensitively and anything else is reported and ignored.
-fn parse_present_mode_override(val: Option<&str>) -> Option<VkPresentModeKHR> {
-    let mode = match val? {
-        "fifo" => VK_PRESENT_MODE_FIFO_KHR,
-        "relaxed" => VK_PRESENT_MODE_FIFO_RELAXED_KHR,
-        "mailbox" => VK_PRESENT_MODE_MAILBOX_KHR,
-        "immediate" => VK_PRESENT_MODE_IMMEDIATE_KHR,
-        _ => {
-            crate::logf!("Invalid MESA_VK_WSI_PRESENT_MODE value!");
-            return None;
-        }
-    };
-    Some(mode)
-}
-
-/// The list offered to the guest: the override mode first when the ring can
-/// serve it, then the served modes in their fixed order, FIFO always present.
-/// An override the ring cannot serve is dropped instead of advertised, matching
-/// mesa's "Unsupported …" behaviour of keeping the requested mode.
-fn offered_present_modes(
-    served: &[VkPresentModeKHR],
-    override_mode: Option<VkPresentModeKHR>,
-) -> Vec<VkPresentModeKHR> {
-    let mut v = Vec::with_capacity(served.len() + 1);
-    if let Some(m) = override_mode {
-        if served.contains(&m) {
-            v.push(m);
-        } else {
-            crate::logf!("Unsupported MESA_VK_WSI_PRESENT_MODE value!");
-        }
-    }
-    for &m in served {
-        if !v.contains(&m) {
-            v.push(m);
-        }
-    }
-    if !v.contains(&VK_PRESENT_MODE_FIFO_KHR) {
-        v.push(VK_PRESENT_MODE_FIFO_KHR);
-    }
-    v
-}
-
-unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfacePresentModesKHR(
-    _pd: VkPhysicalDevice,
-    surface: VkSurfaceKHR,
-    count: *mut u32,
-    modes: *mut VkPresentModeKHR,
-) -> VkResult {
-    if unsafe { find_surface(surface) }.is_null() {
-        crate::logf!("proxy surface present-modes query: {surface:#x} not one of ours");
-        return VK_ERROR_SURFACE_LOST_KHR;
-    }
-    let modes_list = offered_present_modes(
-        &SERVED_PRESENT_MODES,
-        parse_present_mode_override(std::env::var("MESA_VK_WSI_PRESENT_MODE").ok().as_deref()),
-    );
-    unsafe {
-        if modes.is_null() {
-            *count = modes_list.len() as u32;
-            return VK_SUCCESS;
-        }
-        let n = (*count).min(modes_list.len() as u32) as usize;
-        ptr::copy_nonoverlapping(modes_list.as_ptr(), modes, n);
-        *count = n as u32;
-        if n < modes_list.len() {
-            VK_INCOMPLETE
-        } else {
-            VK_SUCCESS
-        }
-    }
-}
-
-unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceSupportKHR(
-    _pd: VkPhysicalDevice,
-    _qf: u32,
-    _surface: VkSurfaceKHR,
-    supported: *mut VkBool32,
-) -> VkResult {
-    unsafe { *supported = VK_TRUE };
-    VK_SUCCESS
-}
-
-unsafe extern "C" fn gn_vkGetPhysicalDeviceWaylandPresentationSupportKHR(
-    _pd: VkPhysicalDevice,
-    _qf: u32,
-    _dpy: *mut wl_display,
-) -> VkBool32 {
-    VK_TRUE
-}
-
-// ------------------------------------------------------- device functions
-
-unsafe extern "C" fn gn_vkCreateDevice(
-    pd: VkPhysicalDevice,
-    ci: *const VkDeviceCreateInfo,
-    alloc: *const VkAllocationCallbacks,
-    out: *mut VkDevice,
-) -> VkResult {
-    let ci = unsafe { &*ci };
-    let gi = unsafe { find_instance_by_pd(pd) };
-    if gi.is_null() || unsafe { (*gi).f.create_device.is_none() } {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
-    const ADD_EXTS: [&CStr; 4] = [
-        c"VK_KHR_external_memory",
-        c"VK_KHR_external_memory_fd",
-        c"VK_EXT_external_memory_dma_buf",
-        c"VK_EXT_image_drm_format_modifier",
-    ];
-    let mut exts: [*const c_char; 48] = [ptr::null(); 48];
-    let mut n: usize = 0;
-    let names = unsafe {
-        slice_or_empty(
-            ci.ppEnabledExtensionNames,
-            ci.enabledExtensionCount as usize,
-        )
-    };
-    for &name in names {
-        // The guest must never enable a WSI extension the proxy cannot honour
-        // (see `unimplemented_wsi_ext`); drop it before the driver sees it.
-        let n_ = unsafe { CStr::from_ptr(name) };
-        if unimplemented_wsi_ext(n_) {
-            crate::logf!("proxy device: masking {}", n_.to_string_lossy());
+        if fence == 0 || !busy {
             continue;
         }
-        if n < exts.len() {
-            exts[n] = name;
-            n += 1;
-        }
-    }
-    'add: for add in ADD_EXTS {
-        for &e in &exts[..n] {
-            if unsafe { CStr::from_ptr(e) } == add {
-                continue 'add;
+        if unsafe { (*present).fence_idle(fence) } {
+            let _g = unsafe { (*sc).shared.lock().unwrap() };
+            unsafe {
+                (*s).in_flight = false;
+                (*sc).cv_free.notify_all();
+                drop(_g);
+            }
+            N_REL.fetch_add(1, Ordering::Relaxed);
+            if rate_ok(&RATE_REL, RATE_EVERY) {
+                crate::logf!("x11 release: slot={i} {}", slot_flags(sc));
             }
         }
-        if n < exts.len() {
-            exts[n] = add.as_ptr();
-            n += 1;
-        }
-    }
-    // Optionally mask the pipeline-library extensions (GN_VKSHIM_NO_GPL=1):
-    // DXVK then builds monolithic pipelines instead of partial ones it links,
-    // which is the A/B for a suspected bad partial/link path in this driver
-    // (the X11 vulkan wrapper fakes VK_KHR_pipeline_library, so X11 never uses
-    // it). Off by default: without it DXVK keeps its pipeline-compilation
-    // optimisation, and masking it means compiling every state monolithically,
-    // which is slow enough on this driver to look like a hang.
-    if std::env::var_os("GN_VKSHIM_NO_GPL").is_some() {
-        for drop in [
-            c"VK_EXT_graphics_pipeline_library",
-            c"VK_KHR_pipeline_library",
-        ] {
-            let mut i = 0;
-            while i < n {
-                if unsafe { CStr::from_ptr(exts[i]) } == drop {
-                    crate::logf!("proxy device: masking {}", drop.to_string_lossy());
-                    for j in i..n - 1 {
-                        exts[j] = exts[j + 1];
-                    }
-                    n -= 1;
-                } else {
-                    i += 1;
-                }
-            }
-        }
-    }
-    let mut ci2 = VkDeviceCreateInfo { ..*ci };
-    ci2.enabledExtensionCount = n as u32;
-    ci2.ppEnabledExtensionNames = exts.as_ptr();
-    // Confine the loader's chain link to the hooks' namespace (see
-    // G_CHAIN_DEV_LINK).
-    let mut p = ci2.pNext as *mut VkBaseOutStructure;
-    while !p.is_null() {
-        unsafe {
-            if (*p).sType == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO {
-                let lci = p.cast::<VkLayerDeviceCreateInfo>();
-                if (*lci).function == VK_LAYER_LINK_INFO {
-                    (*lci).u.pLayerDeviceInfo = &raw const G_CHAIN_DEV_LINK.0 as *mut _;
-                }
-            }
-            p = (*p).pNext;
-        }
-    }
-    let res = unsafe { (*gi).f.create_device.unwrap()(pd, &ci2, alloc, out) };
-    if res != VK_SUCCESS {
-        return res;
-    }
-    let mut gd = Box::new(GnDevice {
-        scratch: [0; GN_HANDLE_SCRATCH],
-        real: unsafe { *out },
-        inst: gi,
-        f: RealDevFns::default(),
-        queues: ptr::null_mut(),
-        cmds: ptr::null_mut(),
-        next: ptr::null_mut(),
-    });
-    // Real-device function resolution never uses the hooks'
-    // vkGetDeviceProcAddr: its answers are vulkan::driver::* trampolines
-    // that index a high dispatch region which isn't valid for this device
-    // (GetDeviceQueue through it returned a NULL queue, crashing the
-    // trampoline's own handle-magic check). The hooks' exported vk* entries
-    // forward through the device's ordinary low dispatch slots — always
-    // consistent with the CreateDevice that produced the handle; the
-    // instance GIPA falls through to the real driver's name tables for the
-    // extension names the hooks don't export.
-    let gdp: *mut GnDevice = &mut *gd;
-    macro_rules! resolve {
-        ($field:ident, $sym:literal) => {
-            gd.f.$field = unsafe {
-                std::mem::transmute(gn_real_device_proc(
-                    gdp,
-                    CStr::from_bytes_with_nul_unchecked(concat!($sym, "\0").as_bytes()),
-                ))
-            };
-        };
-    }
-    resolve!(get_queue, "vkGetDeviceQueue");
-    resolve!(create_image, "vkCreateImage");
-    resolve!(create_pipelines, "vkCreateGraphicsPipelines");
-    resolve!(get_device_queue2, "vkGetDeviceQueue2");
-    resolve!(submit2, "vkQueueSubmit2");
-    resolve!(wait_semaphores, "vkWaitSemaphoresKHR");
-    resolve!(destroy_image, "vkDestroyImage");
-    resolve!(get_mem_reqs, "vkGetImageMemoryRequirements");
-    resolve!(get_layout, "vkGetImageSubresourceLayout");
-    resolve!(alloc_mem, "vkAllocateMemory");
-    resolve!(free_mem, "vkFreeMemory");
-    resolve!(bind_mem, "vkBindImageMemory");
-    resolve!(create_fence, "vkCreateFence");
-    resolve!(destroy_fence, "vkDestroyFence");
-    resolve!(wait_fences, "vkWaitForFences");
-    resolve!(reset_fences, "vkResetFences");
-    resolve!(create_sem, "vkCreateSemaphore");
-    resolve!(destroy_sem, "vkDestroySemaphore");
-    resolve!(alloc_cmd, "vkAllocateCommandBuffers");
-    resolve!(free_cmd, "vkFreeCommandBuffers");
-    resolve!(submit, "vkQueueSubmit");
-    resolve!(wait_idle, "vkDeviceWaitIdle");
-    resolve!(destroy_device, "vkDestroyDevice");
-    let qf = if ci.pQueueCreateInfos.is_null() {
-        0
-    } else {
-        unsafe { (*ci.pQueueCreateInfos).queueFamilyIndex }
-    };
-    let gd = Box::into_raw(gd);
-    {
-        let mut g = G.lock().unwrap();
-        unsafe {
-            (*gd).next = g.devices;
-            g.devices = gd;
-        }
-    }
-    // Hand the loader our own wrapper; gd.real stays private (its first
-    // word must keep pointing at the hooks' dispatch table).
-    unsafe {
-        *out = gd.cast::<c_void>();
-        crate::logf!(
-            "proxy device {:?} (real {:?}, queue family {qf})",
-            gd,
-            (*gd).real
-        );
-    }
-    VK_SUCCESS
-}
-
-unsafe extern "C" fn gn_vkDestroyDevice(device: VkDevice, _alloc: *const VkAllocationCallbacks) {
-    let gd = unsafe { find_device(device) };
-    if gd.is_null() {
-        return;
-    }
-    unsafe {
-        if let Some(wait_idle) = (*gd).f.wait_idle {
-            wait_idle((*gd).real);
-        }
-        if let Some(destroy_device) = (*gd).f.destroy_device {
-            destroy_device((*gd).real, ptr::null());
-        }
-    }
-    {
-        let mut g = G.lock().unwrap();
-        let mut pp: *mut *mut GnDevice = &raw mut g.devices;
-        unsafe {
-            while !(*pp).is_null() && *pp != gd {
-                pp = &raw mut (**pp).next;
-            }
-            if !(*pp).is_null() {
-                *pp = (*gd).next;
-            }
-            while !(*gd).queues.is_null() {
-                let gq = (*gd).queues;
-                (*gd).queues = (*gq).next;
-                drop(Box::from_raw(gq));
-            }
-            while !(*gd).cmds.is_null() {
-                let gc = (*gd).cmds;
-                (*gd).cmds = (*gc).next;
-                drop(Box::from_raw(gc));
-            }
-        }
-    }
-    unsafe {
-        drop(Box::from_raw(gd));
-    }
-}
-
-unsafe extern "C" fn gn_vkGetDeviceQueue(
-    device: VkDevice,
-    family: u32,
-    index: u32,
-    out: *mut VkQueue,
-) {
-    let gd = unsafe { find_device(device) };
-    if gd.is_null() {
-        return;
-    }
-    let mut gq = Box::new(GnQueue {
-        scratch: [0; GN_HANDLE_SCRATCH],
-        real: ptr::null_mut(),
-        gd,
-        next: ptr::null_mut(),
-    });
-    unsafe {
-        if let Some(get_queue) = (*gd).f.get_queue {
-            get_queue((*gd).real, family, index, &mut gq.real);
-        }
-    }
-    let gq = Box::into_raw(gq);
-    {
-        let _g = G.lock().unwrap();
-        unsafe {
-            (*gq).next = (*gd).queues;
-            (*gd).queues = gq;
-        }
-    }
-    unsafe { *out = gq.cast::<c_void>() };
-}
-
-unsafe extern "C" fn gn_vkGetDeviceQueue2(
-    device: VkDevice,
-    info: *const VkDeviceQueueInfo2,
-    out: *mut VkQueue,
-) {
-    let gd = unsafe { find_device(device) };
-    if gd.is_null() {
-        return;
-    }
-    // Per device: these resolved entry points are bound to the device that
-    // produced the handle, so a process-global cache hands a later device a
-    // function that fails its own handle check (a NULL queue or worse).
-    let Some(real_fn) = (unsafe { (*gd).f.get_device_queue2 }) else {
-        unsafe { gn_vkGetDeviceQueue(device, (*info).queueFamilyIndex, (*info).queueIndex, out) };
-        return;
-    };
-    let mut gq = Box::new(GnQueue {
-        scratch: [0; GN_HANDLE_SCRATCH],
-        real: ptr::null_mut(),
-        gd,
-        next: ptr::null_mut(),
-    });
-    unsafe {
-        real_fn((*gd).real, info, &mut gq.real);
-    }
-    let gq = Box::into_raw(gq);
-    {
-        let _g = G.lock().unwrap();
-        unsafe {
-            (*gq).next = (*gd).queues;
-            (*gd).queues = gq;
-        }
-    }
-    unsafe { *out = gq.cast::<c_void>() };
-}
-
-// ------------------------------------------------- swapchain + present
-
-fn vk_format_to_fourcc(format: VkFormat) -> u32 {
-    match format {
-        // DRM fourccs name the LE 32-bit word: ARGB8888 = 0xAARRGGBB, i.e.
-        // memory bytes B,G,R,A — VK_FORMAT_B8G8R8A8_UNORM's layout. Both of
-        // these Vulkan formats carry a real alpha channel, so they map to the
-        // alpha-bearing A-formats, not XRGB8888/XBGR8888: the X byte is
-        // *ignored* by the compositor, which is what forced a guest's frame
-        // opaque. The daemon already reports the same buffer as AR24
-        // (`PRIMARY_FORMATS`), so this keeps the two descriptions in agreement.
-        VK_FORMAT_B8G8R8A8_UNORM => GN_DRM_FORMAT_ARGB8888,
-        VK_FORMAT_R8G8B8A8_UNORM => GN_DRM_FORMAT_ABGR8888,
-        _ => 0,
-    }
-}
-
-/// The scan-out pool's memory layout, which is what a guest swapchain buffer
-/// actually is whenever the daemon's allocator catches it. Kept as the single
-/// accepted/offered format (see [`advertises_rgba`]).
-const SCANOUT_SWAPCHAIN_FORMAT: VkFormat = VK_FORMAT_B8G8R8A8_UNORM;
-
-/// Whether the proxy offers (and accepts) `VK_FORMAT_R8G8B8A8_UNORM` in
-/// addition to `B8G8R8A8_UNORM`. **Off by default.**
-///
-/// This is measured, not stylistic. The scan-out pool allocates
-/// `AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM`, so a guest surface the pool owns
-/// must be that same layout. A guest that picks RGBA
-/// (Nidhogg did: `proxy swapchain … 1280x960 fmt 37 -> fourcc 0x34324258`)
-/// renders R,G,B,X into a buffer the daemon then publishes to SurfaceFlinger
-/// *as* BGRA, exchanging red and blue: Nidhogg's yellow/red art reached the
-/// panel as cyan, while a BGRA guest (Dishonored, `fmt 44`) was correct. The
-/// memory is the pool's, so the format the guest renders in must be the
-/// pool's. `GN_VKSHIM_ALLOW_RGBA=1` re-offers RGBA for bring-up A/B;
-/// `GN_VKSHIM_FORCE_BGRA` forces this off regardless.
-fn advertises_rgba() -> bool {
-    std::env::var_os("GN_VKSHIM_FORCE_BGRA").is_none()
-        && std::env::var_os("GN_VKSHIM_ALLOW_RGBA").is_some()
-}
-
-/// Whether a guest swapchain of `format` may be created, given whether RGBA is
-/// offered (`allow_rgba` = [`advertises_rgba`]). Pure so the rule is
-/// host-testable: exactly `SCANOUT_SWAPCHAIN_FORMAT`, plus RGBA only when
-/// explicitly re-enabled.
-fn swapchain_format_allowed(format: VkFormat, allow_rgba: bool) -> bool {
-    format == SCANOUT_SWAPCHAIN_FORMAT || (allow_rgba && format == VK_FORMAT_R8G8B8A8_UNORM)
-}
-
-unsafe fn slot_release(sc: *mut GnSwapchain, s: *mut GnSlot) {
-    let gd = (*sc).dev;
-    unsafe {
-        if !(*s).buf.is_null() {
-            wlproto::wl_proxy_destroy((*s).buf);
-            (*s).buf = ptr::null_mut();
-        }
-        if (*s).fence != 0 {
-            if let Some(f) = (*gd).f.destroy_fence {
-                f((*gd).real, (*s).fence, ptr::null());
-            }
-        }
-        if (*s).sem != 0 {
-            if let Some(f) = (*gd).f.destroy_sem {
-                f((*gd).real, (*s).sem, ptr::null());
-            }
-        }
-        if (*s).image != 0 {
-            if let Some(f) = (*gd).f.destroy_image {
-                f((*gd).real, (*s).image, ptr::null());
-            }
-        }
-        if (*s).mem != 0 {
-            if let Some(f) = (*gd).f.free_mem {
-                f((*gd).real, (*s).mem, ptr::null());
-            }
-        }
-        if (*s).fd >= 0 {
-            libc::close((*s).fd);
-        }
-        (*s).fd = -1;
-    }
-}
-
-// Present targets are dma-bufs the shim allocates from the system heap and
-// IMPORTS into vulkan. The adrenotools driver family cannot export fds
-// (vkGetMemoryFdKHR / vkGetImageDrmFormatModifierPropertiesEXT are not
-// reachable through its hooks), so the ownership is inverted: the shim owns
-// the fd, vulkan borrows it, and the same fd is committed to wayland.
-fn dma_heap_open() -> i32 {
-    static HEAP_FD: OnceLock<i32> = OnceLock::new();
-    *HEAP_FD.get_or_init(|| {
-        let path = CString::new("/dev/dma_heap/system").unwrap();
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-        if fd < 0 {
-            crate::logf!(
-                "proxy: /dev/dma_heap/system: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        fd
-    })
-}
-
-fn dma_heap_alloc(len: usize) -> i32 {
-    let heap = dma_heap_open();
-    if heap < 0 {
-        return -1;
-    }
-    // DMA_HEAP_IOCTL_ALLOC: _IOWR('H', 0x0, struct dma_heap_allocation_data)
-    #[repr(C)]
-    struct dma_heap_allocation_data {
-        len: u64,
-        fd: u32,
-        fd_flags: u32,
-        heap_flags: u64,
-    }
-    // _IOC(_IOC_READ|_IOC_WRITE=3 << 30, size << 16, magic 'H' << 8, nr 0)
-    const DMA_HEAP_IOCTL_ALLOC: libc::c_ulong = (3u64 << 30)
-        | ((std::mem::size_of::<dma_heap_allocation_data>() as u64) << 16)
-        | ((b'H' as u64) << 8);
-    let mut data = dma_heap_allocation_data {
-        len: len as u64,
-        fd: 0,
-        // O_RDWR: the fd crosses to gndrm, whose CPU upload path mmaps it
-        // PROT_READ — an accmode-less fd fails mmap with EACCES.
-        fd_flags: (libc::O_RDWR | libc::O_CLOEXEC) as u32,
-        heap_flags: 0,
-    };
-    if unsafe { libc::ioctl(heap, DMA_HEAP_IOCTL_ALLOC as _, &mut data) } != 0 {
-        crate::logf!(
-            "proxy: dma_heap alloc({len}): {}",
-            std::io::Error::last_os_error()
-        );
-        return -1;
-    }
-    data.fd as i32
-}
-
-/// Fence/semaphore pair every present slot needs, regardless of layout.
-unsafe fn slot_init_sync(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
-    let gd = (*sc).dev;
-    let dev = unsafe { (*gd).real };
-    let f = unsafe { (*gd).f };
-    let fci = VkFenceCreateInfo {
-        sType: VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        pNext: ptr::null(),
-        flags: 0,
-    };
-    let sci = VkSemaphoreCreateInfo {
-        sType: VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-        pNext: ptr::null(),
-        flags: 0,
-    };
-    let mut res = unsafe { f.create_fence.unwrap()(dev, &fci, ptr::null(), &mut (*s).fence) };
-    if res == VK_SUCCESS {
-        res = unsafe { f.create_sem.unwrap()(dev, &sci, ptr::null(), &mut (*s).sem) };
-    }
-    res
-}
-
-/// GN_VKSHIM_SC_MOD present image: the driver picks its own scanout layout and
-/// names it through the DRM modifier, so the guest renders into the same kind
-/// of target a stock driver allocates. The driver cannot export fds, so the
-/// shim still owns the dma-heap allocation: the modifier is what tells
-/// gamescope how to read it. A tiled image has no CPU-readable layout, hence
-/// no vkGetImageSubresourceLayout probe and no frame dump.
-unsafe fn slot_init_tiled(sc: *mut GnSwapchain, s: *mut GnSlot, modifier: u64) -> VkResult {
-    let gd = (*sc).dev;
-    let dev = unsafe { (*gd).real };
-    let f = unsafe { (*gd).f };
-    let w = (*sc).extent.width;
-    unsafe {
-        if (*s).fd >= 0 {
-            libc::close((*s).fd);
-            (*s).fd = -1;
-        }
-    }
-    (*s).stride = (w * 4 + 255) & !255;
-    (*s).offset = 0;
-    (*s).modifier = modifier;
-    let modlist = VkImageDrmFormatModifierListCreateInfoEXT {
-        sType: VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
-        pNext: ptr::null(),
-        drmFormatModifierCount: 1,
-        pDrmFormatModifiers: &modifier,
-    };
-    let ext_img = VkExternalMemoryImageCreateInfo {
-        sType: VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-        pNext: &modlist as *const _ as *const c_void,
-        handleTypes: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-    };
-    let ici = VkImageCreateInfo {
-        sType: VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        pNext: &ext_img as *const _ as *const c_void,
-        flags: 0,
-        imageType: VK_IMAGE_TYPE_2D,
-        format: (*sc).format,
-        extent: VkExtent3D {
-            width: w,
-            height: (*sc).extent.height,
-            depth: 1,
-        },
-        mipLevels: 1,
-        arrayLayers: 1,
-        samples: VK_SAMPLE_COUNT_1_BIT,
-        tiling: VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-        usage: (*sc).usage,
-        sharingMode: VK_SHARING_MODE_EXCLUSIVE,
-        queueFamilyIndexCount: 0,
-        pQueueFamilyIndices: ptr::null(),
-        initialLayout: VK_IMAGE_LAYOUT_UNDEFINED,
-    };
-    let mut res = unsafe { f.create_image.unwrap()(dev, &ici, ptr::null(), &mut (*s).image) };
-    if res != VK_SUCCESS {
-        crate::logf!("proxy slot: modifier {modifier:#x} image create: {res}");
-        (*s).image = 0;
-        return res;
-    }
-    let mut reqs = VkMemoryRequirements {
-        size: 0,
-        alignment: 0,
-        memoryTypeBits: 0,
-    };
-    unsafe { f.get_mem_reqs.unwrap()(dev, (*s).image, &mut reqs) };
-    let mut mem_type = u32::MAX;
-    for i in 0..32 {
-        if reqs.memoryTypeBits & (1 << i) != 0 {
-            mem_type = i;
-            break;
-        }
-    }
-    // The driver's own size: a compressed layout carries a metadata region
-    // past the pixels, and it is only known once the image exists.
-    (*s).fd = dma_heap_alloc(reqs.size as usize);
-    crate::logf!(
-        "proxy slot: modifier {modifier:#x} {}x{} reqs {} mem_type {mem_type} fd {} stride {}",
-        w,
-        (*sc).extent.height,
-        reqs.size,
-        (*s).fd,
-        (*s).stride
-    );
-    if mem_type == u32::MAX || (*s).fd < 0 {
-        res = VK_ERROR_INITIALIZATION_FAILED;
-    } else {
-        let ded = VkMemoryDedicatedAllocateInfo {
-            sType: VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-            pNext: ptr::null(),
-            image: (*s).image,
-            buffer: 0,
-        };
-        let imp = VkImportMemoryFdInfoKHR {
-            sType: VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
-            pNext: &ded as *const _ as *const c_void,
-            handleType: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-            fd: unsafe { libc::dup((*s).fd) },
-        };
-        let mai = VkMemoryAllocateInfo {
-            sType: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            pNext: &imp as *const _ as *const c_void,
-            allocationSize: reqs.size,
-            memoryTypeIndex: mem_type,
-        };
-        res = unsafe { f.alloc_mem.unwrap()(dev, &mai, ptr::null(), &mut (*s).mem) };
-        if res == VK_SUCCESS {
-            res = unsafe { f.bind_mem.unwrap()(dev, (*s).image, (*s).mem, 0) };
-        }
-        if res != VK_SUCCESS {
-            crate::logf!("proxy slot: modifier {modifier:#x} memory: {res}");
-        }
-    }
-    if res != VK_SUCCESS {
-        unsafe {
-            if (*s).mem != 0 {
-                f.free_mem.unwrap()(dev, (*s).mem, ptr::null());
-            }
-            if (*s).image != 0 {
-                f.destroy_image.unwrap()(dev, (*s).image, ptr::null());
-            }
-            if (*s).fd >= 0 {
-                libc::close((*s).fd);
-            }
-        }
-        (*s).mem = 0;
-        (*s).image = 0;
-        (*s).fd = -1;
-        return res;
-    }
-    slot_init_sync(sc, s)
-}
-
-unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
-    // GN_VKSHIM_SC_MOD=auto|compressed|tiled3. Driver-chosen scanout layouts
-    // first; the explicit-LINEAR export below is always the fallback.
-    for &modifier in sc_modifiers() {
-        if unsafe { slot_init_tiled(sc, s, modifier) } == VK_SUCCESS {
-            return VK_SUCCESS;
-        }
-    }
-    let gd = (*sc).dev;
-    let dev = unsafe { (*gd).real };
-    let f = unsafe { (*gd).f };
-    (*s).fd = -1;
-    (*s).stride = ((*sc).extent.width * 4 + 255) & !255;
-    (*s).offset = 0;
-    (*s).modifier = GN_DRM_MOD_LINEAR;
-    let mut plane = VkSubresourceLayout {
-        offset: 0,
-        size: 0,
-        rowPitch: 0,
-        arrayPitch: 0,
-        depthPitch: 0,
-    };
-    for attempt in 0..2 {
-        unsafe {
-            if (*s).fd >= 0 {
-                libc::close((*s).fd);
-            }
-        }
-        // The swapchain image must be a buffer the daemon owns: the presenter
-        // can only publish one of its own `AHardwareBuffer`s. Ask for it over
-        // the scan-out channel explicitly rather than relying on the
-        // LD_PRELOAD shim to intercept this process's heap allocation. The
-        // returned stride is authoritative for the image this fd backs.
-        match crate::scanout::allocate((*sc).extent.width, (*sc).extent.height) {
-            Some(buf) => {
-                (*s).fd = buf.fd;
-                if buf.stride != 0 {
-                    (*s).stride = buf.stride;
-                }
-                crate::logf!(
-                    "proxy slot: pool buffer fd={} ino={} stride={}",
-                    buf.fd,
-                    buf.ino,
-                    (*s).stride
-                );
-            }
-            None => {
-                // No daemon channel, or it refused: a local system-heap
-                // allocation, the pre-existing behaviour, which the LD_PRELOAD
-                // shim may still redirect.
-                (*s).fd = dma_heap_alloc((*s).stride as usize * (*sc).extent.height as usize);
-            }
-        }
-        if (*s).fd < 0 {
-            return VK_ERROR_INITIALIZATION_FAILED;
-        }
-        plane.offset = 0;
-        plane.rowPitch = (*s).stride as u64;
-        let modexp = VkImageDrmFormatModifierExplicitCreateInfoEXT {
-            sType: VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
-            pNext: ptr::null(),
-            drmFormatModifier: GN_DRM_MOD_LINEAR,
-            drmFormatModifierPlaneCount: 1,
-            pPlaneLayouts: &plane,
-        };
-        let ext_img = VkExternalMemoryImageCreateInfo {
-            sType: VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-            pNext: &modexp as *const _ as *const c_void,
-            handleTypes: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-        };
-        let ici = VkImageCreateInfo {
-            sType: VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            pNext: &ext_img as *const _ as *const c_void,
-            flags: 0,
-            imageType: VK_IMAGE_TYPE_2D,
-            format: (*sc).format,
-            extent: VkExtent3D {
-                width: (*sc).extent.width,
-                height: (*sc).extent.height,
-                depth: 1,
-            },
-            mipLevels: 1,
-            arrayLayers: 1,
-            samples: VK_SAMPLE_COUNT_1_BIT,
-            // TILING_LINEAR forbids UBWC outright; OPTIMAL+explicit LINEAR
-            // modifier still lets turnip pick a compressed layout (the fd
-            // then holds a UBWC payload, not scan-out pixels).
-            tiling: VK_IMAGE_TILING_LINEAR,
-            usage: (*sc).usage,
-            sharingMode: VK_SHARING_MODE_EXCLUSIVE,
-            queueFamilyIndexCount: 0,
-            pQueueFamilyIndices: ptr::null(),
-            initialLayout: VK_IMAGE_LAYOUT_UNDEFINED,
-        };
-        let res = unsafe { f.create_image.unwrap()(dev, &ici, ptr::null(), &mut (*s).image) };
-        if res != VK_SUCCESS {
-            crate::logf!("proxy import image create failed: {res}");
-            return res;
-        }
-        let mut reqs = VkMemoryRequirements {
-            size: 0,
-            alignment: 0,
-            memoryTypeBits: 0,
-        };
-        unsafe { f.get_mem_reqs.unwrap()(dev, (*s).image, &mut reqs) };
-        let mut mem_type = u32::MAX;
-        for i in 0..32 {
-            if reqs.memoryTypeBits & (1 << i) != 0 {
-                mem_type = i;
-                break;
-            }
-        }
-        if mem_type == u32::MAX {
-            crate::logf!("proxy import image: no memory type");
-            return VK_ERROR_INITIALIZATION_FAILED;
-        }
-        let ded = VkMemoryDedicatedAllocateInfo {
-            sType: VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-            pNext: ptr::null(),
-            image: (*s).image,
-            buffer: 0,
-        };
-        let imp = VkImportMemoryFdInfoKHR {
-            sType: VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
-            pNext: &ded as *const _ as *const c_void,
-            handleType: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-            fd: unsafe { libc::dup((*s).fd) },
-        };
-        let mai = VkMemoryAllocateInfo {
-            sType: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            pNext: &imp as *const _ as *const c_void,
-            allocationSize: reqs.size,
-            memoryTypeIndex: mem_type,
-        };
-        let mut res = unsafe { f.alloc_mem.unwrap()(dev, &mai, ptr::null(), &mut (*s).mem) };
-        if res == VK_SUCCESS {
-            res = unsafe { f.bind_mem.unwrap()(dev, (*s).image, (*s).mem, 0) };
-        }
-        if res != VK_SUCCESS {
-            crate::logf!("proxy import memory failed: {res}");
-            return res;
-        }
-        // Ground-truth the driver's plane layout: a driver honoring the
-        // explicit LINEAR modifier reports exactly the pitch handed in;
-        // anything else means the layout guess was wrong, so retry once
-        // with the reported pitch.
-        if let Some(get_layout) = f.get_layout {
-            let sub = VkImageSubresource {
-                aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
-                mipLevel: 0,
-                arrayLayer: 0,
-            };
-            let mut got = VkSubresourceLayout {
-                offset: 0,
-                size: 0,
-                rowPitch: 0,
-                arrayPitch: 0,
-                depthPitch: 0,
-            };
-            unsafe { get_layout(dev, (*s).image, &sub, &mut got) };
-            crate::logf!(
-                "proxy slot layout: pitch {} (asked {}), offset {}",
-                got.rowPitch,
-                (*s).stride,
-                got.offset
-            );
-            if got.rowPitch != 0
-                && got.rowPitch != (*s).stride as u64
-                && got.rowPitch < 65536
-                && attempt == 0
-            {
-                unsafe {
-                    f.destroy_image.unwrap()(dev, (*s).image, ptr::null());
-                    f.free_mem.unwrap()(dev, (*s).mem, ptr::null());
-                }
-                (*s).image = 0;
-                (*s).mem = 0;
-                (*s).stride = got.rowPitch as u32;
-                continue;
-            }
-        }
-        break;
-    }
-    slot_init_sync(sc, s)
-}
-
-unsafe fn slot_make_buffer(sc: *mut GnSwapchain, s: *mut GnSlot) -> *mut wl_proxy {
-    let (dmabuf, queue) = {
-        let w = G_WL.lock().unwrap();
-        (w.dmabuf, w.queue)
-    };
-    let params = unsafe { wlproto::dmabuf_create_params(dmabuf) };
-    if params.is_null() {
-        return ptr::null_mut();
-    }
-    let _sg = SEND_LOCK.lock().unwrap();
-    unsafe {
-        wlproto::params_add(params, (*s).fd, 0, (*s).offset, (*s).stride, (*s).modifier);
-        let buf = wlproto::params_create_immed(
-            params,
-            (*sc).extent.width as i32,
-            (*sc).extent.height as i32,
-            (*sc).fourcc,
-            0,
-        );
-        wlproto::wl_proxy_destroy(params);
-        if !buf.is_null() {
-            wlproto::wl_proxy_add_listener(buf, BUFFER_LISTENER.as_ptr() as *mut _, s.cast());
-            wlproto::wl_proxy_set_queue(buf, queue);
-        }
-        buf
     }
 }
 
@@ -2702,6 +761,9 @@ fn pop_job(sc: *mut GnSwapchain) -> i32 {
             // flags, so an app that stops presenting is visible instead of
             // silent.
             drop(g);
+            // Let X11 releases progress even when the guest has stopped
+            // presenting: the fence fires when the server drops the pixmap.
+            unsafe { x11_reap(sc) };
             if rate_ok(&RATE_IDLE, IDLE_EVERY) {
                 crate::logf!(
                     "gn-vkshim idle: present worker has no work {}",
@@ -2726,6 +788,33 @@ fn worker_main(sc: *mut GnSwapchain) {
                 wait_fences((*(*sc).dev).real, 1, &(*s).fence, VK_TRUE, u64::MAX);
             }
             let fence_ms = t0.elapsed().as_millis();
+            // X11 route: the window carries its own content, so the frame is
+            // presented into it (DRI3 + Present) instead of committed to a
+            // wl_surface. The slot stays in flight until its idle fence
+            // triggers; x11_reap frees every slot whose fence has fired.
+            if (*(*sc).surf).parent.is_null() {
+                // X11 route: the window carries its own content, so the frame
+                // is presented into it (DRI3 + Present) instead of committed to
+                // a wl_surface. A present that cannot be made (route never came
+                // up, or pixmap/fence/present refused) frees the slot here:
+                // only a live present's idle fence releases a slot otherwise,
+                // and a guest waiting on a release that never comes stalls on
+                // its next acquire.
+                if x11_present_slot(sc, s, idx) {
+                    x11_reap(sc);
+                } else {
+                    if !X11_DROP_LOGGED.swap(true, Ordering::Relaxed) {
+                        crate::routef!(
+                            "x11 route: present unavailable - frames dropped, slots kept free (guest keeps running)"
+                        );
+                    }
+                    let _g = (*sc).shared.lock().unwrap();
+                    (*s).in_flight = false;
+                    (*sc).cv_free.notify_all();
+                    drop(_g);
+                }
+                continue;
+            }
             if (*s).buf.is_null() {
                 (*s).buf = slot_make_buffer(sc, s);
             }
@@ -2830,6 +919,9 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         }),
         cv_put: Condvar::new(),
         cv_free: Condvar::new(),
+        x11_dumped: 0,
+        x11_presents: 0,
+        x11_trace: 0,
         next: ptr::null_mut(),
     });
     let scp: *mut GnSwapchain = &mut *sc;
@@ -2843,10 +935,13 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             offset: 0,
             modifier: 0,
             buf: ptr::null_mut(),
+            xpix: 0,
+            xfence: 0,
             fence: 0,
             sem: 0,
             acquired: false,
             in_flight: false,
+            acq_seq: 0,
         });
     }
     for inited in 0..n_slots as usize {
@@ -2860,6 +955,13 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         }
     }
     let sc_addr = scp as usize;
+    if !unsafe { (*(*scp).surf).x11 }.is_null() {
+        crate::logf!(
+            "X11 present engages: swapchain {scp:?} {}x{} presents through DRI3 + Present",
+            ci.imageExtent.width,
+            ci.imageExtent.height
+        );
+    }
     let worker = std::thread::Builder::new()
         .name("gn-present".into())
         .spawn(move || worker_main(sc_addr as *mut GnSwapchain));
@@ -2919,6 +1021,12 @@ unsafe extern "C" fn gn_vkGetSwapchainImagesKHR(
         for i in 0..n {
             *images.add(i) = (*(*sc).slots.as_ptr().add(i)).image;
         }
+        if crate::vkshim_enabled() {
+            let hs: Vec<String> = (0..n)
+                .map(|i| format!("{:#x}", *images.add(i) as usize))
+                .collect();
+            crate::routef!("x11 scimages: sc={sc:?} n={n} imgs={hs:?}");
+        }
         *count = n as u32;
         if n < n_slots {
             VK_INCOMPLETE
@@ -2953,7 +1061,7 @@ unsafe extern "C" fn gn_vkDestroySwapchainKHR(
     for i in 0..unsafe { (*sc).slots.len() } {
         unsafe { slot_release(sc, (*sc).slots.as_mut_ptr().add(i)) };
     }
-    {
+    if !unsafe { (*(*sc).surf).dpy }.is_null() {
         let _sg = SEND_LOCK.lock().unwrap();
         unsafe { wlproto::wl_display_flush((*(*sc).surf).dpy) };
     }
@@ -2978,6 +1086,35 @@ unsafe extern "C" fn gn_vkDestroySwapchainKHR(
 // wl_buffer.release) and signals the app's semaphore/fence with an empty
 // submit: the slot carries no GPU work of ours, the app renders into the
 // imported dma-buf image directly.
+const REAP_SLICE: Duration = Duration::from_millis(4);
+
+/// Claim the first swapchain slot that is neither held by the app nor awaiting
+/// a compositor release. On success `idx` is set to the slot (marked acquired);
+/// when none is free `idx` is left unchanged.
+unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
+    for k in 0..unsafe { (*sc).slots.len() } {
+        let s = unsafe { (*sc).slots.as_mut_ptr().add(k) };
+        if unsafe { !(*s).acquired && !(*s).in_flight } {
+            *idx = k as i32;
+            unsafe {
+                (*s).acquired = true;
+            }
+            let seq = ACQ_SEQ.fetch_add(1, Ordering::Relaxed);
+            unsafe {
+                (*s).acq_seq = seq as u64;
+            }
+            if seq < X11_TRACE_N {
+                crate::routef!(
+                    "x11 acquire {seq}: sc={sc:?} idx={} img={:#x}",
+                    *idx,
+                    unsafe { (*s).image } as usize
+                );
+            }
+            return;
+        }
+    }
+}
+
 unsafe fn gn_acquire_common(
     sc: *mut GnSwapchain,
     timeout: u64,
@@ -2988,44 +1125,55 @@ unsafe fn gn_acquire_common(
     let gd = (*sc).dev;
     let acq_t0 = Instant::now();
     N_ACQ.fetch_add(1, Ordering::Relaxed);
+    ring_push(
+        "vkAcquireNextImageKHR",
+        [timeout as usize, sem as usize, fence as usize, 0, 0],
+    );
     let deadline = (timeout != u64::MAX).then(|| Instant::now() + Duration::from_nanos(timeout));
     let mut idx: i32 = -1;
     let mut timed_out = false;
     {
         let mut g = (*sc).shared.lock().unwrap();
         loop {
-            for k in 0..(*sc).slots.len() {
-                let s = (*sc).slots.as_mut_ptr().add(k);
-                if !(*s).acquired && !(*s).in_flight {
-                    idx = k as i32;
-                    (*s).acquired = true;
-                    break;
-                }
-            }
+            unsafe { acquire_take_free(sc, &mut idx) };
             if idx >= 0 || g.stopping {
                 break;
             }
             if timeout == 0 {
                 break;
             }
-            match deadline {
+            if let Some(dl) = deadline {
+                if Instant::now() >= dl {
+                    timed_out = true;
+                    break;
+                }
+            }
+            // Blocked here the guest is waiting for exactly a slot release. The
+            // present worker only reaps X11 Present idle fences on its 2 s idle
+            // tick, so left to it the acquire always ends on that timeout — a
+            // self-throttle at ~1/2 s per freed slot. Drop the lock and poll the
+            // fences directly so a slot frees as soon as the server drops its
+            // pixmap, instead of a timer.
+            drop(g);
+            unsafe { x11_reap(sc) };
+            g = (*sc).shared.lock().unwrap();
+            unsafe { acquire_take_free(sc, &mut idx) };
+            if idx >= 0 || g.stopping {
+                break;
+            }
+            let slice = match deadline {
                 Some(dl) => {
                     let now = Instant::now();
                     if now >= dl {
                         timed_out = true;
                         break;
                     }
-                    let (guard, res) = (*sc).cv_free.wait_timeout(g, dl - now).unwrap();
-                    g = guard;
-                    if res.timed_out() {
-                        timed_out = true;
-                        break;
-                    }
+                    (dl - now).min(REAP_SLICE)
                 }
-                None => {
-                    g = (*sc).cv_free.wait(g).unwrap();
-                }
-            }
+                None => REAP_SLICE,
+            };
+            let (guard, _res) = (*sc).cv_free.wait_timeout(g, slice).unwrap();
+            g = guard;
         }
         if g.stopping && idx < 0 {
             drop(g);
@@ -3078,6 +1226,12 @@ unsafe fn gn_acquire_common(
     }
     *index = idx as u32;
     let acq_ms = acq_t0.elapsed().as_millis();
+    // Bounded one-shot: a guest thread blocked in acquire for a second or more
+    // is the stall class this ring exists to name, so print the last calls the
+    // guest made before it parked (once per process).
+    if acq_ms >= 1000 {
+        ring_dump("acquire blocked >=1s for a swapchain slot");
+    }
     let n = LOG_ACQ.fetch_add(1, Ordering::Relaxed);
     if n < LOG_FIRST_N || n.is_multiple_of(120) || acq_ms >= 100 {
         crate::logf!("proxy acquire: sc={sc:?} slot={idx} wait={acq_ms}ms");
@@ -3195,26 +1349,39 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
             } else {
                 // Job queue full: commit synchronously instead of dropping.
                 (*slot).in_flight = false;
+                (*sc).cv_free.notify_all();
                 drop(g);
                 if let Some(wait_fences) = (*(*sc).dev).f.wait_fences {
                     wait_fences((*(*sc).dev).real, 1, &(*slot).fence, VK_TRUE, u64::MAX);
                 }
-                if (*slot).buf.is_null() {
-                    (*slot).buf = slot_make_buffer(sc, slot);
-                }
-                if !(*slot).buf.is_null() {
-                    let parent = (*(*sc).surf).parent;
-                    let _sg = SEND_LOCK.lock().unwrap();
-                    wlproto::surface_attach(parent, (*slot).buf, 0, 0);
-                    wlproto::surface_damage_buffer(
-                        parent,
-                        0,
-                        0,
-                        (*sc).extent.width as i32,
-                        (*sc).extent.height as i32,
-                    );
-                    wlproto::surface_commit(parent);
-                    wlproto::wl_display_flush((*(*sc).surf).dpy);
+                let parent = (*(*sc).surf).parent;
+                if parent.is_null() {
+                    // The synchronous path cleared in_flight for the immediate
+                    // commit; the X11 present instead needs the slot held until
+                    // its idle fence triggers.
+                    if x11_present_slot(sc, slot, indices[i] as i32) {
+                        let g = (*sc).shared.lock().unwrap();
+                        (*slot).in_flight = true;
+                        drop(g);
+                    }
+                    x11_reap(sc);
+                } else {
+                    if (*slot).buf.is_null() {
+                        (*slot).buf = slot_make_buffer(sc, slot);
+                    }
+                    if !(*slot).buf.is_null() {
+                        let _sg = SEND_LOCK.lock().unwrap();
+                        wlproto::surface_attach(parent, (*slot).buf, 0, 0);
+                        wlproto::surface_damage_buffer(
+                            parent,
+                            0,
+                            0,
+                            (*sc).extent.width as i32,
+                            (*sc).extent.height as i32,
+                        );
+                        wlproto::surface_commit(parent);
+                        wlproto::wl_display_flush((*(*sc).surf).dpy);
+                    }
                 }
             }
         }
@@ -3596,6 +1763,686 @@ unsafe extern "C" fn gn_vkCreateImage(
     res
 }
 
+// ---- guest-command trace (bounded one-shot, always on) -------------------
+//
+// The guest records its own transfers into command buffers the shim never
+// otherwise inspects; the image a presented frame must carry is one of the
+// shim's swapchain slot images. This names, for the first TRACE_SC_CMD_N
+// recorded commands that touch a slot image, which slot and in which
+// direction, so a single run says whether the guest renders into the image
+// the shim presents, or into some other image it never presents. Always on
+// (not gated by GNDRM_LOG_VKSHIM); bounded by construction so steady-state
+// frame pacing stays silent.
+const TRACE_SC_CMD_N: usize = 48;
+static TRACE_SC_CMD: AtomicUsize = AtomicUsize::new(0);
+
+/// Scan every live swapchain belonging to `gd` for the slot whose image is
+/// `image`. Returns (swapchain, slot index).
+unsafe fn sc_slot_of(gd: *mut GnDevice, image: VkImage) -> Option<(*mut GnSwapchain, usize)> {
+    let g = G.lock().unwrap();
+    let mut p = g.swapchains;
+    while !p.is_null() {
+        unsafe {
+            if (*p).dev == gd {
+                for (i, s) in (*p).slots.iter().enumerate() {
+                    if s.image == image {
+                        return Some((p, i));
+                    }
+                }
+            }
+            p = (*p).next;
+        }
+    }
+    None
+}
+
+/// Emit one bounded `x11 cmd` line. `hits` is only formatted when the line
+/// is actually emitted (the counter gate is checked first).
+fn trace_sc_cmd(name: &str, cmd: VkCommandBuffer, hits: &str) {
+    let n = TRACE_SC_CMD.fetch_add(1, Ordering::Relaxed);
+    if n < TRACE_SC_CMD_N {
+        crate::routef!("x11 cmd {n}: {name} cb={cmd:?} {hits}");
+    }
+}
+
+/// One bounded line the first time the guest resolves/records each traced
+/// command through the shim at all (whatever image it targets). Distinguishes
+/// "the guest never uses this entry point" from "it does, but never on a
+/// swapchain slot image".
+/// Resolve the guest's real driver export for a command entry point. Used
+/// when the shim intercepts a name but the proxy is not active in this process
+/// (then the call must reach the driver unchanged, not be dropped).
+unsafe fn driver_sym(name: *const std::os::raw::c_char) -> Option<PFN_vkVoidFunction> {
+    let h = crate::driver_handle();
+    if h.is_null() {
+        return None;
+    }
+    let sym = unsafe { libc::dlsym(h, name) };
+    if sym.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute::<*mut c_void, PFN_vkVoidFunction>(sym) })
+    }
+}
+
+/// Call the driver's function for an intercepted command: the proxy's resolved
+/// pointer when the device is a shim wrapper, else the driver export (so a
+/// process where the proxy never activated still runs the command).
+macro_rules! call_cmd {
+    ($gd:expr, $field:ident, $name:literal, |$f:ident| $call:expr) => {{
+        let gd = $gd;
+        let f_opt = unsafe { gd.as_ref() }.and_then(|d| d.f.$field);
+        let f_opt = if f_opt.is_none() && gd.is_null() {
+            unsafe { driver_sym(concat!($name, "\0").as_ptr() as *const std::os::raw::c_char) }
+                .map(|p| unsafe { std::mem::transmute(p) })
+        } else {
+            f_opt
+        };
+        if let Some($f) = f_opt {
+            unsafe { $call }
+        }
+    }};
+}
+
+static TRACE_SEEN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+fn trace_seen(name: &'static str) {
+    if let Ok(mut v) = TRACE_SEEN.lock() {
+        if v.len() < 32 && !v.contains(&name) {
+            crate::routef!("x11 cmd-seen: {name} (guest records it through the shim)");
+            v.push(name);
+        }
+    }
+}
+
+/// The real handle for a guest command buffer (the driver must never see the
+/// shim's wrapper), plus the device it belongs to. A command buffer the shim
+/// never wrapped is the driver's own and is passed through untouched.
+unsafe fn cmd_real_and_dev(cmd: VkCommandBuffer) -> (VkCommandBuffer, *mut GnDevice) {
+    let gc = unsafe { find_cmd_any(cmd) };
+    if gc.is_null() {
+        (cmd, ptr::null_mut())
+    } else {
+        (unsafe { (*gc).real }, unsafe { (*gc).gd })
+    }
+}
+
+fn slot_note(s: Option<(*mut GnSwapchain, usize)>) -> String {
+    match s {
+        Some((sc, i)) => format!("SLOT sc={sc:?} slot={i}"),
+        None => "guest".into(),
+    }
+}
+
+/// Extent of the first copy region (does the transfer cover the frame or a
+/// sub-rectangle?).
+fn copy_extent(n: u32, regions: *const VkImageCopy) -> String {
+    if n == 0 || regions.is_null() {
+        return String::new();
+    }
+    let e = unsafe { (*regions).extent };
+    format!("r0={}x{}", e.width, e.height)
+}
+
+/// Extent of the first blit region's destination.
+fn blit_extent(n: u32, regions: *const VkImageBlit) -> String {
+    if n == 0 || regions.is_null() {
+        return String::new();
+    }
+    let r = unsafe { &*regions };
+    format!(
+        "blit={}x{} -> {}x{}",
+        r.srcOffsets[1].x - r.srcOffsets[0].x,
+        r.srcOffsets[1].y - r.srcOffsets[0].y,
+        r.dstOffsets[1].x - r.dstOffsets[0].x,
+        r.dstOffsets[1].y - r.dstOffsets[0].y
+    )
+}
+
+/// Render-pass trace: DXVK's actual rendering path (it uses render passes, not
+/// copies/blits). Log the render area and the first clear value, bounded, so a
+/// single run says whether the game is actually rendering fullscreen and what
+/// it clears the target to.
+static RPB_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+// view -> image and framebuffer -> views, so a render pass can be tied to the
+// swapchain slot image it renders into. Bounded by construction: entries are
+// added only for views/framebuffers the guest actually creates.
+static VIEW_IMAGE: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
+static FB_VIEWS: Mutex<Option<HashMap<u64, Vec<u64>>>> = Mutex::new(None);
+
+unsafe extern "C" fn gn_vkCreateImageView(
+    device: VkDevice,
+    ci: *const VkImageViewCreateInfo,
+    alloc: *const VkAllocationCallbacks,
+    out: *mut VkImageView,
+) -> VkResult {
+    let gd = unsafe { find_device(device) };
+    let f = unsafe { gd.as_ref() }.and_then(|d| d.f.create_image_view);
+    let f = match f {
+        Some(f) => Some(f),
+        None if gd.is_null() => unsafe { driver_sym(c"vkCreateImageView".as_ptr()) }
+            .map(|p| unsafe { std::mem::transmute(p) }),
+        None => None,
+    };
+    let Some(f) = f else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    let real_dev = if gd.is_null() {
+        device
+    } else {
+        unsafe { (*gd).real }
+    };
+    let res = unsafe { f(real_dev, ci, alloc, out) };
+    if res == VK_SUCCESS && !ci.is_null() {
+        let img = unsafe { (*ci).image };
+        if let Ok(mut m) = VIEW_IMAGE.lock() {
+            let m = m.get_or_insert_with(HashMap::new);
+            if m.len() < 4096 {
+                m.insert(unsafe { *out }, img);
+            }
+        }
+    }
+    res
+}
+
+unsafe extern "C" fn gn_vkCreateFramebuffer(
+    device: VkDevice,
+    ci: *const VkFramebufferCreateInfo,
+    alloc: *const VkAllocationCallbacks,
+    out: *mut VkFramebuffer,
+) -> VkResult {
+    let gd = unsafe { find_device(device) };
+    let f = unsafe { gd.as_ref() }.and_then(|d| d.f.create_framebuffer);
+    let f = match f {
+        Some(f) => Some(f),
+        None if gd.is_null() => unsafe { driver_sym(c"vkCreateFramebuffer".as_ptr()) }
+            .map(|p| unsafe { std::mem::transmute(p) }),
+        None => None,
+    };
+    let Some(f) = f else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    let real_dev = if gd.is_null() {
+        device
+    } else {
+        unsafe { (*gd).real }
+    };
+    let res = unsafe { f(real_dev, ci, alloc, out) };
+    if res == VK_SUCCESS && !ci.is_null() {
+        let n = unsafe { (*ci).attachmentCount as usize };
+        let views = unsafe { slice_or_empty((*ci).pAttachments, n) }.to_vec();
+        if let Ok(mut m) = FB_VIEWS.lock() {
+            let m = m.get_or_insert_with(HashMap::new);
+            if m.len() < 4096 {
+                m.insert(unsafe { *out }, views);
+            }
+        }
+    }
+    res
+}
+
+/// Resolve a framebuffer handle to the swapchain slots its attachments use.
+unsafe fn fb_slots(gd: *mut GnDevice, fb: u64) -> Vec<usize> {
+    let mut out = Vec::new();
+    let views = FB_VIEWS
+        .lock()
+        .ok()
+        .and_then(|m| m.as_ref().and_then(|m| m.get(&fb).cloned()))
+        .unwrap_or_default();
+    for v in views {
+        let img = VIEW_IMAGE
+            .lock()
+            .ok()
+            .and_then(|m| m.as_ref().and_then(|m| m.get(&v).copied()));
+        if let Some(img) = img {
+            if let Some((_, i)) = unsafe { sc_slot_of(gd, img) } {
+                if !out.contains(&i) {
+                    out.push(i);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Render-pass trace (vkCmdBeginRenderPass2, DXVK's core-1.2 path): the
+/// framebuffer resolves through the view/image map to the swapchain slot the
+/// pass renders into, so one run says whether the guest renders into the image
+/// the shim presents.
+unsafe fn view_image(view: u64) -> Option<u64> {
+    VIEW_IMAGE
+        .lock()
+        .ok()
+        .and_then(|m| m.as_ref().and_then(|m| m.get(&view).copied()))
+}
+
+/// Dynamic-rendering trace: the color attachment imageView resolves through
+/// the view/image map to the image the guest renders into; if it is a swapchain
+/// slot, the guest renders straight into the image the shim presents.
+unsafe extern "C" fn gn_vkCmdBeginRendering(cmd: VkCommandBuffer, info: *const VkRenderingInfo) {
+    trace_seen("vkCmdBeginRendering");
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    if !gd.is_null() && !info.is_null() {
+        let ri = unsafe { &*info };
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 12 && !ri.pColorAttachments.is_null() {
+            let mut parts: Vec<String> = Vec::new();
+            let na = (ri.colorAttachmentCount as usize).min(4);
+            for k in 0..na {
+                let a = unsafe { &*ri.pColorAttachments.add(k) };
+                let img = unsafe { view_image(a.imageView) };
+                let note = match img {
+                    Some(i) => match unsafe { sc_slot_of(gd, i) } {
+                        Some((sc, si)) => format!("SLOT sc={sc:?} slot={si}"),
+                        None => format!("img={:#x}", i as usize),
+                    },
+                    None => format!("view={:#x}", a.imageView as usize),
+                };
+                let c = a.clearValue.float32;
+                parts.push(format!(
+                    "a{k}[{note} layout={} load={} clear=({},{},{},{})]",
+                    a.imageLayout, a.loadOp, c[0], c[1], c[2], c[3]
+                ));
+            }
+            crate::routef!(
+                "x11 rndr {n}: {}x{} colors={na} {}",
+                ri.renderArea.extent.width,
+                ri.renderArea.extent.height,
+                parts.join(" ")
+            );
+        }
+    }
+    call_cmd!(gd, cmd_begin_rendering, "vkCmdBeginRendering", |f| f(
+        rcmd, info
+    ));
+}
+
+unsafe extern "C" fn gn_vkCmdBeginRenderPass2(
+    cmd: VkCommandBuffer,
+    info: *const VkRenderPassBeginInfo,
+    sub: *const VkSubpassBeginInfo,
+) {
+    trace_seen("vkCmdBeginRenderPass2");
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    if !gd.is_null() && !info.is_null() {
+        static N2: AtomicUsize = AtomicUsize::new(0);
+        let n = N2.fetch_add(1, Ordering::Relaxed);
+        if n < 12 {
+            let bi = unsafe { &*info };
+            let slots = unsafe { fb_slots(gd, bi.framebuffer) };
+            let c = if bi.clearValueCount > 0 && !bi.pClearValues.is_null() {
+                unsafe { (*bi.pClearValues).float32 }
+            } else {
+                [0f32; 4]
+            };
+            crate::routef!(
+                "x11 rpb2 {n}: {}x{} off=({},{}) fb={:#x} rp={:#x} clears={} clear0=({},{},{},{}) slots={slots:?}",
+                bi.renderArea.extent.width,
+                bi.renderArea.extent.height,
+                bi.renderArea.offset.x,
+                bi.renderArea.offset.y,
+                bi.framebuffer as usize,
+                bi.renderPass as usize,
+                bi.clearValueCount,
+                c[0], c[1], c[2], c[3]
+            );
+        }
+    }
+    call_cmd!(gd, cmd_begin_render_pass2, "vkCmdBeginRenderPass2", |f| f(
+        rcmd, info, sub
+    ));
+}
+
+unsafe extern "C" fn gn_vkCmdBeginRenderPass(
+    cmd: VkCommandBuffer,
+    info: *const VkRenderPassBeginInfo,
+    contents: i32,
+) {
+    trace_seen("vkCmdBeginRenderPass");
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    if !gd.is_null() && !info.is_null() {
+        let n = RPB_SEEN.fetch_add(1, Ordering::Relaxed);
+        if n < 12 {
+            let bi = unsafe { &*info };
+            let c = if bi.clearValueCount > 0 && !bi.pClearValues.is_null() {
+                unsafe { (*bi.pClearValues).float32 }
+            } else {
+                [0f32; 4]
+            };
+            let slots = unsafe { fb_slots(gd, bi.framebuffer) };
+            crate::routef!(
+                "x11 rpb {n}: {}x{} off=({},{}) fb={:#x} rp={:#x} clears={} clear0=({},{},{},{}) contents={contents} slots={slots:?}",
+                bi.renderArea.extent.width,
+                bi.renderArea.extent.height,
+                bi.renderArea.offset.x,
+                bi.renderArea.offset.y,
+                bi.framebuffer as usize,
+                bi.renderPass as usize,
+                bi.clearValueCount,
+                c[0], c[1], c[2], c[3]
+            );
+        }
+    }
+    call_cmd!(gd, cmd_begin_render_pass, "vkCmdBeginRenderPass", |f| f(
+        rcmd, info, contents
+    ));
+}
+
+unsafe extern "C" fn gn_vkCmdClearColorImage(
+    cmd: VkCommandBuffer,
+    image: VkImage,
+    layout: VkImageLayout,
+    color: *const VkClearColorValue,
+    n: u32,
+    _ranges: *const VkImageSubresourceRange,
+) {
+    trace_seen("vkCmdClearColorImage");
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    if !gd.is_null() {
+        {
+            static ANY: AtomicUsize = AtomicUsize::new(0);
+            let n2 = ANY.fetch_add(1, Ordering::Relaxed);
+            if n2 < 8 {
+                crate::routef!("x11 any clear: img={:#x} layout={layout}", image as usize);
+            }
+        }
+        if let Some((sc, i)) = unsafe { sc_slot_of(gd, image) } {
+            let c = if color.is_null() {
+                [0f32; 4]
+            } else {
+                unsafe { (*color).float32 }
+            };
+            trace_sc_cmd(
+                "vkCmdClearColorImage",
+                cmd,
+                &format!(
+                    "SLOT sc={sc:?} slot={i} layout={layout} n={n} clear=({},{},{},{})",
+                    c[0], c[1], c[2], c[3]
+                ),
+            );
+        }
+    }
+    call_cmd!(gd, cmd_clear_color_image, "vkCmdClearColorImage", |f| f(
+        rcmd, image, layout, color, n, _ranges
+    ));
+}
+
+unsafe extern "C" fn gn_vkCmdCopyImage(
+    cmd: VkCommandBuffer,
+    src: VkImage,
+    src_layout: VkImageLayout,
+    dst: VkImage,
+    dst_layout: VkImageLayout,
+    n: u32,
+    regions: *const VkImageCopy,
+) {
+    trace_seen("vkCmdCopyImage");
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    if !gd.is_null() {
+        let s = unsafe { sc_slot_of(gd, src) };
+        let d = unsafe { sc_slot_of(gd, dst) };
+        if s.is_some() || d.is_some() {
+            trace_sc_cmd(
+                "vkCmdCopyImage",
+                cmd,
+                &format!(
+                    "src={:#x}({}) dst={:#x}({}) srcLayout={src_layout} dstLayout={dst_layout} n={n} {}",
+                    src as usize,
+                    slot_note(s),
+                    dst as usize,
+                    slot_note(d),
+                    copy_extent(n, regions)
+                ),
+            );
+        }
+    }
+    call_cmd!(gd, cmd_copy_image, "vkCmdCopyImage", |f| f(
+        rcmd, src, src_layout, dst, dst_layout, n, regions
+    ));
+}
+
+unsafe extern "C" fn gn_vkCmdCopyImage2(cmd: VkCommandBuffer, info: *const VkCopyImageInfo2) {
+    trace_seen("vkCmdCopyImage2");
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    if !gd.is_null() && !info.is_null() {
+        let ci = unsafe { &*info };
+        {
+            static ANY: AtomicUsize = AtomicUsize::new(0);
+            let n2 = ANY.fetch_add(1, Ordering::Relaxed);
+            if n2 < 12 {
+                crate::routef!(
+                    "x11 any copyimg2: src={:#x} dst={:#x} {}x{}",
+                    ci.srcImage as usize,
+                    ci.dstImage as usize,
+                    ci.regionCount,
+                    if ci.regionCount > 0 && !ci.pRegions.is_null() {
+                        unsafe { (*ci.pRegions).extent.width }
+                    } else {
+                        0
+                    }
+                );
+            }
+        }
+        let s = unsafe { sc_slot_of(gd, ci.srcImage) };
+        let d = unsafe { sc_slot_of(gd, ci.dstImage) };
+        if s.is_some() || d.is_some() {
+            trace_sc_cmd(
+                "vkCmdCopyImage2",
+                cmd,
+                &format!(
+                    "src={:#x}({}) dst={:#x}({}) srcLayout={} dstLayout={} n={} {}",
+                    ci.srcImage as usize,
+                    slot_note(s),
+                    ci.dstImage as usize,
+                    slot_note(d),
+                    ci.srcImageLayout,
+                    ci.dstImageLayout,
+                    ci.regionCount,
+                    copy_extent(ci.regionCount, ci.pRegions)
+                ),
+            );
+        }
+    }
+    call_cmd!(gd, cmd_copy_image2, "vkCmdCopyImage2", |f| f(rcmd, info));
+}
+
+unsafe extern "C" fn gn_vkCmdBlitImage(
+    cmd: VkCommandBuffer,
+    src: VkImage,
+    src_layout: VkImageLayout,
+    dst: VkImage,
+    dst_layout: VkImageLayout,
+    n: u32,
+    regions: *const VkImageBlit,
+    filter: VkFilter,
+) {
+    trace_seen("vkCmdBlitImage");
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    if !gd.is_null() {
+        let s = unsafe { sc_slot_of(gd, src) };
+        let d = unsafe { sc_slot_of(gd, dst) };
+        if s.is_some() || d.is_some() {
+            trace_sc_cmd(
+                "vkCmdBlitImage",
+                cmd,
+                &format!(
+                    "src={:#x}({}) dst={:#x}({}) srcLayout={src_layout} dstLayout={dst_layout} n={n} filter={filter} {}",
+                    src as usize,
+                    slot_note(s),
+                    dst as usize,
+                    slot_note(d),
+                    blit_extent(n, regions)
+                ),
+            );
+        }
+    }
+    call_cmd!(gd, cmd_blit_image, "vkCmdBlitImage", |f| f(
+        rcmd, src, src_layout, dst, dst_layout, n, regions, filter
+    ));
+}
+
+unsafe extern "C" fn gn_vkCmdBlitImage2(cmd: VkCommandBuffer, info: *const VkBlitImageInfo2) {
+    trace_seen("vkCmdBlitImage2");
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    if !gd.is_null() && !info.is_null() {
+        let ci = unsafe { &*info };
+        let s = unsafe { sc_slot_of(gd, ci.srcImage) };
+        let d = unsafe { sc_slot_of(gd, ci.dstImage) };
+        if s.is_some() || d.is_some() {
+            trace_sc_cmd(
+                "vkCmdBlitImage2",
+                cmd,
+                &format!(
+                    "src={:#x}({}) dst={:#x}({}) srcLayout={} dstLayout={} n={} filter={}",
+                    ci.srcImage as usize,
+                    slot_note(s),
+                    ci.dstImage as usize,
+                    slot_note(d),
+                    ci.srcImageLayout,
+                    ci.dstImageLayout,
+                    ci.regionCount,
+                    ci.filter
+                ),
+            );
+        }
+    }
+    call_cmd!(gd, cmd_blit_image2, "vkCmdBlitImage2", |f| f(rcmd, info));
+}
+
+/// synchronization2 variant of the layout-transition trace (DXVK's actual
+/// path): name the slot each image barrier in the dependency targets.
+unsafe extern "C" fn gn_vkCmdPipelineBarrier2(cmd: VkCommandBuffer, dep: *const VkDependencyInfo) {
+    trace_seen("vkCmdPipelineBarrier2");
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    if !gd.is_null() && !dep.is_null() {
+        let di = unsafe { &*dep };
+        if di.imageMemoryBarrierCount > 0 && !di.pImageMemoryBarriers.is_null() {
+            for k in 0..di.imageMemoryBarrierCount as usize {
+                let b = unsafe { &*di.pImageMemoryBarriers.add(k) };
+                {
+                    static ANY: AtomicUsize = AtomicUsize::new(0);
+                    let n2 = ANY.fetch_add(1, Ordering::Relaxed);
+                    if n2 < 12 {
+                        crate::routef!(
+                            "x11 any bar2: img={:#x} srcStage={:#x} dstStage={:#x}",
+                            b.image as usize,
+                            b.srcStageMask,
+                            b.dstStageMask
+                        );
+                    }
+                }
+                if let Some((sc, i)) = unsafe { sc_slot_of(gd, b.image) } {
+                    trace_sc_cmd(
+                        "vkCmdPipelineBarrier2(image)",
+                        cmd,
+                        &format!(
+                            "SLOT sc={sc:?} slot={i} srcStage={:#x} srcAccess={:#x} dstStage={:#x} dstAccess={:#x}",
+                            b.srcStageMask, b.srcAccessMask, b.dstStageMask, b.dstAccessMask
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    call_cmd!(gd, cmd_pipeline_barrier2, "vkCmdPipelineBarrier2", |f| f(
+        rcmd, dep
+    ));
+}
+
+unsafe extern "C" fn gn_vkCmdCopyBufferToImage(
+    cmd: VkCommandBuffer,
+    src_buffer: VkBuffer,
+    dst: VkImage,
+    dst_layout: VkImageLayout,
+    n: u32,
+    regions: *const VkBufferImageCopy,
+) {
+    trace_seen("vkCmdCopyBufferToImage");
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    if !gd.is_null() {
+        if let Some((sc, i)) = unsafe { sc_slot_of(gd, dst) } {
+            trace_sc_cmd(
+                "vkCmdCopyBufferToImage",
+                cmd,
+                &format!(
+                    "buf={src_buffer:#x} -> SLOT sc={sc:?} slot={i} dstLayout={dst_layout} n={n}"
+                ),
+            );
+        }
+    }
+    call_cmd!(
+        gd,
+        cmd_copy_buffer_to_image,
+        "vkCmdCopyBufferToImage",
+        |f| f(rcmd, src_buffer, dst, dst_layout, n, regions)
+    );
+}
+
+unsafe extern "C" fn gn_vkCmdCopyBufferToImage2(
+    cmd: VkCommandBuffer,
+    info: *const VkCopyBufferToImageInfo2,
+) {
+    trace_seen("vkCmdCopyBufferToImage2");
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    if !gd.is_null() && !info.is_null() {
+        let ci = unsafe { &*info };
+        if let Some((sc, i)) = unsafe { sc_slot_of(gd, ci.dstImage) } {
+            trace_sc_cmd(
+                "vkCmdCopyBufferToImage2",
+                cmd,
+                &format!(
+                    "buf={:#x} -> SLOT sc={sc:?} slot={i} dstLayout={} n={}",
+                    ci.srcBuffer as usize, ci.dstImageLayout, ci.regionCount
+                ),
+            );
+        }
+    }
+    call_cmd!(
+        gd,
+        cmd_copy_buffer_to_image2,
+        "vkCmdCopyBufferToImage2",
+        |f| f(rcmd, info)
+    );
+}
+
+/// Pipeline barriers carry the guest's layout transitions of the swapchain
+/// image; a transition to/from PRESENT_SRC proves the guest is treating that
+/// exact slot image as the frame it will present.
+unsafe extern "C" fn gn_vkCmdPipelineBarrier(
+    cmd: VkCommandBuffer,
+    src_stage: VkPipelineStageFlags,
+    dst_stage: VkPipelineStageFlags,
+    flags: u32,
+    mb_count: u32,
+    mb: *const c_void,
+    bb_count: u32,
+    bb: *const c_void,
+    ib_count: u32,
+    ib: *const VkImageMemoryBarrier,
+) {
+    trace_seen("vkCmdPipelineBarrier");
+    let (rcmd, gd) = unsafe { cmd_real_and_dev(cmd) };
+    if !gd.is_null() && ib_count > 0 && !ib.is_null() {
+        for k in 0..ib_count as usize {
+            let b = unsafe { &*ib.add(k) };
+            if let Some((sc, i)) = unsafe { sc_slot_of(gd, b.image) } {
+                trace_sc_cmd(
+                    "vkCmdPipelineBarrier(image)",
+                    cmd,
+                    &format!(
+                        "SLOT sc={sc:?} slot={i} {}->{} srcStage={src_stage:#x} dstStage={dst_stage:#x}",
+                        b.oldLayout, b.newLayout
+                    ),
+                );
+            }
+        }
+    }
+    call_cmd!(gd, cmd_pipeline_barrier, "vkCmdPipelineBarrier", |f| f(
+        rcmd, src_stage, dst_stage, flags, mb_count, mb, bb_count, bb, ib_count, ib
+    ));
+}
+
 unsafe extern "C" fn gn_vkFreeCommandBuffers(
     device: VkDevice,
     pool: VkCommandPool,
@@ -3918,6 +2765,182 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
             gn_vkDestroyDevice as unsafe extern "C" fn(VkDevice, *const VkAllocationCallbacks),
         )
     }),
+    // Guest-command trace: intercept the recorded transfers that can write a
+    // swapchain slot image, name the slot, then tail-call the driver.
+    (c"vkCmdClearColorImage", unsafe {
+        std::mem::transmute(
+            gn_vkCmdClearColorImage
+                as unsafe extern "C" fn(
+                    VkCommandBuffer,
+                    VkImage,
+                    VkImageLayout,
+                    *const VkClearColorValue,
+                    u32,
+                    *const VkImageSubresourceRange,
+                ),
+        )
+    }),
+    (c"vkCmdCopyImage", unsafe {
+        std::mem::transmute(
+            gn_vkCmdCopyImage
+                as unsafe extern "C" fn(
+                    VkCommandBuffer,
+                    VkImage,
+                    VkImageLayout,
+                    VkImage,
+                    VkImageLayout,
+                    u32,
+                    *const VkImageCopy,
+                ),
+        )
+    }),
+    (c"vkCmdCopyImage2KHR", unsafe {
+        std::mem::transmute(
+            gn_vkCmdCopyImage2 as unsafe extern "C" fn(VkCommandBuffer, *const VkCopyImageInfo2),
+        )
+    }),
+    (c"vkCmdCopyImage2", unsafe {
+        std::mem::transmute(
+            gn_vkCmdCopyImage2 as unsafe extern "C" fn(VkCommandBuffer, *const VkCopyImageInfo2),
+        )
+    }),
+    (c"vkCmdBlitImage", unsafe {
+        std::mem::transmute(
+            gn_vkCmdBlitImage
+                as unsafe extern "C" fn(
+                    VkCommandBuffer,
+                    VkImage,
+                    VkImageLayout,
+                    VkImage,
+                    VkImageLayout,
+                    u32,
+                    *const VkImageBlit,
+                    VkFilter,
+                ),
+        )
+    }),
+    (c"vkCmdBlitImage2KHR", unsafe {
+        std::mem::transmute(
+            gn_vkCmdBlitImage2 as unsafe extern "C" fn(VkCommandBuffer, *const VkBlitImageInfo2),
+        )
+    }),
+    (c"vkCmdBlitImage2", unsafe {
+        std::mem::transmute(
+            gn_vkCmdBlitImage2 as unsafe extern "C" fn(VkCommandBuffer, *const VkBlitImageInfo2),
+        )
+    }),
+    (c"vkCmdCopyBufferToImage", unsafe {
+        std::mem::transmute(
+            gn_vkCmdCopyBufferToImage
+                as unsafe extern "C" fn(
+                    VkCommandBuffer,
+                    VkBuffer,
+                    VkImage,
+                    VkImageLayout,
+                    u32,
+                    *const VkBufferImageCopy,
+                ),
+        )
+    }),
+    (c"vkCmdCopyBufferToImage2KHR", unsafe {
+        std::mem::transmute(
+            gn_vkCmdCopyBufferToImage2
+                as unsafe extern "C" fn(VkCommandBuffer, *const VkCopyBufferToImageInfo2),
+        )
+    }),
+    (c"vkCmdCopyBufferToImage2", unsafe {
+        std::mem::transmute(
+            gn_vkCmdCopyBufferToImage2
+                as unsafe extern "C" fn(VkCommandBuffer, *const VkCopyBufferToImageInfo2),
+        )
+    }),
+    (c"vkCmdPipelineBarrier", unsafe {
+        std::mem::transmute(
+            gn_vkCmdPipelineBarrier
+                as unsafe extern "C" fn(
+                    VkCommandBuffer,
+                    VkPipelineStageFlags,
+                    VkPipelineStageFlags,
+                    u32,
+                    u32,
+                    *const c_void,
+                    u32,
+                    *const c_void,
+                    u32,
+                    *const VkImageMemoryBarrier,
+                ),
+        )
+    }),
+    (c"vkCmdPipelineBarrier2KHR", unsafe {
+        std::mem::transmute(
+            gn_vkCmdPipelineBarrier2
+                as unsafe extern "C" fn(VkCommandBuffer, *const VkDependencyInfo),
+        )
+    }),
+    (c"vkCmdPipelineBarrier2", unsafe {
+        std::mem::transmute(
+            gn_vkCmdPipelineBarrier2
+                as unsafe extern "C" fn(VkCommandBuffer, *const VkDependencyInfo),
+        )
+    }),
+    (c"vkCmdBeginRenderPass", unsafe {
+        std::mem::transmute(
+            gn_vkCmdBeginRenderPass
+                as unsafe extern "C" fn(VkCommandBuffer, *const VkRenderPassBeginInfo, i32),
+        )
+    }),
+    (c"vkCmdBeginRenderPass2KHR", unsafe {
+        std::mem::transmute(
+            gn_vkCmdBeginRenderPass2
+                as unsafe extern "C" fn(
+                    VkCommandBuffer,
+                    *const VkRenderPassBeginInfo,
+                    *const VkSubpassBeginInfo,
+                ),
+        )
+    }),
+    (c"vkCmdBeginRenderPass2", unsafe {
+        std::mem::transmute(
+            gn_vkCmdBeginRenderPass2
+                as unsafe extern "C" fn(
+                    VkCommandBuffer,
+                    *const VkRenderPassBeginInfo,
+                    *const VkSubpassBeginInfo,
+                ),
+        )
+    }),
+    (c"vkCmdBeginRenderingKHR", unsafe {
+        std::mem::transmute(
+            gn_vkCmdBeginRendering as unsafe extern "C" fn(VkCommandBuffer, *const VkRenderingInfo),
+        )
+    }),
+    (c"vkCmdBeginRendering", unsafe {
+        std::mem::transmute(
+            gn_vkCmdBeginRendering as unsafe extern "C" fn(VkCommandBuffer, *const VkRenderingInfo),
+        )
+    }),
+    (c"vkCreateImageView", unsafe {
+        std::mem::transmute(
+            gn_vkCreateImageView
+                as unsafe extern "C" fn(
+                    VkDevice,
+                    *const VkImageViewCreateInfo,
+                    *const VkAllocationCallbacks,
+                    *mut VkImageView,
+                ) -> VkResult,
+        )
+    }),
+    (c"vkCreateFramebuffer", unsafe {
+        std::mem::transmute(
+            gn_vkCreateFramebuffer
+                as unsafe extern "C" fn(
+                    VkDevice,
+                    *const VkFramebufferCreateInfo,
+                    *const VkAllocationCallbacks,
+                    *mut VkFramebuffer,
+                ) -> VkResult,
+        )
+    }),
 ];
 
 /// Interception table: the instance table is consulted for GIPA and GPDPA
@@ -4100,5 +3123,2276 @@ mod tests {
             offered_present_modes(&[VK_PRESENT_MODE_FIFO_KHR], None),
             [VK_PRESENT_MODE_FIFO_KHR]
         );
+    }
+}
+
+// ---- reconstructed from HEAD (items missing after the damaged edit) ----
+
+// First-N diagnostics for the present pipeline handoffs (acquire ->
+// present -> worker commit -> compositor release). Bounded counters, so
+// steady-state frame pacing stays silent in logcat.
+use std::ptr;
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+pub const GN_MAX_SC_IMAGES: usize = 8;
+pub const GN_MAX_PRESENT: usize = 8; // swapchainCount handled per vkQueuePresentKHR
+pub const GN_JOB_CAP: usize = 16;
+
+pub const fn gn_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
+}
+pub const GN_DRM_FORMAT_XRGB8888: u32 = gn_fourcc(b'X', b'R', b'2', b'4');
+pub const GN_DRM_FORMAT_XBGR8888: u32 = gn_fourcc(b'X', b'B', b'2', b'4');
+// Alpha-carrying siblings of the two X-formats above: same red/green/blue byte
+// order, but the fourth byte is real alpha the compositor must honour instead
+// of ignore. A guest swapchain buffer genuinely has that channel (BGRA/RGBA),
+// so describing it as an X-format would force the compositor to discard it.
+pub const GN_DRM_FORMAT_ARGB8888: u32 = gn_fourcc(b'A', b'R', b'2', b'4');
+pub const GN_DRM_FORMAT_ABGR8888: u32 = gn_fourcc(b'A', b'B', b'2', b'4');
+pub const GN_DRM_MOD_LINEAR: u64 = 0;
+// Qualcomm scanout layouts (DRM_FORMAT_MOD_QCOM_*): COMPRESSED is UBWC, TILED3
+// the same macrotile layout without compression. Either names the layout of a
+// present image outright, instead of the explicit-LINEAR export the shim
+// otherwise has to force (a LINEAR export is the only layout it can map and
+// read, and the only one the driver cannot silently replace with a compressed
+// payload). GN_VKSHIM_SC_MOD picks the candidates, LINEAR always last.
+pub const GN_DRM_MOD_QCOM_COMPRESSED: u64 = 0x0500_0000_0000_0001;
+pub const GN_DRM_MOD_QCOM_TILED3: u64 = 0x0500_0000_0000_0003;
+
+fn sc_modifiers() -> &'static [u64] {
+    match std::env::var("GN_VKSHIM_SC_MOD").as_deref() {
+        Ok("compressed") => &[GN_DRM_MOD_QCOM_COMPRESSED],
+        Ok("tiled3") => &[GN_DRM_MOD_QCOM_TILED3],
+        Ok("auto") => &[GN_DRM_MOD_QCOM_COMPRESSED, GN_DRM_MOD_QCOM_TILED3],
+        _ => &[],
+    }
+}
+
+fn max_swapchain_images() -> u32 {
+    match std::env::var("WRAPPER_MAX_IMAGE_COUNT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    {
+        Some(v) if v >= 2 => v.min(GN_MAX_SC_IMAGES as u32),
+        _ => GN_MAX_SC_IMAGES as u32,
+    }
+}
+
+fn unimplemented_wsi_ext(name: &CStr) -> bool {
+    name == c"VK_KHR_present_wait"
+        || name == c"VK_KHR_present_id"
+        || name == c"VK_EXT_swapchain_maintenance1"
+}
+
+// ---------------------------------------------------------------- objects
+
+#[derive(Default, Clone, Copy)]
+pub struct RealInstFns {
+    pub gdp: Option<PFN_vkGetDeviceProcAddr>,
+    pub enum_pds: Option<PFN_vkEnumeratePhysicalDevices>,
+    pub create_device: Option<PFN_vkCreateDevice>,
+    pub destroy_instance: Option<PFN_vkDestroyInstance>,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct RealDevFns {
+    pub gdp: Option<PFN_vkGetDeviceProcAddr>,
+    pub get_queue: Option<PFN_vkGetDeviceQueue>,
+    pub create_image: Option<PFN_vkCreateImage>,
+    pub create_pipelines: Option<PFN_vkCreateGraphicsPipelines>,
+    pub get_device_queue2: Option<PFN_vkGetDeviceQueue2>,
+    pub submit2: Option<PFN_vkQueueSubmit2>,
+    pub wait_semaphores:
+        Option<unsafe extern "C" fn(VkDevice, *const VkSemaphoreWaitInfo, u64) -> VkResult>,
+    pub destroy_image: Option<PFN_vkDestroyImage>,
+    pub get_mem_reqs: Option<PFN_vkGetImageMemoryRequirements>,
+    pub get_layout: Option<PFN_vkGetImageSubresourceLayout>,
+    pub alloc_mem: Option<PFN_vkAllocateMemory>,
+    pub free_mem: Option<PFN_vkFreeMemory>,
+    pub bind_mem: Option<PFN_vkBindImageMemory>,
+    pub create_fence: Option<PFN_vkCreateFence>,
+    pub destroy_fence: Option<PFN_vkDestroyFence>,
+    pub wait_fences: Option<PFN_vkWaitForFences>,
+    pub reset_fences: Option<PFN_vkResetFences>,
+    pub create_sem: Option<PFN_vkCreateSemaphore>,
+    pub destroy_sem: Option<PFN_vkDestroySemaphore>,
+    pub alloc_cmd: Option<PFN_vkAllocateCommandBuffers>,
+    pub free_cmd: Option<PFN_vkFreeCommandBuffers>,
+    pub submit: Option<PFN_vkQueueSubmit>,
+    pub wait_idle: Option<PFN_vkDeviceWaitIdle>,
+    pub queue_wait_idle: Option<PFN_vkQueueWaitIdle>,
+    pub destroy_device: Option<PFN_vkDestroyDevice>,
+    // Slot read-back for the bounded one-shot `x11 view` line.
+    pub map_mem: Option<PFN_vkMapMemory>,
+    pub unmap_mem: Option<PFN_vkUnmapMemory>,
+    // Legacy-sync layout transitions (vkCmdPipelineBarrier) carried by the
+    // guest's command stream; forwarded through the trace hook.
+    pub cmd_pipeline_barrier: Option<PFN_vkCmdPipelineBarrier>,
+    // Guest-command trace: the recorded transfers that could write a
+    // swapchain slot image, so a recorded command can name the slot it targets.
+    pub cmd_clear_color_image: Option<PFN_vkCmdClearColorImage>,
+    pub cmd_copy_image: Option<PFN_vkCmdCopyImage>,
+    pub cmd_copy_image2: Option<PFN_vkCmdCopyImage2>,
+    pub cmd_blit_image: Option<PFN_vkCmdBlitImage>,
+    pub cmd_blit_image2: Option<PFN_vkCmdBlitImage2>,
+    pub cmd_copy_buffer_to_image: Option<PFN_vkCmdCopyBufferToImage>,
+    pub cmd_copy_buffer_to_image2: Option<PFN_vkCmdCopyBufferToImage2>,
+    pub cmd_pipeline_barrier2: Option<PFN_vkCmdPipelineBarrier2>,
+    pub cmd_begin_render_pass: Option<PFN_vkCmdBeginRenderPass>,
+    pub cmd_begin_render_pass2: Option<PFN_vkCmdBeginRenderPass2>,
+    pub cmd_begin_rendering: Option<PFN_vkCmdBeginRendering>,
+    pub create_image_view: Option<PFN_vkCreateImageView>,
+    pub create_framebuffer: Option<PFN_vkCreateFramebuffer>,
+}
+
+pub struct GnInstance {
+    pub real: VkInstance,
+    pub f: RealInstFns,
+    pub pds: [VkPhysicalDevice; 8],
+    pub n_pds: u32,
+    pub next: *mut GnInstance,
+}
+
+pub const GN_HANDLE_SCRATCH: usize = 6;
+
+pub struct GnDevice {
+    pub scratch: [usize; GN_HANDLE_SCRATCH],
+    pub real: VkDevice,
+    pub inst: *mut GnInstance,
+    pub f: RealDevFns,
+    pub queues: *mut GnQueue, // wrapper list
+    pub cmds: *mut GnCmd,     // wrapper list
+    pub next: *mut GnDevice,
+}
+
+pub struct GnQueue {
+    pub scratch: [usize; GN_HANDLE_SCRATCH],
+    pub real: VkQueue,
+    pub gd: *mut GnDevice,
+    pub next: *mut GnQueue,
+}
+
+pub struct GnCmd {
+    pub scratch: [usize; GN_HANDLE_SCRATCH],
+    pub real: VkCommandBuffer,
+    pub gd: *mut GnDevice,
+    pub next: *mut GnCmd,
+}
+
+pub struct GnSurface {
+    pub inst: *mut GnInstance,
+    pub dpy: *mut wl_display,         // winewayland's, or our own (X11 mode)
+    pub parent: *mut wl_proxy,        // commit target wl_surface
+    pub own_surface: *mut wl_proxy,   // X11 mode: shim-created wl_surface
+    pub swapchain_obj: *mut wl_proxy, // X11 mode: gamescope_swapchain
+    pub x11: *mut crate::x11::X11Present, // X11 route (DRI3+Present) presenter
+    pub next: *mut GnSurface,
+}
+
+pub struct GnSlot {
+    pub owner: *mut GnSwapchain, // release listener -> slot free
+    pub image: VkImage,
+    pub mem: VkDeviceMemory,
+    pub fd: i32,
+    pub stride: u32,
+    pub offset: u32,
+    pub modifier: u64,
+    pub buf: *mut wl_proxy, // created on first present (worker thread)
+    pub xpix: u32,          // X11 route: DRI3 pixmap, made once per slot
+    pub xfence: u32,        // X11 route: Present idle fence, made once per slot
+    pub fence: VkFence,
+    pub sem: VkSemaphore, // chains multi-swapchain presents
+    pub acquired: bool,   // owned by the app (acquire -> present)
+    pub in_flight: bool,  // committed, awaiting wl_buffer.release
+    // Guest-side trace: the acquire sequence that filled this slot, so a
+    // present can be tied back to the acquire that handed the guest the image.
+    pub acq_seq: u64,
+}
+
+pub struct ScShared {
+    pub jobs: VecDeque<i32>,
+    pub stopping: bool,
+}
+
+pub struct GnSwapchain {
+    pub surf: *mut GnSurface,
+    pub dev: *mut GnDevice,
+    pub format: VkFormat,
+    pub extent: VkExtent2D,
+    pub fourcc: u32,
+    pub usage: VkImageUsageFlags,
+    pub slots: Vec<GnSlot>,
+    pub worker: Option<std::thread::JoinHandle<()>>,
+    pub shared: Mutex<ScShared>,
+    pub cv_put: Condvar,
+    pub cv_free: Condvar,
+    pub x11_dumped: u32,
+    pub x11_presents: u32,
+    pub x11_trace: u32,
+    pub next: *mut GnSwapchain,
+}
+
+// ---------------------------------------------------------------- wayland
+
+pub struct GnWayland {
+    pub dpy: *mut wl_display, // winewayland's, or our own (X11 mode)
+    pub comp: *mut wl_proxy,
+    pub subcomp: *mut wl_proxy,
+    pub dmabuf: *mut wl_proxy,
+    pub swapchain_factory: *mut wl_proxy, // gamescope_swapchain_factory_v2
+    pub queue: *mut wlproto::wl_event_queue,
+    pub dispatch_started: bool,
+    pub own_dpy: bool, // X11 mode: we connected (WAYLAND_DISPLAY env)
+    pub ready: bool,
+    pub failed: bool,
+}
+
+// Touched from the setup thread, the dispatch thread and present workers
+// (raw wayland pointers — the C's locking model is kept verbatim).
+unsafe impl Send for GnWayland {}
+
+static G_WL: Mutex<GnWayland> = Mutex::new(GnWayland {
+    dpy: ptr::null_mut(),
+    comp: ptr::null_mut(),
+    subcomp: ptr::null_mut(),
+    dmabuf: ptr::null_mut(),
+    swapchain_factory: ptr::null_mut(),
+    queue: ptr::null_mut(),
+    dispatch_started: false,
+    own_dpy: false,
+    ready: false,
+    failed: false,
+});
+
+extern "C" fn registry_global(
+    data: *mut c_void,
+    reg: *mut wl_proxy,
+    id: u32,
+    iface: *const c_char,
+    version: u32,
+) {
+    let w = data as *mut GnWayland;
+    let iface = unsafe { CStr::from_ptr(iface) }.to_bytes();
+    unsafe {
+        if iface == b"wl_compositor" && version >= 4 {
+            (*w).comp = wlproto::registry_bind(reg, id, &wlproto::wl_compositor_interface, 4);
+        } else if iface == b"wl_subcompositor" {
+            (*w).subcomp = wlproto::registry_bind(reg, id, &wlproto::wl_subcompositor_interface, 1);
+        } else if iface == b"zwp_linux_dmabuf_v1" && version >= 3 {
+            (*w).dmabuf =
+                wlproto::registry_bind(reg, id, &wlproto::ZWP_LINUX_DMABUF_V1_INTERFACE, 3);
+        }
+    }
+}
+
+extern "C" fn registry_remove(_data: *mut c_void, _reg: *mut wl_proxy, _id: u32) {}
+
+// Listener vtables: libwayland indexes them by event opcode. Stored as raw
+// fn pointers — wl_proxy_add_listener takes an untyped implementation array.
+type RawListenerFn = extern "C" fn();
+static REGISTRY_LISTENER: [RawListenerFn; 2] = [
+    unsafe {
+        std::mem::transmute::<
+            extern "C" fn(*mut c_void, *mut wl_proxy, u32, *const c_char, u32),
+            RawListenerFn,
+        >(registry_global)
+    },
+    unsafe {
+        std::mem::transmute::<extern "C" fn(*mut c_void, *mut wl_proxy, u32), RawListenerFn>(
+            registry_remove,
+        )
+    },
+];
+static BUFFER_LISTENER: [RawListenerFn; 1] = [unsafe {
+    std::mem::transmute::<extern "C" fn(*mut c_void, *mut wl_proxy), RawListenerFn>(
+        on_buffer_release,
+    )
+}];
+
+fn dispatch_main() {
+    let (dpy, queue) = {
+        let w = G_WL.lock().unwrap();
+        (w.dpy, w.queue)
+    };
+    let fd = unsafe { wlproto::wl_display_get_fd(dpy) };
+    let mut failed = false;
+    // Canonical multi-threaded libwayland read loop: flushes go through
+    // SEND_LOCK (never concurrent with another sender, see SEND_LOCK), the
+    // blocking poll happens with no lock held, and event dispatch runs
+    // lock-free on this thread. wl_display_dispatch_queue() cannot be used:
+    // its internal pre-poll flush races the present worker's marshal+flush.
+    'outer: loop {
+        {
+            let _sg = SEND_LOCK.lock().unwrap();
+            if unsafe { wlproto::wl_display_flush(dpy) } < 0
+                && std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN)
+            {
+                failed = true;
+                break;
+            }
+        }
+        loop {
+            let n = unsafe { wlproto::wl_display_dispatch_queue_pending(dpy, queue) };
+            if n <= 0 {
+                if n < 0 {
+                    failed = true;
+                }
+                break;
+            }
+        }
+        if failed {
+            break;
+        }
+        while unsafe { wlproto::wl_display_prepare_read_queue(dpy, queue) } != 0 {
+            if unsafe { wlproto::wl_display_dispatch_queue_pending(dpy, queue) } < 0 {
+                failed = true;
+                break 'outer;
+            }
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, -1) } < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error();
+            unsafe { wlproto::wl_display_cancel_read(dpy) };
+            if e == Some(libc::EINTR) {
+                continue;
+            }
+            failed = true;
+            break;
+        }
+        if unsafe { wlproto::wl_display_read_events(dpy) } < 0 {
+            failed = true;
+            break;
+        }
+    }
+    let err = unsafe { wlproto::wl_display_get_error(dpy) };
+    G_WL.lock().unwrap().failed = true;
+    crate::logf!(
+        "wayland dispatch thread exited: {}",
+        if err != 0 {
+            std::io::Error::from_raw_os_error(err).to_string()
+        } else if failed {
+            std::io::Error::last_os_error().to_string()
+        } else {
+            "display closed".to_string()
+        }
+    );
+}
+
+fn wl_setup(dpy: *mut wl_display) -> bool {
+    let mut w = G_WL.lock().unwrap();
+    if w.ready || w.failed {
+        return !w.failed;
+    }
+    let wptr: *mut GnWayland = &mut *w;
+    unsafe {
+        let dpy = if dpy.is_null() {
+            let c = wlproto::wl_display_connect(std::ptr::null());
+            if c.is_null() {
+                crate::logf!("proxy wayland connect failed (WAYLAND_DISPLAY unset?)");
+                (*wptr).failed = true;
+                return false;
+            }
+            (*wptr).own_dpy = true;
+            c
+        } else {
+            dpy
+        };
+        (*wptr).dpy = dpy;
+        wlproto::wl_log_set_handler_client(gn_wl_log);
+        (*wptr).queue = wlproto::wl_display_create_queue(dpy);
+        let reg = wlproto::display_get_registry(dpy);
+        wlproto::wl_proxy_set_queue(reg, (*wptr).queue);
+        wlproto::wl_proxy_add_listener(reg, REGISTRY_LISTENER.as_ptr() as *mut _, wptr.cast());
+        if wlproto::wl_display_roundtrip_queue(dpy, (*wptr).queue) < 0 {
+            (*wptr).failed = true;
+        }
+        wlproto::wl_proxy_destroy(reg);
+        if !(*wptr).failed && (*wptr).dmabuf.is_null() {
+            crate::logf!("compositor misses zwp_linux_dmabuf_v1 v3 — proxy cannot present");
+            (*wptr).failed = true;
+        }
+        if !(*wptr).failed {
+            let spawned = std::thread::Builder::new()
+                .name("gn-wl-dispatch".into())
+                .spawn(dispatch_main);
+            if spawned.is_err() {
+                crate::logf!("failed to start wayland dispatch thread");
+                (*wptr).failed = true;
+            }
+        }
+        (*wptr).ready = !(*wptr).failed;
+        !(*wptr).failed
+    }
+}
+
+extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
+    let slot = data as *mut GnSlot;
+    unsafe {
+        let sc = (*slot).owner;
+        if LOG_RELEASE.fetch_add(1, Ordering::Relaxed) < LOG_FIRST_N {
+            crate::logf!("proxy release: slot={slot:?}");
+        }
+        let _g = (*sc).shared.lock().unwrap();
+        (*slot).in_flight = false;
+        (*sc).cv_free.notify_all();
+        drop(_g);
+        N_REL.fetch_add(1, Ordering::Relaxed);
+        if rate_ok(&RATE_REL, RATE_EVERY) {
+            crate::logf!("gn-vkshim release: slot={slot:?} {}", slot_flags(sc));
+        }
+    }
+}
+
+// ------------------------------------------------------------- bookkeeping
+
+pub struct Globals {
+    pub real_gipa: Option<GipaFn>,
+    pub real_handle: *mut c_void,
+    pub instances: *mut GnInstance,
+    pub devices: *mut GnDevice,
+    pub surfaces: *mut GnSurface,
+    pub swapchains: *mut GnSwapchain,
+}
+
+// All list heads and the real-driver pointers sit behind one mutex (the
+// C's g_mtx); raw list pointers are only walked under it.
+unsafe impl Send for Globals {}
+
+pub static G: Mutex<Globals> = Mutex::new(Globals {
+    real_gipa: None,
+    real_handle: ptr::null_mut(),
+    instances: ptr::null_mut(),
+    devices: ptr::null_mut(),
+    surfaces: ptr::null_mut(),
+    swapchains: ptr::null_mut(),
+});
+
+pub fn set_real_gipa(gipa: GipaFn) {
+    G.lock().unwrap().real_gipa = Some(gipa);
+}
+
+pub fn set_real_handle(handle: *mut c_void) {
+    G.lock().unwrap().real_handle = handle;
+}
+
+unsafe fn find_instance(inst: VkInstance) -> *mut GnInstance {
+    let g = G.lock().unwrap();
+    let mut p = g.instances;
+    while !p.is_null() {
+        if (*p).real == inst {
+            return p;
+        }
+        p = (*p).next;
+    }
+    ptr::null_mut()
+}
+
+unsafe fn find_instance_by_pd(pd: VkPhysicalDevice) -> *mut GnInstance {
+    let g = G.lock().unwrap();
+    let mut p = g.instances;
+    while !p.is_null() {
+        for i in 0..(*p).n_pds as usize {
+            if (*p).pds[i] == pd {
+                return p;
+            }
+        }
+        p = (*p).next;
+    }
+    ptr::null_mut()
+}
+
+unsafe fn find_device(dev: VkDevice) -> *mut GnDevice {
+    let g = G.lock().unwrap();
+    let mut p = g.devices;
+    while !p.is_null() {
+        if p.cast::<c_void>() == dev {
+            return p;
+        }
+        p = (*p).next;
+    }
+    ptr::null_mut()
+}
+
+unsafe fn find_queue(q: VkQueue) -> *mut GnQueue {
+    let g = G.lock().unwrap();
+    let mut p = g.devices;
+    while !p.is_null() {
+        let mut gq = (*p).queues;
+        while !gq.is_null() {
+            if gq.cast::<c_void>() == q {
+                return gq;
+            }
+            gq = (*gq).next;
+        }
+        p = (*p).next;
+    }
+    ptr::null_mut()
+}
+
+static WRAPPER_HISTORY: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn noted_wrapper(p: usize) {
+    if let Ok(mut v) = WRAPPER_HISTORY.lock() {
+        if v.len() < 4096 {
+            v.push(p);
+        }
+    }
+}
+
+fn was_wrapper(p: usize) -> bool {
+    WRAPPER_HISTORY
+        .lock()
+        .map(|v| v.contains(&p))
+        .unwrap_or(false)
+}
+
+unsafe fn find_cmd_any(cmd: VkCommandBuffer) -> *mut GnCmd {
+    let g = G.lock().unwrap();
+    let mut d = g.devices;
+    while !d.is_null() {
+        unsafe {
+            let mut gc = (*d).cmds;
+            while !gc.is_null() {
+                if gc.cast::<c_void>() == cmd {
+                    return gc;
+                }
+                gc = (*gc).next;
+            }
+            d = (*d).next;
+        }
+    }
+    ptr::null_mut()
+}
+
+unsafe fn real_cmd(cmd: VkCommandBuffer) -> VkCommandBuffer {
+    let gc = unsafe { find_cmd_any(cmd) };
+    if !gc.is_null() {
+        return unsafe { (*gc).real };
+    }
+    // Not in any device's list. Pass it through: a handle the shim never
+    // wrapped is the driver's own. But say so when it *was* a wrapper —
+    // that case hands the driver a shim pointer and faults inside it.
+    if was_wrapper(cmd as usize) {
+        crate::logf!("proxy: BUG submit carries an untracked wrapper CB {cmd:?}");
+    }
+    cmd
+}
+
+unsafe fn find_cmd(gd: *mut GnDevice, cmd: VkCommandBuffer) -> *mut GnCmd {
+    let mut gc = (*gd).cmds;
+    while !gc.is_null() {
+        if gc.cast::<c_void>() == cmd {
+            return gc;
+        }
+        gc = (*gc).next;
+    }
+    ptr::null_mut()
+}
+
+unsafe fn find_surface(surface: VkSurfaceKHR) -> *mut GnSurface {
+    let g = G.lock().unwrap();
+    let mut p = g.surfaces;
+    while !p.is_null() {
+        if p as usize as VkSurfaceKHR == surface {
+            return p;
+        }
+        p = (*p).next;
+    }
+    ptr::null_mut()
+}
+
+unsafe fn find_swapchain(sc: VkSwapchainKHR) -> *mut GnSwapchain {
+    let g = G.lock().unwrap();
+    let mut p = g.swapchains;
+    while !p.is_null() {
+        if p as usize as VkSwapchainKHR == sc {
+            return p;
+        }
+        p = (*p).next;
+    }
+    ptr::null_mut()
+}
+
+fn alias_of(name: &CStr) -> Option<&'static str> {
+    Some(match name.to_str().ok()? {
+        "vkMapMemory2" => "vkMapMemory2KHR",
+        "vkUnmapMemory2" => "vkUnmapMemory2KHR",
+        "vkGetImageSubresourceLayout2" => "vkGetImageSubresourceLayout2KHR",
+        "vkGetDeviceImageSubresourceLayout" => "vkGetDeviceImageSubresourceLayoutKHR",
+        "vkCopyMemoryToImage" => "vkCopyMemoryToImageEXT",
+        "vkCopyImageToMemory" => "vkCopyImageToMemoryEXT",
+        "vkCopyImageToImage" => "vkCopyImageToImageEXT",
+        "vkCmdBindIndexBuffer2" => "vkCmdBindIndexBuffer2KHR",
+        "vkCmdBindDescriptorSets2" => "vkCmdBindDescriptorSets2KHR",
+        "vkCmdPushConstants2" => "vkCmdPushConstants2KHR",
+        "vkCmdPushDescriptorSet" => "vkCmdPushDescriptorSetKHR",
+        "vkCmdPushDescriptorSet2" => "vkCmdPushDescriptorSet2KHR",
+        "vkCmdPushDescriptorSetWithTemplate" => "vkCmdPushDescriptorSetWithTemplateKHR",
+        "vkCmdPushDescriptorSetWithTemplate2" => "vkCmdPushDescriptorSetWithTemplate2KHR",
+        "vkCmdSetRenderingAttachmentLocations" => "vkCmdSetRenderingAttachmentLocationsKHR",
+        "vkCmdSetRenderingInputAttachmentIndices" => "vkCmdSetRenderingInputAttachmentIndicesKHR",
+        "vkGetRenderingAreaGranularity" => "vkGetRenderingAreaGranularityKHR",
+        "vkCmdSetLineStipple" => "vkCmdSetLineStippleEXT",
+        _ => return None,
+    })
+}
+
+unsafe fn gn_real_device_proc(gd: *mut GnDevice, name: &CStr) -> PFN_vkVoidFunction {
+    let (handle, gipa, inst) = {
+        let g = G.lock().unwrap();
+        let inst = if !gd.is_null() {
+            (*(*gd).inst).real
+        } else if !g.instances.is_null() {
+            (*g.instances).real
+        } else {
+            ptr::null_mut()
+        };
+        (g.real_handle, g.real_gipa, inst)
+    };
+    let mut fnptr: PFN_vkVoidFunction = None;
+    let mut via = "miss";
+    // Which handle a name resolves through decides whether the guest gets the
+    // driver's own implementation or the hooks' replacement. The copy/memory
+    // entry points are exactly where the guest's calls came back empty, so
+    // allow forcing the driver's own (GN_VKSHIM_PREFER_DRIVER_PROC=1).
+    let prefer_driver = std::env::var_os("GN_VKSHIM_PREFER_DRIVER_PROC").is_some();
+    if !handle.is_null() && !prefer_driver {
+        let sym = unsafe { libc::dlsym(handle, name.as_ptr()) };
+        if !sym.is_null() {
+            via = "dlsym";
+            fnptr =
+                Some(unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn()>(sym) });
+        }
+    }
+    if fnptr.is_none() && !inst.is_null() {
+        if let Some(gipa) = gipa {
+            fnptr = unsafe { gipa(inst, name.as_ptr()) };
+            if fnptr.is_some() {
+                via = "gipa";
+            }
+        }
+    }
+    // Core names the driver only exports under an extension spelling.
+    if fnptr.is_none() {
+        if let Some(alias) = alias_of(name) {
+            let c = std::ffi::CString::new(alias).unwrap();
+            fnptr = unsafe { gn_real_device_proc(gd, &c) };
+            if fnptr.is_some() {
+                via = "alias";
+            }
+        }
+    }
+    // The image/memory entry points are where the guest's calls silently do
+    // nothing, so record where each one came from.
+    if let Ok(mut seen) = REAL_PROC_SEEN.lock() {
+        let n = name.to_string_lossy().into_owned();
+        if seen.len() < 128
+            && !seen.iter().any(|s| s == &n)
+            && (n.contains("Copy")
+                || n.contains("Clear")
+                || n.contains("Bind")
+                || n.contains("Allocate")
+                || n.contains("Map")
+                || n.contains("CreateImage")
+                || n.contains("SubresourceLayout"))
+        {
+            crate::logf!("proxy: real proc {n} via {via}");
+            seen.push(n);
+        }
+    }
+    fnptr
+}
+
+unsafe fn gn_real_inst_proc(inst: VkInstance, name: &CStr) -> PFN_vkVoidFunction {
+    let (handle, gipa) = {
+        let g = G.lock().unwrap();
+        (g.real_handle, g.real_gipa)
+    };
+    if !handle.is_null() {
+        let sym = unsafe { libc::dlsym(handle, name.as_ptr()) };
+        if !sym.is_null() {
+            return Some(unsafe {
+                std::mem::transmute::<*mut c_void, unsafe extern "C" fn()>(sym)
+            });
+        }
+    }
+    if let Some(gipa) = gipa {
+        return unsafe { gipa(inst, name.as_ptr()) };
+    }
+    None
+}
+
+// Chain-link resolvers for the create-info we hand to the hooks. The outer
+// loader appends a VkLayer{Instance,Device}CreateInfo link to the pNext
+// chain; forwarded verbatim, the hooks initialize their dispatch tables
+// from it — resolving through the outer loader into THIS shim's entry
+// points, which lands our gn_* functions in their device/queue slots and
+// recurses (our QueueSubmit → hooks forwarder → our GetDeviceQueue → …)
+// until the stack overflows. Terminating the chain with resolvers confined
+// to the hooks' own namespace keeps every slot they initialize consistent
+// with their own CreateDevice.
+unsafe extern "C" fn gn_chain_gipa(
+    instance: VkInstance,
+    name: *const c_char,
+) -> PFN_vkVoidFunction {
+    let gipa = G.lock().unwrap().real_gipa;
+    match gipa {
+        Some(gipa) => unsafe { gipa(instance, name) },
+        None => None,
+    }
+}
+
+unsafe extern "C" fn gn_chain_gpdpa(
+    instance: VkInstance,
+    name: *const c_char,
+) -> PFN_vkVoidFunction {
+    unsafe { gn_chain_gipa(instance, name) }
+}
+
+unsafe extern "C" fn gn_chain_gdpa(_device: VkDevice, name: *const c_char) -> PFN_vkVoidFunction {
+    unsafe { gn_real_device_proc(ptr::null_mut(), CStr::from_ptr(name)) }
+}
+
+// Statics shared with the loader's chain links (contents never change).
+struct SyncLink<T>(T);
+unsafe impl<T> Sync for SyncLink<T> {}
+
+static G_CHAIN_INST_LINK: SyncLink<VkLayerInstanceLink> = SyncLink(VkLayerInstanceLink {
+    pNext: ptr::null_mut(),
+    pfnNextGetInstanceProcAddr: Some(unsafe {
+        std::mem::transmute::<
+            unsafe extern "C" fn(VkInstance, *const c_char) -> PFN_vkVoidFunction,
+            unsafe extern "C" fn(),
+        >(gn_chain_gipa)
+    }),
+    pfnNextGetPhysicalDeviceProcAddr: Some(unsafe {
+        std::mem::transmute::<
+            unsafe extern "C" fn(VkInstance, *const c_char) -> PFN_vkVoidFunction,
+            unsafe extern "C" fn(),
+        >(gn_chain_gpdpa)
+    }),
+});
+
+static G_CHAIN_DEV_LINK: SyncLink<VkLayerDeviceLink> = SyncLink(VkLayerDeviceLink {
+    pNext: ptr::null_mut(),
+    pfnNextGetInstanceProcAddr: Some(unsafe {
+        std::mem::transmute::<
+            unsafe extern "C" fn(VkInstance, *const c_char) -> PFN_vkVoidFunction,
+            unsafe extern "C" fn(),
+        >(gn_chain_gipa)
+    }),
+    pfnNextGetDeviceProcAddr: Some(unsafe {
+        std::mem::transmute::<
+            unsafe extern "C" fn(VkDevice, *const c_char) -> PFN_vkVoidFunction,
+            unsafe extern "C" fn(),
+        >(gn_chain_gdpa)
+    }),
+});
+
+unsafe fn slice_or_empty<'a, T>(p: *const T, n: usize) -> &'a [T] {
+    if p.is_null() || n == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(p, n) }
+    }
+}
+
+// ------------------------------------------------------- prereq probe
+
+fn dev_exts_satisfied(
+    enum_de: PFN_vkEnumerateDeviceExtensionProperties,
+    pd: VkPhysicalDevice,
+) -> bool {
+    const WANT: [&CStr; 4] = [
+        c"VK_KHR_external_memory",
+        c"VK_KHR_external_memory_fd",
+        c"VK_EXT_external_memory_dma_buf",
+        c"VK_EXT_image_drm_format_modifier",
+    ];
+    let mut n: u32 = 0;
+    if unsafe { enum_de(pd, ptr::null(), &mut n, ptr::null_mut()) } != VK_SUCCESS {
+        return false;
+    }
+    let mut props = vec![
+        VkExtensionProperties {
+            extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
+            specVersion: 0,
+        };
+        n as usize
+    ];
+    if unsafe { enum_de(pd, ptr::null(), &mut n, props.as_mut_ptr()) } != VK_SUCCESS {
+        return false;
+    }
+    for want in WANT {
+        let found = props[..n as usize].iter().any(|p| {
+            let name = unsafe { CStr::from_ptr(p.extensionName.as_ptr()) };
+            name == want
+        });
+        if !found {
+            crate::logf!("proxy prereq: device lacks {}", want.to_str().unwrap());
+            return false;
+        }
+    }
+    true
+}
+
+pub fn device_prereqs(gipa: GipaFn) -> bool {
+    let create_inst: Option<PFN_vkCreateInstance> =
+        unsafe { std::mem::transmute(gipa(ptr::null_mut(), c"vkCreateInstance".as_ptr())) };
+    let Some(create_inst) = create_inst else {
+        crate::logf!("proxy prereq: driver exposes no vkCreateInstance");
+        return false;
+    };
+    let app = VkApplicationInfo {
+        sType: VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        pNext: ptr::null(),
+        pApplicationName: c"gn-vkshim-probe".as_ptr(),
+        applicationVersion: 0,
+        pEngineName: ptr::null(),
+        engineVersion: 0,
+        apiVersion: VK_API_VERSION_1_3,
+    };
+    let ci = VkInstanceCreateInfo {
+        sType: VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        pNext: ptr::null(),
+        flags: 0,
+        pApplicationInfo: &app,
+        enabledLayerCount: 0,
+        ppEnabledLayerNames: ptr::null(),
+        enabledExtensionCount: 0,
+        ppEnabledExtensionNames: ptr::null(),
+    };
+    let mut inst: VkInstance = ptr::null_mut();
+    let res = unsafe { create_inst(&ci, ptr::null(), &mut inst) };
+    if res != VK_SUCCESS {
+        crate::logf!("proxy prereq: probe vkCreateInstance failed ({res})");
+        return false;
+    }
+    // Instance-level procs must be fetched against a live instance: mesa
+    // resolves only global functions for a NULL instance.
+    let enum_pds: Option<PFN_vkEnumeratePhysicalDevices> =
+        unsafe { std::mem::transmute(gipa(inst, c"vkEnumeratePhysicalDevices".as_ptr())) };
+    let enum_de: Option<PFN_vkEnumerateDeviceExtensionProperties> = unsafe {
+        std::mem::transmute(gipa(inst, c"vkEnumerateDeviceExtensionProperties".as_ptr()))
+    };
+    let destroy_inst: Option<PFN_vkDestroyInstance> =
+        unsafe { std::mem::transmute(gipa(inst, c"vkDestroyInstance".as_ptr())) };
+    let mut ok = false;
+    match (enum_pds, enum_de, destroy_inst) {
+        (Some(enum_pds), Some(enum_de), _) => {
+            let mut n: u32 = 0;
+            if unsafe { enum_pds(inst, &mut n, ptr::null_mut()) } == VK_SUCCESS && n > 0 {
+                let mut pd: VkPhysicalDevice = ptr::null_mut();
+                let mut one: u32 = 1;
+                if unsafe { enum_pds(inst, &mut one, &mut pd) } == VK_SUCCESS {
+                    ok = dev_exts_satisfied(enum_de, pd);
+                }
+            } else {
+                crate::logf!("proxy prereq: no physical devices");
+            }
+        }
+        _ => crate::logf!("proxy prereq: instance-level procs unresolved"),
+    }
+    if let Some(destroy_inst) = destroy_inst {
+        unsafe { destroy_inst(inst, ptr::null()) };
+    }
+    ok
+}
+
+// ------------------------------------------------ instance-level functions
+
+unsafe extern "C" fn gn_vkCreateInstance(
+    ci: *const VkInstanceCreateInfo,
+    alloc: *const VkAllocationCallbacks,
+    out: *mut VkInstance,
+) -> VkResult {
+    let ci = unsafe { &*ci };
+    let gipa = G.lock().unwrap().real_gipa;
+    let Some(gipa) = gipa else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    let real_create: Option<PFN_vkCreateInstance> =
+        unsafe { std::mem::transmute(gipa(ptr::null_mut(), c"vkCreateInstance".as_ptr())) };
+    let Some(real_create) = real_create else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    let mut exts: [*const c_char; 32] = [ptr::null(); 32];
+    let mut n: usize = 0;
+    let names = unsafe {
+        slice_or_empty(
+            ci.ppEnabledExtensionNames,
+            ci.enabledExtensionCount as usize,
+        )
+    };
+    for &name in names {
+        let n_ = unsafe { CStr::from_ptr(name) };
+        if n_ == c"VK_KHR_wayland_surface" || n_ == c"VK_KHR_xlib_surface" {
+            continue; // proxied, not real
+        }
+        if n < exts.len() {
+            exts[n] = name;
+            n += 1;
+        }
+    }
+    let mut ci2 = VkInstanceCreateInfo { ..*ci };
+    ci2.enabledExtensionCount = n as u32;
+    ci2.ppEnabledExtensionNames = exts.as_ptr();
+    // Confine the loader's chain link to the hooks' namespace (see
+    // G_CHAIN_INST_LINK).
+    let mut p = ci2.pNext as *mut VkBaseOutStructure;
+    while !p.is_null() {
+        unsafe {
+            if (*p).sType == VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO {
+                let lci = p.cast::<VkLayerInstanceCreateInfo>();
+                if (*lci).function == VK_LAYER_LINK_INFO {
+                    (*lci).u.pLayerInfo = &raw const G_CHAIN_INST_LINK.0 as *mut _;
+                }
+            }
+            p = (*p).pNext;
+        }
+    }
+    let res = unsafe { real_create(&ci2, alloc, out) };
+    if res != VK_SUCCESS {
+        return res;
+    }
+    let gi = Box::new(GnInstance {
+        real: unsafe { *out },
+        f: RealInstFns {
+            gdp: unsafe { std::mem::transmute(gn_real_inst_proc(*out, c"vkGetDeviceProcAddr")) },
+            enum_pds: unsafe {
+                std::mem::transmute(gn_real_inst_proc(*out, c"vkEnumeratePhysicalDevices"))
+            },
+            create_device: unsafe {
+                std::mem::transmute(gn_real_inst_proc(*out, c"vkCreateDevice"))
+            },
+            destroy_instance: unsafe {
+                std::mem::transmute(gn_real_inst_proc(*out, c"vkDestroyInstance"))
+            },
+        },
+        pds: [ptr::null_mut(); 8],
+        n_pds: 0,
+        next: ptr::null_mut(),
+    });
+    let gi = Box::into_raw(gi);
+    unsafe {
+        if let Some(enum_pds) = (*gi).f.enum_pds {
+            let mut cnt: u32 = 0;
+            if enum_pds(*out, &mut cnt, ptr::null_mut()) == VK_SUCCESS && cnt > 0 {
+                if cnt > 8 {
+                    cnt = 8;
+                }
+                if enum_pds(*out, &mut cnt, (*gi).pds.as_mut_ptr()) == VK_SUCCESS {
+                    (*gi).n_pds = cnt;
+                }
+            }
+        }
+    }
+    {
+        let mut g = G.lock().unwrap();
+        unsafe {
+            (*gi).next = g.instances;
+            g.instances = gi;
+        }
+    }
+    crate::logf!("proxy instance {:?} (headless WSI backing)", unsafe {
+        *out
+    });
+    VK_SUCCESS
+}
+
+unsafe extern "C" fn gn_vkDestroyInstance(
+    instance: VkInstance,
+    alloc: *const VkAllocationCallbacks,
+) {
+    let gi = {
+        let mut g = G.lock().unwrap();
+        let mut pp: *mut *mut GnInstance = &raw mut g.instances;
+        unsafe {
+            while !(*pp).is_null() && (**pp).real != instance {
+                pp = &raw mut (**pp).next;
+            }
+            let gi = *pp;
+            if !gi.is_null() {
+                *pp = (*gi).next;
+            }
+            gi
+        }
+    };
+    if gi.is_null() {
+        return;
+    }
+    unsafe {
+        if let Some(destroy) = (*gi).f.destroy_instance {
+            destroy(instance, alloc);
+        }
+        drop(Box::from_raw(gi));
+    }
+}
+
+unsafe extern "C" fn gn_vkEnumerateInstanceExtensionProperties(
+    layer: *const c_char,
+    pCount: *mut u32,
+    pProps: *mut VkExtensionProperties,
+) -> VkResult {
+    let gipa = G.lock().unwrap().real_gipa;
+    let Some(gipa) = gipa else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    let real_enum: Option<PFN_vkEnumerateInstanceExtensionProperties> = unsafe {
+        std::mem::transmute(gipa(
+            ptr::null_mut(),
+            c"vkEnumerateInstanceExtensionProperties".as_ptr(),
+        ))
+    };
+    let Some(real_enum) = real_enum else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    unsafe {
+        if pProps.is_null() {
+            let mut n: u32 = 0;
+            let res = real_enum(layer, &mut n, ptr::null_mut());
+            if res != VK_SUCCESS {
+                return res;
+            }
+            *pCount = n + 2;
+            return VK_SUCCESS;
+        }
+        let cap = *pCount;
+        if cap == 0 {
+            *pCount = 0;
+            return VK_INCOMPLETE;
+        }
+        let mut n = cap.saturating_sub(2);
+        let res = real_enum(layer, &mut n, pProps);
+        if res != VK_SUCCESS && res != VK_INCOMPLETE {
+            return res;
+        }
+        let total = n + 2;
+        if cap >= total {
+            // Both surface extensions are proxied: winewayland clients use
+            // the wayland one, winex11 clients (the gamescope path) the xlib
+            // one — the real driver never sees either.
+            for (i, name) in [
+                &b"VK_KHR_wayland_surface\0"[..],
+                &b"VK_KHR_xlib_surface\0"[..],
+            ]
+            .iter()
+            .enumerate()
+            {
+                let slot = &mut *pProps.add(n as usize + i);
+                slot.specVersion = 6;
+                slot.extensionName[..name.len()]
+                    .copy_from_slice(std::mem::transmute::<&[u8], &[c_char]>(name));
+            }
+            *pCount = total;
+            return VK_SUCCESS;
+        }
+        *pCount = total;
+        VK_INCOMPLETE
+    }
+}
+
+unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
+    pd: VkPhysicalDevice,
+    layer: *const c_char,
+    count: *mut u32,
+    props: *mut VkExtensionProperties,
+) -> VkResult {
+    let gipa = G.lock().unwrap().real_gipa;
+    let Some(gipa) = gipa else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    // Instance-level function: mesa resolves it only against a live instance.
+    let gi = unsafe { find_instance_by_pd(pd) };
+    let inst = if gi.is_null() {
+        ptr::null_mut()
+    } else {
+        unsafe { (*gi).real }
+    };
+    let real: Option<PFN_vkEnumerateDeviceExtensionProperties> = unsafe {
+        std::mem::transmute(gipa(inst, c"vkEnumerateDeviceExtensionProperties".as_ptr()))
+    };
+    let Some(real) = real else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    unsafe {
+        let mut n: u32 = 0;
+        let res = real(pd, layer, &mut n, ptr::null_mut());
+        if res != VK_SUCCESS {
+            return res;
+        }
+        let mut buf = vec![
+            VkExtensionProperties {
+                extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
+                specVersion: 0,
+            };
+            n as usize
+        ];
+        let mut got = n;
+        let res = real(pd, layer, &mut got, buf.as_mut_ptr());
+        if res != VK_SUCCESS && res != VK_INCOMPLETE {
+            return res;
+        }
+        let mut kept = 0usize;
+        for i in 0..got as usize {
+            if !unimplemented_wsi_ext(CStr::from_ptr(buf[i].extensionName.as_ptr())) {
+                buf[kept] = buf[i];
+                kept += 1;
+            }
+        }
+        if props.is_null() {
+            *count = kept as u32;
+            return VK_SUCCESS;
+        }
+        let n_copy = (*count as usize).min(kept);
+        ptr::copy_nonoverlapping(buf.as_ptr(), props, n_copy);
+        *count = n_copy as u32;
+        if n_copy < kept {
+            VK_INCOMPLETE
+        } else {
+            VK_SUCCESS
+        }
+    }
+}
+
+// ------------------------------------------------- wayland surface (proxy)
+
+unsafe extern "C" fn gn_vkCreateWaylandSurfaceKHR(
+    instance: VkInstance,
+    ci: *const VkWaylandSurfaceCreateInfoKHR,
+    _alloc: *const VkAllocationCallbacks,
+    out: *mut VkSurfaceKHR,
+) -> VkResult {
+    let ci = unsafe { &*ci };
+    let gi = unsafe { find_instance(instance) };
+    if gi.is_null() {
+        crate::logf!("proxy surface create FAILED: instance {instance:?} not one of ours");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if !wl_setup(ci.display.cast()) {
+        crate::logf!("proxy surface create FAILED: wayland setup failed");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let s = Box::new(GnSurface {
+        inst: gi,
+        dpy: ci.display.cast(),
+        parent: ci.surface.cast(),
+        own_surface: ptr::null_mut(),
+        swapchain_obj: ptr::null_mut(),
+        x11: ptr::null_mut(),
+        next: ptr::null_mut(),
+    });
+    let s = Box::into_raw(s);
+    {
+        let mut g = G.lock().unwrap();
+        unsafe {
+            (*s).next = g.surfaces;
+            g.surfaces = s;
+        }
+    }
+    unsafe {
+        *out = s as usize as VkSurfaceKHR;
+        crate::logf!(
+            "proxy surface {:?} (direct attach on wl_surface {:?})",
+            s,
+            ci.surface
+        );
+    }
+    VK_SUCCESS
+}
+
+// ------------------------------------------------- xlib surface (proxy, X11 mode)
+//
+// Under winex11.drv wine has no wl_surface for the window. The shim opens its
+// own X connection to the Xwayland server (see `crate::x11`) and presents each
+// rendered slot straight into the window's X pixmap with DRI3 + Present: the
+// compositor's own Xwayland IS the client, so the flip reaches the compositor
+// without any gamescope_swapchain override.
+//
+// This is the only WSI provider in the stack: the Vulkan driver (turnip)
+// exports no xlib or wayland WSI entry points at all, so handing an X11
+// surface to it cannot work (its ICD carries no vkCreateXlibSurfaceKHR, and
+// surface setup then fails VK_ERROR_INITIALIZATION_FAILED). The shim must
+// present every window itself, so there is no driver-WSI fallback route.
+
+unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
+    instance: VkInstance,
+    ci: *const VkXlibSurfaceCreateInfoKHR,
+    _alloc: *const VkAllocationCallbacks,
+    out: *mut VkSurfaceKHR,
+) -> VkResult {
+    let ci = unsafe { &*ci };
+    let gi = unsafe { find_instance(instance) };
+    if gi.is_null() {
+        crate::logf!("proxy xlib surface create FAILED: instance {instance:?} not one of ours");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let x11 = if ci.window == 0 {
+        crate::routef!(
+            "x11 route: XID {:#x} unavailable ({})",
+            ci.window,
+            crate::x11::RouteUnavailable::NullXid.reason()
+        );
+        ptr::null_mut()
+    } else {
+        match unsafe { crate::x11::X11Present::new(ci.window as u32) } {
+            Ok(p) => Box::into_raw(Box::new(p)),
+            Err(e) => {
+                crate::routef!(
+                    "x11 route: XID {:#x} unavailable ({})",
+                    ci.window,
+                    e.reason()
+                );
+                ptr::null_mut()
+            }
+        }
+    };
+    let s = Box::new(GnSurface {
+        inst: gi,
+        dpy: ptr::null_mut(),
+        parent: ptr::null_mut(),
+        own_surface: ptr::null_mut(),
+        swapchain_obj: ptr::null_mut(),
+        x11,
+        next: ptr::null_mut(),
+    });
+    let s = Box::into_raw(s);
+    {
+        let mut g = G.lock().unwrap();
+        unsafe {
+            (*s).next = g.surfaces;
+            g.surfaces = s;
+        }
+    }
+    unsafe {
+        *out = s as usize as VkSurfaceKHR;
+        crate::logf!(
+            "proxy surface {:?} (X11 window {:#x}, DRI3+Present route)",
+            s,
+            ci.window
+        );
+    }
+    VK_SUCCESS
+}
+
+unsafe extern "C" fn gn_vkGetPhysicalDeviceXlibPresentationSupportKHR(
+    _pd: VkPhysicalDevice,
+    _qf: u32,
+    _dpy: *mut c_void,
+    _visual: usize,
+) -> VkBool32 {
+    VK_TRUE
+}
+
+unsafe extern "C" fn gn_vkDestroySurfaceKHR(
+    _instance: VkInstance,
+    surface: VkSurfaceKHR,
+    _alloc: *const VkAllocationCallbacks,
+) {
+    let s = unsafe { find_surface(surface) };
+    if s.is_null() {
+        return;
+    }
+    {
+        let mut g = G.lock().unwrap();
+        let mut pp: *mut *mut GnSurface = &raw mut g.surfaces;
+        unsafe {
+            while !(*pp).is_null() && *pp != s {
+                pp = &raw mut (**pp).next;
+            }
+            if !(*pp).is_null() {
+                *pp = (*s).next;
+            }
+        }
+    }
+    unsafe {
+        if !(*s).x11.is_null() {
+            drop(Box::from_raw((*s).x11));
+        }
+        drop(Box::from_raw(s));
+    }
+}
+
+// Surface queries are answered locally: the proxy owns the wayland
+// presentation contract, and the hooks' surface-query trampolines expect
+// loader-wrapped surface objects their VK_EXT_headless_surface path never
+// produces (the ICD-level mesa surface's first word is its object-type
+// enum, not a dispatch table).
+unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+    _pd: VkPhysicalDevice,
+    surface: VkSurfaceKHR,
+    caps: *mut VkSurfaceCapabilitiesKHR,
+) -> VkResult {
+    if unsafe { find_surface(surface) }.is_null() {
+        crate::logf!("proxy surface caps query: {surface:#x} not one of ours");
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
+    unsafe {
+        *caps = VkSurfaceCapabilitiesKHR {
+            minImageCount: 2,
+            maxImageCount: max_swapchain_images(),
+            currentExtent: VkExtent2D {
+                width: u32::MAX,
+                height: u32::MAX,
+            }, // wayland: app picks
+            minImageExtent: VkExtent2D {
+                width: 1,
+                height: 1,
+            },
+            maxImageExtent: VkExtent2D {
+                width: 8192,
+                height: 8192,
+            },
+            maxImageArrayLayers: 1,
+            supportedTransforms: VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+            currentTransform: VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+            // The same set Mesa/turnip's WSI advertises on the X11 arm. There is
+            // no delegate surface to forward from: the proxy owns the wayland
+            // presentation contract and the driver exports no WSI entry points
+            // (see the xlib-surface and present-modes notes above), and
+            // `RealDevFns` carries no surface-capability query. Advertising
+            // OPAQUE alone let DXVK force every present opaque, which covered
+            // the window's own GDI surface. INHERIT is the honest default for a
+            // compositor-managed surface; the pre/post forms let a guest pick
+            // its own blending.
+            supportedCompositeAlpha: VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR
+                | VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR
+                | VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR
+                | VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+            // Exactly what the pool's AHardwareBuffer backs, no more. The pool
+            // allocates GPU_SAMPLED_IMAGE | GPU_COLOR_OUTPUT | COMPOSER_OVERLAY
+            // | CPU_READ_OFTEN and the guest renders straight into it, so
+            // SAMPLED_BIT comes with the first flag and COLOR_ATTACHMENT_BIT
+            // with the second. The transfer bits are on every image the proxy
+            // creates (`GnSwapchain::usage`) and the WSI smoke client actually
+            // exercises them: its present readback copies a swapchain image to
+            // host memory (TRANSFER_SRC) and its clear scene clears one in
+            // TRANSFER_DST_OPTIMAL (TRANSFER_DST). COMPOSER_OVERLAY and
+            // CPU_READ_OFTEN are SurfaceFlinger/host usages with no Vulkan
+            // equivalent. No STORAGE_BIT: an AHardwareBuffer grants that only
+            // through AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER, which this pool
+            // does not set, so advertising it would promise a capability the
+            // scan-out buffer cannot back.
+            supportedUsageFlags: VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                | VK_IMAGE_USAGE_SAMPLED_BIT,
+        };
+    }
+    VK_SUCCESS
+}
+
+unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceFormatsKHR(
+    _pd: VkPhysicalDevice,
+    surface: VkSurfaceKHR,
+    count: *mut u32,
+    formats: *mut VkSurfaceFormatKHR,
+) -> VkResult {
+    if unsafe { find_surface(surface) }.is_null() {
+        crate::logf!("proxy surface formats query: {surface:#x} not one of ours");
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
+    const K_FMTS: [VkSurfaceFormatKHR; 2] = [
+        VkSurfaceFormatKHR {
+            format: VK_FORMAT_B8G8R8A8_UNORM,
+            colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+        },
+        VkSurfaceFormatKHR {
+            format: VK_FORMAT_R8G8B8A8_UNORM,
+            colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+        },
+    ];
+    // BGRA_8888 only by default, so the guest renders in the scan-out pool's
+    // own layout (see `advertises_rgba` — offering RGBA let Nidhogg render
+    // R/B-exchanged into a daemon BGRA buffer, which reached the panel as
+    // cyan). RGBA is offered only under `GN_VKSHIM_ALLOW_RGBA`.
+    let n_formats = if advertises_rgba() { K_FMTS.len() } else { 1 };
+    unsafe {
+        if formats.is_null() {
+            *count = n_formats as u32;
+            return VK_SUCCESS;
+        }
+        let n = (*count).min(n_formats as u32) as usize;
+        ptr::copy_nonoverlapping(K_FMTS.as_ptr(), formats, n);
+        *count = n as u32;
+        if n < n_formats {
+            VK_INCOMPLETE
+        } else {
+            VK_SUCCESS
+        }
+    }
+}
+
+const SERVED_PRESENT_MODES: [VkPresentModeKHR; 3] = [
+    VK_PRESENT_MODE_IMMEDIATE_KHR,
+    VK_PRESENT_MODE_MAILBOX_KHR,
+    VK_PRESENT_MODE_FIFO_KHR,
+];
+
+fn parse_present_mode_override(val: Option<&str>) -> Option<VkPresentModeKHR> {
+    let mode = match val? {
+        "fifo" => VK_PRESENT_MODE_FIFO_KHR,
+        "relaxed" => VK_PRESENT_MODE_FIFO_RELAXED_KHR,
+        "mailbox" => VK_PRESENT_MODE_MAILBOX_KHR,
+        "immediate" => VK_PRESENT_MODE_IMMEDIATE_KHR,
+        _ => {
+            crate::logf!("Invalid MESA_VK_WSI_PRESENT_MODE value!");
+            return None;
+        }
+    };
+    Some(mode)
+}
+
+fn offered_present_modes(
+    served: &[VkPresentModeKHR],
+    override_mode: Option<VkPresentModeKHR>,
+) -> Vec<VkPresentModeKHR> {
+    let mut v = Vec::with_capacity(served.len() + 1);
+    if let Some(m) = override_mode {
+        if served.contains(&m) {
+            v.push(m);
+        } else {
+            crate::logf!("Unsupported MESA_VK_WSI_PRESENT_MODE value!");
+        }
+    }
+    for &m in served {
+        if !v.contains(&m) {
+            v.push(m);
+        }
+    }
+    if !v.contains(&VK_PRESENT_MODE_FIFO_KHR) {
+        v.push(VK_PRESENT_MODE_FIFO_KHR);
+    }
+    v
+}
+
+unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfacePresentModesKHR(
+    _pd: VkPhysicalDevice,
+    surface: VkSurfaceKHR,
+    count: *mut u32,
+    modes: *mut VkPresentModeKHR,
+) -> VkResult {
+    if unsafe { find_surface(surface) }.is_null() {
+        crate::logf!("proxy surface present-modes query: {surface:#x} not one of ours");
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
+    let modes_list = offered_present_modes(
+        &SERVED_PRESENT_MODES,
+        parse_present_mode_override(std::env::var("MESA_VK_WSI_PRESENT_MODE").ok().as_deref()),
+    );
+    unsafe {
+        if modes.is_null() {
+            *count = modes_list.len() as u32;
+            return VK_SUCCESS;
+        }
+        let n = (*count).min(modes_list.len() as u32) as usize;
+        ptr::copy_nonoverlapping(modes_list.as_ptr(), modes, n);
+        *count = n as u32;
+        if n < modes_list.len() {
+            VK_INCOMPLETE
+        } else {
+            VK_SUCCESS
+        }
+    }
+}
+
+unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceSupportKHR(
+    _pd: VkPhysicalDevice,
+    _qf: u32,
+    _surface: VkSurfaceKHR,
+    supported: *mut VkBool32,
+) -> VkResult {
+    unsafe { *supported = VK_TRUE };
+    VK_SUCCESS
+}
+
+unsafe extern "C" fn gn_vkGetPhysicalDeviceWaylandPresentationSupportKHR(
+    _pd: VkPhysicalDevice,
+    _qf: u32,
+    _dpy: *mut wl_display,
+) -> VkBool32 {
+    VK_TRUE
+}
+
+// ------------------------------------------------------- device functions
+
+unsafe extern "C" fn gn_vkCreateDevice(
+    pd: VkPhysicalDevice,
+    ci: *const VkDeviceCreateInfo,
+    alloc: *const VkAllocationCallbacks,
+    out: *mut VkDevice,
+) -> VkResult {
+    let ci = unsafe { &*ci };
+    let gi = unsafe { find_instance_by_pd(pd) };
+    if gi.is_null() || unsafe { (*gi).f.create_device.is_none() } {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    const ADD_EXTS: [&CStr; 4] = [
+        c"VK_KHR_external_memory",
+        c"VK_KHR_external_memory_fd",
+        c"VK_EXT_external_memory_dma_buf",
+        c"VK_EXT_image_drm_format_modifier",
+    ];
+    let mut exts: [*const c_char; 48] = [ptr::null(); 48];
+    let mut n: usize = 0;
+    let names = unsafe {
+        slice_or_empty(
+            ci.ppEnabledExtensionNames,
+            ci.enabledExtensionCount as usize,
+        )
+    };
+    for &name in names {
+        // The guest must never enable a WSI extension the proxy cannot honour
+        // (see `unimplemented_wsi_ext`); drop it before the driver sees it.
+        let n_ = unsafe { CStr::from_ptr(name) };
+        if unimplemented_wsi_ext(n_) {
+            crate::logf!("proxy device: masking {}", n_.to_string_lossy());
+            continue;
+        }
+        if n < exts.len() {
+            exts[n] = name;
+            n += 1;
+        }
+    }
+    'add: for add in ADD_EXTS {
+        for &e in &exts[..n] {
+            if unsafe { CStr::from_ptr(e) } == add {
+                continue 'add;
+            }
+        }
+        if n < exts.len() {
+            exts[n] = add.as_ptr();
+            n += 1;
+        }
+    }
+    // Optionally mask the pipeline-library extensions (GN_VKSHIM_NO_GPL=1):
+    // DXVK then builds monolithic pipelines instead of partial ones it links,
+    // which is the A/B for a suspected bad partial/link path in this driver
+    // (the X11 vulkan wrapper fakes VK_KHR_pipeline_library, so X11 never uses
+    // it). Off by default: without it DXVK keeps its pipeline-compilation
+    // optimisation, and masking it means compiling every state monolithically,
+    // which is slow enough on this driver to look like a hang.
+    if std::env::var_os("GN_VKSHIM_NO_GPL").is_some() {
+        for drop in [
+            c"VK_EXT_graphics_pipeline_library",
+            c"VK_KHR_pipeline_library",
+        ] {
+            let mut i = 0;
+            while i < n {
+                if unsafe { CStr::from_ptr(exts[i]) } == drop {
+                    crate::logf!("proxy device: masking {}", drop.to_string_lossy());
+                    for j in i..n - 1 {
+                        exts[j] = exts[j + 1];
+                    }
+                    n -= 1;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    let mut ci2 = VkDeviceCreateInfo { ..*ci };
+    ci2.enabledExtensionCount = n as u32;
+    ci2.ppEnabledExtensionNames = exts.as_ptr();
+    // Confine the loader's chain link to the hooks' namespace (see
+    // G_CHAIN_DEV_LINK).
+    let mut p = ci2.pNext as *mut VkBaseOutStructure;
+    while !p.is_null() {
+        unsafe {
+            if (*p).sType == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO {
+                let lci = p.cast::<VkLayerDeviceCreateInfo>();
+                if (*lci).function == VK_LAYER_LINK_INFO {
+                    (*lci).u.pLayerDeviceInfo = &raw const G_CHAIN_DEV_LINK.0 as *mut _;
+                }
+            }
+            p = (*p).pNext;
+        }
+    }
+    let res = unsafe { (*gi).f.create_device.unwrap()(pd, &ci2, alloc, out) };
+    if res != VK_SUCCESS {
+        return res;
+    }
+    let mut gd = Box::new(GnDevice {
+        scratch: [0; GN_HANDLE_SCRATCH],
+        real: unsafe { *out },
+        inst: gi,
+        f: RealDevFns::default(),
+        queues: ptr::null_mut(),
+        cmds: ptr::null_mut(),
+        next: ptr::null_mut(),
+    });
+    // Real-device function resolution never uses the hooks'
+    // vkGetDeviceProcAddr: its answers are vulkan::driver::* trampolines
+    // that index a high dispatch region which isn't valid for this device
+    // (GetDeviceQueue through it returned a NULL queue, crashing the
+    // trampoline's own handle-magic check). The hooks' exported vk* entries
+    // forward through the device's ordinary low dispatch slots — always
+    // consistent with the CreateDevice that produced the handle; the
+    // instance GIPA falls through to the real driver's name tables for the
+    // extension names the hooks don't export.
+    let gdp: *mut GnDevice = &mut *gd;
+    macro_rules! resolve {
+        ($field:ident, $sym:literal) => {
+            gd.f.$field = unsafe {
+                std::mem::transmute(gn_real_device_proc(
+                    gdp,
+                    CStr::from_bytes_with_nul_unchecked(concat!($sym, "\0").as_bytes()),
+                ))
+            };
+        };
+    }
+    resolve!(get_queue, "vkGetDeviceQueue");
+    resolve!(create_image, "vkCreateImage");
+    resolve!(create_pipelines, "vkCreateGraphicsPipelines");
+    resolve!(get_device_queue2, "vkGetDeviceQueue2");
+    resolve!(submit2, "vkQueueSubmit2");
+    resolve!(wait_semaphores, "vkWaitSemaphoresKHR");
+    resolve!(destroy_image, "vkDestroyImage");
+    resolve!(get_mem_reqs, "vkGetImageMemoryRequirements");
+    resolve!(get_layout, "vkGetImageSubresourceLayout");
+    resolve!(alloc_mem, "vkAllocateMemory");
+    resolve!(free_mem, "vkFreeMemory");
+    resolve!(bind_mem, "vkBindImageMemory");
+    resolve!(create_fence, "vkCreateFence");
+    resolve!(destroy_fence, "vkDestroyFence");
+    resolve!(wait_fences, "vkWaitForFences");
+    resolve!(reset_fences, "vkResetFences");
+    resolve!(create_sem, "vkCreateSemaphore");
+    resolve!(destroy_sem, "vkDestroySemaphore");
+    resolve!(alloc_cmd, "vkAllocateCommandBuffers");
+    resolve!(free_cmd, "vkFreeCommandBuffers");
+    resolve!(submit, "vkQueueSubmit");
+    resolve!(wait_idle, "vkDeviceWaitIdle");
+    resolve!(queue_wait_idle, "vkQueueWaitIdle");
+    resolve!(destroy_device, "vkDestroyDevice");
+    resolve!(map_mem, "vkMapMemory");
+    resolve!(unmap_mem, "vkUnmapMemory");
+    resolve!(cmd_pipeline_barrier, "vkCmdPipelineBarrier");
+    resolve!(cmd_clear_color_image, "vkCmdClearColorImage");
+    resolve!(cmd_copy_image, "vkCmdCopyImage");
+    resolve!(cmd_copy_image2, "vkCmdCopyImage2");
+    resolve!(cmd_blit_image, "vkCmdBlitImage");
+    resolve!(cmd_blit_image2, "vkCmdBlitImage2");
+    resolve!(cmd_copy_buffer_to_image, "vkCmdCopyBufferToImage");
+    resolve!(cmd_copy_buffer_to_image2, "vkCmdCopyBufferToImage2");
+    resolve!(cmd_pipeline_barrier2, "vkCmdPipelineBarrier2");
+    resolve!(cmd_begin_render_pass, "vkCmdBeginRenderPass");
+    resolve!(cmd_begin_render_pass2, "vkCmdBeginRenderPass2");
+    resolve!(cmd_begin_rendering, "vkCmdBeginRendering");
+    resolve!(create_image_view, "vkCreateImageView");
+    resolve!(create_framebuffer, "vkCreateFramebuffer");
+    let qf = if ci.pQueueCreateInfos.is_null() {
+        0
+    } else {
+        unsafe { (*ci.pQueueCreateInfos).queueFamilyIndex }
+    };
+    let gd = Box::into_raw(gd);
+    {
+        let mut g = G.lock().unwrap();
+        unsafe {
+            (*gd).next = g.devices;
+            g.devices = gd;
+        }
+    }
+    // Hand the loader our own wrapper; gd.real stays private (its first
+    // word must keep pointing at the hooks' dispatch table).
+    unsafe {
+        *out = gd.cast::<c_void>();
+        crate::logf!(
+            "proxy device {:?} (real {:?}, queue family {qf})",
+            gd,
+            (*gd).real
+        );
+    }
+    VK_SUCCESS
+}
+
+unsafe extern "C" fn gn_vkDestroyDevice(device: VkDevice, _alloc: *const VkAllocationCallbacks) {
+    let gd = unsafe { find_device(device) };
+    if gd.is_null() {
+        return;
+    }
+    unsafe {
+        if let Some(wait_idle) = (*gd).f.wait_idle {
+            wait_idle((*gd).real);
+        }
+        if let Some(destroy_device) = (*gd).f.destroy_device {
+            destroy_device((*gd).real, ptr::null());
+        }
+    }
+    {
+        let mut g = G.lock().unwrap();
+        let mut pp: *mut *mut GnDevice = &raw mut g.devices;
+        unsafe {
+            while !(*pp).is_null() && *pp != gd {
+                pp = &raw mut (**pp).next;
+            }
+            if !(*pp).is_null() {
+                *pp = (*gd).next;
+            }
+            while !(*gd).queues.is_null() {
+                let gq = (*gd).queues;
+                (*gd).queues = (*gq).next;
+                drop(Box::from_raw(gq));
+            }
+            while !(*gd).cmds.is_null() {
+                let gc = (*gd).cmds;
+                (*gd).cmds = (*gc).next;
+                drop(Box::from_raw(gc));
+            }
+        }
+    }
+    unsafe {
+        drop(Box::from_raw(gd));
+    }
+}
+
+unsafe extern "C" fn gn_vkGetDeviceQueue(
+    device: VkDevice,
+    family: u32,
+    index: u32,
+    out: *mut VkQueue,
+) {
+    let gd = unsafe { find_device(device) };
+    if gd.is_null() {
+        return;
+    }
+    let mut gq = Box::new(GnQueue {
+        scratch: [0; GN_HANDLE_SCRATCH],
+        real: ptr::null_mut(),
+        gd,
+        next: ptr::null_mut(),
+    });
+    unsafe {
+        if let Some(get_queue) = (*gd).f.get_queue {
+            get_queue((*gd).real, family, index, &mut gq.real);
+        }
+    }
+    let gq = Box::into_raw(gq);
+    {
+        let _g = G.lock().unwrap();
+        unsafe {
+            (*gq).next = (*gd).queues;
+            (*gd).queues = gq;
+        }
+    }
+    unsafe { *out = gq.cast::<c_void>() };
+}
+
+unsafe extern "C" fn gn_vkGetDeviceQueue2(
+    device: VkDevice,
+    info: *const VkDeviceQueueInfo2,
+    out: *mut VkQueue,
+) {
+    let gd = unsafe { find_device(device) };
+    if gd.is_null() {
+        return;
+    }
+    // Per device: these resolved entry points are bound to the device that
+    // produced the handle, so a process-global cache hands a later device a
+    // function that fails its own handle check (a NULL queue or worse).
+    let Some(real_fn) = (unsafe { (*gd).f.get_device_queue2 }) else {
+        unsafe { gn_vkGetDeviceQueue(device, (*info).queueFamilyIndex, (*info).queueIndex, out) };
+        return;
+    };
+    let mut gq = Box::new(GnQueue {
+        scratch: [0; GN_HANDLE_SCRATCH],
+        real: ptr::null_mut(),
+        gd,
+        next: ptr::null_mut(),
+    });
+    unsafe {
+        real_fn((*gd).real, info, &mut gq.real);
+    }
+    let gq = Box::into_raw(gq);
+    {
+        let _g = G.lock().unwrap();
+        unsafe {
+            (*gq).next = (*gd).queues;
+            (*gd).queues = gq;
+        }
+    }
+    unsafe { *out = gq.cast::<c_void>() };
+}
+
+// ------------------------------------------------- swapchain + present
+
+fn vk_format_to_fourcc(format: VkFormat) -> u32 {
+    match format {
+        // DRM fourccs name the LE 32-bit word: ARGB8888 = 0xAARRGGBB, i.e.
+        // memory bytes B,G,R,A — VK_FORMAT_B8G8R8A8_UNORM's layout. Both of
+        // these Vulkan formats carry a real alpha channel, so they map to the
+        // alpha-bearing A-formats, not XRGB8888/XBGR8888: the X byte is
+        // *ignored* by the compositor, which is what forced a guest's frame
+        // opaque. The daemon already reports the same buffer as AR24
+        // (`PRIMARY_FORMATS`), so this keeps the two descriptions in agreement.
+        VK_FORMAT_B8G8R8A8_UNORM => GN_DRM_FORMAT_ARGB8888,
+        VK_FORMAT_R8G8B8A8_UNORM => GN_DRM_FORMAT_ABGR8888,
+        _ => 0,
+    }
+}
+
+const SCANOUT_SWAPCHAIN_FORMAT: VkFormat = VK_FORMAT_B8G8R8A8_UNORM;
+
+fn advertises_rgba() -> bool {
+    std::env::var_os("GN_VKSHIM_FORCE_BGRA").is_none()
+        && std::env::var_os("GN_VKSHIM_ALLOW_RGBA").is_some()
+}
+
+fn swapchain_format_allowed(format: VkFormat, allow_rgba: bool) -> bool {
+    format == SCANOUT_SWAPCHAIN_FORMAT || (allow_rgba && format == VK_FORMAT_R8G8B8A8_UNORM)
+}
+
+unsafe fn slot_release(sc: *mut GnSwapchain, s: *mut GnSlot) {
+    let gd = (*sc).dev;
+    unsafe {
+        if !(*s).buf.is_null() {
+            wlproto::wl_proxy_destroy((*s).buf);
+            (*s).buf = ptr::null_mut();
+        }
+        if (*s).fence != 0 {
+            if let Some(f) = (*gd).f.destroy_fence {
+                f((*gd).real, (*s).fence, ptr::null());
+            }
+        }
+        if (*s).sem != 0 {
+            if let Some(f) = (*gd).f.destroy_sem {
+                f((*gd).real, (*s).sem, ptr::null());
+            }
+        }
+        if (*s).image != 0 {
+            if let Some(f) = (*gd).f.destroy_image {
+                f((*gd).real, (*s).image, ptr::null());
+            }
+        }
+        if (*s).mem != 0 {
+            if let Some(f) = (*gd).f.free_mem {
+                f((*gd).real, (*s).mem, ptr::null());
+            }
+        }
+        if (*s).fd >= 0 {
+            libc::close((*s).fd);
+        }
+        (*s).fd = -1;
+    }
+}
+
+// Present targets are dma-bufs the shim allocates from the system heap and
+// IMPORTS into vulkan. The adrenotools driver family cannot export fds
+// (vkGetMemoryFdKHR / vkGetImageDrmFormatModifierPropertiesEXT are not
+// reachable through its hooks), so the ownership is inverted: the shim owns
+// the fd, vulkan borrows it, and the same fd is committed to wayland.
+fn dma_heap_open() -> i32 {
+    static HEAP_FD: OnceLock<i32> = OnceLock::new();
+    *HEAP_FD.get_or_init(|| {
+        let path = CString::new("/dev/dma_heap/system").unwrap();
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            crate::logf!(
+                "proxy: /dev/dma_heap/system: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        fd
+    })
+}
+
+fn dma_heap_alloc(len: usize) -> i32 {
+    let heap = dma_heap_open();
+    if heap < 0 {
+        return -1;
+    }
+    // DMA_HEAP_IOCTL_ALLOC: _IOWR('H', 0x0, struct dma_heap_allocation_data)
+    #[repr(C)]
+    struct dma_heap_allocation_data {
+        len: u64,
+        fd: u32,
+        fd_flags: u32,
+        heap_flags: u64,
+    }
+    // _IOC(_IOC_READ|_IOC_WRITE=3 << 30, size << 16, magic 'H' << 8, nr 0)
+    const DMA_HEAP_IOCTL_ALLOC: libc::c_ulong = (3u64 << 30)
+        | ((std::mem::size_of::<dma_heap_allocation_data>() as u64) << 16)
+        | ((b'H' as u64) << 8);
+    let mut data = dma_heap_allocation_data {
+        len: len as u64,
+        fd: 0,
+        // O_RDWR: the fd crosses to gndrm, whose CPU upload path mmaps it
+        // PROT_READ — an accmode-less fd fails mmap with EACCES.
+        fd_flags: (libc::O_RDWR | libc::O_CLOEXEC) as u32,
+        heap_flags: 0,
+    };
+    if unsafe { libc::ioctl(heap, DMA_HEAP_IOCTL_ALLOC as _, &mut data) } != 0 {
+        crate::logf!(
+            "proxy: dma_heap alloc({len}): {}",
+            std::io::Error::last_os_error()
+        );
+        return -1;
+    }
+    data.fd as i32
+}
+
+unsafe fn slot_init_sync(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
+    let gd = (*sc).dev;
+    let dev = unsafe { (*gd).real };
+    let f = unsafe { (*gd).f };
+    let fci = VkFenceCreateInfo {
+        sType: VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        pNext: ptr::null(),
+        flags: 0,
+    };
+    let sci = VkSemaphoreCreateInfo {
+        sType: VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        pNext: ptr::null(),
+        flags: 0,
+    };
+    let mut res = unsafe { f.create_fence.unwrap()(dev, &fci, ptr::null(), &mut (*s).fence) };
+    if res == VK_SUCCESS {
+        res = unsafe { f.create_sem.unwrap()(dev, &sci, ptr::null(), &mut (*s).sem) };
+    }
+    res
+}
+
+unsafe fn slot_init_tiled(sc: *mut GnSwapchain, s: *mut GnSlot, modifier: u64) -> VkResult {
+    let gd = (*sc).dev;
+    let dev = unsafe { (*gd).real };
+    let f = unsafe { (*gd).f };
+    let w = (*sc).extent.width;
+    unsafe {
+        if (*s).fd >= 0 {
+            libc::close((*s).fd);
+            (*s).fd = -1;
+        }
+    }
+    (*s).stride = (w * 4 + 255) & !255;
+    (*s).offset = 0;
+    (*s).modifier = modifier;
+    let modlist = VkImageDrmFormatModifierListCreateInfoEXT {
+        sType: VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+        pNext: ptr::null(),
+        drmFormatModifierCount: 1,
+        pDrmFormatModifiers: &modifier,
+    };
+    let ext_img = VkExternalMemoryImageCreateInfo {
+        sType: VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        pNext: &modlist as *const _ as *const c_void,
+        handleTypes: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+    let ici = VkImageCreateInfo {
+        sType: VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        pNext: &ext_img as *const _ as *const c_void,
+        flags: 0,
+        imageType: VK_IMAGE_TYPE_2D,
+        format: (*sc).format,
+        extent: VkExtent3D {
+            width: w,
+            height: (*sc).extent.height,
+            depth: 1,
+        },
+        mipLevels: 1,
+        arrayLayers: 1,
+        samples: VK_SAMPLE_COUNT_1_BIT,
+        tiling: VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+        usage: (*sc).usage,
+        sharingMode: VK_SHARING_MODE_EXCLUSIVE,
+        queueFamilyIndexCount: 0,
+        pQueueFamilyIndices: ptr::null(),
+        initialLayout: VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    let mut res = unsafe { f.create_image.unwrap()(dev, &ici, ptr::null(), &mut (*s).image) };
+    if res != VK_SUCCESS {
+        crate::logf!("proxy slot: modifier {modifier:#x} image create: {res}");
+        (*s).image = 0;
+        return res;
+    }
+    let mut reqs = VkMemoryRequirements {
+        size: 0,
+        alignment: 0,
+        memoryTypeBits: 0,
+    };
+    unsafe { f.get_mem_reqs.unwrap()(dev, (*s).image, &mut reqs) };
+    let mut mem_type = u32::MAX;
+    for i in 0..32 {
+        if reqs.memoryTypeBits & (1 << i) != 0 {
+            mem_type = i;
+            break;
+        }
+    }
+    // The driver's own size: a compressed layout carries a metadata region
+    // past the pixels, and it is only known once the image exists.
+    (*s).fd = dma_heap_alloc(reqs.size as usize);
+    crate::logf!(
+        "proxy slot: modifier {modifier:#x} {}x{} reqs {} mem_type {mem_type} fd {} stride {}",
+        w,
+        (*sc).extent.height,
+        reqs.size,
+        (*s).fd,
+        (*s).stride
+    );
+    if mem_type == u32::MAX || (*s).fd < 0 {
+        res = VK_ERROR_INITIALIZATION_FAILED;
+    } else {
+        let ded = VkMemoryDedicatedAllocateInfo {
+            sType: VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+            pNext: ptr::null(),
+            image: (*s).image,
+            buffer: 0,
+        };
+        let imp = VkImportMemoryFdInfoKHR {
+            sType: VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+            pNext: &ded as *const _ as *const c_void,
+            handleType: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+            fd: unsafe { libc::dup((*s).fd) },
+        };
+        let mai = VkMemoryAllocateInfo {
+            sType: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            pNext: &imp as *const _ as *const c_void,
+            allocationSize: reqs.size,
+            memoryTypeIndex: mem_type,
+        };
+        res = unsafe { f.alloc_mem.unwrap()(dev, &mai, ptr::null(), &mut (*s).mem) };
+        if res == VK_SUCCESS {
+            res = unsafe { f.bind_mem.unwrap()(dev, (*s).image, (*s).mem, 0) };
+        }
+        if res != VK_SUCCESS {
+            crate::logf!("proxy slot: modifier {modifier:#x} memory: {res}");
+        }
+    }
+    if res != VK_SUCCESS {
+        unsafe {
+            if (*s).mem != 0 {
+                f.free_mem.unwrap()(dev, (*s).mem, ptr::null());
+            }
+            if (*s).image != 0 {
+                f.destroy_image.unwrap()(dev, (*s).image, ptr::null());
+            }
+            if (*s).fd >= 0 {
+                libc::close((*s).fd);
+            }
+        }
+        (*s).mem = 0;
+        (*s).image = 0;
+        (*s).fd = -1;
+        return res;
+    }
+    slot_init_sync(sc, s)
+}
+
+unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
+    // GN_VKSHIM_SC_MOD=auto|compressed|tiled3. Driver-chosen scanout layouts
+    // first; the explicit-LINEAR export below is always the fallback.
+    for &modifier in sc_modifiers() {
+        if unsafe { slot_init_tiled(sc, s, modifier) } == VK_SUCCESS {
+            return VK_SUCCESS;
+        }
+    }
+    let gd = (*sc).dev;
+    let dev = unsafe { (*gd).real };
+    let f = unsafe { (*gd).f };
+    (*s).fd = -1;
+    (*s).stride = ((*sc).extent.width * 4 + 255) & !255;
+    (*s).offset = 0;
+    (*s).modifier = GN_DRM_MOD_LINEAR;
+    let mut plane = VkSubresourceLayout {
+        offset: 0,
+        size: 0,
+        rowPitch: 0,
+        arrayPitch: 0,
+        depthPitch: 0,
+    };
+    for attempt in 0..2 {
+        unsafe {
+            if (*s).fd >= 0 {
+                libc::close((*s).fd);
+            }
+        }
+        // The swapchain image must be a buffer the daemon owns: the presenter
+        // can only publish one of its own `AHardwareBuffer`s. Ask for it over
+        // the scan-out channel explicitly rather than relying on the
+        // LD_PRELOAD shim to intercept this process's heap allocation. The
+        // returned stride is authoritative for the image this fd backs.
+        match crate::scanout::allocate((*sc).extent.width, (*sc).extent.height) {
+            Some(buf) => {
+                (*s).fd = buf.fd;
+                if buf.stride != 0 {
+                    (*s).stride = buf.stride;
+                }
+                crate::logf!(
+                    "proxy slot: pool buffer fd={} ino={} stride={}",
+                    buf.fd,
+                    buf.ino,
+                    (*s).stride
+                );
+            }
+            None => {
+                // No daemon channel, or it refused: a local system-heap
+                // allocation, the pre-existing behaviour, which the LD_PRELOAD
+                // shim may still redirect.
+                (*s).fd = dma_heap_alloc((*s).stride as usize * (*sc).extent.height as usize);
+            }
+        }
+        if (*s).fd < 0 {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        plane.offset = 0;
+        plane.rowPitch = (*s).stride as u64;
+        let modexp = VkImageDrmFormatModifierExplicitCreateInfoEXT {
+            sType: VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+            pNext: ptr::null(),
+            drmFormatModifier: GN_DRM_MOD_LINEAR,
+            drmFormatModifierPlaneCount: 1,
+            pPlaneLayouts: &plane,
+        };
+        let ext_img = VkExternalMemoryImageCreateInfo {
+            sType: VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            pNext: &modexp as *const _ as *const c_void,
+            handleTypes: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        };
+        let ici = VkImageCreateInfo {
+            sType: VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            pNext: &ext_img as *const _ as *const c_void,
+            flags: 0,
+            imageType: VK_IMAGE_TYPE_2D,
+            format: (*sc).format,
+            extent: VkExtent3D {
+                width: (*sc).extent.width,
+                height: (*sc).extent.height,
+                depth: 1,
+            },
+            mipLevels: 1,
+            arrayLayers: 1,
+            samples: VK_SAMPLE_COUNT_1_BIT,
+            // TILING_LINEAR forbids UBWC outright; OPTIMAL+explicit LINEAR
+            // modifier still lets turnip pick a compressed layout (the fd
+            // then holds a UBWC payload, not scan-out pixels).
+            tiling: VK_IMAGE_TILING_LINEAR,
+            usage: (*sc).usage,
+            sharingMode: VK_SHARING_MODE_EXCLUSIVE,
+            queueFamilyIndexCount: 0,
+            pQueueFamilyIndices: ptr::null(),
+            initialLayout: VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        let res = unsafe { f.create_image.unwrap()(dev, &ici, ptr::null(), &mut (*s).image) };
+        if res != VK_SUCCESS {
+            crate::logf!("proxy import image create failed: {res}");
+            return res;
+        }
+        let mut reqs = VkMemoryRequirements {
+            size: 0,
+            alignment: 0,
+            memoryTypeBits: 0,
+        };
+        unsafe { f.get_mem_reqs.unwrap()(dev, (*s).image, &mut reqs) };
+        let mut mem_type = u32::MAX;
+        for i in 0..32 {
+            if reqs.memoryTypeBits & (1 << i) != 0 {
+                mem_type = i;
+                break;
+            }
+        }
+        if mem_type == u32::MAX {
+            crate::logf!("proxy import image: no memory type");
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        let ded = VkMemoryDedicatedAllocateInfo {
+            sType: VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+            pNext: ptr::null(),
+            image: (*s).image,
+            buffer: 0,
+        };
+        let imp = VkImportMemoryFdInfoKHR {
+            sType: VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+            pNext: &ded as *const _ as *const c_void,
+            handleType: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+            fd: unsafe { libc::dup((*s).fd) },
+        };
+        let mai = VkMemoryAllocateInfo {
+            sType: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            pNext: &imp as *const _ as *const c_void,
+            allocationSize: reqs.size,
+            memoryTypeIndex: mem_type,
+        };
+        let mut res = unsafe { f.alloc_mem.unwrap()(dev, &mai, ptr::null(), &mut (*s).mem) };
+        if res == VK_SUCCESS {
+            res = unsafe { f.bind_mem.unwrap()(dev, (*s).image, (*s).mem, 0) };
+        }
+        if res != VK_SUCCESS {
+            crate::logf!("proxy import memory failed: {res}");
+            return res;
+        }
+        // Ground-truth the driver's plane layout: a driver honoring the
+        // explicit LINEAR modifier reports exactly the pitch handed in;
+        // anything else means the layout guess was wrong, so retry once
+        // with the reported pitch.
+        if let Some(get_layout) = f.get_layout {
+            let sub = VkImageSubresource {
+                aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
+                mipLevel: 0,
+                arrayLayer: 0,
+            };
+            let mut got = VkSubresourceLayout {
+                offset: 0,
+                size: 0,
+                rowPitch: 0,
+                arrayPitch: 0,
+                depthPitch: 0,
+            };
+            unsafe { get_layout(dev, (*s).image, &sub, &mut got) };
+            crate::logf!(
+                "proxy slot layout: pitch {} (asked {}), offset {}",
+                got.rowPitch,
+                (*s).stride,
+                got.offset
+            );
+            if got.rowPitch != 0
+                && got.rowPitch != (*s).stride as u64
+                && got.rowPitch < 65536
+                && attempt == 0
+            {
+                unsafe {
+                    f.destroy_image.unwrap()(dev, (*s).image, ptr::null());
+                    f.free_mem.unwrap()(dev, (*s).mem, ptr::null());
+                }
+                (*s).image = 0;
+                (*s).mem = 0;
+                (*s).stride = got.rowPitch as u32;
+                continue;
+            }
+        }
+        break;
+    }
+    slot_init_sync(sc, s)
+}
+
+unsafe fn slot_make_buffer(sc: *mut GnSwapchain, s: *mut GnSlot) -> *mut wl_proxy {
+    let (dmabuf, queue) = {
+        let w = G_WL.lock().unwrap();
+        (w.dmabuf, w.queue)
+    };
+    let params = unsafe { wlproto::dmabuf_create_params(dmabuf) };
+    if params.is_null() {
+        return ptr::null_mut();
+    }
+    let _sg = SEND_LOCK.lock().unwrap();
+    unsafe {
+        wlproto::params_add(params, (*s).fd, 0, (*s).offset, (*s).stride, (*s).modifier);
+        let buf = wlproto::params_create_immed(
+            params,
+            (*sc).extent.width as i32,
+            (*sc).extent.height as i32,
+            (*sc).fourcc,
+            0,
+        );
+        wlproto::wl_proxy_destroy(params);
+        if !buf.is_null() {
+            wlproto::wl_proxy_add_listener(buf, BUFFER_LISTENER.as_ptr() as *mut _, s.cast());
+            wlproto::wl_proxy_set_queue(buf, queue);
+        }
+        buf
     }
 }

@@ -52,6 +52,21 @@ macro_rules! logf {
     };
 }
 
+/// Emit a `gn-vkshim:` line to stderr unconditionally.
+///
+/// Route decisions use this: the surface entry point the guest reaches, and
+/// whether its present route came up, must be visible in every session log
+/// without a diagnostic gate, so a session that shows nothing names its cause
+/// instead of being indistinguishable from a route that never engaged.
+/// Bounded by construction: one line per surface created, and one per
+/// swapchain whose frames start being dropped.
+#[macro_export]
+macro_rules! routef {
+    ($fmt:literal $(, $($arg:tt)*)?) => {
+        eprintln!("gn-vkshim: {}", format_args!($fmt $(, $($arg)*)?));
+    };
+}
+
 /// `GNDRM_LOG_VKSHIM` gate, resolved once and cached.
 pub fn vkshim_enabled() -> bool {
     // 0 = unresolved, 1 = off, 2 = on.
@@ -73,6 +88,7 @@ pub mod scanout;
 pub mod thunk;
 pub mod vk;
 pub mod wlproto;
+pub mod x11;
 
 use std::ffi::{c_char, c_void, CStr, CString, OsStr};
 use std::ptr;
@@ -83,8 +99,10 @@ use vk::{GipaFn, PFN_vkVoidFunction, VkExtensionProperties, VkInstance, VkResult
 type IcdGipaFn = Option<unsafe extern "C" fn(VkInstance, *const c_char) -> PFN_vkVoidFunction>;
 
 /// Stamped into the startup line so a stale payload is never mistaken for the
-/// current build (that cost a whole debugging pass).
-pub const SHIM_BUILD: &str = "20260930z5";
+/// current build (that cost a whole debugging pass). The value is emitted by
+/// `build.rs` at compile time (`GN_SHIM_BUILD`); it used to be a hardcoded
+/// constant that never advanced, so every rebuild reported the same date.
+pub const SHIM_BUILD: &str = env!("GN_SHIM_BUILD");
 
 /// Signature recovered from libvulkan_wrapper.so's call site: dlopen flags,
 /// feature bitmask (bit0 always set, bit1 = file redirect dir present), temp
@@ -293,6 +311,13 @@ fn try_adrenotools() {
         "using adrenotools driver {label} via WSI proxy (headless surface + dma-buf export) [shim {}]",
         SHIM_BUILD
     );
+}
+
+/// The real driver .so handle the shim opened (adrenotools- or freedreno-
+/// backed). The proxy uses it to resolve an entry point it intercepts but must
+/// forward unchanged in a process where the proxy is not active.
+pub fn driver_handle() -> *mut c_void {
+    unsafe { DRIVER.handle }
 }
 
 fn dlerror_str() -> String {

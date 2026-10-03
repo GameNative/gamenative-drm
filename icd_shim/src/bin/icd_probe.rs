@@ -42,12 +42,21 @@ fn fail(code: i32, msg: String) -> ! {
 fn main() {
     let mut comm: Option<String> = None;
     let mut so_path: Option<String> = None;
+    let mut xlib_window: Option<u64> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         if a == "--comm" {
             comm = Some(
                 args.next()
                     .unwrap_or_else(|| fail(64, "--comm needs a value".into())),
+            );
+        } else if a == "--xlib-window" {
+            let v = args
+                .next()
+                .unwrap_or_else(|| fail(64, "--xlib-window needs a value".into()));
+            xlib_window = Some(
+                v.parse()
+                    .unwrap_or_else(|_| fail(64, format!("--xlib-window {v} is not a number"))),
             );
         } else if so_path.is_none() {
             so_path = Some(a);
@@ -208,6 +217,52 @@ fn main() {
         );
     }
     println!("PROBE phys_devices={n_pds}");
+
+    // Exercise the surface entry point the guest actually reaches. winex11.drv
+    // maps the app HWND to an X window and calls vkCreateXlibSurfaceKHR with
+    // that XID; VK_KHR_win32_surface is winevulkan's client-side name and never
+    // arrives at an ICD. Driving the name here proves the shim intercepts it
+    // and that its route decision is always reported, whatever X is reachable.
+    if let Some(window) = xlib_window {
+        let create_xlib: Option<
+            unsafe extern "C" fn(
+                vk::VkInstance,
+                *const vk::VkXlibSurfaceCreateInfoKHR,
+                *const c_void,
+                *mut vk::VkSurfaceKHR,
+            ) -> vk::VkResult,
+        > = unsafe { std::mem::transmute(gipa(inst, cs(b"vkCreateXlibSurfaceKHR\0"))) };
+        let Some(create_xlib) = create_xlib else {
+            fail(
+                9,
+                "GIPA(vkCreateXlibSurfaceKHR) returned null: the shim does not intercept the \
+                 X11 surface entry point"
+                    .into(),
+            );
+        };
+        let ci = vk::VkXlibSurfaceCreateInfoKHR {
+            sType: vk::VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR,
+            pNext: ptr::null(),
+            flags: 0,
+            dpy: ptr::null_mut(),
+            window: window as usize,
+        };
+        let mut surf: vk::VkSurfaceKHR = 0;
+        let r = unsafe { create_xlib(inst, &ci, ptr::null(), &mut surf) };
+        println!("PROBE xlib_surface window={window:#x} result={r} surface={surf:#x}");
+        if r != vk::VK_SUCCESS || surf == 0 {
+            fail(
+                9,
+                format!("vkCreateXlibSurfaceKHR -> {r} surface={surf:#x}"),
+            );
+        }
+        let destroy_surface: Option<
+            unsafe extern "C" fn(vk::VkInstance, vk::VkSurfaceKHR, *const c_void),
+        > = unsafe { std::mem::transmute(gipa(inst, cs(b"vkDestroySurfaceKHR\0"))) };
+        if let Some(destroy_surface) = destroy_surface {
+            unsafe { destroy_surface(inst, surf, ptr::null()) };
+        }
+    }
 
     if let Some(destroy) = unsafe { gipa(inst, cs(b"vkDestroyInstance\0")) }.map(|f| unsafe {
         std::mem::transmute::<unsafe extern "C" fn(), vk::PFN_vkDestroyInstance>(f)

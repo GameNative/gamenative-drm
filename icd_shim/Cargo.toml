@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Passthrough-or-proxy Vulkan ICD for GameNative's GameScope mode"
 
-# NEEDEDs stay libc/libdl/libwayland-client — no libvulkan, every real
-# driver symbol resolves via dlopen/dlsym at runtime (see lib.rs).
+# NEEDEDs are libc/libdl/libwayland-client plus the X11 present set
+# (libxcb, libxcb-dri3, libxcb-present, libxcb-sync) — no libvulkan, every
+# real driver symbol resolves via dlopen/dlsym at runtime (see lib.rs).
 # The rlib half exists so the probe binary and the host integration tests
 # can reuse the vk FFI types; the shipped artifact is the cdylib.
 [lib]

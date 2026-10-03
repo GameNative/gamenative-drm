@@ -711,6 +711,60 @@ const SPV_VB_FRAG: &[u8] = include_bytes!("../../shaders/vb.frag.spv");
 const NUM_SCENE_FRAMES: usize = 40;
 const PUSH_BYTES: u32 = 32;
 
+// ------------------------------------------- dynamic rendering (KHR/core 1.3)
+// DXVK 2.7 draws through VK_KHR_dynamic_rendering (vkCmdBeginRendering), not
+// render passes. The remote game path is exactly that, so the draw scenes
+// carry a dynamic-rendering twin of the render-pass "quad" control: same
+// geometry, shaders and expectation, only the rendering path differs.
+// Definitions live here because gn_utils::vk mirrors the core-1.0 subset.
+const VK_STRUCTURE_TYPE_RENDERING_INFO: i32 = 1_000_044_000;
+const VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO: i32 = 1_000_044_001;
+const VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO: i32 = 1_000_044_002;
+
+#[repr(C)]
+struct VkRenderingAttachmentInfo {
+    sType: i32,
+    pNext: *const c_void,
+    imageView: VkImageView,
+    imageLayout: VkImageLayout,
+    resolveMode: u32,
+    resolveImageView: VkImageView,
+    resolveImageLayout: VkImageLayout,
+    loadOp: VkAttachmentLoadOp,
+    storeOp: VkAttachmentStoreOp,
+    clearValue: VkClearValue,
+}
+
+#[repr(C)]
+struct VkRenderingInfo {
+    sType: i32,
+    pNext: *const c_void,
+    flags: u32,
+    renderArea: VkRect2D,
+    layerCount: u32,
+    viewMask: u32,
+    colorAttachmentCount: u32,
+    pColorAttachments: *const VkRenderingAttachmentInfo,
+    pDepthAttachment: *const VkRenderingAttachmentInfo,
+    pStencilAttachment: *const VkRenderingAttachmentInfo,
+}
+
+#[repr(C)]
+struct VkPipelineRenderingCreateInfo {
+    sType: i32,
+    pNext: *const c_void,
+    viewMask: u32,
+    colorAttachmentCount: u32,
+    pColorAttachmentFormats: *const VkFormat,
+    depthAttachmentFormat: VkFormat,
+    stencilAttachmentFormat: VkFormat,
+}
+
+#[allow(non_camel_case_types)]
+type PFN_vkCmdBeginRendering = unsafe extern "C" fn(VkCommandBuffer, *const VkRenderingInfo);
+#[allow(non_camel_case_types)]
+type PFN_vkCmdEndRendering = unsafe extern "C" fn(VkCommandBuffer);
+
 struct Draw {
     rp_clear: VkRenderPass,
     rp_load: VkRenderPass,
@@ -736,6 +790,10 @@ struct Draw {
     p_texel: VkPipeline,
     p_lod: VkPipeline,
     p_vb: VkPipeline,
+    p_dyn: VkPipeline,
+    p_dyntex: VkPipeline,
+    cmd_begin_rendering: Option<PFN_vkCmdBeginRendering>,
+    cmd_end_rendering: Option<PFN_vkCmdEndRendering>,
     layout: VkPipelineLayout,
     build_pool: VkDescriptorPool,
     set_layout: VkDescriptorSetLayout,
@@ -1109,9 +1167,25 @@ unsafe fn make_pipeline(
             dynamicStateCount: dyn_states.len() as u32,
             pDynamicStates: dyn_states.as_ptr(),
         };
+        // A null render pass means a dynamic-rendering pipeline (DXVK's path):
+        // render-pass compatibility is carried in a pNext chain instead.
+        let dyn_fmt = (*vk).sc_format;
+        let dyn_ci = VkPipelineRenderingCreateInfo {
+            sType: VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+            pNext: ptr::null(),
+            viewMask: 0,
+            colorAttachmentCount: 1,
+            pColorAttachmentFormats: &dyn_fmt,
+            depthAttachmentFormat: 0,
+            stencilAttachmentFormat: 0,
+        };
         let gp = VkGraphicsPipelineCreateInfo {
             sType: VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-            pNext: ptr::null(),
+            pNext: if rp == 0 {
+                &dyn_ci as *const VkPipelineRenderingCreateInfo as *const c_void
+            } else {
+                ptr::null()
+            },
             flags: 0,
             stageCount: 2,
             pStages: stages.as_ptr(),
@@ -2388,6 +2462,45 @@ unsafe fn draw_init() -> i32 {
             VK_FRONT_FACE_CLOCKWISE,
         );
 
+        // Dynamic-rendering twin of p_full (same vert/frag state, null render
+        // pass + VkPipelineRenderingCreateInfo): the DXVK path.
+        let p_dyn = make_pipeline(
+            0,
+            layout,
+            vert_full,
+            frag_colour,
+            false,
+            false,
+            false,
+            VK_CULL_MODE_NONE,
+            VK_FRONT_FACE_COUNTER_CLOCKWISE,
+        );
+        // Dynamic-rendering twin of p_tex: samples the 2x2 texture through a
+        // descriptor set while rendering into a dynamic-rendering pass. Used by
+        // the "dyntex" scene (DXVK's offscreen-render-then-blit present model).
+        let p_dyntex = make_pipeline(
+            0,
+            layout,
+            vert_rect,
+            frag_tex,
+            false,
+            false,
+            false,
+            VK_CULL_MODE_NONE,
+            VK_FRONT_FACE_COUNTER_CLOCKWISE,
+        );
+        let cmd_begin_rendering: Option<PFN_vkCmdBeginRendering> = std::mem::transmute(
+            vkGetDeviceProcAddr((*vk).dev, c"vkCmdBeginRendering".as_ptr()),
+        );
+        let cmd_end_rendering: Option<PFN_vkCmdEndRendering> = std::mem::transmute(
+            vkGetDeviceProcAddr((*vk).dev, c"vkCmdEndRendering".as_ptr()),
+        );
+        logf!(
+            "dynamic rendering: begin={} end={}",
+            cmd_begin_rendering.is_some(),
+            cmd_end_rendering.is_some()
+        );
+
         DRAW = Some(Draw {
             rp_clear,
             rp_load,
@@ -2412,6 +2525,10 @@ unsafe fn draw_init() -> i32 {
             p_uv,
             p_texel,
             p_vb,
+            p_dyn,
+            p_dyntex,
+            cmd_begin_rendering,
+            cmd_end_rendering,
             layout,
             build_pool: dpool,
             set_layout,
@@ -2594,6 +2711,229 @@ unsafe fn record_scene(cmd: VkCommandBuffer, scene: &str, idx: u32, last: bool) 
                 // Render-pass clear: attachment path only.
                 begin_pass(cmd, false, fb, [0.9, 0.1, 0.6, 1.0]);
                 vkCmdEndRenderPass(cmd);
+            }
+            "dyn" => {
+                // Dynamic rendering (vkCmdBeginRendering, core 1.3) — DXVK's
+                // path. Same fullscreen triangle and colour as the render-pass
+                // "quad" control, so the two are directly comparable.
+                let view = d._views[idx as usize];
+                let att = VkRenderingAttachmentInfo {
+                    sType: VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                    pNext: ptr::null(),
+                    imageView: view,
+                    imageLayout: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    resolveMode: 0,
+                    resolveImageView: 0,
+                    resolveImageLayout: VK_IMAGE_LAYOUT_UNDEFINED,
+                    loadOp: VK_ATTACHMENT_LOAD_OP_CLEAR,
+                    storeOp: VK_ATTACHMENT_STORE_OP_STORE,
+                    clearValue: VkClearValue {
+                        color: VkClearColorValue {
+                            float32: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                };
+                let ri = VkRenderingInfo {
+                    sType: VK_STRUCTURE_TYPE_RENDERING_INFO,
+                    pNext: ptr::null(),
+                    flags: 0,
+                    renderArea: VkRect2D {
+                        offset: VkOffset2D { x: 0, y: 0 },
+                        extent: (*vk).sc_extent,
+                    },
+                    layerCount: 1,
+                    viewMask: 0,
+                    colorAttachmentCount: 1,
+                    pColorAttachments: &att,
+                    pDepthAttachment: ptr::null(),
+                    pStencilAttachment: ptr::null(),
+                };
+                if let Some(begin) = d.cmd_begin_rendering {
+                    begin(cmd, &ri);
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, d.p_dyn);
+                    vkCmdSetViewport(cmd, 0, 1, &vp);
+                    vkCmdSetScissor(cmd, 0, 1, &scissor);
+                    push_rect(cmd, FULL, [0.8, 0.2, 0.2, 1.0]);
+                    vkCmdDraw(cmd, 3, 1, 0, 0);
+                    if let Some(end) = d.cmd_end_rendering {
+                        end(cmd);
+                    }
+                } else {
+                    logf!("scene dyn: vkCmdBeginRendering unavailable");
+                }
+            }
+            "dyntex" => {
+                // DXVK's present model: a dynamic-rendering pass
+                // (vkCmdBeginRendering) that SAMPLES a texture through a
+                // descriptor set and renders into an offscreen TILING_OPTIMAL
+                // image, then blits that image into the swapchain slot. If the
+                // shim's LINEAR export of the slot is what blocks the game's
+                // frames this is the scene that should fail through the shim
+                // while the raw driver passes; run both and compare the PPMs.
+                let off_vp = VkViewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 320.0,
+                    height: 240.0,
+                    minDepth: 0.0,
+                    maxDepth: 1.0,
+                };
+                let off_sc = VkRect2D {
+                    offset: VkOffset2D { x: 0, y: 0 },
+                    extent: VkExtent2D {
+                        width: 320,
+                        height: 240,
+                    },
+                };
+                // Slot -> transfer destination (blit target).
+                barrier_img(
+                    cmd,
+                    img,
+                    Transition {
+                        from: VK_IMAGE_LAYOUT_UNDEFINED,
+                        to: VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        src_access: 0,
+                        dst_access: VK_ACCESS_TRANSFER_WRITE_BIT,
+                        src_stage: VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        dst_stage: VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    },
+                );
+                // Offscreen -> colour attachment.
+                barrier_img(
+                    cmd,
+                    d.off_img,
+                    Transition {
+                        from: VK_IMAGE_LAYOUT_UNDEFINED,
+                        to: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        src_access: 0,
+                        dst_access: VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                        src_stage: VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        dst_stage: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    },
+                );
+                let att = VkRenderingAttachmentInfo {
+                    sType: VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                    pNext: ptr::null(),
+                    imageView: d._off_view,
+                    imageLayout: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    resolveMode: 0,
+                    resolveImageView: 0,
+                    resolveImageLayout: VK_IMAGE_LAYOUT_UNDEFINED,
+                    loadOp: VK_ATTACHMENT_LOAD_OP_CLEAR,
+                    storeOp: VK_ATTACHMENT_STORE_OP_STORE,
+                    clearValue: VkClearValue {
+                        color: VkClearColorValue {
+                            float32: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                };
+                let ri = VkRenderingInfo {
+                    sType: VK_STRUCTURE_TYPE_RENDERING_INFO,
+                    pNext: ptr::null(),
+                    flags: 0,
+                    renderArea: VkRect2D {
+                        offset: VkOffset2D { x: 0, y: 0 },
+                        extent: VkExtent2D {
+                            width: 320,
+                            height: 240,
+                        },
+                    },
+                    layerCount: 1,
+                    viewMask: 0,
+                    colorAttachmentCount: 1,
+                    pColorAttachments: &att,
+                    pDepthAttachment: ptr::null(),
+                    pStencilAttachment: ptr::null(),
+                };
+                if let Some(begin) = d.cmd_begin_rendering {
+                    begin(cmd, &ri);
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, d.p_dyntex);
+                    vkCmdSetViewport(cmd, 0, 1, &off_vp);
+                    vkCmdSetScissor(cmd, 0, 1, &off_sc);
+                    let sets = [d.set_tex];
+                    vkCmdBindDescriptorSets(
+                        cmd,
+                        VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        d.layout,
+                        0,
+                        1,
+                        sets.as_ptr(),
+                        0,
+                        ptr::null(),
+                    );
+                    push_rect(cmd, FULL, [1.0, 1.0, 1.0, 1.0]);
+                    vkCmdDraw(cmd, 4, 1, 0, 0);
+                    if let Some(end) = d.cmd_end_rendering {
+                        end(cmd);
+                    }
+                } else {
+                    logf!("scene dyntex: vkCmdBeginRendering unavailable");
+                }
+                // Offscreen -> transfer source.
+                barrier_img(
+                    cmd,
+                    d.off_img,
+                    Transition {
+                        from: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        to: VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        src_access: VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                        dst_access: VK_ACCESS_TRANSFER_READ_BIT,
+                        src_stage: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        dst_stage: VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    },
+                );
+                let region = VkImageBlit {
+                    srcSubresource: VkImageSubresourceLayers {
+                        aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
+                        mipLevel: 0,
+                        baseArrayLayer: 0,
+                        layerCount: 1,
+                    },
+                    srcOffsets: [
+                        VkOffset3D { x: 0, y: 0, z: 0 },
+                        VkOffset3D {
+                            x: 320,
+                            y: 240,
+                            z: 1,
+                        },
+                    ],
+                    dstSubresource: VkImageSubresourceLayers {
+                        aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
+                        mipLevel: 0,
+                        baseArrayLayer: 0,
+                        layerCount: 1,
+                    },
+                    dstOffsets: [
+                        VkOffset3D { x: 0, y: 0, z: 0 },
+                        VkOffset3D {
+                            x: (*vk).sc_extent.width as i32,
+                            y: (*vk).sc_extent.height as i32,
+                            z: 1,
+                        },
+                    ],
+                };
+                vkCmdBlitImage(
+                    cmd,
+                    d.off_img,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    img,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    1,
+                    &region,
+                    VK_FILTER_LINEAR,
+                );
+                barrier_img(
+                    cmd,
+                    img,
+                    Transition {
+                        from: VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        to: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        src_access: VK_ACCESS_TRANSFER_WRITE_BIT,
+                        dst_access: VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                        src_stage: VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        dst_stage: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    },
+                );
             }
             "cull" => {
                 // Face culling + winding, both controls, same viewport and
@@ -3299,6 +3639,8 @@ unsafe fn readback(scene: &str) -> i32 {
             "resize" => near(&l, [204, 51, 51], 24) && near(&r, [204, 51, 51], 24),
             "rpclear" => near(&l, [230, 26, 153], 24) && near(&r, [230, 26, 153], 24),
             "quad" => near(&l, [204, 51, 51], 24) && near(&r, [204, 51, 51], 24),
+            // Dynamic-rendering twin of "quad": identical expectation.
+            "dyn" => near(&l, [204, 51, 51], 24) && near(&r, [204, 51, 51], 24),
             "blend" => near(&l, [127, 76, 0], 30) && near(&r, [0, 153, 0], 30),
             "load" => whiteish(&l) && near(&r, [255, 0, 0], 30),
             "vtx" => dom(&q[2], 0) && dom(&q[3], 1) && dom(&q[0], 2) && whiteish(&q[1]),
@@ -3306,7 +3648,7 @@ unsafe fn readback(scene: &str) -> i32 {
             "blit" => near(&l, [51, 153, 51], 30) && near(&r, [51, 153, 51], 30),
             "bigtex" | "bigtex_bgra" => near(&l, [200, 30, 30], 30) && near(&r, [30, 200, 30], 30),
             "bigtex_srgb" => l[0] > 100 && l[1] < 60 && l[2] < 60 && r[1] > 100,
-            "uv" | "texel" | "tex" => {
+            "uv" | "texel" | "tex" | "dyntex" => {
                 let white = |a: &[i32; 3]| whiteish(a);
                 let black = |a: &[i32; 3]| blackish(a);
                 (white(&q[0]) && black(&q[1]) && black(&q[2]) && white(&q[3]))
@@ -4127,7 +4469,7 @@ fn run() -> i32 {
     if let Some(scenes) = std::env::var_os("GNDRAW_SCENES").filter(|v| !v.is_empty()) {
         let list = scenes.to_string_lossy();
         let list = if list == "all" {
-            "clear,rpclear,quad,blend,load,vtx,uv,texel,tex,upload,bigtex,bigtex_bgra,bigtex_srgb,depth,blit,resize,cull"
+            "clear,rpclear,quad,dyn,dyntex,blend,load,vtx,uv,texel,tex,upload,bigtex,bigtex_bgra,bigtex_srgb,depth,blit,resize,cull"
         } else {
             list.as_ref()
         };

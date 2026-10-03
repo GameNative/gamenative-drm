@@ -691,6 +691,7 @@ pub struct VkClearColorValue {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct VkOffset3D {
     pub x: i32,
     pub y: i32,
@@ -869,5 +870,381 @@ pub type PFN_vkQueueSubmit =
     unsafe extern "C" fn(VkQueue, u32, *const VkSubmitInfo, VkFence) -> VkResult;
 pub type PFN_vkQueueSubmit2 =
     unsafe extern "C" fn(VkQueue, u32, *const VkSubmitInfo2, VkFence) -> VkResult;
+pub type PFN_vkQueueWaitIdle = unsafe extern "C" fn(VkQueue) -> VkResult;
 pub type PFN_vkDeviceWaitIdle = unsafe extern "C" fn(VkDevice) -> VkResult;
 pub type PFN_vkDestroyDevice = unsafe extern "C" fn(VkDevice, *const VkAllocationCallbacks);
+
+// ------------------------------------------- driver read-back (bring-up probe)
+//
+// Used only by the bounded one-shot two-view probe: copy a slot image into a
+// host-visible staging buffer through the driver itself, so what the driver
+// believes the image contains can be compared with the shim's own linear mmap.
+pub type VkBuffer = u64;
+pub type VkBufferUsageFlags = u32;
+pub type VkBufferCreateFlags = u32;
+pub const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: VkStructureType = 12;
+pub const VK_BUFFER_USAGE_TRANSFER_SRC_BIT: VkBufferUsageFlags = 0x1;
+pub const VK_BUFFER_USAGE_TRANSFER_DST_BIT: VkBufferUsageFlags = 0x2;
+pub const VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: VkImageLayout = 6;
+pub const VK_ACCESS_TRANSFER_READ_BIT: VkAccessFlags = 0x800;
+pub const VK_ACCESS_MEMORY_READ_BIT: VkAccessFlags = 0x8000;
+pub const VK_ACCESS_MEMORY_WRITE_BIT: VkAccessFlags = 0x10000;
+pub const VK_PIPELINE_STAGE_HOST_BIT: VkPipelineStageFlags = 0x4000;
+pub const VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT: u32 = 0x2;
+pub const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: u32 = 0x4;
+pub const VK_WHOLE_SIZE: VkDeviceSize = !0u64;
+
+#[repr(C)]
+pub struct VkBufferCreateInfo {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub flags: VkBufferCreateFlags,
+    pub size: VkDeviceSize,
+    pub usage: VkBufferUsageFlags,
+    pub sharingMode: VkSharingMode,
+    pub queueFamilyIndexCount: u32,
+    pub pQueueFamilyIndices: *const u32,
+}
+
+#[repr(C)]
+pub struct VkBufferImageCopy {
+    pub bufferOffset: VkDeviceSize,
+    pub bufferRowLength: u32,
+    pub bufferImageHeight: u32,
+    pub imageSubresource: VkImageSubresource,
+    pub imageOffset: VkOffset3D,
+    pub imageExtent: VkExtent3D,
+}
+
+pub type PFN_vkCreateBuffer = unsafe extern "C" fn(
+    VkDevice,
+    *const VkBufferCreateInfo,
+    *const VkAllocationCallbacks,
+    *mut VkBuffer,
+) -> VkResult;
+pub type PFN_vkDestroyBuffer =
+    unsafe extern "C" fn(VkDevice, VkBuffer, *const VkAllocationCallbacks);
+pub type PFN_vkGetBufferMemoryRequirements =
+    unsafe extern "C" fn(VkDevice, VkBuffer, *mut VkMemoryRequirements);
+pub type PFN_vkBindBufferMemory =
+    unsafe extern "C" fn(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize) -> VkResult;
+pub type PFN_vkCreateCommandPool = unsafe extern "C" fn(
+    VkDevice,
+    *const VkCommandPoolCreateInfo,
+    *const VkAllocationCallbacks,
+    *mut VkCommandPool,
+) -> VkResult;
+pub type PFN_vkDestroyCommandPool =
+    unsafe extern "C" fn(VkDevice, VkCommandPool, *const VkAllocationCallbacks);
+pub type PFN_vkBeginCommandBuffer =
+    unsafe extern "C" fn(VkCommandBuffer, *const VkCommandBufferBeginInfo) -> VkResult;
+pub type PFN_vkEndCommandBuffer = unsafe extern "C" fn(VkCommandBuffer) -> VkResult;
+pub type PFN_vkCmdPipelineBarrier = unsafe extern "C" fn(
+    VkCommandBuffer,
+    VkPipelineStageFlags,
+    VkPipelineStageFlags,
+    u32,
+    u32,
+    *const c_void,
+    u32,
+    *const c_void,
+    u32,
+    *const VkImageMemoryBarrier,
+);
+pub type PFN_vkCmdCopyImageToBuffer = unsafe extern "C" fn(
+    VkCommandBuffer,
+    VkImage,
+    VkImageLayout,
+    VkBuffer,
+    u32,
+    *const VkBufferImageCopy,
+);
+pub type PFN_vkMapMemory = unsafe extern "C" fn(
+    VkDevice,
+    VkDeviceMemory,
+    VkDeviceSize,
+    VkDeviceSize,
+    VkMemoryMapFlags,
+    *mut *mut c_void,
+) -> VkResult;
+pub type PFN_vkUnmapMemory = unsafe extern "C" fn(VkDevice, VkDeviceMemory);
+
+pub const VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE: VkStructureType = 6;
+
+#[repr(C)]
+pub struct VkMappedMemoryRange {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub memory: VkDeviceMemory,
+    pub offset: VkDeviceSize,
+    pub size: VkDeviceSize,
+}
+pub type PFN_vkInvalidateMappedMemoryRanges =
+    unsafe extern "C" fn(VkDevice, u32, *const VkMappedMemoryRange) -> VkResult;
+
+// ---------------------------------------- guest-command trace region structs
+// Read only by the bounded one-shot `x11 cmd` trace, to name the image and the
+// transfer extent a recorded copy/blit/clear targets — never by a present path.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkImageSubresourceLayers {
+    pub aspectMask: VkImageAspectFlags,
+    pub mipLevel: u32,
+    pub baseArrayLayer: u32,
+    pub layerCount: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkImageCopy {
+    pub srcSubresource: VkImageSubresourceLayers,
+    pub srcOffset: VkOffset3D,
+    pub dstSubresource: VkImageSubresourceLayers,
+    pub dstOffset: VkOffset3D,
+    pub extent: VkExtent3D,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkImageBlit {
+    pub srcSubresource: VkImageSubresourceLayers,
+    pub srcOffsets: [VkOffset3D; 2],
+    pub dstSubresource: VkImageSubresourceLayers,
+    pub dstOffsets: [VkOffset3D; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkCopyImageInfo2 {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub srcImage: VkImage,
+    pub srcImageLayout: VkImageLayout,
+    pub dstImage: VkImage,
+    pub dstImageLayout: VkImageLayout,
+    pub regionCount: u32,
+    pub pRegions: *const VkImageCopy,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkBlitImageInfo2 {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub srcImage: VkImage,
+    pub srcImageLayout: VkImageLayout,
+    pub dstImage: VkImage,
+    pub dstImageLayout: VkImageLayout,
+    pub regionCount: u32,
+    pub pRegions: *const VkImageBlit,
+    pub filter: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkCopyBufferToImageInfo2 {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub srcBuffer: VkBuffer,
+    pub dstImage: VkImage,
+    pub dstImageLayout: VkImageLayout,
+    pub regionCount: u32,
+    pub pRegions: *const VkBufferImageCopy,
+}
+
+pub type VkFilter = i32;
+
+pub type PFN_vkCmdClearColorImage = unsafe extern "C" fn(
+    VkCommandBuffer,
+    VkImage,
+    VkImageLayout,
+    *const VkClearColorValue,
+    u32,
+    *const VkImageSubresourceRange,
+);
+pub type PFN_vkCmdCopyImage = unsafe extern "C" fn(
+    VkCommandBuffer,
+    VkImage,
+    VkImageLayout,
+    VkImage,
+    VkImageLayout,
+    u32,
+    *const VkImageCopy,
+);
+pub type PFN_vkCmdCopyImage2 = unsafe extern "C" fn(VkCommandBuffer, *const VkCopyImageInfo2);
+pub type PFN_vkCmdBlitImage = unsafe extern "C" fn(
+    VkCommandBuffer,
+    VkImage,
+    VkImageLayout,
+    VkImage,
+    VkImageLayout,
+    u32,
+    *const VkImageBlit,
+    VkFilter,
+);
+pub type PFN_vkCmdBlitImage2 = unsafe extern "C" fn(VkCommandBuffer, *const VkBlitImageInfo2);
+pub type PFN_vkCmdCopyBufferToImage = unsafe extern "C" fn(
+    VkCommandBuffer,
+    VkBuffer,
+    VkImage,
+    VkImageLayout,
+    u32,
+    *const VkBufferImageCopy,
+);
+pub type PFN_vkCmdCopyBufferToImage2 =
+    unsafe extern "C" fn(VkCommandBuffer, *const VkCopyBufferToImageInfo2);
+
+// ------------------------------- synchronization2 (vkCmdPipelineBarrier2)
+// DXVK 2.7 uses VK_KHR_synchronization2: layout transitions of the swapchain
+// image arrive as vkCmdPipelineBarrier2, not vkCmdPipelineBarrier.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkImageMemoryBarrier2 {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub srcStageMask: u64,
+    pub srcAccessMask: u64,
+    pub dstStageMask: u64,
+    pub dstAccessMask: u64,
+    pub srcQueueFamilyIndex: u32,
+    pub dstQueueFamilyIndex: u32,
+    pub image: VkImage,
+    pub subresourceRange: VkImageSubresourceRange,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkDependencyInfo {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub dependencyFlags: u32,
+    pub memoryBarrierCount: u32,
+    pub pMemoryBarriers: *const c_void,
+    pub bufferMemoryBarrierCount: u32,
+    pub pBufferMemoryBarriers: *const c_void,
+    pub imageMemoryBarrierCount: u32,
+    pub pImageMemoryBarriers: *const VkImageMemoryBarrier2,
+}
+pub type PFN_vkCmdPipelineBarrier2 = unsafe extern "C" fn(VkCommandBuffer, *const VkDependencyInfo);
+
+// ------------------------------- render-pass trace (vkCmdBeginRenderPass)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkOffset2D {
+    pub x: i32,
+    pub y: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkRect2D {
+    pub offset: VkOffset2D,
+    pub extent: VkExtent2D,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkRenderPassBeginInfo {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub renderPass: u64,
+    pub framebuffer: u64,
+    pub renderArea: VkRect2D,
+    pub clearValueCount: u32,
+    pub pClearValues: *const VkClearValue,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkClearValue {
+    pub float32: [f32; 4],
+}
+pub type PFN_vkCmdBeginRenderPass =
+    unsafe extern "C" fn(VkCommandBuffer, *const VkRenderPassBeginInfo, i32);
+
+// ------------------------------- view/framebuffer tracking (render-pass target)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkComponentMapping {
+    pub r: i32,
+    pub g: i32,
+    pub b: i32,
+    pub a: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkImageViewCreateInfo {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub image: VkImage,
+    pub viewType: i32,
+    pub format: i32,
+    pub components: VkComponentMapping,
+    pub subresourceRange: VkImageSubresourceRange,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkFramebufferCreateInfo {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub renderPass: u64,
+    pub attachmentCount: u32,
+    pub pAttachments: *const u64,
+    pub width: u32,
+    pub height: u32,
+    pub layers: u32,
+}
+pub type VkImageView = u64;
+pub type VkFramebuffer = u64;
+pub type PFN_vkCreateImageView = unsafe extern "C" fn(
+    VkDevice,
+    *const VkImageViewCreateInfo,
+    *const VkAllocationCallbacks,
+    *mut VkImageView,
+) -> VkResult;
+pub type PFN_vkCreateFramebuffer = unsafe extern "C" fn(
+    VkDevice,
+    *const VkFramebufferCreateInfo,
+    *const VkAllocationCallbacks,
+    *mut VkFramebuffer,
+) -> VkResult;
+
+// ------------------------------- dynamic rendering (vkCmdBeginRendering)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkRenderingAttachmentInfo {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub imageView: VkImageView,
+    pub imageLayout: VkImageLayout,
+    pub resolveMode: i32,
+    pub resolveImageView: VkImageView,
+    pub resolveImageLayout: VkImageLayout,
+    pub loadOp: i32,
+    pub storeOp: i32,
+    pub clearValue: VkClearValue,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkRenderingInfo {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub renderArea: VkRect2D,
+    pub layerCount: u32,
+    pub viewMask: u32,
+    pub colorAttachmentCount: u32,
+    pub pColorAttachments: *const VkRenderingAttachmentInfo,
+    pub pDepthAttachment: *const VkRenderingAttachmentInfo,
+    pub pStencilAttachment: *const VkRenderingAttachmentInfo,
+}
+pub type PFN_vkCmdBeginRendering = unsafe extern "C" fn(VkCommandBuffer, *const VkRenderingInfo);
+
+pub type VkSubpassContents = i32;
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkSubpassBeginInfo {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub contents: VkSubpassContents,
+}
+pub type PFN_vkCmdBeginRenderPass2 =
+    unsafe extern "C" fn(VkCommandBuffer, *const VkRenderPassBeginInfo, *const VkSubpassBeginInfo);
