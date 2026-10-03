@@ -3393,6 +3393,24 @@ pub fn device_func(name: &CStr) -> PFN_vkVoidFunction {
         .and_then(|(_, _, f)| *f)
 }
 
+/// Handler-registry lookup for the loader-facing ICD entry points. The shim
+/// only hands out its own handlers while the WSI proxy is active: every handler
+/// translates shim wrapper handles (devices, queues, command buffers,
+/// surfaces, swapchains) into the driver's real ones, and the proxy is the only
+/// thing that creates them. With the proxy inactive no wrapper exists, so no
+/// shim handler may be served — the caller must fall through to the driver's
+/// own entry point, which `serve_unlisted` returns unchanged. Without this gate
+/// a proxy-owned WSI command (e.g. `vkCreateSwapchainKHR`) is handed out in the
+/// fallback path and fails there with `VK_ERROR_INITIALIZATION_FAILED`, because
+/// the surface it needs is one the proxy would have created. `proxy` is passed
+/// in rather than read from `DRIVER` so the rule is host-testable.
+pub fn entrypoint_handler(name: &CStr, proxy: bool) -> PFN_vkVoidFunction {
+    if !proxy {
+        return None;
+    }
+    instance_func(name).or_else(|| device_func(name))
+}
+
 /// Which entry point is resolving an unlisted name. It decides how a name the
 /// registry cannot classify is treated, because the entry point already fixes
 /// the argument-0 domain: `vkGetDeviceProcAddr` is only ever asked for
@@ -3528,6 +3546,44 @@ mod tests {
         assert!(device_func(c"vkCreateSamplerYcbcrConversion").is_some());
         assert!(instance_func(c"vkGetDeviceProcAddr").is_some());
         assert!(SHIM_HANDLERS.len() >= 61);
+    }
+
+    /// A shim handler may only be handed out while the WSI proxy is active:
+    /// that is the only time the shim owns wrapper handles, and every handler
+    /// translates those wrappers into the driver's real ones. The proxy-owned
+    /// WSI commands are the case that regressed the fallback path — served
+    /// without the proxy, `gn_vkCreateSwapchainKHR` found no shim surface and
+    /// returned `VK_ERROR_INITIALIZATION_FAILED` (see `gn_vkCreateSwapchainKHR`
+    /// and the `find_surface` guard). With the proxy inactive the entry point
+    /// must serve nothing and let the driver's own entry point through, which
+    /// `serve_unlisted` returns unchanged.
+    #[test]
+    fn every_handler_is_gated_on_the_proxy() {
+        let proxy_owned_wsi: [&CStr; 6] = [
+            c"vkCreateSwapchainKHR",
+            c"vkGetSwapchainImagesKHR",
+            c"vkAcquireNextImageKHR",
+            c"vkAcquireNextImage2KHR",
+            c"vkQueuePresentKHR",
+            c"vkDestroySwapchainKHR",
+        ];
+        for name in proxy_owned_wsi {
+            assert!(
+                entrypoint_handler(name, false).is_none(),
+                "{} is handed out without the proxy: the fallback path would reach the shim's WSI",
+                name.to_str().unwrap()
+            );
+            assert!(
+                entrypoint_handler(name, true).is_some(),
+                "{} is not served while the proxy is active",
+                name.to_str().unwrap()
+            );
+        }
+        // Instance- and device-level handlers follow the same gate.
+        for name in [c"vkCreateDevice", c"vkQueueSubmit"] {
+            assert!(entrypoint_handler(name, false).is_none());
+            assert!(entrypoint_handler(name, true).is_some());
+        }
     }
 
     /// The registry (generated from vk.xml) must classify each command's level

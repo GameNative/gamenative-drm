@@ -428,17 +428,14 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
     let name = unsafe { CStr::from_ptr(pName) };
     // The loader asks this entry point for instance- and physical-device-level
     // names, but the ICD contract is that it resolves *all* names, so device
-    // names are answered here too. Names in the handler registry are
-    // intercepted; every other name is served through the one unlisted-name
-    // policy (`proxy::serve_unlisted`), which reads the command's level from
-    // the generated registry and never hands the guest the driver's raw pointer
-    // for a name whose argument 0 is a handle the shim wraps.
-    let fnptr = if unsafe { DRIVER.proxy_active } {
-        proxy::instance_func(name)
-    } else {
-        None
-    }
-    .or_else(|| proxy::device_func(name));
+    // names are answered here too. `entrypoint_handler` serves a name the shim
+    // implements, but only while the WSI proxy is active (that is the only time
+    // the shim owns wrapper handles); every other name — and every name at all
+    // when the proxy is inactive — is served through the one unlisted-name
+    // policy (`proxy::serve_unlisted`), which returns the driver's own entry
+    // point so a fallback session uses the driver's own WSI rather than the
+    // shim's, whose surfaces do not exist without the proxy.
+    let fnptr = proxy::entrypoint_handler(name, proxy_active());
     if fnptr.is_some() {
         return fnptr;
     }
@@ -462,15 +459,12 @@ pub unsafe extern "C" fn vk_icdGetPhysicalDeviceProcAddr(
     // Physical-device-level functions (surface queries) resolve through GPDPA
     // as well as GIPA — intercept on both paths, device functions too (see
     // vk_icdGetInstanceProcAddr), and serve the rest through the same
-    // unlisted-name policy. GPDPA never resolves device-level names, so the
-    // policy's swap branch cannot fire here.
+    // unlisted-name policy. Like GIPA, the handler lookup is gated on the proxy
+    // being active, so a fallback session gets the driver's own surface path
+    // rather than the shim's, whose surfaces only the proxy creates. GPDPA never
+    // resolves device-level names, so the policy's swap branch cannot fire here.
     let name = unsafe { CStr::from_ptr(pName) };
-    let fnptr = if unsafe { DRIVER.proxy_active } {
-        proxy::instance_func(name)
-    } else {
-        None
-    }
-    .or_else(|| proxy::device_func(name));
+    let fnptr = proxy::entrypoint_handler(name, proxy_active());
     if fnptr.is_some() {
         return fnptr;
     }

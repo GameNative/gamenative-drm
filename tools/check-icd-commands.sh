@@ -163,4 +163,16 @@ grep -q 'pub fn serve_unlisted' "$PROXY" || fail "proxy::serve_unlisted is missi
 grep -qF "(\"$CRASH_CLASS\", Level::Device," "$GEN" \
     || fail "$CRASH_CLASS is not device-level in the generated registry"
 
+# --- 7. the loader entry points gate every handler on the proxy --------------
+# A shim handler may only be served while the WSI proxy is active — the only
+# time the shim owns wrapper handles. Without the gate the fallback path is
+# handed the shim's own proxy-owned WSI commands, whose surfaces the proxy alone
+# creates, and swapchain creation fails with VK_ERROR_INITIALIZATION_FAILED.
+grep -q 'pub fn entrypoint_handler' "$PROXY" \
+    || fail "proxy::entrypoint_handler (the proxy gate) is missing"
+awk '/pub fn entrypoint_handler/{f=1} f&&/return None;/{ok=1} f&&/^}/{f=0} END{exit ok?0:1}' "$PROXY" \
+    || fail "entrypoint_handler must return None when the proxy is inactive"
+[ "$(grep -c 'proxy::entrypoint_handler(' "$LIB")" -ge 2 ] \
+    || fail "both ICD entry points must gate their handler lookup on the proxy"
+
 echo "PASS: generated dispatch covers every required command and the policy is single"
