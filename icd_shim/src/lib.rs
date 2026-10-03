@@ -85,6 +85,7 @@ pub mod proxy;
 pub mod scanout;
 pub mod thunk;
 pub mod vk;
+pub mod vk_dispatch_gen;
 pub mod wlproto;
 pub mod x11;
 
@@ -393,6 +394,14 @@ fn ensure_init() {
     INIT.call_once(init_once);
 }
 
+/// Whether the shim is presenting through the WSI proxy, i.e. whether it hands
+/// out wrapper handles at all. The dispatch policy swaps a wrapper for the real
+/// handle only when wrappers exist; without the proxy every handle is the
+/// driver's own and is passed straight through.
+pub fn proxy_active() -> bool {
+    unsafe { DRIVER.proxy_active }
+}
+
 /// # Safety: loader-ICD v5 interface (called by the Khronos loader).
 #[allow(non_snake_case)]
 #[no_mangle]
@@ -418,37 +427,12 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
     ensure_init();
     let name = unsafe { CStr::from_ptr(pName) };
     // The loader asks this entry point for instance- and physical-device-level
-    // names (device-level ones come through vkGetDeviceProcAddr), but the ICD
-    // contract is that it resolves *all* names, so device_func() applies in
-    // both modes: a guest that resolved e.g. vkQueueSubmit2 from the driver
-    // would hand it wrapper command buffers and fault. Everything else is
-    // delegated, which is correct because a thunk only translates handles the
-    // shim wraps, and the loader calls these with physical-device handles,
-    // terminator instances or no handle at all.
-    let fnptr = if unsafe { DRIVER.proxy_active } {
-        proxy::instance_func(name)
-    } else {
-        None
-    }
-    .or_else(|| proxy::device_func(name));
-    if fnptr.is_some() {
-        return fnptr;
-    }
-    unsafe { DRIVER.gipa?(instance, pName) }
-}
-
-/// # Safety: loader-ICD v5 interface (called by the Khronos loader).
-#[allow(non_snake_case)]
-#[no_mangle]
-pub unsafe extern "C" fn vk_icdGetPhysicalDeviceProcAddr(
-    instance: VkInstance,
-    pName: *const c_char,
-) -> PFN_vkVoidFunction {
-    ensure_init();
-    // Physical-device-level functions (surface queries) resolve through
-    // GPDPA as well as GIPA — intercept on both paths, device functions too
-    // (see vk_icdGetInstanceProcAddr).
-    let name = unsafe { CStr::from_ptr(pName) };
+    // names, but the ICD contract is that it resolves *all* names, so device
+    // names are answered here too. Names in the handler registry are
+    // intercepted; every other name is served through the one unlisted-name
+    // policy (`proxy::serve_unlisted`), which reads the command's level from
+    // the generated registry and never hands the guest the driver's raw pointer
+    // for a name whose argument 0 is a handle the shim wraps.
     let fnptr = if unsafe { DRIVER.proxy_active } {
         proxy::instance_func(name)
     } else {
@@ -459,9 +443,42 @@ pub unsafe extern "C" fn vk_icdGetPhysicalDeviceProcAddr(
         return fnptr;
     }
     unsafe {
-        if let Some(gpdpa) = DRIVER.gpdpa {
-            return gpdpa(instance, pName);
-        }
-        DRIVER.gipa?(instance, pName)
+        proxy::serve_unlisted(
+            name,
+            DRIVER.gipa?(instance, pName),
+            proxy::DispatchCtx::Instance,
+        )
     }
+}
+
+/// # Safety: loader-ICD v5 interface (called by the Khronos loader).
+#[allow(non_snake_case)]
+#[no_mangle]
+pub unsafe extern "C" fn vk_icdGetPhysicalDeviceProcAddr(
+    instance: VkInstance,
+    pName: *const c_char,
+) -> PFN_vkVoidFunction {
+    ensure_init();
+    // Physical-device-level functions (surface queries) resolve through GPDPA
+    // as well as GIPA — intercept on both paths, device functions too (see
+    // vk_icdGetInstanceProcAddr), and serve the rest through the same
+    // unlisted-name policy. GPDPA never resolves device-level names, so the
+    // policy's swap branch cannot fire here.
+    let name = unsafe { CStr::from_ptr(pName) };
+    let fnptr = if unsafe { DRIVER.proxy_active } {
+        proxy::instance_func(name)
+    } else {
+        None
+    }
+    .or_else(|| proxy::device_func(name));
+    if fnptr.is_some() {
+        return fnptr;
+    }
+    let raw = unsafe {
+        match DRIVER.gpdpa {
+            Some(gpdpa) => gpdpa(instance, pName),
+            None => DRIVER.gipa?(instance, pName),
+        }
+    };
+    proxy::serve_unlisted(name, raw, proxy::DispatchCtx::PhysicalDevice)
 }

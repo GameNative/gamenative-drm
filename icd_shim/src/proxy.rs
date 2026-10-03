@@ -2780,8 +2780,21 @@ unsafe extern "C" fn gn_vkFreeCommandBuffers(
 
 // ------------------------------------------------------- dispatch tables
 
-static G_INST_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
-    (c"vkCreateInstance", unsafe {
+/// Handler registry: the commands the shim implements, keyed by name. This is
+/// the shim's own implementation surface, not a dispatch policy — a name
+/// absent here is served by the generated registry policy in
+/// [`serve_unlisted`], so an unimplemented command can never be handed to the
+/// guest as the driver's raw pointer when its argument 0 is a wrapped handle.
+/// `HandlerScope::ProxyOnly` marks the handlers that only work while the WSI
+/// proxy is active (instances/surfaces); `Always` marks the device handlers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HandlerScope {
+    ProxyOnly,
+    Always,
+}
+
+static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
+    (c"vkCreateInstance", HandlerScope::ProxyOnly, unsafe {
         std::mem::transmute(
             gn_vkCreateInstance
                 as unsafe extern "C" fn(
@@ -2791,33 +2804,41 @@ static G_INST_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ) -> VkResult,
         )
     }),
-    (c"vkDestroyInstance", unsafe {
+    (c"vkDestroyInstance", HandlerScope::ProxyOnly, unsafe {
         std::mem::transmute(
             gn_vkDestroyInstance as unsafe extern "C" fn(VkInstance, *const VkAllocationCallbacks),
         )
     }),
-    (c"vkEnumerateInstanceExtensionProperties", unsafe {
-        std::mem::transmute(
-            gn_vkEnumerateInstanceExtensionProperties
-                as unsafe extern "C" fn(
-                    *const c_char,
-                    *mut u32,
-                    *mut VkExtensionProperties,
-                ) -> VkResult,
-        )
-    }),
-    (c"vkEnumerateDeviceExtensionProperties", unsafe {
-        std::mem::transmute(
-            gn_vkEnumerateDeviceExtensionProperties
-                as unsafe extern "C" fn(
-                    VkPhysicalDevice,
-                    *const c_char,
-                    *mut u32,
-                    *mut VkExtensionProperties,
-                ) -> VkResult,
-        )
-    }),
-    (c"vkCreateDevice", unsafe {
+    (
+        c"vkEnumerateInstanceExtensionProperties",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                gn_vkEnumerateInstanceExtensionProperties
+                    as unsafe extern "C" fn(
+                        *const c_char,
+                        *mut u32,
+                        *mut VkExtensionProperties,
+                    ) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkEnumerateDeviceExtensionProperties",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                gn_vkEnumerateDeviceExtensionProperties
+                    as unsafe extern "C" fn(
+                        VkPhysicalDevice,
+                        *const c_char,
+                        *mut u32,
+                        *mut VkExtensionProperties,
+                    ) -> VkResult,
+            )
+        },
+    ),
+    (c"vkCreateDevice", HandlerScope::ProxyOnly, unsafe {
         std::mem::transmute(
             gn_vkCreateDevice
                 as unsafe extern "C" fn(
@@ -2828,24 +2849,28 @@ static G_INST_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ) -> VkResult,
         )
     }),
-    (c"vkGetDeviceProcAddr", unsafe {
+    (c"vkGetDeviceProcAddr", HandlerScope::ProxyOnly, unsafe {
         std::mem::transmute(
             gn_vkGetDeviceProcAddr
                 as unsafe extern "C" fn(VkDevice, *const c_char) -> PFN_vkVoidFunction,
         )
     }),
-    (c"vkCreateWaylandSurfaceKHR", unsafe {
-        std::mem::transmute(
-            gn_vkCreateWaylandSurfaceKHR
-                as unsafe extern "C" fn(
-                    VkInstance,
-                    *const VkWaylandSurfaceCreateInfoKHR,
-                    *const VkAllocationCallbacks,
-                    *mut VkSurfaceKHR,
-                ) -> VkResult,
-        )
-    }),
-    (c"vkCreateXlibSurfaceKHR", unsafe {
+    (
+        c"vkCreateWaylandSurfaceKHR",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                gn_vkCreateWaylandSurfaceKHR
+                    as unsafe extern "C" fn(
+                        VkInstance,
+                        *const VkWaylandSurfaceCreateInfoKHR,
+                        *const VkAllocationCallbacks,
+                        *mut VkSurfaceKHR,
+                    ) -> VkResult,
+            )
+        },
+    ),
+    (c"vkCreateXlibSurfaceKHR", HandlerScope::ProxyOnly, unsafe {
         std::mem::transmute(
             gn_vkCreateXlibSurfaceKHR
                 as unsafe extern "C" fn(
@@ -2856,57 +2881,74 @@ static G_INST_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ) -> VkResult,
         )
     }),
-    (c"vkDestroySurfaceKHR", unsafe {
+    (c"vkDestroySurfaceKHR", HandlerScope::ProxyOnly, unsafe {
         std::mem::transmute(
             gn_vkDestroySurfaceKHR
                 as unsafe extern "C" fn(VkInstance, VkSurfaceKHR, *const VkAllocationCallbacks),
         )
     }),
-    (c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR", unsafe {
-        std::mem::transmute(
-            gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR
-                as unsafe extern "C" fn(
-                    VkPhysicalDevice,
-                    VkSurfaceKHR,
-                    *mut VkSurfaceCapabilitiesKHR,
-                ) -> VkResult,
-        )
-    }),
-    (c"vkGetPhysicalDeviceSurfaceFormatsKHR", unsafe {
-        std::mem::transmute(
-            gn_vkGetPhysicalDeviceSurfaceFormatsKHR
-                as unsafe extern "C" fn(
-                    VkPhysicalDevice,
-                    VkSurfaceKHR,
-                    *mut u32,
-                    *mut VkSurfaceFormatKHR,
-                ) -> VkResult,
-        )
-    }),
-    (c"vkGetPhysicalDeviceSurfacePresentModesKHR", unsafe {
-        std::mem::transmute(
-            gn_vkGetPhysicalDeviceSurfacePresentModesKHR
-                as unsafe extern "C" fn(
-                    VkPhysicalDevice,
-                    VkSurfaceKHR,
-                    *mut u32,
-                    *mut VkPresentModeKHR,
-                ) -> VkResult,
-        )
-    }),
-    (c"vkGetPhysicalDeviceSurfaceSupportKHR", unsafe {
-        std::mem::transmute(
-            gn_vkGetPhysicalDeviceSurfaceSupportKHR
-                as unsafe extern "C" fn(
-                    VkPhysicalDevice,
-                    u32,
-                    VkSurfaceKHR,
-                    *mut VkBool32,
-                ) -> VkResult,
-        )
-    }),
+    (
+        c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR
+                    as unsafe extern "C" fn(
+                        VkPhysicalDevice,
+                        VkSurfaceKHR,
+                        *mut VkSurfaceCapabilitiesKHR,
+                    ) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkGetPhysicalDeviceSurfaceFormatsKHR",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                gn_vkGetPhysicalDeviceSurfaceFormatsKHR
+                    as unsafe extern "C" fn(
+                        VkPhysicalDevice,
+                        VkSurfaceKHR,
+                        *mut u32,
+                        *mut VkSurfaceFormatKHR,
+                    ) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkGetPhysicalDeviceSurfacePresentModesKHR",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                gn_vkGetPhysicalDeviceSurfacePresentModesKHR
+                    as unsafe extern "C" fn(
+                        VkPhysicalDevice,
+                        VkSurfaceKHR,
+                        *mut u32,
+                        *mut VkPresentModeKHR,
+                    ) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkGetPhysicalDeviceSurfaceSupportKHR",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                gn_vkGetPhysicalDeviceSurfaceSupportKHR
+                    as unsafe extern "C" fn(
+                        VkPhysicalDevice,
+                        u32,
+                        VkSurfaceKHR,
+                        *mut VkBool32,
+                    ) -> VkResult,
+            )
+        },
+    ),
     (
         c"vkGetPhysicalDeviceWaylandPresentationSupportKHR",
+        HandlerScope::ProxyOnly,
         unsafe {
             std::mem::transmute(
                 gn_vkGetPhysicalDeviceWaylandPresentationSupportKHR
@@ -2914,16 +2956,17 @@ static G_INST_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
             )
         },
     ),
-    (c"vkGetPhysicalDeviceXlibPresentationSupportKHR", unsafe {
-        std::mem::transmute(
-            gn_vkGetPhysicalDeviceXlibPresentationSupportKHR
-                as unsafe extern "C" fn(VkPhysicalDevice, u32, *mut c_void, usize) -> VkBool32,
-        )
-    }),
-];
-
-static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
-    (c"vkCreateSwapchainKHR", unsafe {
+    (
+        c"vkGetPhysicalDeviceXlibPresentationSupportKHR",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                gn_vkGetPhysicalDeviceXlibPresentationSupportKHR
+                    as unsafe extern "C" fn(VkPhysicalDevice, u32, *mut c_void, usize) -> VkBool32,
+            )
+        },
+    ),
+    (c"vkCreateSwapchainKHR", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCreateSwapchainKHR
                 as unsafe extern "C" fn(
@@ -2934,13 +2977,13 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ) -> VkResult,
         )
     }),
-    (c"vkDestroySwapchainKHR", unsafe {
+    (c"vkDestroySwapchainKHR", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkDestroySwapchainKHR
                 as unsafe extern "C" fn(VkDevice, VkSwapchainKHR, *const VkAllocationCallbacks),
         )
     }),
-    (c"vkGetSwapchainImagesKHR", unsafe {
+    (c"vkGetSwapchainImagesKHR", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkGetSwapchainImagesKHR
                 as unsafe extern "C" fn(
@@ -2951,13 +2994,13 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ) -> VkResult,
         )
     }),
-    (c"vkQueuePresentKHR", unsafe {
+    (c"vkQueuePresentKHR", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkQueuePresentKHR
                 as unsafe extern "C" fn(VkQueue, *const VkPresentInfoKHR) -> VkResult,
         )
     }),
-    (c"vkAcquireNextImageKHR", unsafe {
+    (c"vkAcquireNextImageKHR", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkAcquireNextImageKHR
                 as unsafe extern "C" fn(
@@ -2970,7 +3013,7 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ) -> VkResult,
         )
     }),
-    (c"vkAcquireNextImage2KHR", unsafe {
+    (c"vkAcquireNextImage2KHR", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkAcquireNextImage2KHR
                 as unsafe extern "C" fn(
@@ -2980,31 +3023,31 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ) -> VkResult,
         )
     }),
-    (c"vkQueueSubmit", unsafe {
+    (c"vkQueueSubmit", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkQueueSubmit
                 as unsafe extern "C" fn(VkQueue, u32, *const VkSubmitInfo, VkFence) -> VkResult,
         )
     }),
-    (c"vkQueueSubmit2", unsafe {
+    (c"vkQueueSubmit2", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkQueueSubmit2
                 as unsafe extern "C" fn(VkQueue, u32, *const VkSubmitInfo2, VkFence) -> VkResult,
         )
     }),
-    (c"vkWaitSemaphoresKHR", unsafe {
+    (c"vkWaitSemaphoresKHR", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkWaitSemaphores
                 as unsafe extern "C" fn(VkDevice, *const VkSemaphoreWaitInfo, u64) -> VkResult,
         )
     }),
-    (c"vkWaitSemaphores", unsafe {
+    (c"vkWaitSemaphores", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkWaitSemaphores
                 as unsafe extern "C" fn(VkDevice, *const VkSemaphoreWaitInfo, u64) -> VkResult,
         )
     }),
-    (c"vkAllocateCommandBuffers", unsafe {
+    (c"vkAllocateCommandBuffers", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkAllocateCommandBuffers
                 as unsafe extern "C" fn(
@@ -3014,13 +3057,13 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ) -> VkResult,
         )
     }),
-    (c"vkFreeCommandBuffers", unsafe {
+    (c"vkFreeCommandBuffers", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkFreeCommandBuffers
                 as unsafe extern "C" fn(VkDevice, VkCommandPool, u32, *const VkCommandBuffer),
         )
     }),
-    (c"vkCreateGraphicsPipelines", unsafe {
+    (c"vkCreateGraphicsPipelines", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCreateGraphicsPipelines
                 as unsafe extern "C" fn(
@@ -3033,7 +3076,7 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ) -> VkResult,
         )
     }),
-    (c"vkCreateImage", unsafe {
+    (c"vkCreateImage", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCreateImage
                 as unsafe extern "C" fn(
@@ -3044,25 +3087,25 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ) -> VkResult,
         )
     }),
-    (c"vkGetDeviceQueue", unsafe {
+    (c"vkGetDeviceQueue", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkGetDeviceQueue as unsafe extern "C" fn(VkDevice, u32, u32, *mut VkQueue),
         )
     }),
-    (c"vkGetDeviceQueue2", unsafe {
+    (c"vkGetDeviceQueue2", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkGetDeviceQueue2
                 as unsafe extern "C" fn(VkDevice, *const VkDeviceQueueInfo2, *mut VkQueue),
         )
     }),
-    (c"vkDestroyDevice", unsafe {
+    (c"vkDestroyDevice", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkDestroyDevice as unsafe extern "C" fn(VkDevice, *const VkAllocationCallbacks),
         )
     }),
     // Guest-command trace: intercept the recorded transfers that can write a
     // swapchain slot image, name the slot, then tail-call the driver.
-    (c"vkCmdClearColorImage", unsafe {
+    (c"vkCmdClearColorImage", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdClearColorImage
                 as unsafe extern "C" fn(
@@ -3075,7 +3118,7 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ),
         )
     }),
-    (c"vkCmdCopyImage", unsafe {
+    (c"vkCmdCopyImage", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdCopyImage
                 as unsafe extern "C" fn(
@@ -3089,17 +3132,17 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ),
         )
     }),
-    (c"vkCmdCopyImage2KHR", unsafe {
+    (c"vkCmdCopyImage2KHR", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdCopyImage2 as unsafe extern "C" fn(VkCommandBuffer, *const VkCopyImageInfo2),
         )
     }),
-    (c"vkCmdCopyImage2", unsafe {
+    (c"vkCmdCopyImage2", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdCopyImage2 as unsafe extern "C" fn(VkCommandBuffer, *const VkCopyImageInfo2),
         )
     }),
-    (c"vkCmdBlitImage", unsafe {
+    (c"vkCmdBlitImage", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdBlitImage
                 as unsafe extern "C" fn(
@@ -3114,17 +3157,17 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ),
         )
     }),
-    (c"vkCmdBlitImage2KHR", unsafe {
+    (c"vkCmdBlitImage2KHR", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdBlitImage2 as unsafe extern "C" fn(VkCommandBuffer, *const VkBlitImageInfo2),
         )
     }),
-    (c"vkCmdBlitImage2", unsafe {
+    (c"vkCmdBlitImage2", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdBlitImage2 as unsafe extern "C" fn(VkCommandBuffer, *const VkBlitImageInfo2),
         )
     }),
-    (c"vkCmdCopyBufferToImage", unsafe {
+    (c"vkCmdCopyBufferToImage", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdCopyBufferToImage
                 as unsafe extern "C" fn(
@@ -3137,19 +3180,23 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ),
         )
     }),
-    (c"vkCmdCopyBufferToImage2KHR", unsafe {
+    (
+        c"vkCmdCopyBufferToImage2KHR",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                gn_vkCmdCopyBufferToImage2
+                    as unsafe extern "C" fn(VkCommandBuffer, *const VkCopyBufferToImageInfo2),
+            )
+        },
+    ),
+    (c"vkCmdCopyBufferToImage2", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdCopyBufferToImage2
                 as unsafe extern "C" fn(VkCommandBuffer, *const VkCopyBufferToImageInfo2),
         )
     }),
-    (c"vkCmdCopyBufferToImage2", unsafe {
-        std::mem::transmute(
-            gn_vkCmdCopyBufferToImage2
-                as unsafe extern "C" fn(VkCommandBuffer, *const VkCopyBufferToImageInfo2),
-        )
-    }),
-    (c"vkCmdPipelineBarrier", unsafe {
+    (c"vkCmdPipelineBarrier", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdPipelineBarrier
                 as unsafe extern "C" fn(
@@ -3166,25 +3213,25 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ),
         )
     }),
-    (c"vkCmdPipelineBarrier2KHR", unsafe {
+    (c"vkCmdPipelineBarrier2KHR", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdPipelineBarrier2
                 as unsafe extern "C" fn(VkCommandBuffer, *const VkDependencyInfo),
         )
     }),
-    (c"vkCmdPipelineBarrier2", unsafe {
+    (c"vkCmdPipelineBarrier2", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdPipelineBarrier2
                 as unsafe extern "C" fn(VkCommandBuffer, *const VkDependencyInfo),
         )
     }),
-    (c"vkCmdBeginRenderPass", unsafe {
+    (c"vkCmdBeginRenderPass", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdBeginRenderPass
                 as unsafe extern "C" fn(VkCommandBuffer, *const VkRenderPassBeginInfo, i32),
         )
     }),
-    (c"vkCmdBeginRenderPass2KHR", unsafe {
+    (c"vkCmdBeginRenderPass2KHR", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdBeginRenderPass2
                 as unsafe extern "C" fn(
@@ -3194,7 +3241,7 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ),
         )
     }),
-    (c"vkCmdBeginRenderPass2", unsafe {
+    (c"vkCmdBeginRenderPass2", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdBeginRenderPass2
                 as unsafe extern "C" fn(
@@ -3204,17 +3251,17 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ),
         )
     }),
-    (c"vkCmdBeginRenderingKHR", unsafe {
+    (c"vkCmdBeginRenderingKHR", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdBeginRendering as unsafe extern "C" fn(VkCommandBuffer, *const VkRenderingInfo),
         )
     }),
-    (c"vkCmdBeginRendering", unsafe {
+    (c"vkCmdBeginRendering", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdBeginRendering as unsafe extern "C" fn(VkCommandBuffer, *const VkRenderingInfo),
         )
     }),
-    (c"vkCreateImageView", unsafe {
+    (c"vkCreateImageView", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCreateImageView
                 as unsafe extern "C" fn(
@@ -3225,7 +3272,7 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
                 ) -> VkResult,
         )
     }),
-    (c"vkCreateFramebuffer", unsafe {
+    (c"vkCreateFramebuffer", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCreateFramebuffer
                 as unsafe extern "C" fn(
@@ -3239,42 +3286,50 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
     // Dynamic-state trace: the viewport/scissor the guest sets (core 1.0 and
     // the 1.3/EXT WithCount forms), and the render pass whose load/store ops
     // the begin-render-pass trace names.
-    (c"vkCmdSetViewport", unsafe {
+    (c"vkCmdSetViewport", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdSetViewport
                 as unsafe extern "C" fn(VkCommandBuffer, u32, u32, *const VkViewport),
         )
     }),
-    (c"vkCmdSetViewportWithCount", unsafe {
+    (c"vkCmdSetViewportWithCount", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdSetViewportWithCount
                 as unsafe extern "C" fn(VkCommandBuffer, u32, *const VkViewport),
         )
     }),
-    (c"vkCmdSetViewportWithCountEXT", unsafe {
-        std::mem::transmute(
-            gn_vkCmdSetViewportWithCount
-                as unsafe extern "C" fn(VkCommandBuffer, u32, *const VkViewport),
-        )
-    }),
-    (c"vkCmdSetScissor", unsafe {
+    (
+        c"vkCmdSetViewportWithCountEXT",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                gn_vkCmdSetViewportWithCount
+                    as unsafe extern "C" fn(VkCommandBuffer, u32, *const VkViewport),
+            )
+        },
+    ),
+    (c"vkCmdSetScissor", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdSetScissor as unsafe extern "C" fn(VkCommandBuffer, u32, u32, *const VkRect2D),
         )
     }),
-    (c"vkCmdSetScissorWithCount", unsafe {
+    (c"vkCmdSetScissorWithCount", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCmdSetScissorWithCount
                 as unsafe extern "C" fn(VkCommandBuffer, u32, *const VkRect2D),
         )
     }),
-    (c"vkCmdSetScissorWithCountEXT", unsafe {
-        std::mem::transmute(
-            gn_vkCmdSetScissorWithCount
-                as unsafe extern "C" fn(VkCommandBuffer, u32, *const VkRect2D),
-        )
-    }),
-    (c"vkCreateRenderPass", unsafe {
+    (
+        c"vkCmdSetScissorWithCountEXT",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                gn_vkCmdSetScissorWithCount
+                    as unsafe extern "C" fn(VkCommandBuffer, u32, *const VkRect2D),
+            )
+        },
+    ),
+    (c"vkCreateRenderPass", HandlerScope::Always, unsafe {
         std::mem::transmute(
             gn_vkCreateRenderPass
                 as unsafe extern "C" fn(
@@ -3288,52 +3343,111 @@ static G_DEV_FUNCS: &[(&CStr, PFN_vkVoidFunction)] = &[
     // A wrapped-handle device command: intercepted so the guest never reaches
     // the driver's raw entry point with a shim device wrapper (gamescope
     // resolves this at Vulkan device init, before any window exists).
-    (c"vkCreateSamplerYcbcrConversion", unsafe {
-        std::mem::transmute(
-            gn_vkCreateSamplerYcbcrConversion
-                as unsafe extern "C" fn(
-                    VkDevice,
-                    *const c_void,
-                    *const VkAllocationCallbacks,
-                    *mut VkSamplerYcbcrConversion,
-                ) -> VkResult,
-        )
-    }),
-    (c"vkCreateSamplerYcbcrConversionKHR", unsafe {
-        std::mem::transmute(
-            gn_vkCreateSamplerYcbcrConversion
-                as unsafe extern "C" fn(
-                    VkDevice,
-                    *const c_void,
-                    *const VkAllocationCallbacks,
-                    *mut VkSamplerYcbcrConversion,
-                ) -> VkResult,
-        )
-    }),
+    (
+        c"vkCreateSamplerYcbcrConversion",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                gn_vkCreateSamplerYcbcrConversion
+                    as unsafe extern "C" fn(
+                        VkDevice,
+                        *const c_void,
+                        *const VkAllocationCallbacks,
+                        *mut VkSamplerYcbcrConversion,
+                    ) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkCreateSamplerYcbcrConversionKHR",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                gn_vkCreateSamplerYcbcrConversion
+                    as unsafe extern "C" fn(
+                        VkDevice,
+                        *const c_void,
+                        *const VkAllocationCallbacks,
+                        *mut VkSamplerYcbcrConversion,
+                    ) -> VkResult,
+            )
+        },
+    ),
 ];
 
-/// Interception table: the instance table is consulted for GIPA and GPDPA
-/// lookups (surface functions resolve via both).
+/// Handler-registry lookup for GIPA and GPDPA: the proxy-only handlers
+/// (instances, devices, surfaces), which only work while the WSI proxy is up.
 pub fn instance_func(name: &CStr) -> PFN_vkVoidFunction {
-    G_INST_FUNCS
+    SHIM_HANDLERS
         .iter()
-        .find(|(n, _)| *n == name)
-        .and_then(|(_, f)| *f)
+        .find(|(n, scope, _)| *scope == HandlerScope::ProxyOnly && *n == name)
+        .and_then(|(_, _, f)| *f)
 }
 
-/// Interception table: the device table for vkGetDeviceProcAddr lookups.
-/// For entry points the shim does not intercept: a thunk that swaps the
-/// wrapper handle for the real one. Never the driver's own function — the
-/// guest holds shim wrappers for devices, queues and command buffers, so a raw
-/// entry point receives a wrapper and faults inside the driver. Reached from
-/// the loader-ICD entry points, which answer instance- and device-level names
-/// from one table; both must agree, or the guest ends up mixing wrapper and
-/// raw handles across one command stream.
+/// Handler-registry lookup for vkGetDeviceProcAddr and the ICD entry points:
+/// the always-available device handlers.
 pub fn device_func(name: &CStr) -> PFN_vkVoidFunction {
-    G_DEV_FUNCS
+    SHIM_HANDLERS
         .iter()
-        .find(|(n, _)| *n == name)
-        .and_then(|(_, f)| *f)
+        .find(|(n, scope, _)| *scope == HandlerScope::Always && *n == name)
+        .and_then(|(_, _, f)| *f)
+}
+
+/// Which entry point is resolving an unlisted name. It decides how a name the
+/// registry cannot classify is treated, because the entry point already fixes
+/// the argument-0 domain: `vkGetDeviceProcAddr` is only ever asked for
+/// device-level names, `vk_icdGetPhysicalDeviceProcAddr` never is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DispatchCtx {
+    Instance,
+    PhysicalDevice,
+    Device,
+}
+
+/// Whether an unlisted name's argument 0 must be swapped from a shim wrapper to
+/// the driver's real handle. Purely static: derived from the registry level of
+/// the command, with no runtime inspection of the handle. A device-level name
+/// (argument 0 is VkDevice/VkQueue/VkCommandBuffer) always needs the swap; every
+/// other level's argument 0 is the driver's own handle and must be passed
+/// through untouched. `Device` context treats an unclassified name (a vendor
+/// command absent from the registry) as device-level, because that is the only
+/// thing vkGetDeviceProcAddr resolves.
+fn needs_swap(name: &CStr, ctx: DispatchCtx) -> bool {
+    let device_level = name
+        .to_str()
+        .ok()
+        .and_then(crate::vk_dispatch_gen::classify)
+        .is_some_and(|d| d.1 == crate::vk_dispatch_gen::Level::Device);
+    match ctx {
+        DispatchCtx::Device => true,
+        DispatchCtx::Instance => device_level,
+        DispatchCtx::PhysicalDevice => false,
+    }
+}
+
+/// The single unlisted-name policy shared by every entry point. `raw` is the
+/// driver's own resolver result for `name`. When the shim owns wrapper handles
+/// (the proxy is active) and the name's argument 0 is one of them, the guest is
+/// served a wrapper-swapping thunk instead of the raw pointer; otherwise the raw
+/// pointer is correct and is returned unchanged. This is what keeps
+/// `vkCreateSamplerYcbcrConversion` and every other device-level name off the
+/// driver's raw entry point by construction, rather than by a hand table.
+pub fn serve_unlisted(
+    name: &CStr,
+    raw: PFN_vkVoidFunction,
+    ctx: DispatchCtx,
+) -> PFN_vkVoidFunction {
+    let raw = raw?;
+    if !crate::proxy_active() {
+        // No wrappers exist, so every handle is the driver's own.
+        return Some(raw);
+    }
+    if needs_swap(name, ctx) {
+        let n = name.to_str().ok()?;
+        thunk::thunk_for(n, Some(raw))
+    } else {
+        Some(raw)
+    }
 }
 
 pub static GDPA_MISSED: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -3353,8 +3467,9 @@ unsafe extern "C" fn gn_vkGetDeviceProcAddr(
         return Some(f);
     }
     // Never the hooks' vkGetDeviceProcAddr (see gn_real_device_proc). The
-    // loader will call whatever we return with the shim's wrapper handle,
-    // so route the rest through a wrapper-swapping thunk.
+    // loader will call whatever we return with the shim's wrapper handle, so
+    // the rest goes through the shared unlisted-name policy: device context,
+    // which always swaps.
     let target = unsafe { gn_real_device_proc(find_device(device), name) };
     if target.is_none() {
         // Returning NULL hands the guest the loader's no-op stub: the call
@@ -3366,9 +3481,8 @@ unsafe extern "C" fn gn_vkGetDeviceProcAddr(
                 missed.push(n);
             }
         }
-        return None;
     }
-    thunk::thunk_for(name.to_str().unwrap(), target)
+    serve_unlisted(name, target, DispatchCtx::Device)
 }
 
 #[cfg(test)]
@@ -3406,15 +3520,183 @@ mod tests {
         }
     }
 
-    /// The command table is a static slice, so it has no capacity to overflow or
-    /// displace an entry: adding a name can only add. Assert the two commands the
-    /// regression lost and gained are both present, and that the slice carries
-    /// exactly the number of entries the table declares.
+    /// The handler registry is a static slice, so it has no capacity to
+    /// overflow or displace an entry: adding a name can only add. Assert the
+    /// two commands the regression lost and gained are both present.
     #[test]
-    fn command_table_is_unbounded() {
+    fn command_registry_is_unbounded() {
         assert!(device_func(c"vkCreateSamplerYcbcrConversion").is_some());
         assert!(instance_func(c"vkGetDeviceProcAddr").is_some());
-        assert!(G_DEV_FUNCS.len() >= 46);
+        assert!(SHIM_HANDLERS.len() >= 61);
+    }
+
+    /// The registry (generated from vk.xml) must classify each command's level
+    /// and argument-0 kind. This is the fact the unlisted-name policy is built
+    /// on, so it is pinned for a representative set: a device-level command
+    /// (argument 0 is a shim-wrapped handle), physical-device- and
+    /// instance-level commands (argument 0 is the driver's own handle), the
+    /// `vkCreateSamplerYcbcrConversion` pair the crash class is named after, and
+    /// the alias resolution both spellings share.
+    #[test]
+    fn registry_classifies_representative_commands() {
+        use crate::vk_dispatch_gen::{classify, Arg0, Level};
+        let cases: &[(&str, Level, Arg0)] = &[
+            // Device: argument 0 is a shim wrapper (VkDevice/VkQueue/VkCommandBuffer).
+            (
+                "vkCreateSamplerYcbcrConversion",
+                Level::Device,
+                Arg0::Device,
+            ),
+            (
+                "vkCreateSamplerYcbcrConversionKHR",
+                Level::Device,
+                Arg0::Device,
+            ),
+            ("vkCreateSwapchainKHR", Level::Device, Arg0::Device),
+            ("vkQueueSubmit", Level::Device, Arg0::Queue),
+            ("vkCmdDraw", Level::Device, Arg0::CommandBuffer),
+            // Physical device: argument 0 is the driver's own handle.
+            (
+                "vkGetPhysicalDeviceProperties",
+                Level::PhysicalDevice,
+                Arg0::PhysicalDevice,
+            ),
+            (
+                "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+                Level::PhysicalDevice,
+                Arg0::PhysicalDevice,
+            ),
+            (
+                "vkCreateDevice",
+                Level::PhysicalDevice,
+                Arg0::PhysicalDevice,
+            ),
+            // Instance: argument 0 is the driver's own instance handle.
+            // vkEnumeratePhysicalDevices enumerates physical devices but takes
+            // VkInstance, so it is instance-level and passes through untouched.
+            ("vkDestroyInstance", Level::Instance, Arg0::Instance),
+            ("vkGetInstanceProcAddr", Level::Instance, Arg0::Instance),
+            (
+                "vkEnumeratePhysicalDevices",
+                Level::Instance,
+                Arg0::Instance,
+            ),
+            // Global: no dispatchable argument 0.
+            ("vkCreateInstance", Level::Global, Arg0::Other),
+            ("vkEnumerateInstanceVersion", Level::Global, Arg0::Other),
+        ];
+        for &(name, level, arg0) in cases {
+            let d = classify(name).unwrap_or_else(|| panic!("{name} missing from registry"));
+            assert_eq!(d.1, level, "{name} level");
+            assert_eq!(d.2, arg0, "{name} arg0");
+        }
+    }
+
+    /// The policy is decided from the name + entry point alone — never from the
+    /// handle — so a device-level name is always swapped (in device context) and
+    /// an instance- or physical-device-level name never is. This is the
+    /// invariant that closes the `vkCreateSamplerYcbcrConversion` class by
+    /// construction: no entry point can hand out the driver's raw pointer for a
+    /// command whose argument 0 is a shim wrapper.
+    #[test]
+    fn unlisted_policy_follows_registry_level_only() {
+        // Device context (vkGetDeviceProcAddr): everything is swapped, including
+        // a vendor command absent from the registry.
+        assert!(needs_swap(
+            c"vkCreateSamplerYcbcrConversion",
+            DispatchCtx::Device
+        ));
+        assert!(needs_swap(c"vkSomeVendorCommandEXT", DispatchCtx::Device));
+        // Instance context (GIPA asked for a device-level name): swapped.
+        assert!(needs_swap(
+            c"vkCreateSamplerYcbcrConversion",
+            DispatchCtx::Instance
+        ));
+        assert!(needs_swap(c"vkQueueSubmit2", DispatchCtx::Instance));
+        // Instance context, non-device levels: passed through untouched.
+        assert!(!needs_swap(c"vkCreateInstance", DispatchCtx::Instance));
+        assert!(!needs_swap(
+            c"vkEnumeratePhysicalDevices",
+            DispatchCtx::Instance
+        ));
+        assert!(!needs_swap(
+            c"vkGetPhysicalDeviceProperties",
+            DispatchCtx::Instance
+        ));
+        // Unknown vendor name at instance level: not a device handle -> raw.
+        assert!(!needs_swap(
+            c"vkSomeVendorCommandEXT",
+            DispatchCtx::Instance
+        ));
+        // Physical-device context never swaps.
+        assert!(!needs_swap(
+            c"vkGetPhysicalDeviceProperties",
+            DispatchCtx::PhysicalDevice
+        ));
+        assert!(!needs_swap(
+            c"vkCreateSamplerYcbcrConversion",
+            DispatchCtx::PhysicalDevice
+        ));
+    }
+
+    /// The generated alias table replaces the hand-written core<->KHR remap:
+    /// every pair the old list carried must still resolve.
+    #[test]
+    fn generated_aliases_cover_the_former_hand_list() {
+        use crate::vk_dispatch_gen::{alias_of, VK_ALIASES};
+        for (core, khr) in [
+            ("vkMapMemory2", "vkMapMemory2KHR"),
+            ("vkUnmapMemory2", "vkUnmapMemory2KHR"),
+            (
+                "vkGetImageSubresourceLayout2",
+                "vkGetImageSubresourceLayout2KHR",
+            ),
+            (
+                "vkGetDeviceImageSubresourceLayout",
+                "vkGetDeviceImageSubresourceLayoutKHR",
+            ),
+            ("vkCopyMemoryToImage", "vkCopyMemoryToImageEXT"),
+            ("vkCopyImageToMemory", "vkCopyImageToMemoryEXT"),
+            ("vkCopyImageToImage", "vkCopyImageToImageEXT"),
+            ("vkCmdBindIndexBuffer2", "vkCmdBindIndexBuffer2KHR"),
+            ("vkCmdBindDescriptorSets2", "vkCmdBindDescriptorSets2KHR"),
+            ("vkCmdPushConstants2", "vkCmdPushConstants2KHR"),
+            ("vkCmdPushDescriptorSet", "vkCmdPushDescriptorSetKHR"),
+            ("vkCmdPushDescriptorSet2", "vkCmdPushDescriptorSet2KHR"),
+            (
+                "vkCmdPushDescriptorSetWithTemplate",
+                "vkCmdPushDescriptorSetWithTemplateKHR",
+            ),
+            (
+                "vkCmdPushDescriptorSetWithTemplate2",
+                "vkCmdPushDescriptorSetWithTemplate2KHR",
+            ),
+            (
+                "vkCmdSetRenderingAttachmentLocations",
+                "vkCmdSetRenderingAttachmentLocationsKHR",
+            ),
+            (
+                "vkCmdSetRenderingInputAttachmentIndices",
+                "vkCmdSetRenderingInputAttachmentIndicesKHR",
+            ),
+            (
+                "vkGetRenderingAreaGranularity",
+                "vkGetRenderingAreaGranularityKHR",
+            ),
+            ("vkCmdSetLineStipple", "vkCmdSetLineStippleEXT"),
+        ] {
+            assert!(
+                VK_ALIASES.contains(&(core, khr)) || VK_ALIASES.contains(&(khr, core)),
+                "alias pair {core}/{khr} missing from the registry table"
+            );
+            // Both spellings resolve, and the core name's partner resolves back
+            // to it. A core name may have more than one extension spelling (the
+            // registry lists both EXT and KHR for vkGetImageSubresourceLayout2),
+            // so the exact partner is not pinned — the round trip is.
+            assert_eq!(alias_of(khr), Some(core), "alias_of({khr})");
+            let partner = alias_of(core).unwrap_or_else(|| panic!("alias_of({core}) is empty"));
+            assert_eq!(alias_of(partner), Some(core), "round trip from {core}");
+        }
     }
 
     /// The two layouts the proxy knows must map to the DRM fourcc of their
@@ -4140,30 +4422,6 @@ unsafe fn find_swapchain(sc: VkSwapchainKHR) -> *mut GnSwapchain {
     ptr::null_mut()
 }
 
-fn alias_of(name: &CStr) -> Option<&'static str> {
-    Some(match name.to_str().ok()? {
-        "vkMapMemory2" => "vkMapMemory2KHR",
-        "vkUnmapMemory2" => "vkUnmapMemory2KHR",
-        "vkGetImageSubresourceLayout2" => "vkGetImageSubresourceLayout2KHR",
-        "vkGetDeviceImageSubresourceLayout" => "vkGetDeviceImageSubresourceLayoutKHR",
-        "vkCopyMemoryToImage" => "vkCopyMemoryToImageEXT",
-        "vkCopyImageToMemory" => "vkCopyImageToMemoryEXT",
-        "vkCopyImageToImage" => "vkCopyImageToImageEXT",
-        "vkCmdBindIndexBuffer2" => "vkCmdBindIndexBuffer2KHR",
-        "vkCmdBindDescriptorSets2" => "vkCmdBindDescriptorSets2KHR",
-        "vkCmdPushConstants2" => "vkCmdPushConstants2KHR",
-        "vkCmdPushDescriptorSet" => "vkCmdPushDescriptorSetKHR",
-        "vkCmdPushDescriptorSet2" => "vkCmdPushDescriptorSet2KHR",
-        "vkCmdPushDescriptorSetWithTemplate" => "vkCmdPushDescriptorSetWithTemplateKHR",
-        "vkCmdPushDescriptorSetWithTemplate2" => "vkCmdPushDescriptorSetWithTemplate2KHR",
-        "vkCmdSetRenderingAttachmentLocations" => "vkCmdSetRenderingAttachmentLocationsKHR",
-        "vkCmdSetRenderingInputAttachmentIndices" => "vkCmdSetRenderingInputAttachmentIndicesKHR",
-        "vkGetRenderingAreaGranularity" => "vkGetRenderingAreaGranularityKHR",
-        "vkCmdSetLineStipple" => "vkCmdSetLineStippleEXT",
-        _ => return None,
-    })
-}
-
 unsafe fn gn_real_device_proc(gd: *mut GnDevice, name: &CStr) -> PFN_vkVoidFunction {
     let (handle, gipa, inst) = {
         let g = G.lock().unwrap();
@@ -4201,7 +4459,11 @@ unsafe fn gn_real_device_proc(gd: *mut GnDevice, name: &CStr) -> PFN_vkVoidFunct
     }
     // Core names the driver only exports under an extension spelling.
     if fnptr.is_none() {
-        if let Some(alias) = alias_of(name) {
+        if let Some(alias) = name
+            .to_str()
+            .ok()
+            .and_then(crate::vk_dispatch_gen::alias_of)
+        {
             let c = std::ffi::CString::new(alias).unwrap();
             fnptr = unsafe { gn_real_device_proc(gd, &c) };
             if fnptr.is_some() {

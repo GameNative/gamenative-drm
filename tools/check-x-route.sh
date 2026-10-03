@@ -68,12 +68,24 @@ for marker in "vkCreateXlibSurfaceKHR" "x11 route:" "X11 present engages"; do
         fail=1
     fi
 done
-for marker in "override_window_content" "gamescope_swapchain" "vkCreateWin32SurfaceKHR"; do
+# Code-path markers: still asserted against the built artefact.
+for marker in "override_window_content" "gamescope_swapchain"; do
     if grep -qF -- "$marker" "$ROOT/target/check-x-route.strings"; then
         echo "FAIL: ICD shim still carries '$marker' (the override path is not the route)" >&2
         fail=1
     fi
 done
+# `vkCreateWin32SurfaceKHR` is asserted against the shim's *implementation*,
+# not the whole artefact: the generated registry table
+# (icd_shim/src/vk_dispatch_gen.rs) lists every Vulkan command name as data, so
+# the bare string legitimately appears in the .so. What must not survive is a
+# win32-surface override path in the code, which would be a reference in the
+# implementation sources.
+if grep -qF -- "vkCreateWin32SurfaceKHR" "$ROOT/icd_shim/src/proxy.rs" \
+    "$ROOT/icd_shim/src/lib.rs" "$ROOT/icd_shim/src/x11.rs"; then
+    echo "FAIL: ICD shim still carries a vkCreateWin32SurfaceKHR override path" >&2
+    fail=1
+fi
 
 [ "$fail" = 0 ] || exit 1
 echo "PASS: ICD shim hooks the guest's real surface entry point (vkCreateXlibSurfaceKHR) and reports its route ungated"
