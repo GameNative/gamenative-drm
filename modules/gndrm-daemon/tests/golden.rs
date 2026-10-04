@@ -941,14 +941,15 @@ fn addfb2_validation_and_rmfb() {
         errno::ENOENT,
     );
 
-    // Modifier-flagged request rejected (cap ADDFB2_MODIFIERS = 0).
+    // A modifier-flagged request is accepted and registered. A compressed
+    // (UBWC) scan-out framebuffer carries a non-LINEAR modifier; its real
+    // allocation length must enter the pool's length index so a later
+    // length-only scan-out request for that length resolves (the round-U
+    // refusal was this framebuffer being rejected before the note).
     let mut bad = base;
     bad.flags = DRM_MODE_FB_MODIFIERS;
     bad.modifier[0] = 0x0100_0000_0000_0002; // some tiling modifier
-    is_err(
-        &call(&mut d, DRM_IOCTL_MODE_ADDFB2, &pod(&bad)),
-        errno::EINVAL,
-    );
+    ok(&call(&mut d, DRM_IOCTL_MODE_ADDFB2, &pod(&bad)));
 
     // Unknown format.
     let mut bad = base;

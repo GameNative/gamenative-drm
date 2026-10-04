@@ -776,6 +776,36 @@ mod tests {
         );
     }
 
+    /// A compressed (UBWC) scan-out allocation is longer than both the tight
+    /// and the row-padded linear size: the Adreno UBWC surface for 1280x960 is
+    /// 4947968 B, not the 4915200 B a LINEAR image needs. The `ADDFB2` feed
+    /// registers a client framebuffer with that real length, so a length-only
+    /// scan-out request for it must resolve once the geometry is noted — the
+    /// round-U refusal was this exact lookup returning `None`. Both classes
+    /// resolve; neither shadows the other.
+    #[test]
+    fn compressed_allocation_length_resolves_to_its_geometry() {
+        let mut pool = ReusePool::<Id>::new(4);
+        let g = geom(1280, 960);
+        let linear = g.alloc_len();
+        let ubwc = 4_947_968u64;
+        assert_eq!(linear, 4_915_200);
+        assert_ne!(linear, ubwc);
+        assert_eq!(
+            pool.resolve_len(ubwc, g.format),
+            None,
+            "an unregistered compressed length must not resolve"
+        );
+        pool.note_geometry(g, linear);
+        pool.note_geometry(g, ubwc);
+        assert_eq!(pool.resolve_len(linear, g.format), Some(g));
+        assert_eq!(
+            pool.resolve_len(ubwc, g.format),
+            Some(g),
+            "the compressed allocation length resolves to its geometry"
+        );
+    }
+
     /// A commit teaches the pool its geometry, so a window size first seen as a
     /// framebuffer becomes resolvable by length afterwards.
     #[test]

@@ -293,6 +293,10 @@ pub struct Device {
     /// Id/handle spaces already reported exhausted. One line per space: a
     /// sustained leak must surface once, not flood logcat.
     logged_exhaustion: Vec<&'static str>,
+    /// Distinct modifiers already reported by the `ADDFB2` feed, so a
+    /// compressed framebuffer's geometry registration (and the modifier it
+    /// carried) surfaces once per modifier rather than once per registration.
+    addfb_mods: Vec<u64>,
     pub(crate) logged_first_commit: bool,
     pub(crate) commit_count: u32,
     /// Last plane set the census logged (see `commit::plane_census_text`):
@@ -363,6 +367,7 @@ impl Device {
             emulated_fences: HashSet::new(),
             seen_ioctls: Vec::new(),
             logged_exhaustion: Vec::new(),
+            addfb_mods: Vec::new(),
             logged_first_commit: false,
             commit_count: 0,
             plane_census: String::new(),
@@ -1366,14 +1371,14 @@ impl Device {
         {
             return DispatchResult::err(errno::EINVAL);
         }
-        // ADDFB2_MODIFIERS cap is 1: accept explicit LINEAR (the only
-        // modifier in the primary plane's IN_FORMATS blob) so gamescope
-        // can scan out client dma-bufs directly; reject anything else.
-        if cmd.flags & DRM_MODE_FB_MODIFIERS != 0
-            && cmd.modifier.iter().any(|&m| m != DRM_FORMAT_MOD_LINEAR)
-        {
-            return DispatchResult::err(errno::EINVAL);
-        }
+        // Modifiers are recorded, not gated on: gamescope scans out the client
+        // dma-bufs directly, and a compressed (UBWC) slot is one of them. The
+        // primary plane's `IN_FORMATS` blob advertises LINEAR, but a framebuffer
+        // registered with a modifier the plane did not advertise is still a
+        // buffer the presenter can publish — refusing it here is what kept the
+        // compressed image's real allocation length (4947968) out of the
+        // geometry feed, so a later length-only scan-out request for it could
+        // not resolve. Accepting it lets the note below register that length.
         let Some(bpp) = format_bpp(cmd.pixel_format) else {
             return DispatchResult::err(errno::EINVAL);
         };
@@ -1426,6 +1431,17 @@ impl Device {
             if let Some(note) = &self.addfb_geometry {
                 note(cmd.width, cmd.height, gem_size);
             }
+        }
+        // One line per distinct explicit modifier: this is where a compressed
+        // (UBWC) framebuffer's real allocation length enters the geometry feed,
+        // so its registration is visible without per-frame logging.
+        let modifier = cmd.modifier[0];
+        if cmd.flags & DRM_MODE_FB_MODIFIERS != 0 && !self.addfb_mods.contains(&modifier) {
+            self.addfb_mods.push(modifier);
+            self.diag(&format!(
+                "addfb2: fb {}x{} fmt={:#x} gem={} modifier={:#x} registered into the length index",
+                cmd.width, cmd.height, cmd.pixel_format, gem_size, modifier
+            ));
         }
         let mut body = Vec::new();
         pod_write(&mut body, &cmd);

@@ -123,6 +123,12 @@ pub struct ScanoutBuffer {
     /// Row stride in bytes (`AHardwareBuffer_Desc::stride` counts pixels for a
     /// 32-bit format, and DRM pitches are bytes).
     pub stride: u32,
+    /// Real allocation length of the backing dma-buf (`stat.st_size`), row
+    /// padded and page rounded — the length a length-only scan-out request
+    /// carries. A compressed (UBWC) gralloc buffer carries its metadata region
+    /// past the pixels, so this is longer than the tight `width * height * 4`;
+    /// the pool registers it so a later request for that exact length resolves.
+    pub size: u64,
 }
 
 /// Completion-callback mailbox, one per registered dma-buf inode.
@@ -476,6 +482,12 @@ impl ScanoutPool {
             latched,
             cold,
         );
+        // Register the buffer's real allocation length too, so a length-only
+        // scan-out request for a compressed (UBWC) buffer — whose length is
+        // longer than the tight `width * height * 4` the cache notes itself —
+        // resolves to this geometry. Idempotent: the length index keeps the
+        // first geometry noted for a (length, format) pair.
+        self.cache.note_geometry(geom, buffer.size);
         log_info!(
             "asc: scan-out {width}x{height} {origin} (ino={}, stride={}, pool={}/{MAX_SCANOUT_POOL})",
             buffer.ino,
@@ -502,8 +514,18 @@ impl ScanoutPool {
     }
 
     /// Put a freshly built spare in the pool, returning the one it replaces
-    /// (released outside the lock).
+    /// (released outside the lock). The spare's real allocation length is
+    /// registered first, so a length-only request for a compressed buffer
+    /// resolves even before the spare is first handed out.
     fn install_warm(&mut self, warm: Warm) -> Option<Warm> {
+        self.cache.note_geometry(
+            Geometry {
+                width: warm.width,
+                height: warm.height,
+                format: warm.format,
+            },
+            warm.buffer.size,
+        );
         self.warm.replace(warm)
     }
 
@@ -1251,7 +1273,7 @@ pub fn serve_scanout(
                 let resolved = api.and_then(|api| dup_scanout_fd(&api, payload.ahb));
                 d.note_stage(Stage::Alloc, dup_started.elapsed().as_millis() as u64);
                 match resolved {
-                    Some((fd, ino)) => {
+                    Some((fd, ino, size)) => {
                         // The cached buffer was registered under `cached_ino`,
                         // and a dup of its dma-buf keeps the inode — so the
                         // fresh descriptor should carry the same identity.
@@ -1269,6 +1291,7 @@ pub fn serve_scanout(
                             fd,
                             ino,
                             stride: payload.stride,
+                            size,
                         };
                         let replaced = pool.lock(Role::Scanout).commit(
                             width,
@@ -1676,7 +1699,7 @@ fn allocate_buffer(
         log_warn!("asc: AHardwareBuffer_allocate {width}x{height} failed (rc={rc})");
         return Err(if rc != 0 { -rc } else { libc::ENOMEM });
     }
-    let Some((fd, ino)) = dup_scanout_fd(&api, ahb) else {
+    let Some((fd, ino, size)) = dup_scanout_fd(&api, ahb) else {
         // SAFETY: the reference belongs to this call.
         unsafe { ffi::AHardwareBuffer_release(ahb) };
         return Err(libc::EIO);
@@ -1685,7 +1708,15 @@ fn allocate_buffer(
     // SAFETY: `ahb` is a live buffer owned by this call.
     unsafe { ffi::AHardwareBuffer_describe(ahb, &mut real) };
     let stride = real.stride.saturating_mul(4);
-    Ok((ScanoutBuffer { fd, ino, stride }, ahb))
+    Ok((
+        ScanoutBuffer {
+            fd,
+            ino,
+            stride,
+            size,
+        },
+        ahb,
+    ))
 }
 
 /// Drop retired buffers' gralloc references, and close any descriptor that came
@@ -1797,7 +1828,7 @@ fn apply_transaction(api: &ffi::ScApi, tx: *mut ffi::ASurfaceTransaction) {
 /// doc `android/06`); its `stat.st_ino` is the same identity the GEM store
 /// dedups `PRIME_FD_TO_HANDLE` imports by, which is how a committed
 /// framebuffer later resolves back to this buffer.
-fn dup_scanout_fd(api: &ffi::ScApi, ahb: *mut ffi::AHardwareBuffer) -> Option<(RawFd, u64)> {
+fn dup_scanout_fd(api: &ffi::ScApi, ahb: *mut ffi::AHardwareBuffer) -> Option<(RawFd, u64, u64)> {
     // SAFETY: `ahb` is a live buffer owned by this call; the native handle it
     // returns is borrowed and stays valid while `ahb` does.
     let nh = unsafe { (api.ahb_get_native_handle)(ahb) };
@@ -1806,24 +1837,25 @@ fn dup_scanout_fd(api: &ffi::ScApi, ahb: *mut ffi::AHardwareBuffer) -> Option<(R
     }
     // SAFETY: `nh` is a live native handle; fd 0 is the mappable dma-buf.
     let fd0 = unsafe { ffi::NativeHandle::fd(nh, 0) }?;
-    let ino = fstat_ino(fd0)?;
+    let (ino, size) = fstat_ino_size(fd0)?;
     // The client owns the descriptor it is given, so it must be a fresh one.
     // SAFETY: dup of a descriptor this call can read; the result is owned here.
     let fd = unsafe { libc::fcntl(fd0, libc::F_DUPFD_CLOEXEC, 0) };
     if fd < 0 {
         return None;
     }
-    Some((fd, ino))
+    Some((fd, ino, size))
 }
 
-/// `st_ino` of `fd`, which for a dma-buf is the kernel's per-buffer identity.
-fn fstat_ino(fd: c_int) -> Option<u64> {
+/// `(st_ino, st_size)` of `fd`, which for a dma-buf is the kernel's per-buffer
+/// identity and the real allocation length.
+fn fstat_ino_size(fd: c_int) -> Option<(u64, u64)> {
     let mut st: libc::stat = unsafe { core::mem::zeroed() };
     // SAFETY: fstat on a descriptor we own; `st` is fully written on success.
     if unsafe { libc::fstat(fd, &mut st) } != 0 {
         return None;
     }
-    Some(st.st_ino as u64)
+    Some((st.st_ino as u64, st.st_size as u64))
 }
 
 /// Receive one `SOCK_SEQPACKET` message into `buf`: its length and any single
