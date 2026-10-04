@@ -16,8 +16,12 @@
 #     (mocked driver, no GNDRM_LOG_VKSHIM) and the always-on route line must
 #     name the decision. This is the local proof that the entry point is
 #     intercepted and that a broken route is visible in any session log.
-#  2. structural — the built ICD names the X11 entry point and carries no
-#     leftover compositor-override / gamescope_swapchain path.
+#  2. structural — the built ICD names the X11 entry point, and the gamescope
+#     override/Wayland route is the DEFAULT. The override protocol names are
+#     therefore present in the artefact, but reachable ONLY through the
+#     GN_VKSHIM_GUEST_SURFACE capability switch: the default is selected by
+#     `!use_guest_surface()`, and the guest-surface (DRI3) route runs only when
+#     the switch is set to 1. This harness enforces that confinement.
 #
 # A live DRI3 present (window content, idle-fence release) is exercised
 # separately by tools/check-x-present.sh against a real X server + GPU; what
@@ -38,29 +42,60 @@ DIR="$ROOT/target/debug"
 
 fail=0
 
-# ---- 1. the entry point is intercepted and the route line is gate-free ----
-out="$(env -u DISPLAY -u GNDRM_LOG_VKSHIM \
+# ---- 1. the entry point is intercepted; the DEFAULT route is the override ----
+# Default (GN_VKSHIM_GUEST_SURFACE unset): the present-target override must be
+# chosen and named, and the DRI3 route line must be absent. `--xlib-window 0`
+# reports the decision ungated (the override itself cannot engage on the host:
+# no Wayland display, so it fails cleanly).
+# The override route cannot engage on the host (no Wayland display), so the
+# probe legitimately exits non-zero here; assert on the reported route instead.
+out="$(env -u DISPLAY -u GNDRM_LOG_VKSHIM -u GN_VKSHIM_GUEST_SURFACE \
     LD_LIBRARY_PATH="$DIR" \
     ADRENOTOOLS_HOOKS_PATH="$DIR" \
     ADRENOTOOLS_DRIVER_PATH="$DIR" \
     ADRENOTOOLS_DRIVER_NAME="libmock_vkdriver.so" \
-    "$PROBE" --xlib-window 0 "$LIB" 2>&1)" || {
-        echo "FAIL: icd_probe could not drive vkCreateXlibSurfaceKHR" >&2
-        echo "$out" >&2
-        exit 1
-    }
+    "$PROBE" --xlib-window 0 "$LIB" 2>&1)" || true
 if ! grep -qF "PROBE xlib_surface" <<<"$out"; then
     echo "FAIL: the shim did not intercept vkCreateXlibSurfaceKHR" >&2
     echo "$out" >&2
     fail=1
 fi
-if ! grep -qF "x11 route: XID 0x0 unavailable (null XID)" <<<"$out"; then
-    echo "FAIL: the route decision was not reported without GNDRM_LOG_VKSHIM" >&2
+if ! grep -qF "override: XID 0x0" <<<"$out"; then
+    echo "FAIL: the default route was not the override route" >&2
+    echo "$out" >&2
+    fail=1
+fi
+if grep -qF "x11 route:" <<<"$out"; then
+    echo "FAIL: the DRI3 route ran without GN_VKSHIM_GUEST_SURFACE=1" >&2
     echo "$out" >&2
     fail=1
 fi
 
-# ---- 2. the X11 entry point is named, and no override path survives -------
+# With GN_VKSHIM_GUEST_SURFACE=1 the guest-surface (DRI3) route must be
+# reachable, and its decision reported without GNDRM_LOG_VKSHIM.
+out_gs="$(env -u DISPLAY -u GNDRM_LOG_VKSHIM \
+    GN_VKSHIM_GUEST_SURFACE=1 \
+    LD_LIBRARY_PATH="$DIR" \
+    ADRENOTOOLS_HOOKS_PATH="$DIR" \
+    ADRENOTOOLS_DRIVER_PATH="$DIR" \
+    ADRENOTOOLS_DRIVER_NAME="libmock_vkdriver.so" \
+    "$PROBE" --xlib-window 0 "$LIB" 2>&1)" || {
+        echo "FAIL: icd_probe could not drive vkCreateXlibSurfaceKHR (GN_VKSHIM_GUEST_SURFACE=1)" >&2
+        echo "$out_gs" >&2
+        exit 1
+    }
+if ! grep -qF "PROBE xlib_surface" <<<"$out_gs"; then
+    echo "FAIL: the shim did not intercept vkCreateXlibSurfaceKHR (=1)" >&2
+    echo "$out_gs" >&2
+    fail=1
+fi
+if ! grep -qF "x11 route: XID 0x0 unavailable (null XID)" <<<"$out_gs"; then
+    echo "FAIL: GN_VKSHIM_GUEST_SURFACE=1 did not reach the DRI3 route, or the route decision was not reported without GNDRM_LOG_VKSHIM" >&2
+    echo "$out_gs" >&2
+    fail=1
+fi
+
+# ---- 2. the X11 entry point is named; override names are confined ----------
 strings -a "$LIB" >"$ROOT/target/check-x-route.strings"
 for marker in "vkCreateXlibSurfaceKHR" "x11 route:" "X11 present engages"; do
     if ! grep -qF -- "$marker" "$ROOT/target/check-x-route.strings"; then
@@ -68,13 +103,45 @@ for marker in "vkCreateXlibSurfaceKHR" "x11 route:" "X11 present engages"; do
         fail=1
     fi
 done
-# Code-path markers: still asserted against the built artefact.
+# Code-path markers: asserted against the built artefact. The gamescope
+# override/Wayland protocol names are present (it is the DEFAULT route), so the
+# invariant is that they are reachable ONLY through the GN_VKSHIM_GUEST_SURFACE
+# capability switch: the override route is selected by `!use_guest_surface()`,
+# and both override consumers (the surface-create branch and the
+# gamescope_swapchain_factory_v2 registry bind) are gated on `!use_guest_surface()`.
+# The guest-surface (DRI3) route is reachable only when the switch is set to 1.
+override_present=0
 for marker in "override_window_content" "gamescope_swapchain"; do
     if grep -qF -- "$marker" "$ROOT/target/check-x-route.strings"; then
-        echo "FAIL: ICD shim still carries '$marker' (the override path is not the route)" >&2
-        fail=1
+        override_present=1
     fi
 done
+if [ "$override_present" = 1 ]; then
+    if ! grep -qF -- "GN_VKSHIM_GUEST_SURFACE" "$ROOT/target/check-x-route.strings"; then
+        echo "FAIL: override protocol present without the GN_VKSHIM_GUEST_SURFACE switch" >&2
+        fail=1
+    fi
+    if ! grep -q 'fn use_guest_surface' "$ROOT/icd_shim/src/proxy.rs"; then
+        echo "FAIL: override protocol present but no use_guest_surface switch" >&2
+        fail=1
+    fi
+    if ! grep -q 'fn xlib_override_surface' "$ROOT/icd_shim/src/proxy.rs"; then
+        echo "FAIL: override protocol present but no xlib_override_surface route" >&2
+        fail=1
+    fi
+    # The override route is the DEFAULT: selected by the negated switch.
+    if ! grep -q 'if !use_guest_surface()' "$ROOT/icd_shim/src/proxy.rs"; then
+        echo "FAIL: the override route is not the default (no 'if !use_guest_surface()')" >&2
+        fail=1
+    fi
+    # The override registry bind must be gated the same way (it is the only
+    # other consumer of the gamescope_swapchain_factory_v2 global).
+    if ! grep -q 'gamescope_swapchain_factory_v2" && !use_guest_surface()' \
+        "$ROOT/icd_shim/src/proxy.rs"; then
+        echo "FAIL: gamescope_swapchain_factory_v2 bind is not gated on the default route" >&2
+        fail=1
+    fi
+fi
 # `vkCreateWin32SurfaceKHR` is asserted against the shim's *implementation*,
 # not the whole artefact: the generated registry table
 # (icd_shim/src/vk_dispatch_gen.rs) lists every Vulkan command name as data, so

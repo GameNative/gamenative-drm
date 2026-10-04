@@ -213,14 +213,17 @@ fn driver_refusing_instances_falls_back() {
 
 /// `vkCreateXlibSurfaceKHR` is the entry point winex11.drv actually reaches
 /// (winevulkan translates the app's VK_KHR_win32_surface to a host Xlib
-/// surface). The shim must intercept it and always report the route decision,
-/// gated or not: a session that shows nothing is otherwise indistinguishable
-/// from a route that never engaged. With a null XID the call must still
-/// succeed and leave the surface usable-but-dropping, never block the guest.
+/// surface). The DRI3 route into wine's own X window is now selected by
+/// `GN_VKSHIM_GUEST_SURFACE=1`, so this scenario sets it. The shim must
+/// intercept the call and always report the route decision, gated or not: a
+/// session that shows nothing is otherwise indistinguishable from a route that
+/// never engaged. With a null XID the call must still succeed and leave the
+/// surface usable-but-dropping, never block the guest.
 #[test]
 fn xlib_surface_entry_point_is_intercepted_and_reports_route() {
     let dir = target_dir();
-    let env = adrenotools_env(&dir); // headless driver -> the shim's proxy answers GIPA
+    let mut env = adrenotools_env(&dir); // headless driver -> the shim's proxy answers GIPA
+    env.push(("GN_VKSHIM_GUEST_SURFACE", "1".into())); // select the DRI3 route
     let (code, out, err) = run_probe_args(&Scenario { comm: None, env }, &["--xlib-window", "0"]);
     assert_ok(code, &out, &err);
     assert!(out.contains("PROBE xlib_surface"), "stdout:\n{out}");
@@ -235,13 +238,35 @@ fn xlib_surface_entry_point_is_intercepted_and_reports_route() {
 #[test]
 fn xlib_surface_without_x_names_the_unreachable_check() {
     let dir = target_dir();
-    let env = adrenotools_env(&dir);
-    // run_probe_args env_clears, so DISPLAY is unset for the child.
+    let mut env = adrenotools_env(&dir);
+    env.push(("GN_VKSHIM_GUEST_SURFACE", "1".into())); // select the DRI3 route
+                                                       // run_probe_args env_clears, so DISPLAY is unset for the child.
     let (code, out, err) = run_probe_args(&Scenario { comm: None, env }, &["--xlib-window", "1"]);
     assert_ok(code, &out, &err);
     assert!(out.contains("PROBE xlib_surface"), "stdout:\n{out}");
     assert!(
         err.contains("x11 route: XID 0x1 unavailable (guest X server unreachable (DISPLAY))"),
         "stderr:\n{err}"
+    );
+}
+
+/// The DEFAULT (`GN_VKSHIM_GUEST_SURFACE` unset) must take the override/Wayland
+/// route, not DRI3: the route decision must be reported, and the DRI3 route
+/// line must be absent. On the host there is no Wayland display, so the
+/// override route fails cleanly with VK_ERROR_INITIALIZATION_FAILED and the
+/// probe exits non-zero — that is the expected host outcome, not a test error.
+#[test]
+fn xlib_surface_defaults_to_override_route() {
+    let dir = target_dir();
+    let env = adrenotools_env(&dir);
+    let (_code, out, err) = run_probe_args(&Scenario { comm: None, env }, &["--xlib-window", "0"]);
+    assert!(out.contains("PROBE xlib_surface"), "stdout:\n{out}");
+    assert!(
+        err.contains("override: XID 0x0"),
+        "the default must take the override route; stderr:\n{err}"
+    );
+    assert!(
+        !err.contains("x11 route:"),
+        "the DRI3 route must not be the default; stderr:\n{err}"
     );
 }

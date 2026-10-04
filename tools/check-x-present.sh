@@ -11,6 +11,10 @@
 # no DRI3/Present, or no importable dma-buf node); the device-side check is the
 # session log line `x11: window 0x... DRI3 1.2 Present 1.2 - X11 route ready`
 # plus the game's visible background.
+#
+# GN_VKSHIM_GUEST_SURFACE is NOT needed here: this harness drives the DRI3
+# sequence directly against a real X server and does not go through the shim's
+# `gn_vkCreateXlibSurfaceKHR` route selector, so the switch is irrelevant.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

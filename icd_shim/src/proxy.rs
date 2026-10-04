@@ -4353,6 +4353,17 @@ extern "C" fn registry_global(
         } else if iface == b"zwp_linux_dmabuf_v1" && version >= 3 {
             (*w).dmabuf =
                 wlproto::registry_bind(reg, id, &wlproto::ZWP_LINUX_DMABUF_V1_INTERFACE, 3);
+        } else if iface == b"gamescope_swapchain_factory_v2" && !use_guest_surface() {
+            // Capability switch (`GN_VKSHIM_GUEST_SURFACE`): the
+            // gamescope_swapchain_factory_v2 global is bound only while the
+            // override (default) route is active. The `=1` DRI3 route binds
+            // exactly the globals it always did and nothing more.
+            (*w).swapchain_factory = wlproto::registry_bind(
+                reg,
+                id,
+                &wlproto::GAMESCOPE_SWAPCHAIN_FACTORY_V2_INTERFACE,
+                1,
+            );
         }
     }
 }
@@ -5495,6 +5506,96 @@ unsafe extern "C" fn gn_vkCreateWaylandSurfaceKHR(
 // surface setup then fails VK_ERROR_INITIALIZATION_FAILED). The shim must
 // present every window itself, so there is no driver-WSI fallback route.
 
+/// `GN_VKSHIM_GUEST_SURFACE` — the present-route capability switch.
+///
+/// This shim's DEFAULT (`0` or unset) presents the guest's Vulkan frames to
+/// gamescope's override/Wayland surface (`xlib_override_surface`), ignoring
+/// the guest's window content: Vulkan-only, lowest CPU, no dependence on
+/// Xwayland's DRI3. Setting `GN_VKSHIM_GUEST_SURFACE=1` involves the guest's
+/// surface instead — the DRI3 1.2 + Present route into wine's own X window,
+/// which additionally carries wine's GDI/2D content drawn outside the guest's
+/// Vulkan surface.
+///
+/// This is a deliberate, documented capability switch — not scaffolding. It
+/// intentionally deviates from the project's usual "no knobs" rule by the
+/// user's decision: `=1` restores GDI/2D support at a CPU cost.
+fn use_guest_surface() -> bool {
+    std::env::var_os("GN_VKSHIM_GUEST_SURFACE").is_some_and(|v| v == "1")
+}
+
+/// The override/Wayland present route — the shim's DEFAULT (see
+/// `use_guest_surface`). Creates the shim's OWN wl_surface, wraps it in a
+/// gamescope_swapchain, and binds it to the guest's X window via
+/// override_window_content; the compositor then routes this surface's commits
+/// as that window's content. Presenting therefore shows the guest's frames
+/// directly — wine's own GDI/2D window content is NOT composited (the known
+/// and accepted "chooses, never combines" consequence of this route). That
+/// GDI/2D gap is exactly the cost the `=1` DRI3 route buys back.
+///
+/// Recovered from `cb89a9f^` (the commit whose DRI3 route deleted it); adapted
+/// to the current shim (the `x11` field on `GnSurface`, the worker's existing
+/// `parent.is_null()` dispatch, and `gn_vkDestroySurfaceKHR`'s proxy teardown).
+/// Its only caller is the default (non-`use_guest_surface`) branch of
+/// `gn_vkCreateXlibSurfaceKHR`.
+unsafe fn xlib_override_surface(
+    gi: *mut GnInstance,
+    window: u32,
+    out: *mut VkSurfaceKHR,
+) -> VkResult {
+    crate::routef!(
+        "override: XID {:#x} → gamescope override surface (default; guest GDI/2D not composited)",
+        window
+    );
+    if !wl_setup(ptr::null_mut()) {
+        crate::logf!("proxy xlib surface create FAILED: wayland setup failed");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let (comp, factory, dpy) = {
+        let w = G_WL.lock().unwrap();
+        (w.comp, w.swapchain_factory, w.dpy)
+    };
+    if factory.is_null() {
+        crate::logf!("compositor misses gamescope_swapchain_factory_v2 — cannot bind XID");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    unsafe {
+        let _sg = SEND_LOCK.lock().unwrap();
+        let surf = wlproto::compositor_create_surface(comp);
+        if surf.is_null() {
+            crate::logf!("proxy xlib surface create FAILED: wl_surface create failed");
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        let scobj = wlproto::swapchain_factory_create_swapchain(factory, surf);
+        // Single xwayland server (--xwayland-count 1) is always id 0.
+        wlproto::swapchain_override_window_content(scobj, 0, window);
+        wlproto::wl_display_flush(dpy);
+        drop(_sg);
+        let s = Box::new(GnSurface {
+            inst: gi,
+            dpy,
+            parent: surf,
+            own_surface: surf,
+            swapchain_obj: scobj,
+            x11: ptr::null_mut(),
+            next: ptr::null_mut(),
+        });
+        let s = Box::into_raw(s);
+        {
+            let mut g = G.lock().unwrap();
+            (*s).next = g.surfaces;
+            g.surfaces = s;
+        }
+        *out = s as usize as VkSurfaceKHR;
+        crate::routef!(
+            "override: proxy surface {:?} (own wl_surface {:?} bound to XID {:#x}; Vulkan-only, guest GDI/2D not composited)",
+            s,
+            surf,
+            window
+        );
+    }
+    VK_SUCCESS
+}
+
 unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
     instance: VkInstance,
     ci: *const VkXlibSurfaceCreateInfoKHR,
@@ -5506,6 +5607,13 @@ unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
     if gi.is_null() {
         crate::logf!("proxy xlib surface create FAILED: instance {instance:?} not one of ours");
         return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // Present-route capability switch (`GN_VKSHIM_GUEST_SURFACE`, see
+    // `use_guest_surface`). The DEFAULT (0/unset) presents the guest's Vulkan
+    // frames to the gamescope override/Wayland surface; `=1` selects the
+    // DRI3-into-wine's-X-window route below, which restores wine's GDI/2D.
+    if !use_guest_surface() {
+        return unsafe { xlib_override_surface(gi, ci.window as u32, out) };
     }
     let x11 = if ci.window == 0 {
         crate::routef!(
@@ -5588,6 +5696,20 @@ unsafe extern "C" fn gn_vkDestroySurfaceKHR(
     unsafe {
         if !(*s).x11.is_null() {
             drop(Box::from_raw((*s).x11));
+        }
+        // The override route (default) owns a wl_surface + gamescope_swapchain.
+        // Both are null on the `GN_VKSHIM_GUEST_SURFACE=1` DRI3 route, so this
+        // teardown is inert there.
+        if !(*s).swapchain_obj.is_null() || !(*s).own_surface.is_null() {
+            let _sg = SEND_LOCK.lock().unwrap();
+            if !(*s).swapchain_obj.is_null() {
+                wlproto::wl_proxy_destroy((*s).swapchain_obj);
+            }
+            if !(*s).own_surface.is_null() {
+                wlproto::wl_proxy_destroy((*s).own_surface);
+            }
+            wlproto::wl_display_flush((*s).dpy);
+            drop(_sg);
         }
         drop(Box::from_raw(s));
     }

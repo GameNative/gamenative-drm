@@ -173,10 +173,137 @@ pub unsafe fn surface_commit(surface: *mut wl_proxy) {
     wl_proxy_marshal_array(surface, 6, std::ptr::null_mut());
 }
 
-// The wayland arm presents on the guest's OWN wl_surface (winewayland hands
-// it to `vkCreateWaylandSurfaceKHR`), so no compositor-specific swapchain
-// protocol is declared here: the X11 window route is DRI3 + Present in
-// `crate::x11`, and it no longer binds a gamescope override surface.
+// gamescope override/Wayland present route (the shim's DEFAULT) — see
+// `gn_vkCreateXlibSurfaceKHR` in `crate::proxy` and `GN_VKSHIM_GUEST_SURFACE`.
+// Recovered from the pre-DRI3 route that this shim carried at commit
+// `cb89a9f^` ("icd_shim: X11 DRI3+Present present route …", which *deleted*
+// this block). This is the upstream gamescope WSI-override mechanism: the
+// shim creates its OWN wl_surface and binds it to an X11 window via
+// override_window_content; the compositor then routes that surface's commits
+// as the window's content. It presents the guest's Vulkan frames straight to
+// the override/Wayland surface instead of into wine's own X window, so wine's
+// own GDI/2D is not composited. Its only caller is the default route.
+
+/// wl_compositor_create_surface (opcode 0): new_id wl_surface.
+pub unsafe fn compositor_create_surface(comp: *mut wl_proxy) -> *mut wl_proxy {
+    let mut args = [wl_argument { u: 0 }];
+    wl_proxy_marshal_array_constructor(comp, 0, args.as_mut_ptr(), &wl_surface_interface)
+}
+
+// ------------------------------------------- gamescope_swapchain statics
+// Transliterated from gamescope's protocol/gamescope-swapchain.xml: the
+// upstream WSI-override mechanism — a client presents on its OWN wl_surface
+// and binds it to an X11 window via override_window_content; the compositor
+// routes that surface's commits as the window's content (incl. draining
+// g_PendingCommits on bind). Only the requests the shim sends are declared.
+
+#[allow(clippy::missing_transmute_annotations)]
+mod swapchain_statics {
+    use super::{wl_interface, wl_message};
+    use std::os::raw::c_char;
+
+    const fn cs(s: &'static [u8]) -> *const c_char {
+        s.as_ptr() as *const c_char
+    }
+
+    // create_swapchain args: wl_surface (object), gamescope_swapchain (new_id).
+    struct SyncIfaces([*const wl_interface; 2]);
+    unsafe impl Sync for SyncIfaces {}
+    static TYPES: SyncIfaces = SyncIfaces([
+        &raw const super::wl_surface_interface,
+        &raw const GAMESCOPE_SWAPCHAIN_INTERFACE,
+    ]);
+
+    static FACTORY_REQUESTS: [wl_message; 2] = [
+        wl_message {
+            name: cs(b"destroy\0"),
+            signature: cs(b"\0"),
+            types: std::ptr::null(),
+        },
+        wl_message {
+            name: cs(b"create_swapchain\0"),
+            signature: cs(b"on\0"),
+            types: TYPES.0.as_ptr(),
+        },
+    ];
+
+    pub static GAMESCOPE_SWAPCHAIN_FACTORY_V2_INTERFACE: wl_interface = wl_interface {
+        name: cs(b"gamescope_swapchain_factory_v2\0"),
+        version: 1,
+        method_count: 2,
+        methods: FACTORY_REQUESTS.as_ptr(),
+        event_count: 0,
+        events: std::ptr::null(),
+    };
+
+    static SWAPCHAIN_REQUESTS: [wl_message; 2] = [
+        wl_message {
+            name: cs(b"destroy\0"),
+            signature: cs(b"\0"),
+            types: std::ptr::null(),
+        },
+        wl_message {
+            name: cs(b"override_window_content\0"),
+            signature: cs(b"uu\0"),
+            types: std::ptr::null(),
+        },
+    ];
+
+    // The server sends these (refresh_cycle right after override_window_content
+    // binds); if event_count under-declares them, libwayland's demarshal fails
+    // and wl_display_fatal latches last_error, after which every
+    // wl_display_flush is a no-op.
+    static SWAPCHAIN_EVENTS: [wl_message; 3] = [
+        wl_message {
+            name: cs(b"past_present_timing\0"),
+            signature: cs(b"9u\0"),
+            types: std::ptr::null(),
+        },
+        wl_message {
+            name: cs(b"refresh_cycle\0"),
+            signature: cs(b"uu\0"),
+            types: std::ptr::null(),
+        },
+        wl_message {
+            name: cs(b"retired\0"),
+            signature: cs(b"\0"),
+            types: std::ptr::null(),
+        },
+    ];
+
+    pub static GAMESCOPE_SWAPCHAIN_INTERFACE: wl_interface = wl_interface {
+        name: cs(b"gamescope_swapchain\0"),
+        version: 1,
+        method_count: 2,
+        methods: SWAPCHAIN_REQUESTS.as_ptr(),
+        event_count: 3,
+        events: SWAPCHAIN_EVENTS.as_ptr(),
+    };
+}
+
+pub use swapchain_statics::{
+    GAMESCOPE_SWAPCHAIN_FACTORY_V2_INTERFACE, GAMESCOPE_SWAPCHAIN_INTERFACE,
+};
+
+/// gamescope_swapchain_factory_v2.create_swapchain (opcode 1): surface, new_id.
+pub unsafe fn swapchain_factory_create_swapchain(
+    factory: *mut wl_proxy,
+    surface: *mut wl_proxy,
+) -> *mut wl_proxy {
+    let mut args = [wl_argument { o: surface }, wl_argument { u: 0 }];
+    wl_proxy_marshal_array_constructor(
+        factory,
+        1,
+        args.as_mut_ptr(),
+        &GAMESCOPE_SWAPCHAIN_INTERFACE,
+    )
+}
+
+/// gamescope_swapchain.override_window_content (opcode 1): server id, XID.
+pub unsafe fn swapchain_override_window_content(sc: *mut wl_proxy, server: u32, xid: u32) {
+    let mut args = [wl_argument { u: server }, wl_argument { u: xid }];
+    wl_proxy_marshal_array(sc, 1, args.as_mut_ptr());
+}
 
 // ------------------------------------------- zwp_linux_dmabuf_v1 statics
 // Transliterated from the wayland-scanner output (linux-dmabuf-v1); only
