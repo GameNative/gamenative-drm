@@ -13,9 +13,9 @@
 #
 # Two layers:
 #  1. behavioural — icd_probe drives vkCreateXlibSurfaceKHR through the shim
-#     (mocked driver, no GNDRM_LOG_VKSHIM) and the always-on route line must
-#     name the decision. This is the local proof that the entry point is
-#     intercepted and that a broken route is visible in any session log.
+#     (with GNDRM_LOG_VKSHIM=1) and the route line must name the decision. This
+#     is the local proof that the entry point is intercepted and that a broken
+#     route is visible in a session log with the diagnostics gate on.
 #  2. structural — the built ICD names the X11 entry point, and the gamescope
 #     override/Wayland route is the DEFAULT. The override protocol names are
 #     therefore present in the artefact, but reachable ONLY through the
@@ -45,11 +45,12 @@ fail=0
 # ---- 1. the entry point is intercepted; the DEFAULT route is the override ----
 # Default (GN_VKSHIM_GUEST_SURFACE unset): the present-target override must be
 # chosen and named, and the DRI3 route line must be absent. `--xlib-window 0`
-# reports the decision ungated (the override itself cannot engage on the host:
-# no Wayland display, so it fails cleanly).
+# reports the decision; the route lines now follow GNDRM_LOG_VKSHIM, so the gate
+# is turned on here (the override itself cannot engage on the host: no Wayland
+# display, so it fails cleanly).
 # The override route cannot engage on the host (no Wayland display), so the
 # probe legitimately exits non-zero here; assert on the reported route instead.
-out="$(env -u DISPLAY -u GNDRM_LOG_VKSHIM -u GN_VKSHIM_GUEST_SURFACE \
+out="$(env -u DISPLAY -u GN_VKSHIM_GUEST_SURFACE GNDRM_LOG_VKSHIM=1 \
     LD_LIBRARY_PATH="$DIR" \
     ADRENOTOOLS_HOOKS_PATH="$DIR" \
     ADRENOTOOLS_DRIVER_PATH="$DIR" \
@@ -72,8 +73,8 @@ if grep -qF "x11 route:" <<<"$out"; then
 fi
 
 # With GN_VKSHIM_GUEST_SURFACE=1 the guest-surface (DRI3) route must be
-# reachable, and its decision reported without GNDRM_LOG_VKSHIM.
-out_gs="$(env -u DISPLAY -u GNDRM_LOG_VKSHIM \
+# reachable, and its decision reported with GNDRM_LOG_VKSHIM=1.
+out_gs="$(env -u DISPLAY GNDRM_LOG_VKSHIM=1 \
     GN_VKSHIM_GUEST_SURFACE=1 \
     LD_LIBRARY_PATH="$DIR" \
     ADRENOTOOLS_HOOKS_PATH="$DIR" \
@@ -90,7 +91,7 @@ if ! grep -qF "PROBE xlib_surface" <<<"$out_gs"; then
     fail=1
 fi
 if ! grep -qF "x11 route: XID 0x0 unavailable (null XID)" <<<"$out_gs"; then
-    echo "FAIL: GN_VKSHIM_GUEST_SURFACE=1 did not reach the DRI3 route, or the route decision was not reported without GNDRM_LOG_VKSHIM" >&2
+    echo "FAIL: GN_VKSHIM_GUEST_SURFACE=1 did not reach the DRI3 route, or the route decision was not reported under GNDRM_LOG_VKSHIM" >&2
     echo "$out_gs" >&2
     fail=1
 fi
@@ -155,4 +156,4 @@ if grep -qF -- "vkCreateWin32SurfaceKHR" "$ROOT/icd_shim/src/proxy.rs" \
 fi
 
 [ "$fail" = 0 ] || exit 1
-echo "PASS: ICD shim hooks the guest's real surface entry point (vkCreateXlibSurfaceKHR) and reports its route ungated"
+echo "PASS: ICD shim hooks the guest's real surface entry point (vkCreateXlibSurfaceKHR) and reports its route under GNDRM_LOG_VKSHIM"

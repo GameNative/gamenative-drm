@@ -33,13 +33,13 @@ use std::io;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use jni::objects::{JClass, JObject, JString};
+use jni::objects::{GlobalRef, JClass, JObject, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong};
-use jni::JNIEnv;
+use jni::{JNIEnv, JavaVM};
 
 use gndrm_daemon::diag;
 use gndrm_daemon::server;
@@ -55,6 +55,83 @@ const E_IO: jint = -5;
 /// commits excluded). Reset by `nativeStart`/`nativeStop`; polled by the app
 /// via `nativeFramesPresented` for first-frame splash dismissal.
 pub(crate) static PRESENTED_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// The app's `JavaVM`, cached from the first JNI entry point (`nativeStart`).
+/// Needed by the presenter thread, which is a Rust-spawned thread with no
+/// `JNIEnv` of its own: it attaches with [`JavaVM::attach_current_thread`] to
+/// emit the booting-splash event. Set once per process; a missing VM only means
+/// the event cannot be pushed (the app still polls `nativeFramesPresented`).
+static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
+
+/// Global ref to `GameNativeDrm`, resolved on a Java thread by
+/// [`cache_java_vm`]. A name lookup from the presenter thread cannot work: an
+/// attached native thread has no context class loader, so `FindClass` falls back
+/// to the system loader, which cannot see app classes.
+static CALLBACK_CLASS: OnceLock<GlobalRef> = OnceLock::new();
+
+/// Cache the process `JavaVM` and the callback class from a JNI entry point. Best-effort: any failure
+/// is logged and ignored — the rest of the daemon does not depend on it.
+fn cache_java_vm(env: &mut JNIEnv) {
+    match env.get_java_vm() {
+        Ok(vm) => {
+            if JAVA_VM.set(vm).is_ok() {
+                log_info!("cached JavaVM for JNI callbacks");
+            }
+        }
+        Err(e) => log_warn!("get_java_vm failed: {e}"),
+    }
+    match env.find_class("app/gamenative/display/GameNativeDrm") {
+        Ok(class) => match env.new_global_ref(class) {
+            Ok(global) => {
+                if CALLBACK_CLASS.set(global).is_ok() {
+                    log_info!("cached GameNativeDrm class for JNI callbacks");
+                }
+            }
+            Err(e) => log_warn!("new_global_ref(GameNativeDrm) failed: {e}"),
+        },
+        Err(e) => {
+            log_warn!("find_class(GameNativeDrm) failed: {e}");
+            let _ = env.exception_clear();
+        }
+    }
+}
+
+/// Emit `AndroidEvent.ClearBootingSplash` on the app's event bus. Best-effort —
+/// a failure to attach, a missing cached VM, or a failing call is logged and
+/// swallowed; nothing on this path may panic.
+pub(crate) fn clear_booting_splash() {
+    call_app_static("clearBootingSplash");
+}
+
+/// Attach the calling thread, call a no-arg static method on `GameNativeDrm`,
+/// detach. Attaching needs the class resolved on a Java thread, so it comes from
+/// [`CALLBACK_CLASS`]; every failure is logged and swallowed.
+fn call_app_static(method: &str) {
+    let Some(vm) = JAVA_VM.get() else {
+        log_warn!("{method}: no cached JavaVM; call skipped");
+        return;
+    };
+    let Some(class) = CALLBACK_CLASS.get() else {
+        log_warn!("{method}: GameNativeDrm class not cached; call skipped");
+        return;
+    };
+    // AttachGuard detaches on drop, including on the early returns below.
+    let mut env = match vm.attach_current_thread() {
+        Ok(env) => env,
+        Err(e) => {
+            log_warn!("{method}: attach_current_thread failed: {e}");
+            return;
+        }
+    };
+    match env.call_static_method(class, method, "()V", &[]) {
+        Ok(_) => log_info!("{method}: called"),
+        Err(e) => {
+            log_warn!("{method}: call failed: {e}");
+            // Never leave a pending exception on this thread.
+            let _ = env.exception_clear();
+        }
+    }
+}
 
 /// Client fds accepted so far (`-1` = not yet). Written by the server
 /// thread right after each accept; read by `nativeStop` to unblock a
@@ -406,6 +483,9 @@ fn start(
     refresh_hz: jfloat,
 ) -> jint {
     PRESENTED_FRAMES.store(0, Ordering::Relaxed);
+    // First JNI entry point to run: capture the VM so the presenter thread can
+    // push the booting-splash event on the first frame.
+    cache_java_vm(env);
     let name: String = match env.get_string(socket_name) {
         Ok(s) => s.to_string_lossy().into_owned(),
         Err(_) => return E_INVAL,

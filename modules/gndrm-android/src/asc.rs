@@ -943,7 +943,10 @@ impl AscState {
 
         self.frames += 1;
         if fb.id != 0 {
-            crate::PRESENTED_FRAMES.fetch_add(1, Ordering::Relaxed);
+            // First real frame on the panel: clear the splash.
+            if crate::PRESENTED_FRAMES.fetch_add(1, Ordering::Relaxed) == 0 {
+                crate::clear_booting_splash();
+            }
         }
         handle
     }

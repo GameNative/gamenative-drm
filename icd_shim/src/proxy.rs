@@ -142,14 +142,14 @@ fn leave(token: usize) {
     }
 }
 
-// --------------------------------------- last-calls ring (bounded, always on)
+// --------------------------------------- last-calls ring (bounded, gated off)
 //
 // A tiny per-thread history of the last entry points the guest invoked, so
 // the call the guest made just before its threads park is named without a
 // diagnostic env knob. Always recording (cheap: one push per intercepted
 // call), but only *printed* once — when a stall is suspected — so a healthy
-// session stays silent. `routef!` (not the GNDRM_LOG_VKSHIM-gated `logf!`)
-// because this must work with every toggle off.
+// session stays silent. The dump uses `logf!` (GNDRM_LOG_VKSHIM-gated, off by
+// default): a session that wants the ring turns the gate on.
 struct RingEnt {
     tid: u32,
     name: &'static str,
@@ -187,10 +187,10 @@ fn ring_dump(reason: &str) {
     let Ok(r) = RING.lock() else {
         return;
     };
-    crate::routef!("x11 stall ring ({reason}): last {} entry points:", r.len());
+    crate::logf!("x11 stall ring ({reason}): last {} entry points:", r.len());
     let n = r.len();
     for (i, e) in r.iter().enumerate() {
-        crate::routef!(
+        crate::logf!(
             "x11 stall ring [{}/{}] tid={} {} args={:x} {:x} {:x} {:x} {:x}",
             i + 1,
             n,
@@ -615,7 +615,7 @@ unsafe fn x11_present_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) -> bo
         unsafe { (*sc).x11_trace = trace_n + 1 };
         let (a0, nz, px) = unsafe { slot_signature(sc, s) };
         let acq = unsafe { (*s).acq_seq };
-        crate::routef!(
+        crate::logf!(
             "x11 trace {trace_n}: sc={sc:?} idx={idx} acq#{acq} {}x{} alpha0={a0}/{} nz={nz} px0=({},{},{},{})",
             unsafe { (*sc).extent.width },
             unsafe { (*sc).extent.height },
@@ -631,7 +631,7 @@ unsafe fn x11_present_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) -> bo
         // image's real layout/stride is not what the shim advertises/reads.
         if trace_n < X11_VIEW_N {
             if let Some((va0, vnz, vpx)) = unsafe { slot_mem_signature(sc, s) } {
-                crate::routef!(
+                crate::logf!(
                     "x11 view {trace_n}: idx={idx} driver(mapmem) alpha0={va0}/{} nz={vnz} px0=({},{},{},{})",
                     unsafe { (*sc).extent.width as usize * (*sc).extent.height as usize },
                     vpx[0],
@@ -784,7 +784,7 @@ fn worker_main(sc: *mut GnSwapchain) {
                     x11_reap(sc);
                 } else {
                     if !X11_DROP_LOGGED.swap(true, Ordering::Relaxed) {
-                        crate::routef!(
+                        crate::logf!(
                             "x11 route: present unavailable - frames dropped, slots kept free (guest keeps running)"
                         );
                     }
@@ -952,7 +952,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         if let Ok(adv) = ADVERTISED_CAPS.lock() {
             if let Some(a) = *adv {
                 let stride = sc.slots.first().map_or(0, |s| s.stride);
-                crate::routef!(
+                crate::logf!(
                     "x11 caps vs slot: advertised current={}x{} min={}x{} max={}x{} -> image {}x{} stride={} slots={}",
                     a.current.0,
                     a.current.1,
@@ -1039,7 +1039,7 @@ unsafe extern "C" fn gn_vkGetSwapchainImagesKHR(
             let hs: Vec<String> = (0..n)
                 .map(|i| format!("{:#x}", *images.add(i) as usize))
                 .collect();
-            crate::routef!("x11 scimages: sc={sc:?} n={n} imgs={hs:?}");
+            crate::logf!("x11 scimages: sc={sc:?} n={n} imgs={hs:?}");
         }
         *count = n as u32;
         if n < n_slots {
@@ -1118,7 +1118,7 @@ unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
                 (*s).acq_seq = seq as u64;
             }
             if seq < X11_TRACE_N {
-                crate::routef!(
+                crate::logf!(
                     "x11 acquire {seq}: sc={sc:?} idx={} img={:#x}",
                     *idx,
                     unsafe { (*s).image } as usize
@@ -1422,7 +1422,7 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
             crate::logf!("proxy present: sc={sc:?} idx={} {}", indices[i], counters());
         }
         if LOUD_PRESENT.fetch_add(1, Ordering::Relaxed) < 4 {
-            crate::routef!(
+            crate::logf!(
                 "proxy: present flow pid={} sc={sc:?} idx={} {}",
                 std::process::id(),
                 indices[i],
@@ -1499,7 +1499,7 @@ unsafe fn submit_impl(
             .collect::<Vec<_>>()
     );
     if LOUD_SUBMIT.fetch_add(1, Ordering::Relaxed) < 4 {
-        crate::routef!(
+        crate::logf!(
             "proxy: submit flow #{seq} pid={} q={queue:?} real_q={:?} n={count} ncmd={:?}",
             std::process::id(),
             unsafe { (*gq).real },
@@ -1619,7 +1619,7 @@ unsafe fn submit2_impl(
     unsafe { translate_nested("vkQueueSubmit2", &mut args, &mut stage) };
     let translated = args[2] as *const VkSubmitInfo2;
     if LOUD_SUBMIT2.fetch_add(1, Ordering::Relaxed) < 4 {
-        crate::routef!(
+        crate::logf!(
             "proxy: submit2 flow pid={} q={queue:?} real_q={:?} n={count} ncmd={:?}",
             std::process::id(),
             unsafe { (*gq).real },
@@ -1887,7 +1887,7 @@ unsafe fn sc_slot_of(gd: *mut GnDevice, image: VkImage) -> Option<(*mut GnSwapch
 fn trace_sc_cmd(name: &str, cmd: VkCommandBuffer, hits: &str) {
     let n = TRACE_SC_CMD.fetch_add(1, Ordering::Relaxed);
     if n < TRACE_SC_CMD_N {
-        crate::routef!("x11 cmd {n}: {name} cb={cmd:?} {hits}");
+        crate::logf!("x11 cmd {n}: {name} cb={cmd:?} {hits}");
     }
 }
 
@@ -1934,7 +1934,7 @@ static TRACE_SEEN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 fn trace_seen(name: &'static str) {
     if let Ok(mut v) = TRACE_SEEN.lock() {
         if v.len() < 32 && !v.contains(&name) {
-            crate::routef!("x11 cmd-seen: {name} (guest records it through the shim)");
+            crate::logf!("x11 cmd-seen: {name} (guest records it through the shim)");
             v.push(name);
         }
     }
@@ -2079,12 +2079,12 @@ unsafe extern "C" fn gn_vkCreateFramebuffer(
     res
 }
 
-// ---- viewport / scissor trace (bounded one-shot, always on) --------------
+// ---- viewport / scissor trace (bounded one-shot, GNDRM_LOG_VKSHIM-gated) --
 // The drawn geometry never lands while clears and copies do; a viewport whose
 // extent is zero, or whose rect lies outside the swapchain image, clips every
 // draw while leaving a loadOp clear intact. Log the first non-empty values and
-// any change thereafter, bounded, with the running call count. Always on
-// (routef!), silent once the budget is spent.
+// any change thereafter, bounded, with the running call count. `logf!`-gated
+// (off by default), silent once the budget is spent.
 const VS_LOG_N: usize = 6;
 static VP_CALLS: AtomicUsize = AtomicUsize::new(0);
 static VP_LOGGED: AtomicUsize = AtomicUsize::new(0);
@@ -2115,7 +2115,7 @@ fn trace_viewports(name: &str, count: u32, vps: *const VkViewport) {
     }
     *last = Some(key);
     VP_LOGGED.fetch_add(1, Ordering::Relaxed);
-    crate::routef!(
+    crate::logf!(
         "x11 {name}: call={n} count={count} vp0 x={} y={} w={} h={} depth={}..{}",
         v.x,
         v.y,
@@ -2146,7 +2146,7 @@ fn trace_scissors(name: &str, count: u32, rects: *const VkRect2D) {
     }
     *last = Some(key);
     SC_LOGGED.fetch_add(1, Ordering::Relaxed);
-    crate::routef!(
+    crate::logf!(
         "x11 {name}: call={n} count={count} sc0 off=({},{}) ext={}x{}",
         r.offset.x,
         r.offset.y,
@@ -2396,7 +2396,7 @@ unsafe extern "C" fn gn_vkCmdBeginRendering(cmd: VkCommandBuffer, info: *const V
                     a.imageLayout, a.loadOp, a.storeOp, c[0], c[1], c[2], c[3]
                 ));
             }
-            crate::routef!(
+            crate::logf!(
                 "x11 rndr {n}: {}x{} colors={na} {}",
                 ri.renderArea.extent.width,
                 ri.renderArea.extent.height,
@@ -2427,7 +2427,7 @@ unsafe extern "C" fn gn_vkCmdBeginRenderPass2(
             } else {
                 [0f32; 4]
             };
-            crate::routef!(
+            crate::logf!(
                 "x11 rpb2 {n}: {}x{} off=({},{}) fb={:#x} rp={:#x} clears={} clear0=({},{},{},{}) rpOps={} slots={slots:?}",
                 bi.renderArea.extent.width,
                 bi.renderArea.extent.height,
@@ -2463,7 +2463,7 @@ unsafe extern "C" fn gn_vkCmdBeginRenderPass(
                 [0f32; 4]
             };
             let slots = unsafe { fb_slots(gd, bi.framebuffer) };
-            crate::routef!(
+            crate::logf!(
                 "x11 rpb {n}: {}x{} off=({},{}) fb={:#x} rp={:#x} clears={} clear0=({},{},{},{}) contents={contents} rpOps={} slots={slots:?}",
                 bi.renderArea.extent.width,
                 bi.renderArea.extent.height,
@@ -2497,7 +2497,7 @@ unsafe extern "C" fn gn_vkCmdClearColorImage(
             static ANY: AtomicUsize = AtomicUsize::new(0);
             let n2 = ANY.fetch_add(1, Ordering::Relaxed);
             if n2 < 8 {
-                crate::routef!("x11 any clear: img={:#x} layout={layout}", image as usize);
+                crate::logf!("x11 any clear: img={:#x} layout={layout}", image as usize);
             }
         }
         if let Some((sc, i)) = unsafe { sc_slot_of(gd, image) } {
@@ -2564,7 +2564,7 @@ unsafe extern "C" fn gn_vkCmdCopyImage2(cmd: VkCommandBuffer, info: *const VkCop
             static ANY: AtomicUsize = AtomicUsize::new(0);
             let n2 = ANY.fetch_add(1, Ordering::Relaxed);
             if n2 < 12 {
-                crate::routef!(
+                crate::logf!(
                     "x11 any copyimg2: src={:#x} dst={:#x} {}x{}",
                     ci.srcImage as usize,
                     ci.dstImage as usize,
@@ -2677,7 +2677,7 @@ unsafe extern "C" fn gn_vkCmdPipelineBarrier2(cmd: VkCommandBuffer, dep: *const 
                     static ANY: AtomicUsize = AtomicUsize::new(0);
                     let n2 = ANY.fetch_add(1, Ordering::Relaxed);
                     if n2 < 12 {
-                        crate::routef!(
+                        crate::logf!(
                             "x11 any bar2: img={:#x} srcStage={:#x} dstStage={:#x}",
                             b.image as usize,
                             b.srcStageMask,
@@ -4604,12 +4604,11 @@ fn was_wrapper(p: usize) -> bool {
         .unwrap_or(false)
 }
 
-/// A dropped call must never be invisible. `logf!` is gated on
-/// `GNDRM_LOG_VKSHIM`, which the guest process does not set, so every silent
-/// early-return used `logf!` and was unobservable in a real session — a call
-/// the shim dropped looked identical to one the guest never made. These lines
-/// go out unconditionally (`routef!`), bounded per site so a storm of misses
-/// cannot flood logcat.
+/// A dropped call must never be invisible. Every diagnostic line in this shim
+/// now follows `GNDRM_LOG_VKSHIM` (via `logf!`, off by default), so a call the
+/// shim dropped is named when the gate is on rather than being indistinguishable
+/// from one the guest never made. Bounded per site so a storm of misses cannot
+/// flood logcat.
 const LOUD_MAX: u32 = 6;
 fn loud(site: &'static str, msg: String) {
     static SEEN: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new());
@@ -4620,7 +4619,7 @@ fn loud(site: &'static str, msg: String) {
             None => v.push((site, 1)),
         }
     }
-    crate::routef!("{msg}");
+    crate::logf!("{msg}");
 }
 
 /// A handle the shim could not resolve, against the wrapper table it searched,
@@ -4847,7 +4846,7 @@ fn note_nested(name: &str, n: usize) {
             // the shim translated nested wrapper handles" is the fact that
             // settles whether the submit path is live, and the guest process
             // does not set GNDRM_LOG_VKSHIM. Bounded to one line per name.
-            crate::routef!("proxy nested translate: {name} ({n} handle(s))");
+            crate::logf!("proxy nested translate: {name} ({n} handle(s))");
         }
     }
 }
@@ -5252,7 +5251,7 @@ unsafe extern "C" fn gn_vkCreateInstance(
         *out
     });
     if !LOUD_INSTANCE.swap(true, Ordering::Relaxed) {
-        crate::routef!(
+        crate::logf!(
             "proxy: instance created pid={} real={:?} npds={}",
             std::process::id(),
             unsafe { *out },
@@ -5513,7 +5512,7 @@ unsafe fn xlib_override_surface(
     window: u32,
     out: *mut VkSurfaceKHR,
 ) -> VkResult {
-    crate::routef!(
+    crate::logf!(
         "override: XID {:#x} → gamescope override surface (default; guest GDI/2D not composited)",
         window
     );
@@ -5557,7 +5556,7 @@ unsafe fn xlib_override_surface(
             g.surfaces = s;
         }
         *out = s as usize as VkSurfaceKHR;
-        crate::routef!(
+        crate::logf!(
             "override: proxy surface {:?} (own wl_surface {:?} bound to XID {:#x}; Vulkan-only, guest GDI/2D not composited)",
             s,
             surf,
@@ -5587,7 +5586,7 @@ unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
         return unsafe { xlib_override_surface(gi, ci.window as u32, out) };
     }
     let x11 = if ci.window == 0 {
-        crate::routef!(
+        crate::logf!(
             "x11 route: XID {:#x} unavailable ({})",
             ci.window,
             crate::x11::RouteUnavailable::NullXid.reason()
@@ -5597,7 +5596,7 @@ unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
         match unsafe { crate::x11::X11Present::new(ci.window as u32) } {
             Ok(p) => Box::into_raw(Box::new(p)),
             Err(e) => {
-                crate::routef!(
+                crate::logf!(
                     "x11 route: XID {:#x} unavailable ({})",
                     ci.window,
                     e.reason()
@@ -6480,7 +6479,7 @@ unsafe fn trace_image_create(ci: &VkImageCreateInfo, tag: &str, shot: &AtomicBoo
         return;
     }
     let pnext = unsafe { pnext_image_create_summary(ci.pNext) };
-    crate::routef!(
+    crate::logf!(
         "{tag}: vkCreateImage fmt={} {}x{}x{} mips={} layers={} samples={:#x} tiling={} usage={:#x} flags={:#x} pNext=[{pnext}]",
         ci.format,
         ci.extent.width,
@@ -6514,9 +6513,7 @@ unsafe fn query_linear_modifier_support(
     let pd = unsafe { (*gd).pd };
     let raw = unsafe { gn_real_inst_proc(inst, c"vkGetPhysicalDeviceImageFormatProperties2") };
     let Some(_) = raw else {
-        crate::routef!(
-            "modq: vkGetPhysicalDeviceImageFormatProperties2 unresolved (driver/loader)"
-        );
+        crate::logf!("modq: vkGetPhysicalDeviceImageFormatProperties2 unresolved (driver/loader)");
         return;
     };
     let query: PFN_vkGetPhysicalDeviceImageFormatProperties2 = unsafe { std::mem::transmute(raw) };
@@ -6566,7 +6563,7 @@ unsafe fn query_linear_modifier_support(
         };
         let res = unsafe { query(pd, &fmtinfo, &mut props) };
         let ip = props.imageFormatProperties;
-        crate::routef!(
+        crate::logf!(
             "modq: vkGetPhysicalDeviceImageFormatProperties2 fmt={format} type=2D tiling={tiling} usage={usage:#x} pNext=VkPhysicalDeviceImageDrmFormatModifierInfoEXT{{mod=LINEAR(0), sharing=EXCLUSIVE}} -> res={res} maxExtent={}x{}x{} maxMips={} maxLayers={} samples={:#x} maxRes={} modCount={} mod0={:#x} feat0={:#x} planes0={} [informational only: result not consulted]",
             ip.maxExtent.width,
             ip.maxExtent.height,
@@ -6629,7 +6626,7 @@ unsafe fn log_mem_props_once(pd: VkPhysicalDevice, mp: &VkPhysicalDeviceMemoryPr
             )
         })
         .collect();
-    crate::routef!(
+    crate::logf!(
         "memprops: types={} [{}] heaps={} [{}]",
         mp.memoryTypeCount,
         summary.join(" "),
@@ -6690,7 +6687,7 @@ unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
             if buf.stride != 0 {
                 (*s).stride = buf.stride;
             }
-            crate::routef!(
+            crate::logf!(
                 "proxy slot: pool buffer fd={} ino={} stride={}",
                 buf.fd,
                 buf.ino,
@@ -6762,7 +6759,7 @@ unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
         crate::logf!("proxy import image: no memory type");
         return VK_ERROR_INITIALIZATION_FAILED;
     }
-    crate::routef!(
+    crate::logf!(
         "proxy slot: linear {}x{} reqs {} memTypeBits {:#x} {}",
         (*sc).extent.width,
         (*sc).extent.height,

@@ -554,7 +554,7 @@ impl X11Present {
                 )
             };
             if attr.is_null() {
-                crate::routef!("x11 window: 0x{w:x} attributes unavailable at level {level}");
+                crate::logf!("x11 window: 0x{w:x} attributes unavailable at level {level}");
                 return;
             }
             let (map, or, class) =
@@ -575,7 +575,7 @@ impl X11Present {
                 1 => "IsUnviewable",
                 _ => "IsViewable",
             };
-            crate::routef!(
+            crate::logf!(
                 "x11 window: level={level} id=0x{w:x} map={ms} override={or} class={class} {gw}x{gh}"
             );
             let tree = unsafe {
@@ -594,12 +594,12 @@ impl X11Present {
         // The outcome the presenter depends on: the root child the present
         // lands in. Named once, unconditionally.
         if self.window == origin {
-            crate::routef!(
+            crate::logf!(
                 "x11 present target: 0x{:x} (named window is already a root child)",
                 self.window
             );
         } else {
-            crate::routef!(
+            crate::logf!(
                 "x11 present target: 0x{:x} offset=({},{}) (root child of named window 0x{:x})",
                 self.window,
                 self.x_off,

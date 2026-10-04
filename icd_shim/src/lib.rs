@@ -50,21 +50,6 @@ macro_rules! logf {
     };
 }
 
-/// Emit a `gn-vkshim:` line to stderr unconditionally.
-///
-/// Route decisions use this: the surface entry point the guest reaches, and
-/// whether its present route came up, must be visible in every session log
-/// without a diagnostic gate, so a session that shows nothing names its cause
-/// instead of being indistinguishable from a route that never engaged.
-/// Bounded by construction: one line per surface created, and one per
-/// swapchain whose frames start being dropped.
-#[macro_export]
-macro_rules! routef {
-    ($fmt:literal $(, $($arg:tt)*)?) => {
-        eprintln!("gn-vkshim: {}", format_args!($fmt $(, $($arg)*)?));
-    };
-}
-
 /// `GNDRM_LOG_VKSHIM` gate, resolved once and cached.
 pub fn vkshim_enabled() -> bool {
     // 0 = unresolved, 1 = off, 2 = on.
