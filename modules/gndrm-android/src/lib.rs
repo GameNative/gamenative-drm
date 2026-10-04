@@ -768,6 +768,19 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeFps(
 }
 
 /// `GameNativeDrm.nativeInjectorStop()`.
+/// `GameNativeDrm.nativeSetFpsLimit(fps)` — cap gamescope's frame rate for this
+/// app (0 = uncapped). Never blocks.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetFpsLimit(
+    _env: JNIEnv,
+    _class: JClass,
+    fps: jint,
+) {
+    if let Err(e) = std::panic::catch_unwind(|| injector::set_fps_limit(fps.max(0) as u32)) {
+        report_panic("gndrm-fpslimit", e.as_ref());
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeInjectorStop(
     _env: JNIEnv,

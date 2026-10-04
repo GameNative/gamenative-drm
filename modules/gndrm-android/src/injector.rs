@@ -9,7 +9,7 @@
 //! is worse than lost input.
 
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -64,7 +64,9 @@ mod gscontrol {
         wayland_scanner::generate_client_code!("protocols/gamescope-control.xml");
     }
 }
-use gscontrol::client::gamescope_control::{Event as GsControlEvent, GamescopeControl};
+use gscontrol::client::gamescope_control::{
+    Event as GsControlEvent, GamescopeControl, TargetRefreshCycleFlag,
+};
 
 /// Minimal xkb keymap (validated against libxkbcommon: compiles with 8
 /// mods, 0 layouts). Contents barely matter: gamescope forces its seat
@@ -201,6 +203,15 @@ pub fn key(code: i32, pressed: bool) {
 /// gamescope's last reported frametime in ns (0 = none reported yet).
 pub fn app_frametime_ns() -> u64 {
     APP_FRAMETIME_NS.load(Ordering::Relaxed)
+}
+
+/// Frame-rate cap asked of gamescope; u32::MAX = nothing pending.
+static FPS_LIMIT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Ask gamescope to cap this app's frame rate (0 = uncapped). Applied by the
+/// injector thread on its next wakeup, so this never blocks the caller.
+pub fn set_fps_limit(fps: u32) {
+    FPS_LIMIT.store(fps, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -384,8 +395,10 @@ fn connect_and_run(
     conn.flush().map_err(|e| format!("flush: {e}"))?;
     log_info!("injector connected: virtual pointer + keyboard created");
 
-    // Main loop: apply queued input, flush, drain server events.
+    // Main loop: apply queued input, apply a pending fps cap, flush, drain
+    // server events.
     let mut last_roundtrip = std::time::Instant::now();
+    let mut applied_fps: Option<u32> = None;
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
@@ -394,6 +407,15 @@ fn connect_and_run(
             Ok(ev) => apply(&state, ev),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+        // gamescope takes the cap as a request, so re-issue it only when the
+        // value changes (including the first pass after connecting).
+        if let Some(control) = &state.gs_control {
+            let want = FPS_LIMIT.load(Ordering::Relaxed);
+            if want != u32::MAX && applied_fps != Some(want) {
+                control.set_app_target_refresh_cycle(want, TargetRefreshCycleFlag::empty());
+                applied_fps = Some(want);
+            }
         }
         conn.flush().map_err(|e| format!("flush: {e}"))?;
         // Keep the read side drained and detect server death promptly.
