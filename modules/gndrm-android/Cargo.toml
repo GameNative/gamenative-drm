@@ -14,6 +14,7 @@ crate-type = ["cdylib"]
 # crate compiles to an empty stub so workspace-wide fmt/clippy/test stay green
 # (real verification of this module is `tools/build-android.sh` + on-device).
 [target.'cfg(target_os = "android")'.dependencies]
+bitflags = "2"
 gndrm-daemon = { path = "../gndrm-daemon" }
 gndrm-uapi = { path = "../gndrm-uapi" }
 jni = "0.21"

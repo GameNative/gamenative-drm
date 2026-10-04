@@ -315,33 +315,6 @@ extern "C" fn gn_wl_log(fmt: *const c_char, ap: *mut c_void) {
     crate::logf!("libwayland: {}", msg.trim_end());
 }
 
-/// Game FPS measured at the wayland commit point, published once per second
-/// to $GAMENATIVE_FPS_FILE (a single float line) for the app's HUD — in
-/// Gamescope mode the X11 renderer's frame counter never ticks. The reader
-/// treats a stale file as 0, so nothing is written while no frames commit.
-static FPS_FILE: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
-
-fn fps_note_commit() {
-    static WINDOW: OnceLock<Mutex<(Instant, u32)>> = OnceLock::new();
-    let Some(path) = FPS_FILE
-        .get_or_init(|| std::env::var_os("GAMENATIVE_FPS_FILE").filter(|v| !v.is_empty()))
-        .as_ref()
-    else {
-        return;
-    };
-    let w = WINDOW.get_or_init(|| Mutex::new((Instant::now(), 0)));
-    let mut g = w.lock().unwrap();
-    g.1 += 1;
-    let elapsed = g.0.elapsed();
-    if elapsed >= Duration::from_secs(1) {
-        let _ = std::fs::write(
-            path,
-            format!("{:.1}\n", f64::from(g.1) / elapsed.as_secs_f64()),
-        );
-        *g = (Instant::now(), 0);
-    }
-}
-
 // -------------------------------- bring-up frame dumps
 // dma-buf sync ioctl (same values as the daemon's EGL presenter).
 const DMA_BUF_SYNC_READ: u64 = 1 << 0;
@@ -694,7 +667,6 @@ unsafe fn x11_present_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) -> bo
     }
     match unsafe { (*present).present((*s).xpix, (*s).xfence) } {
         Some(serial) => {
-            fps_note_commit();
             // Bounded one-shot frame dump (GAMENATIVE_DUMP_DIR): capture the
             // first X11_DUMP_FIRST frames of this swapchain so what the route
             // hands the compositor is inspectable — the X11 route has no
@@ -850,7 +822,6 @@ fn worker_main(sc: *mut GnSwapchain) {
                 wlproto::wl_display_flush((*(*sc).surf).dpy)
             };
             let commit_ms = t1.elapsed().as_millis();
-            fps_note_commit();
             dump_slot(sc, s, idx);
             let n = LOG_COMMIT.fetch_add(1, Ordering::Relaxed);
             let done = N_COMMIT_OK.fetch_add(1, Ordering::Relaxed);

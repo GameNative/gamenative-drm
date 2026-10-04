@@ -333,8 +333,14 @@ fn server_thread_inner(
     // even before that buffer is first published. This takes the pool's own
     // lock, never `AscState`'s: the presenter holds the latter across the
     // blocking SurfaceFlinger apply, while ADDFB2 runs here on the serve
-    // thread. The lock is held for one map insert.
+    // thread. The lock is held for one map insert. The registration is logged
+    // (a bounded handful per session, one per distinct geometry) so the
+    // compressed-class allocation length entering the index is visible.
+    let addfb_logged = std::sync::atomic::AtomicU32::new(0);
     dev.set_addfb_geometry(Box::new(move |width, height, alloc_len| {
+        if addfb_logged.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+            log_info!("asc: addfb geometry {width}x{height} alloc_len={alloc_len}");
+        }
         addfb_pool
             .lock(diag::Role::Commit)
             .note_framebuffer(width, height, alloc_len);
@@ -727,6 +733,7 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeInjectorS
     _class: JClass,
     xdg_runtime_dir: JString,
     wayland_display: JString,
+    app_id: jint,
 ) -> jint {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let dir: String = match env.get_string(&xdg_runtime_dir) {
@@ -737,9 +744,27 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeInjectorS
             Ok(s) => s.to_string_lossy().into_owned(),
             Err(_) => return E_INVAL,
         };
-        injector::start(dir, display)
+        injector::start(dir, display, app_id as u32)
     }))
     .unwrap_or(E_FAULT)
+}
+
+/// `GameNativeDrm.nativeFps()` — gamescope's most recently reported app
+/// frametime as a rate. 0 until gamescope has answered a stats request.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeFps(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jfloat {
+    std::panic::catch_unwind(|| {
+        let ns = injector::app_frametime_ns();
+        if ns == 0 {
+            0.0
+        } else {
+            (1_000_000_000f64 / ns as f64) as jfloat
+        }
+    })
+    .unwrap_or(0.0)
 }
 
 /// `GameNativeDrm.nativeInjectorStop()`.

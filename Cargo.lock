@@ -87,6 +87,7 @@ dependencies = [
 name = "gndrm-android"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "gndrm-daemon",
  "gndrm-uapi",
  "jni",
