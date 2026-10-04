@@ -214,7 +214,8 @@ struct State {
     keyboard: Option<ZwpVirtualKeyboardV1>,
     /// gamescope's control global; absent if the compositor doesn't offer it.
     gs_control: Option<GamescopeControl>,
-    /// App id whose frame pacing we ask for (gamescope keys on SteamAppId).
+    /// App id whose frame pacing we ask for. Gamescope assigns every game
+    /// window the same fixed id (`GAMESCOPE_APP_ID` in GameNativeDrm.kt).
     app_id: u32,
 }
 
@@ -374,7 +375,8 @@ fn connect_and_run(
     upload_keymap(keyboard);
     // Ask gamescope for this app's frame pacing. It answers once per
     // request, so the event handler above re-arms; the value is published in
-    // APP_FRAMETIME_NS for JNI to read.
+    // APP_FRAMETIME_NS for JNI to read. app_id is the fixed id gamescope
+    // assigns every game window (not a per-store Steam app id).
     match &state.gs_control {
         Some(control) => control.request_app_performance_stats(app_id),
         None => log_warn!("gamescope_control not offered; fps unavailable"),
