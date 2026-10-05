@@ -14,6 +14,11 @@
 //! sockets down (unblocks accept/recv), joins the threads (presenter teardown
 //! happens on the server thread), releases the window.
 //!
+//! A display power cycle is not a teardown. `nativeRetargetSurface(surface, w,
+//! h, hz)` rebuilds only the publish layer from the new window and re-presents
+//! the retained last frame, keeping the listen sockets, the object stores and
+//! the gamescope connection alive; `nativeStop()` stays the session-exit path.
+//!
 //! On non-Android targets this crate is an empty stub so host-side
 //! workspace gates (fmt/clippy/test) stay green; the real gates for this
 //! module are `tools/build-android.sh` and on-device runs.
@@ -33,7 +38,7 @@ use std::io;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::Duration;
 
@@ -50,6 +55,8 @@ const E_BUSY: jint = -16;
 const E_INVAL: jint = -22;
 const E_FAULT: jint = -14;
 const E_IO: jint = -5;
+/// `nativeRetargetSurface` with no running session; the caller starts one.
+const E_NOENT: jint = -2;
 
 /// Real frames put on the panel (fb != 0 commits — gamescope's blank fb=0
 /// commits excluded). Reset by `nativeStart`/`nativeStop`; polled by the app
@@ -167,6 +174,12 @@ struct Runtime {
     render_thread: Option<thread::JoinHandle<()>>,
     fds: Arc<Mutex<AcceptedFds>>,
     window: WindowPtr,
+    /// The presenter's state, shared with the JNI thread so a display power
+    /// cycle can retarget the publish layer without tearing the session down.
+    /// Weak: the server thread's presenter owns the session's strong reference,
+    /// so the layer and the pool are still released on the server thread when
+    /// `serve` returns.
+    asc: Weak<Mutex<asc::AscState>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -197,7 +210,7 @@ fn server_thread(
     window: WindowPtr,
     panel: PanelDesc,
     fds: Arc<Mutex<AcceptedFds>>,
-    ready: mpsc::Sender<Result<(), String>>,
+    ready: mpsc::Sender<Result<Arc<Mutex<asc::AscState>>, String>>,
 ) {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         server_thread_inner(listener, window, panel, fds, ready);
@@ -212,10 +225,11 @@ fn server_thread_inner(
     window: WindowPtr,
     panel: PanelDesc,
     fds: Arc<Mutex<AcceptedFds>>,
-    ready: mpsc::Sender<Result<(), String>>,
+    ready: mpsc::Sender<Result<Arc<Mutex<asc::AscState>>, String>>,
 ) {
     // 1. Build the presenter first; it is owned by this thread for the whole
-    // session and released when `serve` returns.
+    // session and released when `serve` returns. The shared handle is sent back
+    // to `start` so a display power cycle can retarget the layer from JNI.
     let asc_state = Arc::new(Mutex::new(asc::AscState::new(
         window.0,
         i32::from(panel.width),
@@ -223,7 +237,7 @@ fn server_thread_inner(
     )));
     let presenter: Box<dyn gndrm_daemon::Presenter> =
         Box::new(asc::AscPresenter::new(Arc::clone(&asc_state)));
-    let _ = ready.send(Ok(()));
+    let _ = ready.send(Ok(Arc::clone(&asc_state)));
 
     // 2. Wire contract: first connection = RPC, second = events.
     let rpc = match server::accept(listener) {
@@ -610,7 +624,7 @@ fn start(
             return E_IO;
         }
     };
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel::<Result<Arc<Mutex<asc::AscState>>, String>>();
     let thread_fds = Arc::clone(&fds);
     let handle = thread::Builder::new()
         .name("gndrm".into())
@@ -635,9 +649,11 @@ fn start(
         }
     };
 
-    // Wait for the presenter bring-up handshake before reporting success.
-    match rx.recv() {
-        Ok(Ok(())) => {}
+    // Wait for the presenter bring-up handshake before reporting success. The
+    // server thread hands back its shared presenter state, which is kept so a
+    // display power cycle can retarget the publish layer from JNI.
+    let asc = match rx.recv() {
+        Ok(Ok(asc)) => asc,
         other => {
             if let Ok(Err(e)) = other {
                 log_error!("server thread init: {e}");
@@ -657,10 +673,11 @@ fn start(
             unsafe { ffi::ANativeWindow_release(window.0) };
             return E_IO;
         }
-    }
+    };
 
     log_info!("started: socket={name} {panel_w}x{panel_h} @{refresh_hz}Hz");
     log_info!("gndrm build 20260926-1: ADDFB2_MODIFIERS + IN_FORMATS (LINEAR) on both planes");
+    let asc = Arc::downgrade(&asc);
     *slot = Some(Runtime {
         name,
         listener,
@@ -669,6 +686,7 @@ fn start(
         render_thread: Some(render_handle),
         fds,
         window,
+        asc,
         thread: Some(handle),
     });
     0
@@ -732,6 +750,93 @@ fn stop() {
     log_info!("stopped");
 }
 
+/// Adopt a new display window for a RUNNING session: rebuild the publish layer
+/// from `surface` and re-present the retained last frame. Nothing else is
+/// touched — the listen sockets, the object stores and every gamescope
+/// connection stay exactly as they are, which is what a display power cycle
+/// needs (gamescope connects only once at startup, so a torn-down daemon can
+/// never get it back).
+///
+/// Returns 0, [`E_NOENT`] when no session is running (the caller starts one),
+/// or a negative code when the surface is unusable or the layer could not be
+/// rebuilt (the current layer is then kept).
+fn retarget(
+    env: &mut JNIEnv,
+    surface: &JObject,
+    width: jint,
+    height: jint,
+    refresh_hz: jfloat,
+) -> jint {
+    if width < 64 || height < 64 || !(1.0..=480.0).contains(&refresh_hz) {
+        log_error!("bad retarget geometry {width}x{height} @{refresh_hz}");
+        return E_INVAL;
+    }
+    let mut slot = RUNTIME.lock().expect("runtime poisoned");
+    let Some(rt) = slot.as_mut() else {
+        log_info!("retarget: no running session");
+        return E_NOENT;
+    };
+    // The presenter owns the session's strong reference to the shared state, so
+    // a failed upgrade means the session is already shutting down.
+    let Some(state) = rt.asc.upgrade() else {
+        log_warn!("retarget: the presenter is shutting down; no layer to rebuild");
+        return E_NOENT;
+    };
+    // SAFETY: `surface` is a live android.view.Surface jobject; the acquired
+    // window is either released below or kept as the session's window.
+    let raw =
+        unsafe { ffi::ANativeWindow_fromSurface(env.get_native_interface(), surface.as_raw()) };
+    if raw.is_null() {
+        log_error!("retarget: ANativeWindow_fromSurface returned null");
+        return E_INVAL;
+    }
+    let (win_w, win_h) = unsafe {
+        (
+            ffi::ANativeWindow_getWidth(raw),
+            ffi::ANativeWindow_getHeight(raw),
+        )
+    };
+    let (panel_w, panel_h) = if win_w > 0 && win_h > 0 {
+        (win_w, win_h)
+    } else {
+        (width, height)
+    };
+    // The same window means a redundant or geometry-only callback (a resize, or
+    // the `surfaceChanged` that always follows `surfaceCreated`): adopt the
+    // size and drop the extra reference. Rebuilding the layer would only churn
+    // it — it already holds the retained frame.
+    if raw == rt.window.0 {
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_panel(panel_w, panel_h);
+        // SAFETY: `raw` is the extra reference this call acquired.
+        unsafe { ffi::ANativeWindow_release(raw) };
+        return 0;
+    }
+    let rebuilt = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retarget(raw, panel_w, panel_h);
+    if !rebuilt {
+        log_error!("retarget: the publish layer could not be rebuilt; keeping the current window");
+        // SAFETY: `raw` is the extra reference this call acquired.
+        unsafe { ffi::ANativeWindow_release(raw) };
+        return E_IO;
+    }
+    let old = rt.window.0;
+    rt.window = WindowPtr(raw);
+    // SAFETY: the old window was acquired by `nativeStart`; the presenter now
+    // builds on `raw` and nothing else references the old one.
+    unsafe { ffi::ANativeWindow_release(old) };
+    // The layer holds the retained frame again; ask gamescope to repaint so the
+    // picture is redrawn now instead of waiting for the next guest frame (which
+    // may never come if the guest is still paused).
+    let _ = injector::gamescope_command("debug_force_repaint");
+    log_info!("retarget: adopted the new window {panel_w}x{panel_h}");
+    0
+}
+
 /// `GameNativeDrm.nativeStart` — see module docs. Returns 0 or a
 /// negative errno-style code.
 #[no_mangle]
@@ -759,6 +864,25 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeStop(
     let _ = std::panic::catch_unwind(stop);
 }
 
+/// `GameNativeDrm.nativeRetargetSurface` — adopt a new display window for a
+/// running session without ending it (see [`retarget`]). Returns 0, [`E_NOENT`]
+/// when no session is running (the caller starts one), or another negative code
+/// on failure.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeRetargetSurface(
+    mut env: JNIEnv,
+    _class: JClass,
+    surface: JObject,
+    width: jint,
+    height: jint,
+    refresh_hz: jfloat,
+) -> jint {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        retarget(&mut env, &surface, width, height, refresh_hz)
+    }))
+    .unwrap_or(E_FAULT)
+}
+
 /// `GameNativeDrm.nativeFramesPresented` — real frames put on the panel so
 /// far (see [`PRESENTED_FRAMES`]); 0 before the first start and after stop.
 #[no_mangle]
@@ -767,37 +891,6 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeFramesPre
     _class: JClass,
 ) -> jlong {
     std::panic::catch_unwind(|| PRESENTED_FRAMES.load(Ordering::Relaxed) as jlong).unwrap_or(0)
-}
-
-/// `GameNativeDrm.nativeSurfaceChanged` — v1 semantics: full
-/// restart with the new surface/geometry (SurfaceView rotation/resize
-/// delivers a brand-new surface anyway).
-#[no_mangle]
-pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSurfaceChanged(
-    env: JNIEnv,
-    class: JClass,
-    surface: JObject,
-    width: jint,
-    height: jint,
-    refresh_hz: jfloat,
-) -> jint {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let name = RUNTIME
-            .lock()
-            .expect("runtime poisoned")
-            .as_ref()
-            .map(|rt| rt.name.clone());
-        let Some(name) = name else { return E_INVAL };
-        stop();
-        let jname = match env.new_string(&name) {
-            Ok(s) => s,
-            Err(_) => return E_FAULT,
-        };
-        Java_app_gamenative_display_GameNativeDrm_nativeStart(
-            env, class, jname, surface, width, height, refresh_hz,
-        )
-    }))
-    .unwrap_or(E_FAULT)
 }
 
 // ---------------------------------------------------------------------------

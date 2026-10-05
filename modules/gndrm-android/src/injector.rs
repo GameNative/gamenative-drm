@@ -249,6 +249,7 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "debug_set_fps_limit",
     "set_look",
     "screenshot",
+    "debug_force_repaint",
 ];
 
 /// TEMPORARY diagnostics for the gamescope concommand bridge: emitted to logcat

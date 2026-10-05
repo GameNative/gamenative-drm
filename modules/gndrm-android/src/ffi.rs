@@ -239,6 +239,16 @@ pub type FnStSetOnComplete = unsafe extern "C" fn(
 );
 pub type FnStStatsGetPreviousReleaseFenceFd =
     unsafe extern "C" fn(stats: *mut ASurfaceTransactionStats, sc: *mut ASurfaceControl) -> c_int;
+/// `ASurfaceTransactionStats_getASurfaceControls`: the controls a completed
+/// transaction itself updated. The array it stores in `out_controls` is owned by
+/// the caller until `FnStStatsReleaseASurfaceControls` is called on it.
+pub type FnStStatsGetASurfaceControls = unsafe extern "C" fn(
+    stats: *mut ASurfaceTransactionStats,
+    out_controls: *mut *mut *mut ASurfaceControl,
+    out_count: *mut usize,
+);
+pub type FnStStatsReleaseASurfaceControls =
+    unsafe extern "C" fn(controls: *mut *mut ASurfaceControl);
 pub type FnAhbGetNativeHandle =
     unsafe extern "C" fn(buffer: *const AHardwareBuffer) -> *mut NativeHandle;
 
@@ -282,6 +292,8 @@ pub struct ScApi {
     pub st_set_color: FnStSetColor,
     pub st_set_on_complete: FnStSetOnComplete,
     pub st_stats_previous_release_fence_fd: FnStStatsGetPreviousReleaseFenceFd,
+    pub st_stats_get_controls: FnStStatsGetASurfaceControls,
+    pub st_stats_release_controls: FnStStatsReleaseASurfaceControls,
     pub ahb_get_native_handle: FnAhbGetNativeHandle,
     pub looper: Option<LooperApi>,
 }
@@ -335,6 +347,14 @@ impl ScApi {
                 st_stats_previous_release_fence_fd: sym(
                     handle,
                     c"ASurfaceTransactionStats_getPreviousReleaseFenceFd",
+                )?,
+                st_stats_get_controls: sym(
+                    handle,
+                    c"ASurfaceTransactionStats_getASurfaceControls",
+                )?,
+                st_stats_release_controls: sym(
+                    handle,
+                    c"ASurfaceTransactionStats_releaseASurfaceControls",
                 )?,
                 ahb_get_native_handle: sym(handle, c"AHardwareBuffer_getNativeHandle")?,
                 looper,

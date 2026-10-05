@@ -140,8 +140,13 @@ pub struct ScanoutBuffer {
 /// registered buffer, and registrations are bounded by the shim's pool.
 #[repr(C)]
 struct ReleaseCtx {
-    /// Layer the fence is asked about; fixed for the presenter's lifetime.
-    sc: *mut ffi::ASurfaceControl,
+    /// The two stats functions the completion callback needs, copied in because
+    /// the API table is not reachable from the SurfaceFlinger callback thread.
+    /// The callback asks the stats for the controls the reported transaction
+    /// itself updated and queries the fence on one of those, so the mailbox
+    /// holds no layer handle at all and none can go stale across a retarget.
+    stats_get_controls: ffi::FnStStatsGetASurfaceControls,
+    stats_release_controls: ffi::FnStStatsReleaseASurfaceControls,
     previous_release: ffi::FnStStatsGetPreviousReleaseFenceFd,
     /// fd of the previous release fence, `-1` when none is waiting.
     release_fd: AtomicI32,
@@ -177,9 +182,38 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
     // SAFETY: `context` is the leaked ReleaseCtx this presenter handed to
     // setOnComplete; it outlives every callback by construction.
     let ctx = unsafe { &*context.cast::<ReleaseCtx>() };
-    // SAFETY: `stats` belongs to this completion, `ctx.sc` is the layer that
-    // was published in the transaction it reports.
-    let fd = unsafe { (ctx.previous_release)(stats, ctx.sc) };
+    // Ask `stats` for the controls this transaction itself updated: a publish
+    // transaction updates exactly one control — the layer it published on — so
+    // the entry names the layer of *this* transaction. A control taken from
+    // `stats` is by construction one of `stats`' own entries, so the fence query
+    // below can never be handed a handle that belongs to a different
+    // transaction. This is the invariant the callback keeps: no callback ever
+    // passes a handle that could belong to a different transaction. The mailbox
+    // holds no layer handle, so a retarget cannot make it point at another
+    // transaction's layer.
+    let mut controls: *mut *mut ffi::ASurfaceControl = ptr::null_mut();
+    let mut count: usize = 0;
+    // SAFETY: `stats` belongs to this completion; the out-parameters are valid
+    // for the two values the call stores.
+    unsafe { (ctx.stats_get_controls)(stats, &mut controls, &mut count) };
+    let fd = if count >= 1 && !controls.is_null() {
+        // SAFETY: `controls` is an array of `count` controls, each an entry of
+        // `stats`.
+        let sc = unsafe { *controls };
+        // SAFETY: `sc` is one of `stats`' own controls, which is exactly the
+        // handle this query requires.
+        unsafe { (ctx.previous_release)(stats, sc) }
+    } else {
+        // The stats name no control (an empty update): there is no previous
+        // release fence to take this time. A normal outcome — the publish
+        // completes without a fence instead of the query asserting.
+        -1
+    };
+    if !controls.is_null() {
+        // SAFETY: `controls` is the array the get call above returned, released
+        // exactly once here.
+        unsafe { (ctx.stats_release_controls)(controls) };
+    }
     if fd >= 0
         && ctx
             .release_fd
@@ -286,8 +320,6 @@ enum Reservation {
 pub struct ScanoutPool {
     /// dlopen'd publish surface; `None` disables publishing (symbols missing).
     api: Option<ffi::ScApi>,
-    /// Child layer of the app's window; null while publishing is disabled.
-    sc: *mut ffi::ASurfaceControl,
     /// Live buffers, retired buffers held for reuse, and the cap.
     cache: ReusePool<PoolBuf>,
     /// Buffer held ready for the next request (see [`Warm`]).
@@ -301,10 +333,9 @@ pub struct ScanoutPool {
 unsafe impl Send for ScanoutPool {}
 
 impl ScanoutPool {
-    fn new(api: Option<ffi::ScApi>, sc: *mut ffi::ASurfaceControl) -> Self {
+    fn new(api: Option<ffi::ScApi>) -> Self {
         Self {
             api,
-            sc,
             cache: ReusePool::new(MAX_SCANOUT_POOL),
             warm: None,
         }
@@ -439,7 +470,8 @@ impl ScanoutPool {
             .expect("a slot is only committed when the presenter is enabled");
         let latched = Arc::new(AtomicBool::new(false));
         let ctx = Box::into_raw(Box::new(ReleaseCtx {
-            sc: self.sc,
+            stats_get_controls: api.st_stats_get_controls,
+            stats_release_controls: api.st_stats_release_controls,
             previous_release: api.st_stats_previous_release_fence_fd,
             release_fd: AtomicI32::new(-1),
             latch: Mutex::new(None),
@@ -681,7 +713,7 @@ impl AscState {
             pool: Arc::new(TrackedMutex::new(
                 diag::diag(),
                 LOCK_SCANOUT_POOL,
-                ScanoutPool::new(api, sc),
+                ScanoutPool::new(api),
             )),
             last_publish: None,
             frames: 0,
@@ -1034,6 +1066,65 @@ impl AscState {
             apply_transaction(&api, tx);
         }
         log_info!("asc: re-published ino {} onto the layer", lp.ino);
+    }
+
+    /// Adopt a new display window without ending the session. The listen
+    /// sockets, the object stores and every gamescope connection stay exactly
+    /// as they are; only the publish layer is rebuilt from `window` and the
+    /// retained last frame put back on it, so a display power cycle never
+    /// leaves the panel with a bufferless layer.
+    ///
+    /// Returns `false` when publishing is disabled or the new layer cannot be
+    /// created, in which case the caller keeps the current window and layer.
+    pub fn retarget(
+        &mut self,
+        window: *mut ffi::ANativeWindow,
+        panel_w: i32,
+        panel_h: i32,
+    ) -> bool {
+        let Some(api) = self.api else {
+            return false;
+        };
+        if window.is_null() {
+            return false;
+        }
+        // SAFETY: `window` is a live ANativeWindow the caller owns for the rest
+        // of the session (it stores it before releasing the old one).
+        let new_sc = unsafe { (api.sc_create_from_window)(window, SC_DEBUG_NAME.as_ptr()) };
+        if new_sc.is_null() {
+            log_warn!(
+                "asc: retarget: ASurfaceControl_createFromWindow failed; keeping the current layer"
+            );
+            return false;
+        }
+        // The retarget replaces the layer the presenter publishes through;
+        // every later transaction names the new one, and no mailbox holds a
+        // layer handle, so no completion callback can reach the old layer this
+        // call is about to drop.
+        let old_sc = core::mem::replace(&mut self.sc, new_sc);
+        self.panel_w = panel_w;
+        self.panel_h = panel_h;
+        // SAFETY: the old layer was created by this API, is no longer
+        // referenced by the presenter or any mailbox, and is released exactly
+        // once here. The window it was created from is released by the caller
+        // afterwards.
+        if !old_sc.is_null() {
+            unsafe { (api.sc_release)(old_sc) };
+        }
+        log_info!("asc: retargeted to the new window ({panel_w}x{panel_h})");
+        // A layer with no buffer set composites nothing (the app's background
+        // shows through as a blank panel), so the retained frame goes straight
+        // back on before anything else can run.
+        self.republish_last();
+        true
+    }
+
+    /// Adopt a panel geometry reported by a new window without rebuilding the
+    /// layer (a resize on the same window: the geometry only bounds the
+    /// published rect).
+    pub fn set_panel(&mut self, panel_w: i32, panel_h: i32) {
+        self.panel_w = panel_w;
+        self.panel_h = panel_h;
     }
 }
 
