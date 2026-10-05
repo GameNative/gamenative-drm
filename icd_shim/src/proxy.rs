@@ -725,10 +725,19 @@ unsafe fn x11_reap(sc: *mut GnSwapchain) {
     }
 }
 
+/// Take the pending job: a mailbox entry (the newest frame) wins, otherwise
+/// the oldest queued fifo job.
+fn take_job(g: &mut ScShared) -> Option<i32> {
+    if let Some(job) = g.mailbox.take() {
+        return Some(job);
+    }
+    g.jobs.pop_front()
+}
+
 fn pop_job(sc: *mut GnSwapchain) -> i32 {
     let mut g = unsafe { (*sc).shared.lock().unwrap() };
     loop {
-        if let Some(job) = g.jobs.pop_front() {
+        if let Some(job) = take_job(&mut g) {
             return job;
         }
         if g.stopping {
@@ -876,7 +885,13 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         );
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
-    let mut n_slots = ci.minImageCount + 1;
+    let mode = effective_present_mode(ci);
+    // Mesa's wayland WSI derives minImageCount from the present mode
+    // (wsi_common_wayland.c:1188): the extra image exists so one can be queued
+    // for scan-out while the app renders the next. Mailbox therefore carries
+    // one more slot than fifo; fifo keeps its existing count.
+    let extra_slot = u32::from(mode == VK_PRESENT_MODE_MAILBOX_KHR);
+    let mut n_slots = ci.minImageCount + 1 + extra_slot;
     if n_slots < 2 {
         n_slots = 2;
     }
@@ -889,6 +904,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         format: ci.imageFormat,
         extent: ci.imageExtent,
         fourcc,
+        present_mode: mode,
         // The slot image carries exactly the usage the guest asked for. The
         // present path needs no image usage of its own: the X11 route wraps the
         // slot's dma-buf in a DRI3 pixmap, the wayland route in a linux-dmabuf
@@ -903,6 +919,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         worker: None,
         shared: Mutex::new(ScShared {
             jobs: VecDeque::with_capacity(GN_JOB_CAP),
+            mailbox: None,
             stopping: false,
         }),
         cv_put: Condvar::new(),
@@ -997,7 +1014,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     unsafe {
         *out = sc as usize as VkSwapchainKHR;
         crate::logf!(
-            "proxy swapchain {:?}: {}x{} fmt {} -> fourcc {:#x}, {} images; requested usage={:#x} minImages={} presentMode={} compositeAlpha={:#x} colorspace={} clipped={} tiling=LINEAR",
+            "proxy swapchain {:?}: {}x{} fmt {} -> fourcc {:#x}, {} images; requested usage={:#x} minImages={} presentMode={} compositeAlpha={:#x} colorspace={} clipped={} tiling=LINEAR effective_mode={}",
             sc,
             (*sc).extent.width,
             (*sc).extent.height,
@@ -1009,7 +1026,8 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             ci.presentMode,
             ci.compositeAlpha,
             ci.imageColorSpace,
-            ci.clipped
+            ci.clipped,
+            mode
         );
     }
     VK_SUCCESS
@@ -1282,6 +1300,139 @@ unsafe extern "C" fn gn_vkAcquireNextImage2KHR(
     unsafe { gn_acquire_common(sc, ai.timeout, ai.semaphore, ai.fence, index) }
 }
 
+// Present discipline, one function per effective present mode; `present_dispatch`
+// is the single entry point the present path uses.
+
+/// fifo: one pending frame; a present blocks the guest only when the bounded job
+/// queue is full, and then commits inline on the guest's thread, so presentation
+/// paces to the compositor's release.
+unsafe fn present_fifo(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
+    let mut g = unsafe { (*sc).shared.lock().unwrap() };
+    unsafe {
+        (*slot).acquired = false;
+        (*slot).in_flight = true;
+        if g.jobs.len() < GN_JOB_CAP {
+            g.jobs.push_back(idx);
+            (*sc).cv_put.notify_one();
+            drop(g);
+        } else {
+            // Job queue full: commit synchronously instead of dropping.
+            (*slot).in_flight = false;
+            (*sc).cv_free.notify_all();
+            drop(g);
+            present_sync_commit(sc, slot, idx);
+        }
+    }
+}
+
+/// One 60 Hz frame: the longest fifo_relaxed waits for a slot release before it
+/// hands the late frame to the worker anyway.
+const PRESENT_RELAXED_FRAME_BUDGET: Duration = Duration::from_micros(16_667);
+
+/// fifo_relaxed: fifo's in-order worker queue, but a full queue waits for a slot
+/// release only up to one frame budget, then hands the frame to the worker
+/// anyway, so a late present is delayed rather than pushed back a whole vblank
+/// (and never dropped).
+unsafe fn present_fifo_relaxed(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
+    let mut g = unsafe { (*sc).shared.lock().unwrap() };
+    unsafe {
+        (*slot).acquired = false;
+        (*slot).in_flight = true;
+        if g.jobs.len() >= GN_JOB_CAP {
+            let deadline = Instant::now() + PRESENT_RELAXED_FRAME_BUDGET;
+            while g.jobs.len() >= GN_JOB_CAP {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let (guard, _res) = (*sc).cv_free.wait_timeout(g, deadline - now).unwrap();
+                g = guard;
+            }
+        }
+        g.jobs.push_back(idx);
+        (*sc).cv_put.notify_one();
+    }
+    drop(g);
+}
+
+/// mailbox: single-entry mailbox. The guest never blocks; the newest frame
+/// replaces any pending one and the replaced slot is freed immediately.
+unsafe fn present_mailbox(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
+    let mut g = unsafe { (*sc).shared.lock().unwrap() };
+    unsafe {
+        (*slot).acquired = false;
+        (*slot).in_flight = true;
+        if let Some(old) = g.mailbox.replace(idx) {
+            let os = (*sc).slots.as_mut_ptr().add(old as usize);
+            (*os).in_flight = false;
+        }
+        (*sc).cv_free.notify_all();
+        (*sc).cv_put.notify_one();
+    }
+    drop(g);
+}
+
+/// immediate: no vsync wait and no frame replacement. Every present is queued
+/// for the worker in order; the bounded job queue (GN_JOB_CAP) is the only
+/// backpressure, so the guest never blocks here and no frame is dropped.
+unsafe fn present_immediate(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
+    let mut g = unsafe { (*sc).shared.lock().unwrap() };
+    unsafe {
+        (*slot).acquired = false;
+        (*slot).in_flight = true;
+        g.jobs.push_back(idx);
+        (*sc).cv_put.notify_one();
+    }
+    drop(g);
+}
+
+/// Commit a present inline on the calling thread and wait the slot's fence.
+unsafe fn present_sync_commit(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
+    if let Some(wait_fences) = unsafe { (*(*sc).dev).f.wait_fences } {
+        unsafe { wait_fences((*(*sc).dev).real, 1, &(*slot).fence, VK_TRUE, u64::MAX) };
+    }
+    let parent = unsafe { (*(*sc).surf).parent };
+    if parent.is_null() {
+        // The X11 present holds the slot until its idle fence triggers; the
+        // immediate in_flight clear above is restored on success.
+        if unsafe { x11_present_slot(sc, slot, idx) } {
+            let g = unsafe { (*sc).shared.lock().unwrap() };
+            unsafe { (*slot).in_flight = true };
+            drop(g);
+        }
+        unsafe { x11_reap(sc) };
+    } else {
+        if unsafe { (*slot).buf.is_null() } {
+            unsafe { (*slot).buf = slot_make_buffer(sc, slot) };
+        }
+        if !unsafe { (*slot).buf.is_null() } {
+            let _sg = SEND_LOCK.lock().unwrap();
+            unsafe {
+                wlproto::surface_attach(parent, (*slot).buf, 0, 0);
+                wlproto::surface_damage_buffer(
+                    parent,
+                    0,
+                    0,
+                    (*sc).extent.width as i32,
+                    (*sc).extent.height as i32,
+                );
+                wlproto::surface_commit(parent);
+                wlproto::wl_display_flush((*(*sc).surf).dpy);
+            }
+        }
+    }
+}
+
+/// Route a present to the discipline its effective present mode names.
+unsafe fn present_dispatch(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
+    match unsafe { (*sc).present_mode } {
+        VK_PRESENT_MODE_IMMEDIATE_KHR => unsafe { present_immediate(sc, slot, idx) },
+        VK_PRESENT_MODE_MAILBOX_KHR => unsafe { present_mailbox(sc, slot, idx) },
+        VK_PRESENT_MODE_FIFO_RELAXED_KHR => unsafe { present_fifo_relaxed(sc, slot, idx) },
+        _ => unsafe { present_fifo(sc, slot, idx) },
+    }
+}
+
 // Present: the app's render completion
 unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentInfoKHR) -> VkResult {
     report_abandoned(None);
@@ -1371,53 +1522,7 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
         if signal_chain {
             chain_prev = unsafe { (*slot).sem };
         }
-        let mut g = unsafe { (*sc).shared.lock().unwrap() };
-        unsafe {
-            (*slot).acquired = false;
-            (*slot).in_flight = true;
-            if g.jobs.len() < GN_JOB_CAP {
-                g.jobs.push_back(indices[i] as i32);
-                (*sc).cv_put.notify_one();
-                drop(g);
-            } else {
-                // Job queue full: commit synchronously instead of dropping.
-                (*slot).in_flight = false;
-                (*sc).cv_free.notify_all();
-                drop(g);
-                if let Some(wait_fences) = (*(*sc).dev).f.wait_fences {
-                    wait_fences((*(*sc).dev).real, 1, &(*slot).fence, VK_TRUE, u64::MAX);
-                }
-                let parent = (*(*sc).surf).parent;
-                if parent.is_null() {
-                    // The synchronous path cleared in_flight for the immediate
-                    // commit; the X11 present instead needs the slot held until
-                    // its idle fence triggers.
-                    if x11_present_slot(sc, slot, indices[i] as i32) {
-                        let g = (*sc).shared.lock().unwrap();
-                        (*slot).in_flight = true;
-                        drop(g);
-                    }
-                    x11_reap(sc);
-                } else {
-                    if (*slot).buf.is_null() {
-                        (*slot).buf = slot_make_buffer(sc, slot);
-                    }
-                    if !(*slot).buf.is_null() {
-                        let _sg = SEND_LOCK.lock().unwrap();
-                        wlproto::surface_attach(parent, (*slot).buf, 0, 0);
-                        wlproto::surface_damage_buffer(
-                            parent,
-                            0,
-                            0,
-                            (*sc).extent.width as i32,
-                            (*sc).extent.height as i32,
-                        );
-                        wlproto::surface_commit(parent);
-                        wlproto::wl_display_flush((*(*sc).surf).dpy);
-                    }
-                }
-            }
-        }
+        unsafe { present_dispatch(sc, slot, indices[i] as i32) };
         if LOG_PRESENT.fetch_add(1, Ordering::Relaxed) < LOG_FIRST_N {
             crate::logf!("proxy present: sc={sc:?} idx={} {}", indices[i], counters());
         }
@@ -4000,6 +4105,25 @@ mod tests {
         assert_eq!(parse_present_mode_override(None), None);
     }
 
+    /// Every mode the override parser accepts is also served, so selecting any
+    /// MESA_VK_WSI_PRESENT_MODE name changes what the guest is offered.
+    #[test]
+    fn every_parsed_present_mode_is_served() {
+        assert_eq!(SERVED_PRESENT_MODES.len(), 4);
+        for name in ["fifo", "relaxed", "mailbox", "immediate"] {
+            let m = parse_present_mode_override(Some(name)).expect(name);
+            assert!(
+                SERVED_PRESENT_MODES.contains(&m),
+                "{name} is parsed but not served"
+            );
+            assert_eq!(
+                offered_present_modes(&SERVED_PRESENT_MODES, Some(m))[0],
+                m,
+                "{name} does not lead the offered list"
+            );
+        }
+    }
+
     /// The offered list leads with a served override, keeps the served order
     /// otherwise, drops an override the ring cannot serve, and always offers
     /// FIFO.
@@ -4010,7 +4134,8 @@ mod tests {
             [
                 VK_PRESENT_MODE_IMMEDIATE_KHR,
                 VK_PRESENT_MODE_MAILBOX_KHR,
-                VK_PRESENT_MODE_FIFO_KHR
+                VK_PRESENT_MODE_FIFO_KHR,
+                VK_PRESENT_MODE_FIFO_RELAXED_KHR
             ]
         );
         assert_eq!(
@@ -4018,7 +4143,8 @@ mod tests {
             [
                 VK_PRESENT_MODE_IMMEDIATE_KHR,
                 VK_PRESENT_MODE_MAILBOX_KHR,
-                VK_PRESENT_MODE_FIFO_KHR
+                VK_PRESENT_MODE_FIFO_KHR,
+                VK_PRESENT_MODE_FIFO_RELAXED_KHR
             ]
         );
         // FIFO leads when it is the override, and is not duplicated.
@@ -4027,14 +4153,28 @@ mod tests {
             [
                 VK_PRESENT_MODE_FIFO_KHR,
                 VK_PRESENT_MODE_IMMEDIATE_KHR,
-                VK_PRESENT_MODE_MAILBOX_KHR
+                VK_PRESENT_MODE_MAILBOX_KHR,
+                VK_PRESENT_MODE_FIFO_RELAXED_KHR
             ]
         );
-        // An override the ring cannot serve is dropped, not advertised.
+        // fifo_relaxed is served, so it leads and is not duplicated.
+        assert_eq!(
+            offered_present_modes(
+                &SERVED_PRESENT_MODES,
+                Some(VK_PRESENT_MODE_FIFO_RELAXED_KHR)
+            ),
+            [
+                VK_PRESENT_MODE_FIFO_RELAXED_KHR,
+                VK_PRESENT_MODE_IMMEDIATE_KHR,
+                VK_PRESENT_MODE_MAILBOX_KHR,
+                VK_PRESENT_MODE_FIFO_KHR
+            ]
+        );
+        // An override the served slice cannot serve is dropped, not advertised.
         assert_eq!(
             offered_present_modes(
                 &[VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR],
-                Some(VK_PRESENT_MODE_FIFO_RELAXED_KHR)
+                Some(VK_PRESENT_MODE_IMMEDIATE_KHR)
             ),
             [VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR]
         );
@@ -4254,6 +4394,9 @@ pub struct GnSlot {
 
 pub struct ScShared {
     pub jobs: VecDeque<i32>,
+    /// Single-entry mailbox for the mailbox/immediate modes: a newer present
+    /// replaces any pending frame, so the slot map holds at most one entry.
+    pub mailbox: Option<i32>,
     pub stopping: bool,
 }
 
@@ -4264,6 +4407,10 @@ pub struct GnSwapchain {
     pub extent: VkExtent2D,
     pub fourcc: u32,
     pub usage: VkImageUsageFlags,
+    /// The present mode the shim honours for this swapchain (override wins over
+    /// the app's request; see `effective_present_mode`). Read by
+    /// `present_dispatch` on every present.
+    pub present_mode: VkPresentModeKHR,
     pub slots: Vec<GnSlot>,
     pub worker: Option<std::thread::JoinHandle<()>>,
     pub shared: Mutex<ScShared>,
@@ -5821,10 +5968,13 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceFormatsKHR(
     }
 }
 
-const SERVED_PRESENT_MODES: [VkPresentModeKHR; 3] = [
+// All four MESA_VK_WSI_PRESENT_MODE names are served; fifo_relaxed sits next to
+// fifo as its sibling, so the delivered order of the other three is unchanged.
+const SERVED_PRESENT_MODES: [VkPresentModeKHR; 4] = [
     VK_PRESENT_MODE_IMMEDIATE_KHR,
     VK_PRESENT_MODE_MAILBOX_KHR,
     VK_PRESENT_MODE_FIFO_KHR,
+    VK_PRESENT_MODE_FIFO_RELAXED_KHR,
 ];
 
 fn parse_present_mode_override(val: Option<&str>) -> Option<VkPresentModeKHR> {
@@ -5839,6 +5989,24 @@ fn parse_present_mode_override(val: Option<&str>) -> Option<VkPresentModeKHR> {
         }
     };
     Some(mode)
+}
+
+/// The present mode the shim honours for a swapchain: the
+/// MESA_VK_WSI_PRESENT_MODE override wins over the app's requested
+/// `presentMode`, falling back to fifo (mesa wsi_common.c:1521).
+fn effective_present_mode(ci: &VkSwapchainCreateInfoKHR) -> VkPresentModeKHR {
+    if let Some(m) =
+        parse_present_mode_override(std::env::var("MESA_VK_WSI_PRESENT_MODE").ok().as_deref())
+    {
+        return m;
+    }
+    match ci.presentMode {
+        VK_PRESENT_MODE_IMMEDIATE_KHR
+        | VK_PRESENT_MODE_MAILBOX_KHR
+        | VK_PRESENT_MODE_FIFO_KHR
+        | VK_PRESENT_MODE_FIFO_RELAXED_KHR => ci.presentMode,
+        _ => VK_PRESENT_MODE_FIFO_KHR,
+    }
 }
 
 fn offered_present_modes(
