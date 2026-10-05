@@ -38,7 +38,7 @@ use std::thread;
 use std::time::Duration;
 
 use jni::objects::{GlobalRef, JClass, JObject, JString};
-use jni::sys::{jboolean, jfloat, jint, jlong};
+use jni::sys::{jboolean, jfloat, jint, jlong, jstring};
 use jni::{JNIEnv, JavaVM};
 
 use gndrm_daemon::diag;
@@ -867,6 +867,51 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeInjectorS
     _class: JClass,
 ) {
     let _ = std::panic::catch_unwind(injector::stop);
+}
+
+/// `GameNativeDrm.nativeGamescopeCommand(command)` — run one allowlisted
+/// gamescope concommand, e.g. `"scaling_filter fsr"` or `"scaling_sharpness 5"`
+/// (see `injector::ALLOWED_COMMANDS`). Returns 0 when queued, [`E_INVAL`] when
+/// the command name is empty or not allowlisted. Fire-and-forget: never blocks;
+/// a command queued while gamescope is absent is logged and dropped.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeGamescopeCommand(
+    mut env: JNIEnv,
+    _class: JClass,
+    command: JString,
+) -> jint {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let cmd: String = match env.get_string(&command) {
+            Ok(s) => s.to_string_lossy().into_owned(),
+            Err(_) => return E_INVAL,
+        };
+        if injector::gamescope_command(&cmd) {
+            0
+        } else {
+            E_INVAL
+        }
+    }))
+    .unwrap_or(E_FAULT)
+}
+
+/// `GameNativeDrm.nativeDisplayInfo()` — `feature_support` + `active_display_info`
+/// as the compact string
+/// `features=0x<hex>;connector=<name>;display_flags=0x<hex>;rates=<r>,<r>,...`
+/// (features bit N = feature id N; rates empty when the display is fixed).
+/// Reads cached values, so it never blocks and returns empty fields / 0 before
+/// gamescope has answered, or while it is absent.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeDisplayInfo(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match env.new_string(injector::display_and_features()) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(std::ptr::null_mut())
 }
 
 /// `GameNativeDrm.nativePointerAbsolute(x, y)`.

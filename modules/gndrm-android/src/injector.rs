@@ -68,6 +68,25 @@ use gscontrol::client::gamescope_control::{
     Event as GsControlEvent, GamescopeControl, TargetRefreshCycleFlag,
 };
 
+// gamescope's private concommand protocol, vendored (from gamescope, MIT) and
+// generated the same way. Its `execute` request runs an allowlisted concommand
+// inside the compositor — the route for settings that have no control request.
+#[allow(dead_code, non_camel_case_types, unused_imports, clippy::all)]
+mod gsprivate {
+    pub mod client {
+        use wayland_client;
+        use wayland_client::protocol::*;
+
+        pub mod __interfaces {
+            use wayland_client::protocol::__interfaces::*;
+            wayland_scanner::generate_interfaces!("protocols/gamescope-private.xml");
+        }
+        use self::__interfaces::*;
+        wayland_scanner::generate_client_code!("protocols/gamescope-private.xml");
+    }
+}
+use gsprivate::client::gamescope_private::{Event as GsPrivateEvent, GamescopePrivate};
+
 /// Minimal xkb keymap (validated against libxkbcommon: compiles with 8
 /// mods, 0 layouts). Contents barely matter: gamescope forces its seat
 /// keymap onto every device it adopts (`wlserver_new_input` keyboard path).
@@ -82,6 +101,12 @@ enum InputEvent {
     PointerButton(i32, bool),
     PointerAxis(i32, f32),
     Key(i32, bool),
+    /// An allowlisted concommand and its value, run through
+    /// `gamescope_private.execute`.
+    Command {
+        name: String,
+        value: String,
+    },
 }
 
 struct InjectorHandle {
@@ -214,6 +239,111 @@ pub fn set_fps_limit(fps: u32) {
     FPS_LIMIT.store(fps, Ordering::Relaxed);
 }
 
+/// Concommands a client may run through `gamescope_private.execute`. Each is
+/// the runtime route for one of the settings with no `gamescope_control`
+/// request (steamcompmgr.cpp / wlserver.cpp). The value string is passed
+/// through unchanged; no other command name is accepted.
+const ALLOWED_COMMANDS: &[&str] = &[
+    "scaling_filter",
+    "scaling_sharpness",
+    "debug_set_fps_limit",
+    "set_look",
+    "screenshot",
+];
+
+/// TEMPORARY diagnostics for the gamescope concommand bridge: emitted to logcat
+/// unconditionally (deliberately NOT behind a `GNDRM_LOG_*` gate) under the tag
+/// `gndrm-gscmd`, so a device run always shows whether a command reached the
+/// compositor. Remove together with the gscmd diagnostics.
+fn gslog(text: &str) {
+    let c = std::ffi::CString::new(text)
+        .unwrap_or_else(|_| std::ffi::CString::new("<log error>").unwrap());
+    // SAFETY: `c` is NUL-terminated and outlives the call.
+    unsafe {
+        crate::ffi::__android_log_write(
+            crate::ffi::ANDROID_LOG_INFO,
+            c"gndrm-gscmd".as_ptr(),
+            c.as_ptr(),
+        );
+    }
+}
+
+/// Queue a concommand for the injector thread. `command` is `"name [value]"`
+/// (see [`ALLOWED_COMMANDS`]). Returns true when queued, false when the command
+/// name is empty or not allowlisted. A queued command is run on the injector
+/// thread's next wakeup; if gamescope is absent it is logged and dropped.
+pub fn gamescope_command(command: &str) -> bool {
+    let mut parts = command.trim().splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or("");
+    let value = parts.next().unwrap_or("").trim();
+    if name.is_empty() {
+        gslog(&format!(
+            "gscmd reject: empty command name (raw '{command}')"
+        ));
+        return false;
+    }
+    if !ALLOWED_COMMANDS.contains(&name) {
+        gslog(&format!(
+            "gscmd reject: '{name}' not allowlisted (raw '{command}')"
+        ));
+        return false;
+    }
+    // The queue is a no-op when the injector thread is not running; report it so
+    // a returned 0 is not misread as "reached gamescope".
+    let injector_running = INPUT_TX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some();
+    gslog(&format!(
+        "gscmd queue: '{name}' value=\"{value}\" injector_running={injector_running}"
+    ));
+    post(InputEvent::Command {
+        name: name.to_string(),
+        value: value.to_string(),
+    });
+    true
+}
+
+/// Last `active_display_info` gamescope sent: connector, display flags and the
+/// valid refresh rates for combined fps-limit + refresh control.
+#[derive(Clone, Default)]
+struct DisplayInfo {
+    connector: String,
+    flags: u32,
+    rates: Vec<u32>,
+}
+
+/// Bitmask of `feature_support` entries received; bit N = feature id N
+/// (see the `feature` enum in the protocol). 0 = none received yet.
+static FEATURE_SUPPORT: AtomicU32 = AtomicU32::new(0);
+
+/// Latest `active_display_info`; None until gamescope answers.
+static DISPLAY_INFO: Mutex<Option<DisplayInfo>> = Mutex::new(None);
+
+/// `feature_support` + `active_display_info` as one compact string:
+/// `features=0x<hex>;connector=<name>;display_flags=0x<hex>;rates=<r>,<r>,...`
+/// (features bits and rates empty when gamescope has not answered). Read from
+/// the cached values, so this never blocks and returns "" fields when the
+/// compositor is absent.
+pub fn display_and_features() -> String {
+    let features = FEATURE_SUPPORT.load(Ordering::Relaxed);
+    let info = DISPLAY_INFO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_default();
+    let rates = info
+        .rates
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "features=0x{features:X};connector={};display_flags=0x{:X};rates={rates}",
+        info.connector, info.flags
+    )
+}
+
 // ---------------------------------------------------------------------------
 
 /// Proxies + registry state for the current connection.
@@ -225,6 +355,8 @@ struct State {
     keyboard: Option<ZwpVirtualKeyboardV1>,
     /// gamescope's control global; absent if the compositor doesn't offer it.
     gs_control: Option<GamescopeControl>,
+    /// gamescope's private concommand global; absent if not offered.
+    gs_private: Option<GamescopePrivate>,
     /// App id whose frame pacing we ask for. Gamescope assigns every game
     /// window the same fixed id (`GAMESCOPE_APP_ID` in GameNativeDrm.kt).
     app_id: u32,
@@ -264,6 +396,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     state.gs_control =
                         Some(registry.bind::<GamescopeControl, _, _>(name, version.min(7), qh, ()));
                 }
+                "gamescope_private" => {
+                    state.gs_private =
+                        Some(registry.bind::<GamescopePrivate, _, _>(name, 1, qh, ()));
+                    gslog("gscmd wayland: gamescope_private global bound (v1)");
+                }
                 _ => {}
             }
         }
@@ -292,6 +429,31 @@ empty_dispatch!(ZwpVirtualKeyboardManagerV1);
 empty_dispatch!(ZwpVirtualKeyboardV1);
 empty_dispatch!(wayland_client::protocol::wl_display::WlDisplay);
 
+impl Dispatch<GamescopePrivate, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _private: &GamescopePrivate,
+        event: GsPrivateEvent,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // TEMPORARY bridge diagnostics: these two events were previously ignored.
+        // `CommandExecuted` is the direct answer to "did gamescope run it" — the
+        // server only emits it when `ConCommand::Exec` found and invoked the
+        // command (wlserver.cpp `gamescope_private_execute`). `Log` carries the
+        // concommand's own output (e.g. a failed parse or a missing LUT file).
+        match event {
+            GsPrivateEvent::Log { text } => {
+                gslog(&format!("gamescope_private log: {text}"));
+            }
+            GsPrivateEvent::CommandExecuted => {
+                gslog("gamescope_private command_executed: gamescope RAN the concommand");
+            }
+        }
+    }
+}
+
 impl Dispatch<GamescopeControl, ()> for State {
     fn event(
         state: &mut Self,
@@ -301,23 +463,57 @@ impl Dispatch<GamescopeControl, ()> for State {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let GsControlEvent::AppPerformanceStats {
-            frametime_ns_lo,
-            frametime_ns_hi,
-            ..
-        } = event
-        {
-            let ns = (u64::from(frametime_ns_hi) << 32) | u64::from(frametime_ns_lo);
-            APP_FRAMETIME_NS.store(ns, Ordering::Relaxed);
-            // The first few are logged so the app id gamescope answers for is
-            // verifiable on device; then it goes quiet.
-            static EVENTS: AtomicUsize = AtomicUsize::new(0);
-            if EVENTS.fetch_add(1, Ordering::Relaxed) < 3 {
-                log_info!("gamescope stats: app_id={} frametime={ns}ns", state.app_id);
+        match event {
+            GsControlEvent::AppPerformanceStats {
+                frametime_ns_lo,
+                frametime_ns_hi,
+                ..
+            } => {
+                let ns = (u64::from(frametime_ns_hi) << 32) | u64::from(frametime_ns_lo);
+                APP_FRAMETIME_NS.store(ns, Ordering::Relaxed);
+                // The first few are logged so the app id gamescope answers for is
+                // verifiable on device; then it goes quiet.
+                static EVENTS: AtomicUsize = AtomicUsize::new(0);
+                if EVENTS.fetch_add(1, Ordering::Relaxed) < 3 {
+                    log_info!("gamescope stats: app_id={} frametime={ns}ns", state.app_id);
+                }
+                // gamescope answers once per request (it drops it when it fires),
+                // so re-arm to be told about the next presented frame.
+                control.request_app_performance_stats(state.app_id);
             }
-            // gamescope answers once per request (it drops it when it fires),
-            // so re-arm to be told about the next presented frame.
-            control.request_app_performance_stats(state.app_id);
+            // One entry per supported feature, terminated by "done". Cache the
+            // bitmask the UI gates its controls on (ids are 0..=9; anything
+            // wider is dropped rather than shifted out of range).
+            GsControlEvent::FeatureSupport { feature, .. } => {
+                FEATURE_SUPPORT.fetch_or(1u32.checked_shl(feature).unwrap_or(0), Ordering::Relaxed);
+            }
+            // Connector, display flags and valid refresh rates; the source for
+            // refresh-rate / HDR / VRR gating.
+            GsControlEvent::ActiveDisplayInfo {
+                connector_name,
+                display_flags,
+                valid_refresh_rates,
+                ..
+            } => {
+                let flags = match display_flags {
+                    wayland_client::WEnum::Value(f) => f.bits(),
+                    wayland_client::WEnum::Unknown(bits) => bits,
+                };
+                let rates = valid_refresh_rates
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| u32::from_ne_bytes(*c))
+                    .collect();
+                *DISPLAY_INFO
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(DisplayInfo {
+                    connector: connector_name,
+                    flags,
+                    rates,
+                });
+            }
+            _ => {}
         }
     }
 }
@@ -364,6 +560,7 @@ fn connect_and_run(
         pointer: None,
         keyboard: None,
         gs_control: None,
+        gs_private: None,
         app_id,
     };
     event_queue
@@ -472,6 +669,15 @@ fn apply(state: &State, ev: InputEvent) {
                 kbd.key(t, code as u32, u32::from(pressed));
             }
         }
+        InputEvent::Command { name, value } => match &state.gs_private {
+            Some(private) => {
+                gslog(&format!("gscmd exec: '{name}' value=\"{value}\""));
+                private.execute(name, value);
+            }
+            None => gslog(&format!(
+                "gscmd drop: '{name}' (gamescope_private not offered)"
+            )),
+        },
     }
 }
 
