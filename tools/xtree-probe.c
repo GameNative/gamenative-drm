@@ -98,6 +98,17 @@ static xcb_connection_t *connect_path(const char *path, int *screen_out)
     return c;
 }
 
+static xcb_atom_t intern_pid_atom(xcb_connection_t *c)
+{
+    static xcb_atom_t a = 0;
+    if (!a) {
+        xcb_intern_atom_cookie_t ck = xcb_intern_atom(c, 1, 12, "_NET_WM_PID");
+        xcb_intern_atom_reply_t *r = xcb_intern_atom_reply(c, ck, NULL);
+        if (r) { a = r->atom; free(r); }
+    }
+    return a;
+}
+
 static void print_name_class(xcb_connection_t *c, xcb_window_t w)
 {
     xcb_get_property_cookie_t ck = xcb_get_property(c, 0, w, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 0, 256);
@@ -118,6 +129,15 @@ static void print_name_class(xcb_connection_t *c, xcb_window_t w)
                (strlen(p) + 1 < (size_t)len) ? p + strlen(p) + 1 : "");
     }
     if (r) free(r);
+
+    xcb_atom_t pa = intern_pid_atom(c);
+    if (pa) {
+        ck = xcb_get_property(c, 0, w, pa, XCB_ATOM_CARDINAL, 0, 1);
+        r = xcb_get_property_reply(c, ck, NULL);
+        if (r && xcb_get_property_value_length(r) >= 4)
+            printf("      _NET_WM_PID=%u\n", *(uint32_t *)xcb_get_property_value(r));
+        if (r) free(r);
+    }
 }
 
 static void print_attrs(xcb_connection_t *c, xcb_window_t w)
@@ -155,6 +175,7 @@ static void dump_tree(xcb_connection_t *c, xcb_window_t w, int depth, int *budge
     xcb_query_tree_reply_t *r = xcb_query_tree_reply(c, ck, NULL);
     int n = r ? xcb_query_tree_children_length(r) : 0;
     printf("%*s0x%08x\n", depth * 2, "", w);
+    print_name_class(c, w);
     if (depth == 0) print_attrs(c, w);
     if (r) {
         xcb_window_t *kids = xcb_query_tree_children(r);
@@ -248,6 +269,31 @@ int main(int argc, char **argv)
     printf("--- tree (depth-first from root) ---\n");
     int budget = 500;
     dump_tree(c, screen->root, 0, &budget);
+
+    /* gamescope's compositor focus: the WM's _NET_ACTIVE_WINDOW on the root,
+     * and the X input focus. This names which window the compositor is
+     * actually painting, independent of the override target. */
+    {
+        xcb_atom_t aw = 0;
+        xcb_intern_atom_cookie_t c1 = xcb_intern_atom(c, 1, 15, "_NET_ACTIVE_WINDOW");
+        xcb_intern_atom_reply_t *r1 = xcb_intern_atom_reply(c, c1, NULL);
+        if (r1) { aw = r1->atom; free(r1); }
+        if (aw) {
+            xcb_get_property_cookie_t ck = xcb_get_property(c, 0, screen->root, aw, XCB_ATOM_WINDOW, 0, 1);
+            xcb_get_property_reply_t *r = xcb_get_property_reply(c, ck, NULL);
+            if (r && xcb_get_property_value_length(r) >= 4)
+                printf("  _NET_ACTIVE_WINDOW=0x%08x\n", *(uint32_t *)xcb_get_property_value(r));
+            else
+                printf("  _NET_ACTIVE_WINDOW=<unset>\n");
+            if (r) free(r);
+        }
+        xcb_get_input_focus_cookie_t fc = xcb_get_input_focus(c);
+        xcb_get_input_focus_reply_t *fr = xcb_get_input_focus_reply(c, fc, NULL);
+        if (fr) {
+            printf("  X input focus=0x%08x\n", fr->focus);
+            free(fr);
+        }
+    }
 
     if (target) {
         printf("--- target 0x%08x: attributes + upward parent chain ---\n", target);

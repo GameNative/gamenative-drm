@@ -5512,9 +5512,14 @@ unsafe fn xlib_override_surface(
     window: u32,
     out: *mut VkSurfaceKHR,
 ) -> VkResult {
+    // The window gamescope will actually paint. gamescope resolves whatever
+    // XID the override names to its root-child ancestor, so binding the window
+    // winex11 named lands a 1x1 override-redirect wine helper for Dishonored;
+    // `resolve_override_target` swaps a degenerate ancestor for the real,
+    // painted window and leaves a legitimate one untouched (see x11.rs).
+    let bound_window = unsafe { crate::x11::resolve_override_target(window) };
     crate::logf!(
-        "override: XID {:#x} → gamescope override surface (default; guest GDI/2D not composited)",
-        window
+        "override: XID {window:#x} -> gamescope override surface on {bound_window:#x} (default; guest GDI/2D not composited)"
     );
     if !wl_setup(ptr::null_mut()) {
         crate::logf!("proxy xlib surface create FAILED: wayland setup failed");
@@ -5536,8 +5541,9 @@ unsafe fn xlib_override_surface(
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         let scobj = wlproto::swapchain_factory_create_swapchain(factory, surf);
-        // Single xwayland server (--xwayland-count 1) is always id 0.
-        wlproto::swapchain_override_window_content(scobj, 0, window);
+        // Single xwayland server (--xwayland-count 1) is always id 0. Bind to
+        // the window gamescope paints, not the one wine happened to name.
+        wlproto::swapchain_override_window_content(scobj, 0, bound_window);
         wlproto::wl_display_flush(dpy);
         drop(_sg);
         let s = Box::new(GnSurface {

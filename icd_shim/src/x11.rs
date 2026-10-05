@@ -175,6 +175,36 @@ struct xcb_get_window_attributes_reply_t {
     pad0: [u8; 2],
 }
 
+#[repr(C)]
+struct xcb_intern_atom_reply_t {
+    response_type: u8,
+    pad0: u8,
+    sequence: u16,
+    length: u32,
+    atom: u32,
+}
+
+#[repr(C)]
+struct xcb_get_property_reply_t {
+    response_type: u8,
+    format: u8,
+    sequence: u16,
+    length: u32,
+    type_: u32,
+    bytes_after: u32,
+    value_len: u32,
+    pad0: [u8; 12],
+}
+
+#[repr(C)]
+struct xcb_get_input_focus_reply_t {
+    response_type: u8,
+    pad0: u8,
+    sequence: u16,
+    length: u32,
+    focus: u32,
+}
+
 #[link(name = "xcb")]
 extern "C" {
     fn xcb_connect(displayname: *const c_char, screenp: *mut c_int) -> *mut xcb_connection_t;
@@ -206,6 +236,37 @@ extern "C" {
         cookie: cookie_t,
         e: *mut *mut xcb_generic_error_t,
     ) -> *mut xcb_get_window_attributes_reply_t;
+    fn xcb_intern_atom(
+        c: *mut xcb_connection_t,
+        only_if_exists: u8,
+        name_len: u16,
+        name: *const c_char,
+    ) -> cookie_t;
+    fn xcb_intern_atom_reply(
+        c: *mut xcb_connection_t,
+        cookie: cookie_t,
+        e: *mut *mut xcb_generic_error_t,
+    ) -> *mut xcb_intern_atom_reply_t;
+    fn xcb_get_property(
+        c: *mut xcb_connection_t,
+        delete: u8,
+        window: u32,
+        property: u32,
+        type_: u32,
+        long_offset: u32,
+        long_length: u32,
+    ) -> cookie_t;
+    fn xcb_get_property_reply(
+        c: *mut xcb_connection_t,
+        cookie: cookie_t,
+        e: *mut *mut xcb_generic_error_t,
+    ) -> *mut xcb_get_property_reply_t;
+    fn xcb_get_input_focus(c: *mut xcb_connection_t) -> cookie_t;
+    fn xcb_get_input_focus_reply(
+        c: *mut xcb_connection_t,
+        cookie: cookie_t,
+        e: *mut *mut xcb_generic_error_t,
+    ) -> *mut xcb_get_input_focus_reply_t;
 }
 
 #[link(name = "xcb-dri3")]
@@ -361,6 +422,312 @@ unsafe fn resolve_target(conn: *mut xcb_connection_t, window: u32) -> Option<Pre
         cur = parent;
     }
     None
+}
+
+// ------------------------------------- the override target (gamescope route)
+//
+// The default present route (proxy.rs `xlib_override_surface`) binds the
+// shim's own wl_surface to an X window with gamescope's
+// `override_window_content`. gamescope then runs its own
+// `x11_find_toplevel_for_xid` on whatever XID it is handed, so handing it the
+// window winex11 named lands the override on that window's root-child
+// ancestor. For Dishonored that ancestor is a 1x1 override-redirect wine
+// helper, while the window gamescope actually paints is a *different*,
+// full-size root child of the same client: the override frame is committed
+// correctly (the shim's `wlcommit ... buf=1152x864 route=x11`) but never
+// composed. `resolve_override_target` fixes that by selecting the window
+// gamescope will paint whenever the resolved ancestor is degenerate, and by
+// returning the ancestor unchanged otherwise, so already-working targets
+// (Dave the Diver, Nidhogg) bind the exact XID they bound before.
+
+/// XCB atom ids that are fixed for every server (`XCB_ATOM_*`).
+const XCB_ATOM_STRING: u32 = 31;
+const XCB_ATOM_WM_CLASS: u32 = 67;
+/// `XCB_MAP_STATE_VIEWABLE`.
+const MAP_STATE_VIEWABLE: u8 = 2;
+/// `XCB_WINDOW_CLASS_INPUT_OUTPUT`.
+const WINDOW_CLASS_INPUT_OUTPUT: u16 = 1;
+
+/// A window this small carries no frame - the shape wine leaves its nominated
+/// window, and the 1x1 override-redirect helper ancestor, in.
+fn is_degenerate(w: u16, h: u16) -> bool {
+    w <= 1 || h <= 1
+}
+
+unsafe fn window_size(conn: *mut xcb_connection_t, w: u32) -> (u16, u16) {
+    let geom = unsafe { xcb_get_geometry_reply(conn, xcb_get_geometry(conn, w), ptr::null_mut()) };
+    if geom.is_null() {
+        return (0, 0);
+    }
+    let d = unsafe { ((*geom).width, (*geom).height) };
+    unsafe { libc::free(geom.cast()) };
+    d
+}
+
+unsafe fn window_root(conn: *mut xcb_connection_t, w: u32) -> u32 {
+    let tree = unsafe { xcb_query_tree_reply(conn, xcb_query_tree(conn, w), ptr::null_mut()) };
+    if tree.is_null() {
+        return 0;
+    }
+    let root = unsafe { (*tree).root };
+    unsafe { libc::free(tree.cast()) };
+    root
+}
+
+unsafe fn intern_atom(conn: *mut xcb_connection_t, name: &[u8]) -> u32 {
+    let cookie =
+        unsafe { xcb_intern_atom(conn, 1, name.len() as u16, name.as_ptr().cast::<c_char>()) };
+    let reply = unsafe { xcb_intern_atom_reply(conn, cookie, ptr::null_mut()) };
+    if reply.is_null() {
+        return 0;
+    }
+    let a = unsafe { (*reply).atom };
+    unsafe { libc::free(reply.cast()) };
+    a
+}
+
+/// Reads the first 32-bit word of a window property (type-unfiltered, so it
+/// reads both `CARDINAL` and `WINDOW` properties). 0 when absent.
+unsafe fn window_u32_prop(conn: *mut xcb_connection_t, w: u32, prop: u32) -> u32 {
+    if prop == 0 {
+        return 0;
+    }
+    let cookie = unsafe { xcb_get_property(conn, 0, w, prop, 0, 0, 1) };
+    let reply = unsafe { xcb_get_property_reply(conn, cookie, ptr::null_mut()) };
+    if reply.is_null() {
+        return 0;
+    }
+    let mut v = 0u32;
+    let r = unsafe { &*reply };
+    if r.format == 32 && r.value_len >= 1 {
+        let p = unsafe { (reply as *const u8).add(32).cast::<u32>() };
+        v = unsafe { ptr::read_unaligned(p) };
+    }
+    unsafe { libc::free(reply.cast()) };
+    v
+}
+
+/// The `WM_CLASS` instance string (the first NUL-terminated field), copied
+/// into a fixed buffer; all-zero when the property is absent.
+unsafe fn window_class_instance(conn: *mut xcb_connection_t, w: u32) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let cookie = unsafe { xcb_get_property(conn, 0, w, XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 0, 8) };
+    let reply = unsafe { xcb_get_property_reply(conn, cookie, ptr::null_mut()) };
+    if reply.is_null() {
+        return out;
+    }
+    let r = unsafe { &*reply };
+    if r.format == 8 && r.value_len > 0 {
+        let bytes = unsafe {
+            std::slice::from_raw_parts((reply as *const u8).add(32), r.value_len as usize)
+        };
+        let n = bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(bytes.len())
+            .min(31);
+        out[..n].copy_from_slice(&bytes[..n]);
+    }
+    unsafe { libc::free(reply.cast()) };
+    out
+}
+
+unsafe fn window_attr(conn: *mut xcb_connection_t, w: u32) -> Option<(u8, u16, u8)> {
+    let attr = unsafe {
+        xcb_get_window_attributes_reply(conn, xcb_get_window_attributes(conn, w), ptr::null_mut())
+    };
+    if attr.is_null() {
+        return None;
+    }
+    let v = unsafe { ((*attr).map_state, (*attr).class_, (*attr).override_redirect) };
+    unsafe { libc::free(attr.cast()) };
+    Some(v)
+}
+
+unsafe fn input_focus(conn: *mut xcb_connection_t) -> u32 {
+    let cookie = unsafe { xcb_get_input_focus(conn) };
+    let reply = unsafe { xcb_get_input_focus_reply(conn, cookie, ptr::null_mut()) };
+    if reply.is_null() {
+        return 0;
+    }
+    let f = unsafe { (*reply).focus };
+    unsafe { libc::free(reply.cast()) };
+    f
+}
+
+/// The named window's client identity, read from the window itself or, when it
+/// carries neither `_NET_WM_PID` nor `WM_CLASS` (wine sets them on managed
+/// windows), the first ancestor that does. Returns (pid, class_instance,
+/// class_len).
+unsafe fn named_identity(
+    conn: *mut xcb_connection_t,
+    named: u32,
+    ancestor: u32,
+    pid_atom: u32,
+) -> (u32, [u8; 32], usize) {
+    let mut pid = 0u32;
+    let mut cls = [0u8; 32];
+    let mut cls_len = 0usize;
+    let mut cur = named;
+    for _ in 0..MAX_ANCESTOR_DEPTH {
+        if pid == 0 {
+            pid = unsafe { window_u32_prop(conn, cur, pid_atom) };
+        }
+        if cls_len == 0 {
+            let c = unsafe { window_class_instance(conn, cur) };
+            let n = c.iter().position(|&b| b == 0).unwrap_or(c.len());
+            if n > 0 {
+                cls = c;
+                cls_len = n.min(31);
+            }
+        }
+        if (pid != 0 && cls_len != 0) || cur == ancestor {
+            break;
+        }
+        let tree =
+            unsafe { xcb_query_tree_reply(conn, xcb_query_tree(conn, cur), ptr::null_mut()) };
+        if tree.is_null() {
+            break;
+        }
+        let parent = unsafe { (*tree).parent };
+        unsafe { libc::free(tree.cast()) };
+        if parent == 0 || parent == cur {
+            break;
+        }
+        cur = parent;
+    }
+    (pid, cls, cls_len)
+}
+
+/// The window the content override must bind to (see the section comment).
+///
+/// Opens its own X connection; returns `named` unchanged when it cannot
+/// connect, so a failed resolve degrades to the previous behaviour rather than
+/// binding nothing.
+pub unsafe fn resolve_override_target(named: u32) -> u32 {
+    let conn = unsafe { xcb_connect(ptr::null(), ptr::null_mut()) };
+    if conn.is_null() || unsafe { xcb_connection_has_error(conn) } != 0 {
+        if !conn.is_null() {
+            unsafe { xcb_disconnect(conn) };
+        }
+        return named;
+    }
+    let target = unsafe { resolve_override_target_on(conn, named) };
+    unsafe { xcb_disconnect(conn) };
+    target
+}
+
+/// The selection rule, on a caller-provided connection (host tests drive it).
+///
+///  1. Resolve the named window's root-child ancestor, as gamescope does.
+///  2. Not degenerate (both extents > 1) -> return the ancestor, unchanged.
+///  3. Degenerate -> select among the root's children the window gamescope
+///     actually paints: viewable, InputOutput, non-degenerate, and of the same
+///     client as the named window (same `_NET_WM_PID` as the named window's
+///     chain or as this process, or the same `WM_CLASS` instance). The X input
+///     focus / `_NET_ACTIVE_WINDOW` are accepted as that window when no
+///     pid/class match is found; otherwise the largest match wins.
+///  4. No candidate -> return the ancestor (the caller logs the empty set).
+unsafe fn resolve_override_target_on(conn: *mut xcb_connection_t, named: u32) -> u32 {
+    let Some(resolved) = (unsafe { resolve_target(conn, named) }) else {
+        return named;
+    };
+    let ancestor = resolved.window;
+    let (aw, ah) = unsafe { window_size(conn, ancestor) };
+    if !is_degenerate(aw, ah) {
+        crate::logf!(
+            "override target: named=0x{named:x} ancestor=0x{ancestor:x} {aw}x{ah} -> 0x{ancestor:x} (legitimate; unchanged)"
+        );
+        return ancestor;
+    }
+
+    let pid_atom = unsafe { intern_atom(conn, b"_NET_WM_PID") };
+    let active_atom = unsafe { intern_atom(conn, b"_NET_ACTIVE_WINDOW") };
+    let self_pid = unsafe { libc::getpid() } as u32;
+    let (named_pid, named_cls, named_cls_len) =
+        unsafe { named_identity(conn, named, ancestor, pid_atom) };
+
+    let root = unsafe { window_root(conn, ancestor) };
+    if root == 0 {
+        return ancestor;
+    }
+    let active = unsafe { window_u32_prop(conn, root, active_atom) };
+    let focus = unsafe { input_focus(conn) };
+
+    let tree = unsafe { xcb_query_tree_reply(conn, xcb_query_tree(conn, root), ptr::null_mut()) };
+    if tree.is_null() {
+        return ancestor;
+    }
+    let n = unsafe { (*tree).children_len as usize };
+    let kids = unsafe { (tree as *const u8).add(32).cast::<u32>() };
+
+    let mut best: u32 = 0;
+    let mut best_area: u64 = 0;
+    let mut focus_viable = false;
+    let mut active_viable = false;
+    let mut report = String::new();
+    let mut seen = 0u32;
+    for i in 0..n {
+        let c = unsafe { ptr::read_unaligned(kids.add(i)) };
+        if c == ancestor {
+            continue;
+        }
+        let Some((map_state, class_, _)) = (unsafe { window_attr(conn, c) }) else {
+            continue;
+        };
+        if map_state != MAP_STATE_VIEWABLE || class_ != WINDOW_CLASS_INPUT_OUTPUT {
+            continue;
+        }
+        let (w, h) = unsafe { window_size(conn, c) };
+        if is_degenerate(w, h) {
+            continue;
+        }
+        let cpid = unsafe { window_u32_prop(conn, c, pid_atom) };
+        let ccls = unsafe { window_class_instance(conn, c) };
+        let pid_ok = cpid != 0 && (cpid == named_pid || cpid == self_pid);
+        let class_ok = named_cls_len != 0 && ccls[..named_cls_len] == named_cls[..named_cls_len];
+        let matched = pid_ok || class_ok;
+        if c == focus {
+            focus_viable = true;
+        }
+        if c == active {
+            active_viable = true;
+        }
+        seen += 1;
+        if seen <= 12 {
+            let cn = ccls.iter().position(|&b| b == 0).unwrap_or(ccls.len());
+            let cstr = String::from_utf8_lossy(&ccls[..cn]);
+            report.push_str(&format!(
+                " 0x{c:x} {w}x{h} pid={cpid} class=\"{cstr}\"{}{}{}",
+                if c == focus { " <focus>" } else { "" },
+                if c == active { " <active>" } else { "" },
+                if matched { " <match>" } else { "" },
+            ));
+        }
+        if matched {
+            let area = u64::from(w) * u64::from(h);
+            if area > best_area {
+                best_area = area;
+                best = c;
+            }
+        }
+    }
+    unsafe { libc::free(tree.cast()) };
+
+    let (chosen, why) = if best != 0 {
+        (best, "client-matched")
+    } else if focus_viable && focus != ancestor {
+        (focus, "input-focus")
+    } else if active_viable && active != ancestor {
+        (active, "active-window")
+    } else {
+        (ancestor, "no-candidate")
+    };
+    crate::logf!(
+        "override target: named=0x{named:x} ancestor=0x{ancestor:x} {aw}x{ah} -> 0x{chosen:x} ({why}; self_pid={self_pid} named_pid={named_pid} named_class=\"{}\"; root_children:{report})",
+        String::from_utf8_lossy(&named_cls[..named_cls_len])
+    );
+    chosen
 }
 
 // ---------------------------------------------------------------- the route
@@ -836,7 +1203,24 @@ mod tests {
             value_list: *const c_void,
         ) -> cookie_t;
         fn xcb_destroy_window(c: *mut xcb_connection_t, window: u32) -> cookie_t;
+        fn xcb_map_window(c: *mut xcb_connection_t, window: u32) -> cookie_t;
+        fn xcb_change_property(
+            c: *mut xcb_connection_t,
+            mode: u8,
+            window: u32,
+            property: u32,
+            type_: u32,
+            format: u8,
+            data_len: u32,
+            data: *const c_void,
+        ) -> cookie_t;
     }
+    const XCB_ATOM_CARDINAL_T: u32 = 6;
+    const PROP_MODE_REPLACE: u8 = 0;
+    /// `CWOverrideRedirect`: keep the host WM from reparenting the test windows
+    /// (a reparented window is no longer a root child, which would defeat the
+    /// enumeration the test exercises).
+    const CW_OVERRIDE_REDIRECT: u32 = 0x0200;
 
     // Layout of xcb's setup reply: a fixed 40-byte header, then the vendor
     // string (padded to 4 bytes), then the pixmap formats (8 bytes each), then
@@ -958,6 +1342,151 @@ mod tests {
         unsafe {
             xcb_destroy_window(conn, client);
             xcb_destroy_window(conn, top);
+            xcb_flush(conn);
+            xcb_disconnect(conn);
+        }
+    }
+
+    /// The content-override selection rule. A degenerate (1x1) ancestor must be
+    /// swapped for the full-size viewable root child of the same client, and a
+    /// legitimate ancestor must be returned untouched. Host/DISPLAY-gated.
+    #[test]
+    fn override_target_swaps_a_degenerate_ancestor_for_the_painted_window() {
+        let conn = unsafe { xcb_connect(ptr::null(), ptr::null_mut()) };
+        if conn.is_null() || unsafe { xcb_connection_has_error(conn) } != 0 {
+            eprintln!("skip: no X server (DISPLAY unreachable)");
+            return;
+        }
+        let screen = unsafe { host_root(conn) };
+        let Some((root, depth)) = screen else {
+            eprintln!("skip: no X server (no screen in setup)");
+            unsafe { xcb_disconnect(conn) };
+            return;
+        };
+
+        // A 1x1 root-child helper with a 1x1 named client under it: the shape
+        // Dishonored's nominated window resolves to.
+        let helper = unsafe { xcb_generate_id(conn) };
+        let named = unsafe { xcb_generate_id(conn) };
+        // The window gamescope would paint: a full-size root child of the same
+        // client (same _NET_WM_PID).
+        let game = unsafe { xcb_generate_id(conn) };
+        let mk = |w: u32, parent: u32, width: u16, height: u16| unsafe {
+            xcb_create_window(
+                conn,
+                depth,
+                w,
+                parent,
+                0,
+                0,
+                width,
+                height,
+                0,
+                WINDOW_CLASS_INPUT_OUTPUT,
+                COPY_FROM_PARENT,
+                0,
+                ptr::null(),
+            )
+        };
+        // override-redirect so the host WM does not reparent the root children.
+        let or_val: u32 = 1;
+        unsafe {
+            xcb_create_window(
+                conn,
+                depth,
+                helper,
+                root,
+                0,
+                0,
+                1,
+                1,
+                0,
+                WINDOW_CLASS_INPUT_OUTPUT,
+                COPY_FROM_PARENT,
+                CW_OVERRIDE_REDIRECT,
+                (&raw const or_val).cast(),
+            )
+        };
+        mk(named, helper, 1, 1);
+        unsafe {
+            xcb_create_window(
+                conn,
+                depth,
+                game,
+                root,
+                0,
+                0,
+                640,
+                480,
+                0,
+                WINDOW_CLASS_INPUT_OUTPUT,
+                COPY_FROM_PARENT,
+                CW_OVERRIDE_REDIRECT,
+                (&raw const or_val).cast(),
+            )
+        };
+        // Identity: give both the helper (which the named window inherits) and
+        // the painted window this process's pid.
+        let pid_atom = unsafe { intern_atom(conn, b"_NET_WM_PID") };
+        let my_pid = unsafe { libc::getpid() } as u32;
+        for w in [helper, game] {
+            unsafe {
+                xcb_change_property(
+                    conn,
+                    PROP_MODE_REPLACE,
+                    w,
+                    pid_atom,
+                    XCB_ATOM_CARDINAL_T,
+                    32,
+                    1,
+                    (&raw const my_pid).cast(),
+                )
+            };
+        }
+        unsafe {
+            xcb_map_window(conn, helper);
+            xcb_map_window(conn, game);
+            xcb_flush(conn);
+        }
+        // Let the server process the maps; if the WM interfered, skip.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let game_attr = unsafe { window_attr(conn, game) };
+        if game_attr.map(|(m, _, _)| m) != Some(MAP_STATE_VIEWABLE) {
+            eprintln!("skip: test window not viewable (host WM interference)");
+            unsafe {
+                xcb_destroy_window(conn, named);
+                xcb_destroy_window(conn, helper);
+                xcb_destroy_window(conn, game);
+                xcb_flush(conn);
+                xcb_disconnect(conn);
+            }
+            return;
+        }
+
+        let chosen = unsafe { resolve_override_target_on(conn, named) };
+        assert_eq!(
+            chosen, game,
+            "a degenerate 1x1 ancestor is swapped for the painted 640x480 window"
+        );
+
+        // A legitimate (full-size) ancestor is returned unchanged.
+        let legit = unsafe { xcb_generate_id(conn) };
+        let lclient = unsafe { xcb_generate_id(conn) };
+        mk(legit, root, 320, 240);
+        mk(lclient, legit, 160, 120);
+        unsafe { xcb_flush(conn) };
+        assert_eq!(
+            unsafe { resolve_override_target_on(conn, lclient) },
+            legit,
+            "a non-degenerate ancestor is returned unchanged"
+        );
+
+        unsafe {
+            xcb_destroy_window(conn, lclient);
+            xcb_destroy_window(conn, legit);
+            xcb_destroy_window(conn, named);
+            xcb_destroy_window(conn, helper);
+            xcb_destroy_window(conn, game);
             xcb_flush(conn);
             xcb_disconnect(conn);
         }
