@@ -819,6 +819,16 @@ fn worker_main(sc: *mut GnSwapchain) {
             let t1 = Instant::now();
             let flush_rc = {
                 let _sg = SEND_LOCK.lock().unwrap();
+                // This surface presents FIFO (a slot becomes reusable only on the
+                // compositor's wl_buffer.release) and gamescope reads the declared
+                // mode once per commit, then paces only the commits it reads as
+                // FIFO — so the declaration rides every commit. Without it a
+                // window's fps limit is applied in the compositor and never
+                // reaches this present path.
+                wlproto::swapchain_set_present_mode(
+                    (*(*sc).surf).swapchain_obj,
+                    crate::vk::VK_PRESENT_MODE_FIFO_KHR as u32,
+                );
                 wlproto::surface_attach(parent, (*s).buf, 0, 0);
                 wlproto::surface_damage_buffer(
                     parent,
@@ -1408,6 +1418,12 @@ unsafe fn present_sync_commit(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32)
         if !unsafe { (*slot).buf.is_null() } {
             let _sg = SEND_LOCK.lock().unwrap();
             unsafe {
+                // Declare FIFO as on the worker path above (gamescope reads the
+                // mode once per commit).
+                wlproto::swapchain_set_present_mode(
+                    (*(*sc).surf).swapchain_obj,
+                    crate::vk::VK_PRESENT_MODE_FIFO_KHR as u32,
+                );
                 wlproto::surface_attach(parent, (*slot).buf, 0, 0);
                 wlproto::surface_damage_buffer(
                     parent,

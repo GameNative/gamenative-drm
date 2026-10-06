@@ -217,7 +217,11 @@ impl Presenter for NullPresenter {
     }
 }
 
-type ClockFn = Box<dyn Fn() -> (u32, u32) + Send>;
+type ClockFn = Box<dyn Fn() -> (u32, u32) + Send + Sync>;
+/// The event clock, shared between the [`Device`] and the commit worker, which
+/// re-stamps a page-flip event at emission (see [`commit_worker_loop`]); the
+/// indirection lets [`Device::set_clock`] (tests) reach the worker too.
+type SharedClock = Arc<Mutex<ClockFn>>;
 /// Diagnostics sink for rejections (see `Device::set_logger`).
 pub type LogFn = Box<dyn Fn(&str) + Send>;
 /// Sink for a framebuffer geometry the client registered (`ADDFB2`), so a
@@ -256,7 +260,7 @@ pub struct Device {
     /// `PRIMARY_FORMATS` fourcc × `DRM_FORMAT_MOD_LINEAR`).
     in_formats_blob: u32,
 
-    clock: ClockFn,
+    clock: SharedClock,
     flip_sequence: u32,
 
     /// Outbound commit jobs: the serve thread queues, the worker pops. `None`
@@ -327,6 +331,9 @@ impl Device {
         let logger: Arc<Mutex<Option<LogFn>>> = Arc::new(Mutex::new(None));
         // The worker owns the presenter and signals a dup of the flip eventfd.
         let worker_fd = dup_fd(flip_event_fd, 0).expect("dup flip eventfd");
+        // The event clock is shared with the commit worker, which re-stamps a
+        // page-flip event when it emits it (see `commit_worker_loop`).
+        let clock: SharedClock = Arc::new(Mutex::new(Box::new(monotonic_now)));
         let worker = thread::Builder::new()
             .name("gndrm-commit".into())
             .spawn({
@@ -334,9 +341,11 @@ impl Device {
                 let in_flight = Arc::clone(&in_flight);
                 let shutdown = Arc::clone(&shutdown);
                 let logger = Arc::clone(&logger);
+                let clock = Arc::clone(&clock);
                 move || {
                     commit_worker(
                         presenter, commit_rx, flip_queue, worker_fd, in_flight, shutdown, logger,
+                        clock,
                     )
                 }
             })
@@ -354,7 +363,7 @@ impl Device {
             primary: PlaneState::default(),
             cursor: PlaneState::default(),
             in_formats_blob,
-            clock: Box::new(monotonic_now),
+            clock,
             flip_sequence: 0,
             commit_tx: Some(commit_tx),
             flip_queue,
@@ -442,7 +451,7 @@ impl Device {
 
     /// Override the event clock (tests).
     pub fn set_clock(&mut self, clock: ClockFn) {
-        self.clock = clock;
+        *self.clock.lock().unwrap_or_else(PoisonError::into_inner) = clock;
     }
 
     /// Access the object stores (read-only; for the socket/presenter layer).
@@ -538,7 +547,7 @@ impl Device {
     }
 
     pub(crate) fn now(&self) -> (u32, u32) {
-        (self.clock)()
+        (self.clock.lock().unwrap_or_else(PoisonError::into_inner))()
     }
 
     pub(crate) fn next_flip_sequence(&mut self) -> u32 {
@@ -1632,6 +1641,7 @@ fn commit_worker(
     in_flight: Arc<Mutex<HashSet<u32>>>,
     shutdown: Arc<AtomicBool>,
     logger: Arc<Mutex<Option<LogFn>>>,
+    clock: SharedClock,
 ) {
     let report = Arc::clone(&logger);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1643,6 +1653,7 @@ fn commit_worker(
             in_flight,
             shutdown,
             logger,
+            clock,
         );
     }));
     if caught.is_err() {
@@ -1671,6 +1682,7 @@ fn commit_worker_loop(
     in_flight: Arc<Mutex<HashSet<u32>>>,
     shutdown: Arc<AtomicBool>,
     logger: Arc<Mutex<Option<LogFn>>>,
+    clock: SharedClock,
 ) {
     // One-shot: a withheld latch is reported once, not once per frame.
     let mut warned_latch = false;
@@ -1700,11 +1712,53 @@ fn commit_worker_loop(
                 FlipHandle::latched_now()
             }
         };
-        // Wait for the latch, bounded. A completion the presenter never reports
-        // must degrade — the frame is treated as latched so the flip event
-        // still fires and the buffer is released — and a dropped latch is
-        // detected at once instead of spinning out the budget. Teardown still
-        // interrupts the wait (the in-flight frame is dropped on the way out).
+        // The frame is now queued to SurfaceFlinger. Emit the page-flip event
+        // here, not after the presenter reports its completion: gamescope's DRM
+        // backend blocks its present loop on this event
+        // (`drm->uPendingFlipCount.wait`, Backends/DRMBackend.cpp), so gating the
+        // event on the SurfaceFlinger completion callback serialises the whole
+        // SurfaceFlinger round-trip into every paced frame. On this port that
+        // round trip is ~9.8 ms (median, measured on device) and it is the
+        // additive term C that pacing fits as `1/(1/target + C)`: a 60 target
+        // measured 39.9 presents/s before this change and 55.4 after. A real KMS
+        // page-flip event is delivered when the flip is *queued* for the next
+        // vblank, which is what emitting here now means. (The uncapped rate is
+        // unchanged: it is bounded upstream by the client's own present lap, not
+        // by this event.)
+        //
+        // Correctness is unchanged: nothing is reusable before the compositor
+        // has released it. The pool still caches a buffer for reuse only once
+        // the presenter reports SurfaceFlinger's completion (the slot's
+        // `latched` flag), and the next publish still blocks on the previous
+        // release fence. This only stops the *event* — a pacing/visibility
+        // signal to the client — from carrying the round trip; the buffer's
+        // lifetime is still pinned to the real completion.
+        d.set_role(Role::Commit, State::CommitFlushing);
+        if let Some(fb_id) = in_flight_fb {
+            in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&fb_id);
+        }
+        if let Some(mut ev) = job.event.take() {
+            // Stamp the event when it is *emitted*, not when the commit was
+            // built. A real kernel delivers a page-flip event at the vblank it
+            // reports, so timestamp and delivery coincide, and gamescope
+            // re-anchors its vblank timer off this timestamp.
+            let (sec, usec) = (clock.lock().unwrap_or_else(PoisonError::into_inner))();
+            ev.tv_sec = sec;
+            ev.tv_usec = usec;
+            flip_queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push_back(ev);
+            write_eventfd(flip_event_fd);
+        }
+        // Acknowledge SurfaceFlinger's completion after the event, bounded. The
+        // wait is no longer on the client's critical path; it keeps at most one
+        // frame in flight (back-pressure) and lets teardown interrupt a stalled
+        // completion. A completion the presenter never reports degrades to
+        // "treat as latched" instead of stalling the loop.
         d.set_role(Role::Commit, State::CommitWaitingLatch);
         let wait_started = Instant::now();
         let deadline = wait_started + LATCH_TIMEOUT;
@@ -1735,23 +1789,6 @@ fn commit_worker_loop(
                     wait_started.elapsed().as_millis()
                 ));
             }
-        }
-        // Mark the buffer reusable before emitting the flip event: the event is
-        // the client's signal that the buffer is free, so it may `RMFB` it the
-        // moment it reads the event.
-        d.set_role(Role::Commit, State::CommitFlushing);
-        if let Some(fb_id) = in_flight_fb {
-            in_flight
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&fb_id);
-        }
-        if let Some(ev) = job.event.take() {
-            flip_queue
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push_back(ev);
-            write_eventfd(flip_event_fd);
         }
         d.set_role(Role::Commit, State::CommitWaitingJob);
     }

@@ -236,7 +236,10 @@ mod swapchain_statics {
         events: std::ptr::null(),
     };
 
-    static SWAPCHAIN_REQUESTS: [wl_message; 2] = [
+    // Requests up to `set_present_mode`: libwayland indexes this table by the
+    // opcode it sends, so `swapchain_feedback` — which we never send — is still
+    // declared to keep `set_present_mode` at its wire opcode (3).
+    static SWAPCHAIN_REQUESTS: [wl_message; 4] = [
         wl_message {
             name: cs(b"destroy\0"),
             signature: cs(b"\0"),
@@ -245,6 +248,16 @@ mod swapchain_statics {
         wl_message {
             name: cs(b"override_window_content\0"),
             signature: cs(b"uu\0"),
+            types: std::ptr::null(),
+        },
+        wl_message {
+            name: cs(b"swapchain_feedback\0"),
+            signature: cs(b"uuuuuus\0"),
+            types: std::ptr::null(),
+        },
+        wl_message {
+            name: cs(b"set_present_mode\0"),
+            signature: cs(b"u\0"),
             types: std::ptr::null(),
         },
     ];
@@ -274,7 +287,7 @@ mod swapchain_statics {
     pub static GAMESCOPE_SWAPCHAIN_INTERFACE: wl_interface = wl_interface {
         name: cs(b"gamescope_swapchain\0"),
         version: 1,
-        method_count: 2,
+        method_count: 4,
         methods: SWAPCHAIN_REQUESTS.as_ptr(),
         event_count: 3,
         events: SWAPCHAIN_EVENTS.as_ptr(),
@@ -303,6 +316,12 @@ pub unsafe fn swapchain_factory_create_swapchain(
 pub unsafe fn swapchain_override_window_content(sc: *mut wl_proxy, server: u32, xid: u32) {
     let mut args = [wl_argument { u: server }, wl_argument { u: xid }];
     wl_proxy_marshal_array(sc, 1, args.as_mut_ptr());
+}
+
+/// gamescope_swapchain.set_present_mode (opcode 3): VkPresentModeKHR.
+pub unsafe fn swapchain_set_present_mode(sc: *mut wl_proxy, present_mode: u32) {
+    let mut args = [wl_argument { u: present_mode }];
+    wl_proxy_marshal_array(sc, 3, args.as_mut_ptr());
 }
 
 // ------------------------------------------- zwp_linux_dmabuf_v1 statics

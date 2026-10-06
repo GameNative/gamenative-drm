@@ -321,6 +321,24 @@ static FEATURE_SUPPORT: AtomicU32 = AtomicU32::new(0);
 /// Latest `active_display_info`; None until gamescope answers.
 static DISPLAY_INFO: Mutex<Option<DisplayInfo>> = Mutex::new(None);
 
+/// `display_flag` bit set for an internal panel (see the protocol's
+/// `gamescope_control` enum).
+const DISPLAY_FLAG_INTERNAL: u32 = 0x1;
+
+/// Whether the connected display is an internal panel. gamescope files an fps
+/// override under one screen type and `_update_app_target_refresh_cycle` reads
+/// back the type of the live connector, so a cap sent without
+/// [`TargetRefreshCycleFlag::InternalDisplay`] on an internal panel (a DSI/eDP
+/// connector) is stored under the external type and never reaches the panel.
+/// False until the display info arrives.
+pub fn display_is_internal() -> bool {
+    DISPLAY_INFO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|info| info.flags & DISPLAY_FLAG_INTERNAL != 0)
+}
+
 /// `feature_support` + `active_display_info` as one compact string:
 /// `features=0x<hex>;connector=<name>;display_flags=0x<hex>;rates=<r>,<r>,...`
 /// (features bits and rates empty when gamescope has not answered). Read from
@@ -596,7 +614,9 @@ fn connect_and_run(
     // Main loop: apply queued input, apply a pending fps cap, flush, drain
     // server events.
     let mut last_roundtrip = std::time::Instant::now();
-    let mut applied_fps: Option<u32> = None;
+    // Cap last sent, plus the screen type it was filed under: gamescope takes
+    // the cap as a request, so re-issue it when either changes.
+    let mut applied_fps: Option<(u32, bool)> = None;
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
@@ -607,12 +627,19 @@ fn connect_and_run(
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
         // gamescope takes the cap as a request, so re-issue it only when the
-        // value changes (including the first pass after connecting).
+        // value changes (including the first pass after connecting) or when the
+        // display info that decides its screen type finally arrives.
         if let Some(control) = &state.gs_control {
             let want = FPS_LIMIT.load(Ordering::Relaxed);
-            if want != u32::MAX && applied_fps != Some(want) {
-                control.set_app_target_refresh_cycle(want, TargetRefreshCycleFlag::empty());
-                applied_fps = Some(want);
+            let internal = display_is_internal();
+            if want != u32::MAX && applied_fps != Some((want, internal)) {
+                let flags = if internal {
+                    TargetRefreshCycleFlag::InternalDisplay
+                } else {
+                    TargetRefreshCycleFlag::empty()
+                };
+                control.set_app_target_refresh_cycle(want, flags);
+                applied_fps = Some((want, internal));
             }
         }
         conn.flush().map_err(|e| format!("flush: {e}"))?;

@@ -1693,11 +1693,13 @@ fn unsignalled_fence() -> RawFd {
     fd
 }
 
-/// The core async contract: a commit queues and returns immediately, no flip
-/// event is observable until the presenter reports the latch, and after the
-/// latch exactly one ordered event fires and the buffer becomes reusable.
+/// The core async contract: a commit queues and returns immediately; the flip
+/// event is emitted with the *publish* (before the presenter's latch), because
+/// the event paces the client and must not carry the compositor round trip; the
+/// latch is still awaited as the completion acknowledgement, and the current
+/// primary still refuses RMFB.
 #[test]
-fn async_commit_returns_before_latch_event_follows_latch() {
+fn async_commit_returns_before_latch_event_follows_publish() {
     let (mut d, latches) = dev_latch();
     let blob = create_mode_blob(&mut d).0;
     let (_handle, fb, fd) = import_fb(&mut d);
@@ -1711,12 +1713,16 @@ fn async_commit_returns_before_latch_event_follows_latch() {
     let r = call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req);
     // (a) the commit returned 0 immediately.
     ok(&r);
-    // (b) no flip event is observable before the latch.
-    assert!(
-        d.drain_flip_events().is_empty(),
-        "no event before the latch"
-    );
-    // (e) TEST_ONLY validates without side effects (still no event).
+    // (b) the flip event is emitted with the publish, before any latch: it means
+    // "queued to the compositor", not "compositor finished".
+    let events = wait_flip(&mut d, 2000);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].base.ty, DRM_EVENT_FLIP_COMPLETE);
+    assert_eq!(events[0].user_data, 0xC0DE);
+    assert_eq!(events[0].sequence, 1);
+    assert_eq!(events[0].crtc_id, CRTC_ID);
+
+    // (e) TEST_ONLY validates without side effects (no second event).
     ok(&call(
         &mut d,
         DRM_IOCTL_MODE_ATOMIC,
@@ -1728,21 +1734,14 @@ fn async_commit_returns_before_latch_event_follows_latch() {
     ));
     assert!(d.drain_flip_events().is_empty());
 
-    // The committed fb is in-flight: RMFB must refuse it.
+    // The committed fb is the current primary, still scanned out: RMFB refuses.
     is_err(&call(&mut d, DRM_IOCTL_MODE_RMFB, &pod(&fb)), errno::EBUSY);
 
-    // (c) fire the latch → exactly one event fires, ordered, with the right
-    // payload.
+    // The latch is still consumed (the worker's completion acknowledgement); it
+    // no longer gates the event.
     fire_next(&latches);
-    let events = wait_flip(&mut d, 2000);
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].base.ty, DRM_EVENT_FLIP_COMPLETE);
-    assert_eq!(events[0].user_data, 0xC0DE);
-    assert_eq!(events[0].sequence, 1);
-    assert_eq!(events[0].crtc_id, CRTC_ID);
 
-    // The buffer is now reusable: after a teardown commit moves it off the
-    // plane, RMFB succeeds.
+    // The buffer becomes reusable once it is moved off the plane: RMFB succeeds.
     let zero = [
         (
             PLANE_PRIMARY_ID,
@@ -1774,10 +1773,10 @@ fn async_commit_returns_before_latch_event_follows_latch() {
 }
 
 /// Two commits against different buffers stay ordered: the worker presents and
-/// emits in commit order, and both buffers are in-flight (refuse RMFB) until
-/// their own latch fires.
+/// emits in commit order, each event following its own publish. The current
+/// primary refuses RMFB; a superseded buffer is no longer in flight.
 #[test]
-fn async_commits_stay_ordered_and_track_in_flight() {
+fn async_commits_stay_ordered_and_events_follow_publish() {
     let (mut d, latches) = dev_latch();
     let blob = create_mode_blob(&mut d).0;
     let (_ha, fb_a, fd_a) = import_fb(&mut d);
@@ -1809,31 +1808,29 @@ fn async_commits_stay_ordered_and_track_in_flight() {
         ),
     ));
 
-    // Both fbs are in-flight: neither can be RMFB'd yet.
-    is_err(
-        &call(&mut d, DRM_IOCTL_MODE_RMFB, &pod(&fb_a)),
-        errno::EBUSY,
-    );
-    is_err(
-        &call(&mut d, DRM_IOCTL_MODE_RMFB, &pod(&fb_b)),
-        errno::EBUSY,
-    );
-    // No event has been emitted (both commits still await their latch).
-    assert!(d.drain_flip_events().is_empty());
-
-    // First latch → first event (fb_a), still no second event.
-    fire_next(&latches);
+    // First publish → first event (fb_a).
     let events = wait_flip(&mut d, 2000);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].user_data, 0xA1);
     assert_eq!(events[0].sequence, 1);
 
-    // Second latch → second event (fb_b), ordered after the first.
-    fire_next(&latches);
+    // Second publish → second event (fb_b), ordered after the first.
     let events = wait_flip(&mut d, 2000);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].user_data, 0xA2);
     assert_eq!(events[0].sequence, 2);
+
+    // fb_b is the current primary → RMFB refused. fb_a was superseded and is no
+    // longer in flight (its event already fired) → RMFB succeeds.
+    is_err(
+        &call(&mut d, DRM_IOCTL_MODE_RMFB, &pod(&fb_b)),
+        errno::EBUSY,
+    );
+    ok(&call(&mut d, DRM_IOCTL_MODE_RMFB, &pod(&fb_a)));
+
+    // Drain the two latches so the worker's acknowledgements complete.
+    fire_next(&latches);
+    fire_next(&latches);
 
     // SAFETY: caller's fds.
     unsafe {
