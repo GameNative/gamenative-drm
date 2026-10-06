@@ -47,6 +47,24 @@ pub(crate) fn daemon_info(text: &str) {
     }
 }
 
+/// TEMPORARY (pacing work): an ungated line from the app-side modules, under the
+/// same `gndrm-pace` tag the daemon's pace line uses. Needed for the same reason
+/// as [`daemon_info`]: this crate's own gates (`GNDRM_LOG_ASC`, …) are read from
+/// the app process, which a container cannot reach. Remove with the pace
+/// diagnostics.
+pub(crate) fn pace_info(text: &str) {
+    let c = std::ffi::CString::new(text)
+        .unwrap_or_else(|_| std::ffi::CString::new("<log error>").unwrap());
+    // SAFETY: `c` is NUL-terminated and outlives the call.
+    unsafe {
+        crate::ffi::__android_log_write(
+            crate::ffi::ANDROID_LOG_INFO,
+            c"gndrm-pace".as_ptr(),
+            c.as_ptr(),
+        );
+    }
+}
+
 /// One log line at `prio`; `fmt`/`args` go through `format_args!`.
 #[macro_export]
 macro_rules! alog {

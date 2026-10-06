@@ -167,6 +167,16 @@ struct ReleaseCtx {
 unsafe impl Send for ReleaseCtx {}
 unsafe impl Sync for ReleaseCtx {}
 
+/// TEMPORARY (pacing work): how many completions SurfaceFlinger has delivered to
+/// this presenter, and how many times an armed latch was replaced before it
+/// fired. These two numbers explain why the commit worker's latch wait always
+/// ends in `latch_lost` — the completion never setting `latched` is also what
+/// makes a retired buffer look unreleased to the reuse cache. Remove with the
+/// pace diagnostics.
+static COMPLETIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LATCHES_REPLACED_ARMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PUBLISH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// `ASurfaceTransaction_setOnComplete`: capture the fence that says
 /// SurfaceFlinger has finished with the buffer published in the previous
 /// transaction. First writer wins; a second fence arriving before the present
@@ -179,6 +189,12 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
     // the commit worker waits on, so a snapshot must be able to say whether a
     // callback was running when a request stalled.
     diag::diag().set_role(Role::PresenterCallback, State::PresenterCallback);
+    // TEMPORARY (pacing work): count the completions this presenter actually
+    // receives (see `COMPLETIONS`).
+    let n = COMPLETIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 10 {
+        crate::log::pace_info(&format!("asc: completion #{n} ctx={context:p}"));
+    }
     // SAFETY: `context` is the leaked ReleaseCtx this presenter handed to
     // setOnComplete; it outlives every callback by construction.
     let ctx = unsafe { &*context.cast::<ReleaseCtx>() };
@@ -230,13 +246,26 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
     // Fire the latch the worker waits on for this publish. The worker is
     // serial, so only one latch is ever in flight; a stray callback finds an
     // empty slot and does nothing.
-    if let Some(latch) = ctx
+    let took = if let Some(latch) = ctx
         .latch
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .take()
     {
         latch.fire();
+        true
+    } else {
+        false
+    };
+    // TEMPORARY (pacing work): `took=0` means the completion found no latch to
+    // fire for this registration — the other half of why the worker's wait
+    // ends in `latch_lost` (see `COMPLETIONS`).
+    let c = COMPLETIONS.load(std::sync::atomic::Ordering::Relaxed);
+    if c <= 10 || c.is_multiple_of(120) {
+        crate::log::pace_info(&format!(
+            "asc: completion #{c} ctx={context:p} took_latch={}",
+            u8::from(took)
+        ));
     }
     diag::diag().set_role(Role::PresenterCallback, State::Idle);
 }
@@ -628,6 +657,30 @@ fn ctx_release_fd(buf: &PoolBuf) -> RawFd {
     unsafe { (*buf.ctx).release_fd.swap(-1, Ordering::AcqRel) }
 }
 
+/// Whether SurfaceFlinger has reported the completion for this registration's
+/// last publish, so the buffer may be handed back out.
+///
+/// TEMPORARY (pacing work): the flag is currently written by the completion and
+/// never read — the retire decision releases buffers regardless, which frees the
+/// mailbox (and any armed latch in it) while the commit worker is still waiting
+/// on it. This and [`ctx_latch_armed`] are what the retire policy must consult.
+fn ctx_latched(buf: &PoolBuf) -> bool {
+    // SAFETY: `buf.ctx` is a leaked mailbox owned by the pool for the session.
+    unsafe { (*buf.ctx).latched.load(Ordering::Acquire) }
+}
+
+/// Whether a publish on this registration is still awaiting its completion.
+fn ctx_latch_armed(buf: &PoolBuf) -> bool {
+    // SAFETY: `buf.ctx` is a leaked mailbox owned by the pool for the session.
+    unsafe {
+        (*buf.ctx)
+            .latch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+}
+
 /// The last buffer actually put on the layer, with the geometry it went out
 /// with. A commit for an inode that is not registered re-publishes this rather
 /// than leaving the layer empty: SurfaceFlinger compositing nothing drops the
@@ -931,12 +984,34 @@ impl AscState {
                             // waits on before emitting the flip event.
                             let (handle, latch) = FlipHandle::new();
                             // SAFETY: `ctx` is the leaked mailbox of this slot.
-                            unsafe {
+                            // TEMPORARY (pacing work): a latch replaced while it is still
+                            // armed is dropped without firing, which is one way the worker's
+                            // wait ends in `latch_lost` (`LATCHES_REPLACED_ARMED`).
+                            let armed_prev = unsafe {
                                 (*ctx)
                                     .latch
                                     .lock()
                                     .unwrap_or_else(PoisonError::into_inner)
-                                    .replace(latch);
+                                    .replace(latch)
+                            }
+                            .is_some();
+                            if armed_prev {
+                                let n = LATCHES_REPLACED_ARMED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if n < 10 {
+                                    crate::log::pace_info(&format!(
+                                        "asc: armed latch replaced without firing (#{n})"
+                                    ));
+                                }
+                            }
+                            let p = PUBLISH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if p < 5 || p.is_multiple_of(120) {
+                                crate::log::pace_info(&format!(
+                                    "asc: publish #{p} ctx={ctx:p} armed_prev={} completions={} replaced_armed={}",
+                                    u8::from(armed_prev),
+                                    COMPLETIONS.load(std::sync::atomic::Ordering::Relaxed),
+                                    LATCHES_REPLACED_ARMED.load(std::sync::atomic::Ordering::Relaxed)
+                                ));
                             }
                             apply_transaction(&api, tx);
                             // What is on the layer is what a later commit falls
@@ -1598,6 +1673,15 @@ fn retire_to_release(removed: &[Removed<PoolBuf>]) -> Vec<Retired> {
                 }
             }
             Removed::Released { ino, payload } => {
+                // TEMPORARY (pacing work): the registration is about to be freed —
+                // and with it any armed latch, which is what the commit worker's
+                // wait sees as `latch_lost`. `armed=1` here is the whole defect.
+                crate::log::pace_info(&format!(
+                    "asc: FREE ino={ino} ctx={:p} armed={} latched={}",
+                    payload.ctx,
+                    u8::from(ctx_latch_armed(payload)),
+                    u8::from(ctx_latched(payload))
+                ));
                 log_info!("asc: dma-buf ino {ino} retired; releasing its AHardwareBuffer");
                 out.push(retire_buf(*payload));
             }
