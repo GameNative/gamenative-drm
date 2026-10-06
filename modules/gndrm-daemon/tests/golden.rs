@@ -1496,8 +1496,11 @@ fn atomic_test_only_then_modeset_then_flip() {
     assert_eq!(c.mode_valid, 0);
     assert_eq!(c.fb_id, 0);
 
-    // Real modeset: queues and returns immediately — no flip event is
-    // observable until the presenter reports the latch.
+    // Real modeset: queues and returns immediately. The flip event is emitted
+    // with the publish, not after the presenter's latch — gamescope's DRM
+    // backend blocks its present loop on this event, so gating it on
+    // SurfaceFlinger's completion would serialise that round trip into every
+    // paced frame. It must therefore be observable *without* any latch firing.
     let req = atomic_req(
         &sets,
         DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
@@ -1505,10 +1508,24 @@ fn atomic_test_only_then_modeset_then_flip() {
     );
     let r = call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req);
     ok(&r);
-    assert!(
-        d.drain_flip_events().is_empty(),
-        "no flip event before the latch"
+    let events = wait_flip(&mut d, 2000);
+    assert_eq!(
+        events.len(),
+        1,
+        "one event per commit, emitted with the publish"
     );
+    let ev = events[0];
+    assert_eq!(ev.base.ty, DRM_EVENT_FLIP_COMPLETE);
+    assert_eq!(
+        ev.base.length as usize,
+        core::mem::size_of::<DrmEventVblank>()
+    );
+    assert_eq!(ev.user_data, 0xCAFE);
+    assert_eq!(ev.crtc_id, CRTC_ID);
+    assert_eq!(ev.sequence, 1);
+    // The timestamp is the vblank this frame claims, not the emit instant: the
+    // first claim is the clock's own reading (see `VblankTimeline`).
+    assert_eq!((ev.tv_sec, ev.tv_usec), (1000, 500));
 
     // State is already visible to queries (applied synchronously on commit).
     let r = call(
@@ -1524,20 +1541,12 @@ fn atomic_test_only_then_modeset_then_flip() {
     assert_eq!(c.fb_id, fb);
     assert_eq!((c.mode.hdisplay, c.mode.vdisplay), (1280, 720));
 
-    // Fire the presenter's latch → exactly one flip event, ordered.
+    // Firing the latch completes that frame; it emits no event of its own.
     fire_next(&latches);
-    let events = wait_flip(&mut d, 2000);
-    assert_eq!(events.len(), 1);
-    let ev = events[0];
-    assert_eq!(ev.base.ty, DRM_EVENT_FLIP_COMPLETE);
-    assert_eq!(
-        ev.base.length as usize,
-        core::mem::size_of::<DrmEventVblank>()
+    assert!(
+        d.drain_flip_events().is_empty(),
+        "the latch must not emit a second event"
     );
-    assert_eq!(ev.user_data, 0xCAFE);
-    assert_eq!(ev.crtc_id, CRTC_ID);
-    assert_eq!((ev.tv_sec, ev.tv_usec), (1000, 500));
-    assert_eq!(ev.sequence, 1);
 
     // Page-flip-only commit (no ALLOW_MODESET, same FB → no re-present) emits
     // the next event immediately, still ordered after the first.
@@ -1556,6 +1565,14 @@ fn atomic_test_only_then_modeset_then_flip() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].sequence, 2);
     assert_eq!(events[0].user_data, 0xBEEF);
+    // The claimed vblank advanced by exactly one mode interval (the mocked clock
+    // does not move), which is what keeps gamescope's grid on the mode's rate:
+    // the 60 Hz default panel is 16 666 666 ns per frame.
+    assert_eq!(
+        (events[0].tv_sec, events[0].tv_usec),
+        (1000, 17_166),
+        "the next claim is one interval after the previous vblank"
+    );
 
     // SAFETY: caller's fd.
     unsafe { libc::close(fd) };

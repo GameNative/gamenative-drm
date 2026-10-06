@@ -17,6 +17,7 @@
 
 use std::collections::HashSet;
 use std::os::fd::RawFd;
+use std::time::Instant;
 
 use gndrm_uapi::drm::*;
 use gndrm_uapi::mode::*;
@@ -475,6 +476,7 @@ impl Device {
             live_inos,
             fence: fence_fd,
             event,
+            t_commit: Instant::now(),
         });
     }
 }

@@ -334,6 +334,9 @@ impl Device {
         // The event clock is shared with the commit worker, which re-stamps a
         // page-flip event when it emits it (see `commit_worker_loop`).
         let clock: SharedClock = Arc::new(Mutex::new(Box::new(monotonic_now)));
+        // The mode's rate is what the flip events quantize their claimed vblank
+        // timeline to (see `VblankTimeline`).
+        let refresh_mhz = panel.refresh_mhz;
         let worker = thread::Builder::new()
             .name("gndrm-commit".into())
             .spawn({
@@ -344,8 +347,15 @@ impl Device {
                 let clock = Arc::clone(&clock);
                 move || {
                     commit_worker(
-                        presenter, commit_rx, flip_queue, worker_fd, in_flight, shutdown, logger,
+                        presenter,
+                        commit_rx,
+                        flip_queue,
+                        worker_fd,
+                        in_flight,
+                        shutdown,
+                        logger,
                         clock,
+                        refresh_mhz,
                     )
                 }
             })
@@ -1597,6 +1607,10 @@ struct CommitJob {
     /// Built at commit time when `PAGE_FLIP_EVENT` was requested; the worker
     /// emits it after the latch.
     event: Option<DrmEventVblank>,
+    /// TEMPORARY (pacing work): when the commit reached the daemon, so a
+    /// published frame's interval can be decomposed into queue wait, publish
+    /// work and the presenter's latch. Remove with the `pace` diagnostics.
+    t_commit: Instant,
 }
 
 impl Drop for CommitJob {
@@ -1626,6 +1640,60 @@ const LATCH_TIMEOUT: Duration = Duration::from_millis(100);
 /// Latch-wait poll granularity: short enough to notice `shutdown` promptly.
 const LATCH_POLL: Duration = Duration::from_millis(20);
 
+/// The vblank timeline a page-flip event claims.
+///
+/// A real KMS page-flip event is delivered at the vblank the flip takes effect
+/// on, and gamescope re-anchors its entire vblank grid off that timestamp
+/// (`Backends/DRMBackend.cpp` `page_flip_handler` → `vblankmanager` `MarkVBlank`).
+/// As the display, gndrm owns that schedule: events are quantized to the mode's
+/// own rate — one interval apart while frames keep up, stepping whole intervals
+/// when one is late — which is what a real display's vblank timeline looks like.
+///
+/// Stamping the *emit* instant instead re-anchors that grid slightly early on
+/// every frame. The grid is armed early by design (its aim-early offset, so a
+/// real kernel can hold the flip to the panel cycle), so the error integrates
+/// into the grid's rate: every divisor-based fps cap then runs fast by roughly
+/// that offset over one interval — measured as +7 % on this port across four
+/// divisors (targets 20/24/30/40 → 21/26/32/43).
+struct VblankTimeline {
+    interval_ns: u64,
+    claimed_ns: u64,
+    started: bool,
+}
+
+impl VblankTimeline {
+    fn new(refresh_mhz: u32) -> Self {
+        // A missing or absurd rate falls back to 60 Hz.
+        let mhz = if refresh_mhz == 0 {
+            60_000
+        } else {
+            refresh_mhz
+        };
+        Self {
+            interval_ns: 1_000_000_000_000 / u64::from(mhz),
+            claimed_ns: 0,
+            started: false,
+        }
+    }
+
+    /// The vblank this frame lands on: the next boundary of the mode's rate at or
+    /// after `now_ns`. Never moves backwards, so a late frame skips whole vblanks
+    /// instead of claiming a time in the past.
+    fn claim(&mut self, now_ns: u64) -> u64 {
+        if !self.started {
+            self.started = true;
+            self.claimed_ns = now_ns;
+            return now_ns;
+        }
+        let mut t = self.claimed_ns + self.interval_ns;
+        while t < now_ns {
+            t += self.interval_ns;
+        }
+        self.claimed_ns = t;
+        t
+    }
+}
+
 /// The commit worker: a thin panic barrier around [`commit_worker_loop`].
 ///
 /// A panic anywhere on this worker — most plausibly inside the presenter — is
@@ -1642,6 +1710,7 @@ fn commit_worker(
     shutdown: Arc<AtomicBool>,
     logger: Arc<Mutex<Option<LogFn>>>,
     clock: SharedClock,
+    refresh_mhz: u32,
 ) {
     let report = Arc::clone(&logger);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1654,6 +1723,7 @@ fn commit_worker(
             shutdown,
             logger,
             clock,
+            refresh_mhz,
         );
     }));
     if caught.is_err() {
@@ -1683,6 +1753,7 @@ fn commit_worker_loop(
     shutdown: Arc<AtomicBool>,
     logger: Arc<Mutex<Option<LogFn>>>,
     clock: SharedClock,
+    refresh_mhz: u32,
 ) {
     // One-shot: a withheld latch is reported once, not once per frame.
     let mut warned_latch = false;
@@ -1691,10 +1762,19 @@ fn commit_worker_loop(
     // Atomics only, so this cannot perturb the flip path.
     let d = diag();
     d.set_role(Role::Commit, State::CommitWaitingJob);
+    // The vblank schedule the flip events claim (see `VblankTimeline`).
+    let mut vblank = VblankTimeline::new(refresh_mhz);
+    // TEMPORARY (pacing work): this worker's pacing counters. Remove with `Pace`.
+    let mut pace = Pace::new();
     'outer: while let Ok(mut job) = commit_rx.recv() {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
+        // TEMPORARY (pacing work): the commit's arrival stamp and the moment the
+        // worker picked it up, so a published frame's interval separates queue
+        // wait from publish work. Remove with the `pace` diagnostics.
+        let t_commit = job.t_commit;
+        let t_pick = Instant::now();
         // The fb id to free once the latch lands (None when nothing published).
         let in_flight_fb = job.fb.as_ref().map(|fb| fb.id);
         // Publish the buffer when there is one; otherwise the commit is already
@@ -1712,6 +1792,7 @@ fn commit_worker_loop(
                 FlipHandle::latched_now()
             }
         };
+        let t_pub = Instant::now();
         // The frame is now queued to SurfaceFlinger. Emit the page-flip event
         // here, not after the presenter reports its completion: gamescope's DRM
         // backend blocks its present loop on this event
@@ -1741,13 +1822,13 @@ fn commit_worker_loop(
                 .remove(&fb_id);
         }
         if let Some(mut ev) = job.event.take() {
-            // Stamp the event when it is *emitted*, not when the commit was
-            // built. A real kernel delivers a page-flip event at the vblank it
-            // reports, so timestamp and delivery coincide, and gamescope
-            // re-anchors its vblank timer off this timestamp.
+            // Stamp the vblank this frame lands on, not the instant the event is
+            // built or emitted (see `VblankTimeline`). Delivery stays immediate,
+            // so gamescope's present loop never waits on a display round trip.
             let (sec, usec) = (clock.lock().unwrap_or_else(PoisonError::into_inner))();
-            ev.tv_sec = sec;
-            ev.tv_usec = usec;
+            let claimed = vblank.claim(u64::from(sec) * 1_000_000_000 + u64::from(usec) * 1_000);
+            ev.tv_sec = (claimed / 1_000_000_000) as u32;
+            ev.tv_usec = ((claimed % 1_000_000_000) / 1_000) as u32;
             flip_queue
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -1777,6 +1858,11 @@ fn commit_worker_loop(
             let slice = LATCH_POLL.min(deadline.saturating_duration_since(now));
             latched = handle.wait_latched_timeout(slice);
         }
+        // TEMPORARY (pacing work): one line per published frame — the effective
+        // present period plus where it went. Remove with `Pace`.
+        if in_flight_fb.is_some() {
+            pace.log(&logger, t_commit, t_pick, t_pub, Instant::now(), latched);
+        }
         if !latched && !shutdown.load(Ordering::Relaxed) && !warned_latch {
             warned_latch = true;
             if let Some(log) = logger
@@ -1791,6 +1877,73 @@ fn commit_worker_loop(
             }
         }
         d.set_role(Role::Commit, State::CommitWaitingJob);
+    }
+}
+
+/// TEMPORARY diagnostics for the fps-limiter/pacing work: one line per published
+/// frame, decomposing its interval so an fps target's accuracy can be read off a
+/// device run instead of inferred. Fields, all in microseconds from this
+/// worker's start:
+///
+/// - `dc` commit-to-commit — the rate the compositor hands frames to the daemon
+/// - `q`  commit→pick — how long the job waited behind the previous frame
+/// - `cp` pick→publish — the presenter's own work
+/// - `pl` publish→latch — SurfaceFlinger's completion round trip
+/// - `dp` publish-to-publish — the effective present period
+/// - `lt` 1 when the latch timed out and the frame was completed anyway
+///
+/// The state lives per worker, not in a static: several workers can exist in one
+/// process (the tests run them concurrently) and a shared "previous stamp" would
+/// then mix two streams. Removed when the pacing work closes (the tag is ungated
+/// by design; see `gndrm_android::log::daemon_info`).
+struct Pace {
+    base: Instant,
+    prev_commit: u64,
+    prev_pub: u64,
+    n: u64,
+}
+
+impl Pace {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            prev_commit: 0,
+            prev_pub: 0,
+            n: 0,
+        }
+    }
+
+    fn log(
+        &mut self,
+        logger: &Arc<Mutex<Option<LogFn>>>,
+        t_commit: Instant,
+        t_pick: Instant,
+        t_pub: Instant,
+        t_latch: Instant,
+        latched: bool,
+    ) {
+        let us = |t: Instant| t.saturating_duration_since(self.base).as_micros() as u64;
+        let (c, p, l) = (us(t_commit), us(t_pub), us(t_latch));
+        let line = format!(
+            "pace n={} dc={} q={} cp={} pl={} dp={} lt={}",
+            self.n,
+            c.saturating_sub(self.prev_commit),
+            us(t_pick).saturating_sub(c),
+            p.saturating_sub(us(t_pick)),
+            l.saturating_sub(p),
+            p.saturating_sub(self.prev_pub),
+            u8::from(latched),
+        );
+        self.prev_commit = c;
+        self.prev_pub = p;
+        self.n += 1;
+        if let Some(log) = logger
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            log(&line);
+        }
     }
 }
 

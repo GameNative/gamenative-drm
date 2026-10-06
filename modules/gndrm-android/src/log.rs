@@ -29,12 +29,22 @@ pub(crate) fn write(prio: i32, module: &'static str, args: fmt::Arguments<'_>) {
 /// Log a line the daemon produced (its logger callbacks land here), tagged with
 /// the daemon's own module path so it classifies to the daemon gate rather than
 /// this library's.
+///
+/// TEMPORARY (pacing work): emitted unconditionally, NOT behind
+/// `GNDRM_LOG_DAEMON`. The daemon runs in the app process, whose environment a
+/// container cannot reach, so that gate cannot be opened for a device run.
+/// Restore the gated `write` path when the pacing diagnostics are removed.
 pub(crate) fn daemon_info(text: &str) {
-    write(
-        crate::ffi::ANDROID_LOG_INFO,
-        "gndrm_daemon",
-        format_args!("{text}"),
-    );
+    let c = std::ffi::CString::new(text)
+        .unwrap_or_else(|_| std::ffi::CString::new("<log error>").unwrap());
+    // SAFETY: `c` is NUL-terminated and outlives the call.
+    unsafe {
+        crate::ffi::__android_log_write(
+            crate::ffi::ANDROID_LOG_INFO,
+            c"gndrm-daemon".as_ptr(),
+            c.as_ptr(),
+        );
+    }
 }
 
 /// One log line at `prio`; `fmt`/`args` go through `format_args!`.
