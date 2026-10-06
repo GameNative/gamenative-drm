@@ -252,6 +252,7 @@ Archive layout (extracted to `filesDir/gamescope/` by
 
 ```
 bin/gamescope, bin/gamescopereaper
+bin/Xwayland, bin/xkbcomp   # absorbed from the gamenative-xwayland build (05 §2)
 bin/gn-dmabuf-test   # client-dmabuf smoke test (04 §3.4): native wayland+vulkan
                    # client presenting solid-color dma-buf frames via
                    # zwp_linux_dmabuf_v1; run as the session guest via
@@ -277,10 +278,19 @@ share/xkeyboard-config-2/   # libxkbcommon keymaps (gamescope seat + winex11)
 share/hwdata/pnp.ids        # monitor names (A9)
 ```
 
-The gamescope payload excludes XWayland and xkbcomp — those ship in the
-`gamenative-xwayland` payload (05 §2). Library resolution: `LD_LIBRARY_PATH`
-(launcher prepends `filesDir/gamescope/lib`; beats the binary's build-time
-DT_RUNPATH — no patchelf).
+The gamescope payload carries XWayland and xkbcomp too — `package-gamescope.sh`
+absorbs the `gamenative-xwayland` build (05 §2) so a single asset ships; the
+launcher points `WLR_XWAYLAND` at `bin/Xwayland` inside it. Library resolution:
+`LD_LIBRARY_PATH` (launcher prepends `filesDir/gamescope/lib`; beats the binary's
+build-time DT_RUNPATH — no patchelf).
+
+Every shipped ELF is 16 KB page aligned: our own objects are linked with
+`-Wl,-z,max-page-size=16384` (each cross file, plus the daemon's `RUSTFLAGS`),
+and the libraries staged from the termux prefix are current package builds, which
+are. Android 15+ devices use 16 KB pages and cannot map a library aligned below
+that, so `package-gamescope.sh` refuses to archive a staged tree containing one
+and `check-payload-closure.sh` reports the alignment of every shipped ELF. The
+same holds for the APK's own `jniLibs/arm64-v8a/` set.
 
 ## 7. Runtime env assembled by GameNative (handoff to 04)
 
@@ -291,7 +301,7 @@ XDG_RUNTIME_DIR=<imagefs>/tmp/xdg-run   # wayland socket dir (0700)
 TMPDIR=<pkg>/tmp                        # bionic P_tmpdir is not app-writable
 XKB_CONFIG_ROOT=<pkg>/share/xkeyboard-config-2
 GAMESCOPE_PNP_IDS_PATH=<pkg>/share/hwdata/pnp.ids
-WLR_XWAYLAND=<pkg>/xwayland/bin/Xwayland
+WLR_XWAYLAND=<pkg>/bin/Xwayland
 # WAYLAND_DISPLAY absent from gamescope's own env (04 §3.2) — children get
 # WAYLAND_DISPLAY=gamescope-0 via --expose-wayland; DISPLAY=:0 is set for the
 # guest so winex11 dials XWayland.
