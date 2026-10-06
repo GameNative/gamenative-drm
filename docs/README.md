@@ -24,7 +24,9 @@ winlator X11 path (which remains the default for normal launches).
 | gamescope | `/data/workspace/Projects/gamescope` | `gamenative` | Valve micro-compositor, patched for Android; runs in the bionic/termux prefix |
 | gamenative-drm | `/data/workspace/Projects/gamenative-drm` | `master` | Rust project: userspace DRM (KMS) emulation + SurfaceControl presenter + LD_PRELOAD shim |
 | GameNative | `/data/workspace/Projects/GameNative` | `feat/gamescope-display` | App: Display Server setting, launch integration, JNI host for gamenative-drm |
-| proton-wine | `/data/workspace/Projects/proton-wine` | — | Wine: `winex11.drv` client driver + DXVK; the X11 client that talks to XWayland |
+| proton-wine | `/data/workspace/Projects/proton-wine` | `proton_11.0-2` | Wine: `winex11.drv` client driver + DXVK; the X11 client that talks to XWayland |
+| gamenative-xwayland | `/data/workspace/Projects/gamenative-xwayland` | `gamenative` | XWayland: the X server the payload ships, built for the bionic prefix |
+| mesa | `/data/workspace/Projects/mesa` | `build-xwayland` | The staged minimal Mesa the payload ships (zink + softpipe, LLVM off), built into `build-android-glamor/stage` |
 
 ## Documents
 
@@ -35,6 +37,11 @@ winlator X11 path (which remains the default for normal launches).
 5. [05-xwayland-reintroduction.md](05-xwayland-reintroduction.md) — client windowing via `winex11.drv` + XWayland (`gamenative-xwayland`), XID-bound proxy surfaces, cursor/input via the upstream X11 compositor path.
 6. [06-presenter-latency.md](06-presenter-latency.md) — the SurfaceControl presenter: AHardwareBuffer scan-out pool and `ASurfaceTransaction` publish.
 7. [07-kernel-drm-parity.md](07-kernel-drm-parity.md) — the async commit + vblank event-queue model.
+8. [08-xwayland-render-node.md](08-xwayland-render-node.md) — the render-node path: Xwayland's second DRM listener, and why the card and render nodes are served separately.
+9. [09-runtime-features.md](09-runtime-features.md) — the gamescope runtime controls behind the QuickMenu Gamescope tab, and which of them the control connection can actually carry.
+10. [10-fps-limit.md](10-fps-limit.md) — how the app's fps limit reaches gamescope, what the deadline grid and the commit deferral each do, and what the divisor can express.
+11. [11-refresh-model.md](11-refresh-model.md) — `g_nOutputRefresh` against `g_nNestedRefresh` (`-r`): what each drives, and what that means for a panel whose real rate is 120 Hz.
+12. [12-present-latency-budget.md](12-present-latency-budget.md) — the present-latency budget: what each frame on the paced path pays, and the round-trip that was removed from it.
 
 ## One-paragraph summary
 
