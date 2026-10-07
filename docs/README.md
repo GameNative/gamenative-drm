@@ -40,8 +40,8 @@ winlator X11 path (which remains the default for normal launches).
 8. [08-xwayland-render-node.md](08-xwayland-render-node.md) — the render-node path: Xwayland's second DRM listener, and why the card and render nodes are served separately.
 9. [09-runtime-features.md](09-runtime-features.md) — the gamescope runtime controls behind the QuickMenu Gamescope tab, and which of them the control connection can actually carry.
 10. [10-fps-limit.md](10-fps-limit.md) — how the app's fps limit reaches gamescope, what the deadline grid and the commit deferral each do, and what the divisor can express.
-11. [11-refresh-model.md](11-refresh-model.md) — `g_nOutputRefresh` against `g_nNestedRefresh` (`-r`): what each drives, and what that means for a panel whose real rate is 120 Hz.
-12. [12-present-latency-budget.md](12-present-latency-budget.md) — the present-latency budget: what each frame on the paced path pays, and the round-trip that was removed from it.
+11. [11-refresh-model.md](11-refresh-model.md) — `g_nOutputRefresh` against `g_nNestedRefresh` (`-r`): what each drives, and what that means when gndrm advertises its own session rate rather than the panel's.
+12. [12-present-latency-budget.md](12-present-latency-budget.md) — the present-latency budget: what each frame on the paced path pays, and why the flip event is emitted with the publish.
 
 ## One-paragraph summary
 
@@ -56,7 +56,7 @@ atomic commit, flip events, sync objects). It owns the scan-out
 `AHardwareBuffer` pool (BGRA, HAL value 5) and publishes each committed frame
 with `ASurfaceControl`/`ASurfaceTransaction`, so gamescope renders directly into
 the buffer SurfaceFlinger scans out. Commits validate and queue and return
-immediately; a per-CRTC commit worker presents, waits the SurfaceFlinger latch,
-then emits the flip event — matching a real kernel DRM driver. Input is
+immediately; a per-CRTC commit worker presents and emits the flip event with the
+publish — matching a real kernel DRM driver. Input is
 app-injected into gamescope's compositor over the wayland virtual-input
 protocols (no libinput).

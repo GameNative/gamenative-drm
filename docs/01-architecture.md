@@ -128,7 +128,7 @@ resp := { u32 len; i32 ret; i32 errno_; u8 payload[len] } + SCM_RIGHTS fds?
   request is the same shape: the shim asks for a buffer by geometry and receives
   a dup'd dma-buf fd via `SCM_RIGHTS`.
 - Events: the commit worker emits `DRM_EVENT_FLIP_COMPLETE` (+ vblank
-  sequence/timestamps) on E after each presented frame is latched, honoring
+  sequence/timestamps) on E with each presented frame's publish, honoring
   `DRM_MODE_ATOMIC_EVENT` / `DRM_EVENT_*` semantics.
 
 ## 5. Presentation (daemon)

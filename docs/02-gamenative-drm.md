@@ -123,8 +123,9 @@ Commit flags: `DRM_MODE_ATOMIC_TEST_ONLY` → validate, don't present.
 Daemon → **event channel** (the second SEQPACKET connection, §4): kernel-ABI
 `struct drm_event_vblank` packets, `type=DRM_EVENT_FLIP_COMPLETE`, carrying
 sequence + `tv_sec/tv_usec` (CLOCK_MONOTONIC, matching the advertised cap) and
-the user_data cookie from the commit. Emitted by the commit worker after the
-frame is actually latched by SurfaceFlinger (see 07).
+the user_data cookie from the commit. Emitted by the commit worker with the
+publish — the frame is queued to SurfaceFlinger, and the event reports the
+vblank that flip claims (see 07).
 
 ### 3.4 Explicitly out of scope (return ENOSYS/EINVAL, logged)
 
@@ -237,9 +238,11 @@ E     : raw `struct drm_event_vblank` packets (one per frame), kernel-ABI bytes
   CRTC) → queue → the commit worker applies and presents the primary FB when it
   changed under an active CRTC → queue `DRM_EVENT_FLIP_COMPLETE` (monotonic
   timestamp, sequence, user_data) on the event channel when `PAGE_FLIP_EVENT`,
-  after the SurfaceFlinger latch (see 07).
-- `trait Presenter` — async: `fn publish(&mut self, fb: &Framebuffer,
-  plane: &PlaneState, stores: &Stores, fence: Option<RawFd>) -> FlipHandle`.
+  with the publish (see 07).
+- `trait Presenter` — `fn publish(&mut self, fb: &Framebuffer,
+  plane: &PlaneState, ino: Option<u64>, live_inos: &HashSet<u64>,
+  fence: Option<RawFd>)`. It hands the frame to the compositor and returns;
+  the worker does not wait on it.
   `gndrm-android` implements it with the SurfaceControl presenter;
   `NullPresenter` is used for host tests.
 - `ImportedBuffer` (`GemObject`): dedup by `stat.st_ino` of the dma-buf fd
@@ -269,7 +272,7 @@ documented in 06-presenter-latency.md; the shape is:
   slot reuse; a warm spare keeps one pre-allocated buffer ready.
 - **Locks.** The scan-out pool and the presenter state each have their own
   lock; no lock is held across a gralloc or SurfaceFlinger call.
-- **Threads.** The commit worker presents and waits the latch; the scan-out
+- **Threads.** The commit worker presents and emits the flip event; the scan-out
   allocator and a doorbell-driven warm worker keep the pool stocked; the input
   injector runs on its own thread (see §8).
 - **Vsync.** `Choreographer` (via the `android` crate / JNI up-call) paces
@@ -284,9 +287,8 @@ JNI surface (class **`app.gamenative.display.GameNativeDrm`**; the cdylib ships
 in the app's `jniLibs/arm64-v8a/` and is loaded via
 `System.loadLibrary("gamenative_drm")`, linked `-Wl,-z,max-page-size=16384`):
 
-- `nativeStart(socketName: String, surface: Surface, width: Int, height: Int,
-  refreshHz: Float): Int`
-- `nativeStop()`, `nativeSurfaceChanged(surface, w, h)`
+- `nativeStart(socketName: String, surface: Surface, width: Int, height: Int): Int`
+- `nativeStop()`, `nativeRetargetSurface(surface, w, h)`
 - injector calls: `nativePointerAbsolute(x, y)`, `nativePointerMotion(dx, dy)`,
   `nativePointerButton(btn, pressed)`, `nativePointerAxis(axis, value)`,
   `nativeKey(evdevCode, pressed)`.
@@ -295,7 +297,7 @@ Threading (see 07 for the full concurrency summary):
 
 - **Serve thread** — owns the `Device`, handles all ioctls (no lock on the
   device).
-- **Commit worker (per CRTC)** — present → wait latch → emit flip event.
+- **Commit worker (per CRTC)** — present → emit flip event.
 - **Scan-out allocator thread** — owns the pool and warm spare (its own lock).
 - **Warm worker** — doorbell-driven; keeps the warm spare ready.
 - **Input injector thread** — wayland virtual-input client.

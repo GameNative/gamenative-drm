@@ -40,26 +40,25 @@ on top of a 120 Hz grid.
   divisor only applies while `g_nSteamCompMgrTargetFPS != 0`.
 
 Both the grid and the app pacing come from **one** expression, so there is no way to pace
-the app at N while keeping the grid at the panel rate — they move together.
+the app at N while keeping the grid at the mode rate — they move together.
 
-## Consequences on a native 120 Hz panel
+## Consequences on the session's own rate
 
-- **Uncapped:** `-r 0` is the optimum. Mode, grid and the client-visible refresh all stay
-  at the panel's real 120 Hz and the loop reaches its measured ceiling (~56.5 presents/s).
-- **`-r N`, N ≠ panel rate:** declares N Hz everywhere — the guest is told N, the grid runs
-  at N, and the achievable ceiling follows the grid (measured: declared 60 → ~39.8/s
-  uncapped).
-- **Capping at 30/40/60 on a 120 Hz panel is exact arithmetic** — all three divide 120. The
-  measured shortfall is therefore not the divisor: the paced interval behaves as
-  `1 / (1/target + C)` with **C ≈ 8.7 ms** (fits 30→23.6, 40→29.4, 60→39.7). The divisor
-  itself was verified correct (presents land exactly every D vblank indices).
-- **gndrm exposes a single preferred mode** (`gndrm-daemon/src/objects.rs:110`,
-  `vrefresh: self.refresh_mhz.div_ceil(1000)`), so a preferred refresh with no matching
-  exposed mode has nothing to select.
+gndrm advertises **one** preferred mode — `1280x960@1200`, from its own
+`SESSION_REFRESH_MHZ` constant (`gndrm-daemon/src/objects.rs`,
+`vrefresh: SESSION_REFRESH_MHZ.div_ceil(1000)`), not the panel's rate — so a
+preferred refresh with no matching exposed mode has nothing to select, and the
+grid, declared output refresh and client-visible refresh move together with `-r`.
+
+- **Uncapped:** `-r 0` falls back to the output refresh (1200 Hz); the loop
+  reaches its measured ceiling (~259 presents/s).
+- **`-r N`:** declares N Hz everywhere — the guest is told N, the grid runs at N —
+  while the single 1200 Hz DRM mode is kept.
+- **Capping at 30/40/60 is exact arithmetic** — all three divide 1200, and a
+  divisor cap lands on its target exactly (`-r 60` reads 60.0 presents/s).
 
 ## Open — to measure, not assume
 
-- Whether `-r N` actually changes the selected mode (`drm: selecting mode …`) and what
-  `g_nOutputRefresh` ends up as when the connector exposes no N-Hz mode.
-- Whether the ~8.7 ms pacing cost is the FIFO commit deferral that was introduced to make
-  the limiter engage at all.
+- The `active_display_info` refresh list carries the connector's mode list, not
+  `g_nOutputRefresh`; the client-visible refresh for a low `-r` was not measured
+  directly on device.

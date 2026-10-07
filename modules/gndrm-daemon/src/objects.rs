@@ -56,10 +56,10 @@ const END_SYNCOBJ_HANDLE: u32 = 0x5000;
 /// and honours only integer divisors of it for an fps cap, so this one value
 /// sets both the guest's uncapped ceiling and every cap's granularity. It is
 /// deliberately high: the grid is a timer, so a finite value is required, and
-/// 1200 Hz is ~13x the present pipeline's measured throughput (~93 presents/s),
-/// so it cannot bind once the commit path no longer latches. The only real cap
-/// on the guest is the user's own fps limit in the QuickMenu; the physical panel
-/// is downstream and coalesces whatever the session sends.
+/// 1200 Hz is ~4.6x the present pipeline's measured throughput (~259
+/// presents/s), so it cannot bind. The only real cap on the guest is the user's
+/// own fps limit in the QuickMenu; the physical panel is downstream and
+/// coalesces whatever the session sends.
 pub const SESSION_REFRESH_MHZ: u32 = 1_200_000;
 
 /// Physical panel description: the surface size the session presents into. The

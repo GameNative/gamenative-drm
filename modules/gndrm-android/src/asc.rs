@@ -164,9 +164,8 @@ unsafe impl Send for ReleaseCtx {}
 unsafe impl Sync for ReleaseCtx {}
 
 /// TEMPORARY (pacing work): how many completions SurfaceFlinger has delivered to
-/// this presenter. Kept to confirm the completion still lands 1:1 with publishes
-/// now that the commit worker no longer consumes a latch for it. Remove with the
-/// pace diagnostics.
+/// this presenter. Kept to read the completion rate against the publish rate.
+/// Remove with the pace diagnostics.
 static COMPLETIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PUBLISH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -632,9 +631,8 @@ fn ctx_release_fd(buf: &PoolBuf) -> RawFd {
 /// last publish, so the buffer may be handed back out.
 ///
 /// TEMPORARY (pacing work): the flag is written by the completion callback and
-/// read only by the `FREE` line below. The reuse decision is currently gated on
-/// the release-fence wait in `publish`; wiring this flag into the retire policy
-/// is the remaining hardening. Remove the `FREE` line with the pace diagnostics.
+/// read by the pool's reuse rule (`gndrm_daemon::scanout::ReusePool`) and by the
+/// `FREE` line below. Remove the `FREE` line with the pace diagnostics.
 fn ctx_latched(buf: &PoolBuf) -> bool {
     // SAFETY: `buf.ctx` is a leaked mailbox owned by the pool for the session.
     unsafe { (*buf.ctx).latched.load(Ordering::Acquire) }

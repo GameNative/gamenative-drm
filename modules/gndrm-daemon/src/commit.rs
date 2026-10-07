@@ -55,8 +55,8 @@ impl Device {
         };
         // Unknown flag bits are a hard error, like the kernel. ASYNC is
         // accepted: our present path is asynchronous anyway (commit queues and
-        // returns; the worker presents on the latch), so "present immediately"
-        // is the only behaviour we have.
+        // returns; the worker presents on its own thread), so "present
+        // immediately" is the only behaviour we have.
         const KNOWN: u32 = DRM_MODE_ATOMIC_TEST_ONLY
             | DRM_MODE_ATOMIC_NONBLOCK
             | DRM_MODE_ATOMIC_ALLOW_MODESET
@@ -69,8 +69,8 @@ impl Device {
             ));
             return DispatchResult::err(errno::EINVAL);
         }
-        // TEST_ONLY with an event is what the kernel rejects (a test commit has
-        // nothing to latch).
+        // TEST_ONLY with an event is what the kernel rejects (a test commit
+        // presents nothing).
         if a.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0 && a.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
             self.diag("atomic: reject EINVAL TEST_ONLY+EVENT");
             return DispatchResult::err(errno::EINVAL);
@@ -432,8 +432,9 @@ impl Device {
                 .map(|gem| gem.ino)
         });
         // Inodes still backed by a GEM object — the presenter's retire signal
-        // ("client stopped importing") now also requires the flip event to have
-        // fired, which the worker's latch wait enforces.
+        // ("client stopped importing"). The pool reuses a retired buffer only
+        // once the presenter has reported the frame's completion (see
+        // `scanout`).
         let live_inos: HashSet<u64> = self
             .stores
             .gems
@@ -444,13 +445,14 @@ impl Device {
         let plane = self.primary_state();
 
         // Real GEM semantics: the buffer is in-flight from commit until its
-        // flip event fires; the worker clears it after the latch.
+        // flip event fires; the worker clears it when it emits the event.
         if let Some(fb) = &fb {
             self.mark_in_flight(fb.id);
         }
 
-        // The flip event is built now (sequence + timestamp) but the worker
-        // emits it only after the presenter reports the latch.
+        // The flip event is built at commit time with its sequence and
+        // user_data; the worker stamps the claimed vblank and emits it with the
+        // publish.
         let event = if commit.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
             let (sec, usec) = self.now();
             let seq = self.next_flip_sequence();

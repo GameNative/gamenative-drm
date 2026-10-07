@@ -1,14 +1,16 @@
 # 07 — Kernel DRM parity: async commit + vblank event queue
 
 gndrm commits behave like a real kernel DRM driver: an atomic commit validates,
-queues, and returns immediately, and the flip event arrives later, when the
-buffer is latched. Gamescope's buffer-lifecycle logic depends on that contract —
-a buffer is not touched again until its flip event fires.
+queues, and returns immediately, and the flip event is delivered when the flip
+is queued for the next vblank. Gamescope's present loop blocks on that event, so
+the worker emits it as soon as it has published — never after SurfaceFlinger's
+completion. A buffer's lifetime is pinned to the compositor's own release
+signal, not to the event.
 
 ## Model
 
 One commit worker per CRTC (there is one CRTC), an in-flight buffer set, and a
-flip event that means "SurfaceFlinger latched it":
+flip event that means "the flip is queued for the next vblank":
 
 ```
 serve thread                          commit worker (per CRTC)
@@ -19,9 +21,9 @@ atomic commit -> validate (TEST_ONLY,     |
                                           | wait IN_FENCE (acquire fence)
                                           | presenter.publish(buffer, fence)
                                           |   -> setBuffer + apply (async)
-                                          | SurfaceFlinger latch / release fence
                                           | emit PAGE_FLIP_EVENT (ordered, once)
                                           | mark buffer reusable
+                    SurfaceFlinger completion (release fence) -> pool reuse gate
 ```
 
 ## Component responsibilities
@@ -31,29 +33,30 @@ atomic commit -> validate (TEST_ONLY,     |
 - The serve thread owns the whole `Device`; no lock is held on the device.
 - `ioctl_atomic` (the non-`TEST_ONLY` path) validates, queues, and returns `0`
   without presenting. `TEST_ONLY` validates and returns errno without queuing.
-- A buffer is **in-flight** from commit until its flip event fires, and is only
-  reusable after that. The "retired" signal for pool recycling is flip-event
-  delivery.
-- The commit worker presents the buffer, waits the SurfaceFlinger latch, then
-  emits `PAGE_FLIP_EVENT` and marks the buffer reusable. Events are ordered and
-  one per commit.
+- A buffer is **in-flight** from commit until its flip event fires. The event
+  is emitted with the publish; a buffer is reused only once the presenter has
+  reported SurfaceFlinger's completion (the pool's `latched` flag) and the next
+  publish onto that slot has waited out the previous release fence.
+- The commit worker presents the buffer and emits `PAGE_FLIP_EVENT` with the
+  publish. Events are ordered and one per commit; the worker never waits on
+  SurfaceFlinger.
 - `IN_FENCE_FD` passes through as the acquire fence; the presenter's release
-  fence is the latch the worker waits on.
-- The `Presenter` trait is async: `fn publish(&mut self, fb, plane, stores,
-  fence) -> FlipHandle`, with `FlipHandle` resolved on the latch (or a pollable
-  variant). The worker emits the event on the latch without blocking the serve
-  thread.
+  fence gates pool reuse.
+- The `Presenter` trait is `fn publish(&mut self, fb, plane, ino, live_inos,
+  fence)` — it hands the frame to the compositor and returns. The worker emits
+  the event without blocking the serve thread.
 - A non-blocking commit whose fence is not signalled returns `EBUSY` rather than
   stalling. The ioctl surface and wire protocol are byte-compatible with the
   shim — the client side does not change.
 
 ### `modules/gndrm-android` (presenter host)
 
-- `AscPresenter` implements `publish -> FlipHandle`. The
-  `ASurfaceTransaction` completion callback signals `FlipHandle`;
-  `ASurfaceTransactionStats_getPreviousReleaseFenceFd` provides the latch.
-- The scan-out allocator keeps its own lock and warm spare; "retire" keys on
-  flip-event delivery.
+- `AscPresenter` implements `publish`. The `ASurfaceTransaction` completion
+  callback sets the pool's completion flag;
+  `ASurfaceTransactionStats_getPreviousReleaseFenceFd` provides the release
+  fence the next publish waits on.
+- The scan-out allocator keeps its own lock and warm spare; a buffer is reused
+  only after its completion is reported.
 
 ### `modules/gndrm-shim`
 
@@ -65,7 +68,7 @@ atomic commit -> validate (TEST_ONLY,     |
 
 - **Serve thread** — owns the `Device`, handles all ioctls (no lock on the
   device).
-- **Commit worker (per CRTC)** — present → wait latch → emit flip event.
+- **Commit worker (per CRTC)** — present → emit flip event.
 - **Scan-out allocator thread** — owns the pool and warm spare (its own lock).
 - **Warm worker** — doorbell-driven; keeps the warm spare ready.
 - **Input injector thread** — wayland virtual-input client.

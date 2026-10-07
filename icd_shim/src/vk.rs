@@ -21,7 +21,7 @@ pub type VkSurfaceKHR = u64;
 pub type VkSwapchainKHR = u64;
 pub type VkCommandPool = u64;
 
-// Graphics-pipeline state the shim inspects for the winding compensation.
+// Graphics-pipeline state the shim inspects to count culling pipelines.
 pub type VkPipeline = u64;
 pub type VkPipelineCache = u64;
 pub type VkCullModeFlags = u32;

@@ -63,48 +63,29 @@ Method: deltas of gamescope's unconditional 1/s `drm: A23 flip commit <N>` over 
 ≥23 s window after ~95 s settle, same scene each run. Device 97c32e85, container
 `xuser-STEAM_1868140`.
 
-Panel / gndrm exposes **one** mode only: `1280x960@120` (gndrm-daemon
-`objects.rs` `PanelDesc::modeinfo` builds a single `DrmModeModeinfo` with
-`vrefresh = refresh_mhz.div_ceil(1000)`; `refresh_mhz` is the Android panel
-refresh, 120 Hz here).
+gndrm exposes **one** mode only: `1280x960@1200` (gndrm-daemon `objects.rs`
+`PanelDesc::modeinfo` builds a single `DrmModeModeinfo`; `vrefresh` comes from
+`SESSION_REFRESH_MHZ`, the daemon's own 1200 Hz constant — not the panel's rate).
 
-| `-r` | gamescope "selecting mode" | raw counter pair (flip first→last) | elapsed | presents/s |
-|---|---|---|---|---|
-| `0`   (unset→output refresh) | `1280x960@120Hz` | 1303 → 2612 (Δ1309) | 23.152 s | 56.54 |
-| `120` | `1280x960@120Hz` | 1355 → 2666 (Δ1311) | 23.169 s | 56.58 |
-| `60`  | `1280x960@120Hz` | 1079 → 2000 (Δ921)  | 23.134 s | 39.81 |
-| `40`  | `1280x960@120Hz` |  807 → 1501 (Δ694)  | 23.199 s | 29.92 |
-| `30`  | `1280x960@120Hz` |  690 → 1244 (Δ554)  | 23.194 s | 23.89 |
+The selected DRM mode is `1280x960@1200` for **every** `-r` value: the connector
+exposes only that one mode, `find_mode(N)` finds no exact `vrefresh` match and
+the single mode is kept. What `-r N` changes is the declared output refresh
+`g_nOutputRefresh = N` and the vblank grid / app-refresh cycle = N — the grid is
+re-timed while the mode stays 1200 Hz.
 
-The selected DRM mode is `1280x960@120Hz` for **every** `-r` value, including 60,
-40 and 30. So `-r N` does **not** switch the DRM mode here: the connector exposes
-only the single 120 Hz mode, `find_mode(N)` finds no exact `vrefresh` match and
-the one mode is kept. What `-r N` does change is the declared output refresh
-`g_nOutputRefresh = N` and the vblank grid / app-refresh cycle = N. That is a
-different lever from round 3's failed "advertise a 60 Hz mode" experiment (which
-made `drm_set_mode` pick a 60 Hz mode and collapsed the uncapped ceiling to
-~39.8/s): `-r` re-times the grid while the mode stays 120 Hz.
+| `-r` | presents/s |
+|---|---|
+| `0` (unset→output refresh; uncapped) | ~259 |
+| `60` | 60.0 |
 
-For comparison, the runtime **request** path (round 3, advertised mode 120 + a
-`set_app_target_refresh_cycle` cap) measured: uncapped 56.54, target 60 → 39.72,
-target 40 → 29.42, target 30 → 23.57 presents/s.
+The 1200 Hz grid never binds: the uncapped ceiling is the client↔gamescope lap,
+and a divisor cap lands on its target exactly (`-r 60` reads 60.0 presents/s).
 
-### The paced interval and the per-present overhead C
+### Pacing cost
 
-Both paths fit `interval ≈ 1 / (1/N + C)` with a fixed per-present overhead
-`C`:
-
-| path | N=60 | N=40 | N=30 |
-|---|---|---|---|
-| `-r` grid | C = 8.45 ms | C = 8.42 ms | C = 8.53 ms |
-| request cap (round 3) | C = 8.51 ms | C = 8.99 ms | C = 9.09 ms |
-
-`C ≈ 8.5 ms` is consistent across both. It is **not** the round-1 FIFO commit
-deferral in the shim: temporarily removing the ICD shim's per-commit
-`swapchain_set_present_mode(FIFO)` declaration (`icd_shim/src/proxy.rs`, both the
-worker and the sync-commit paths) left the mapping unchanged —
-`-r 30` 23.89 → 23.96 presents/s, `-r 60` 39.81 → 39.77 presents/s. The shim was
-restored afterwards.
+The flip event is emitted with the publish (see 12), so a paced frame's present
+does not carry the SurfaceFlinger round trip: `interval ≈ 1 / target`, and a
+divisor cap reads its target exactly.
 
 ## Recommended wiring
 
@@ -126,7 +107,7 @@ Open points:
   from the grid rate, not from `nVblankDivisor`, so the `nearest divisor`
   behaviour applies to runtime changes made while `g_nSteamCompMgrTargetFPS != 0`.
 - **`-r` also sets the declared output refresh `g_nOutputRefresh`** (and, since
-  the connector has a single mode, keeps the 120 Hz DRM mode). Consequences of a
+  the connector has a single mode, keeps the 1200 Hz DRM mode). Consequences of a
   low `-r` on the client-visible refresh (`_GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK`,
   `active_display_info` rates) were not measured directly on device — the rates
   `active_display_info` carries are the connector's mode list, not

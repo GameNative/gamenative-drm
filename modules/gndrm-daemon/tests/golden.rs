@@ -86,6 +86,29 @@ fn wait_flip(d: &mut Device, timeout_ms: u64) -> Vec<DrmEventVblank> {
     }
 }
 
+/// Block until at least `want` flip events have arrived, then drain and return
+/// them in commit order. Two back-to-back async commits legitimately queue two
+/// events before a reader looks — the worker emits each event with its own
+/// publish and never waits for a latch — so a caller asserting one event per
+/// commit must collect to a count, not assume a lone event per drain.
+fn wait_flips(d: &mut Device, want: usize, timeout_ms: u64) -> Vec<DrmEventVblank> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut events = Vec::new();
+    while events.len() < want {
+        events.extend(d.drain_flip_events());
+        if events.len() >= want {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {} of {want} flip events within {timeout_ms}ms",
+            events.len()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    events
+}
+
 fn call(d: &mut Device, nr: u32, payload: &[u8]) -> DispatchResult {
     d.dispatch(nr, payload, None)
 }
@@ -1791,17 +1814,20 @@ fn async_commits_stay_ordered_and_events_follow_publish() {
         ),
     ));
 
-    // First publish → first event (fb_a).
-    let events = wait_flip(&mut d, 2000);
-    assert_eq!(events.len(), 1);
+    // Both commits' events, in commit order. A single drain may return both:
+    // the worker emits each event with its own publish and never waits for a
+    // latch, so collect to a count rather than assuming one event per read.
+    let events = wait_flips(&mut d, 2, 2000);
+    assert_eq!(events.len(), 2, "one flip event per commit");
     assert_eq!(events[0].user_data, 0xA1);
     assert_eq!(events[0].sequence, 1);
-
-    // Second publish → second event (fb_b), ordered after the first.
-    let events = wait_flip(&mut d, 2000);
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].user_data, 0xA2);
-    assert_eq!(events[0].sequence, 2);
+    assert_eq!(events[1].user_data, 0xA2);
+    assert_eq!(events[1].sequence, 2);
+    // Exactly one event per commit: nothing extra — no duplicate, and no event
+    // for a commit that did not ask for one — remains queued. Both jobs have
+    // already left the serial worker (the second event is in hand) and no
+    // further commit was issued, so this is a contract assertion, not a race.
+    assert!(d.drain_flip_events().is_empty());
 
     // fb_b is the current primary → RMFB refused. fb_a was superseded and is no
     // longer in flight (its event already fired) → RMFB succeeds.

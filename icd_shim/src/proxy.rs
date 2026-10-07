@@ -1883,18 +1883,14 @@ static SEEN_IMAGE: Mutex<Vec<(VkFormat, VkImageUsageFlags, VkImageTiling)>> =
     Mutex::new(Vec::new());
 const LOG_IMAGE_FIRST_N: usize = 48;
 
-// ------------------------------ pipeline creation (winding compensation)
+// ------------------------------ pipeline creation (winding passes through)
 //
-// This driver applies a negative-height (D3D-style) viewport to the image but
-// does NOT invert the effective winding, so with cullMode enabled a client's
-// front faces are culled as back faces. Measurements: a quad with
-// frontFace=CW + cull BACK is correctly culled, and a flipped viewport does
-// flip the image, yet a quad under a flipped viewport is not culled. DXVK
-// renders D3D content with a flipped viewport, so its culling is inverted
-// relative to what it asks for. Compensate by flipping frontFace on pipelines
-// that cull. This is unconditional: every client this shim fronts reaches the
-// driver through the same flipped-viewport D3D path, and the compensated
-// winding is the shim's one behaviour (no env gate).
+// The driver applies a negative-height (D3D-style) viewport but does not
+// invert the effective winding. Compensating by swapping frontFace on culling
+// pipelines is wrong: a vkd3d-proton (D3D12) two-sided material shades from
+// gl_FrontFacing and renders a black silhouette under the swap, and neither
+// DXVK (D3D11) nor the X11 arm needs it — a synthetic-quad measurement does
+// not generalise. Culling pipelines are counted and passed through unmodified.
 unsafe extern "C" fn gn_vkCreateGraphicsPipelines(
     device: VkDevice,
     cache: VkPipelineCache,
@@ -1912,32 +1908,20 @@ unsafe extern "C" fn gn_vkCreateGraphicsPipelines(
     if cis.is_null() {
         return unsafe { real((*gd).real, cache, count, cis, alloc, out) };
     }
-    // Copy the create infos and the rasterization state we need to change:
-    // the caller's structs are not ours to modify. Capacity is reserved up
-    // front so the pointers into these vectors stay valid.
-    let mut infos: Vec<VkGraphicsPipelineCreateInfo> = Vec::with_capacity(count as usize);
-    let mut rasts: Vec<VkPipelineRasterizationStateCreateInfo> = Vec::with_capacity(count as usize);
-    let mut flipped = 0u32;
+    // Count the pipelines that cull; the client's create infos pass through
+    // unmodified.
+    let mut culled = 0u32;
     for i in 0..count as usize {
-        let mut ci = unsafe { *cis.add(i) };
-        if !ci.pRasterizationState.is_null() {
-            let mut rs = unsafe { *ci.pRasterizationState };
-            if rs.cullMode != VK_CULL_MODE_NONE {
-                rs.frontFace = if rs.frontFace == VK_FRONT_FACE_COUNTER_CLOCKWISE {
-                    VK_FRONT_FACE_CLOCKWISE
-                } else {
-                    VK_FRONT_FACE_COUNTER_CLOCKWISE
-                };
-                rasts.push(rs);
-                ci.pRasterizationState = unsafe { rasts.as_ptr().add(rasts.len() - 1) };
-                flipped += 1;
-            }
+        let ci = unsafe { *cis.add(i) };
+        if !ci.pRasterizationState.is_null()
+            && unsafe { (*ci.pRasterizationState).cullMode } != VK_CULL_MODE_NONE
+        {
+            culled += 1;
         }
-        infos.push(ci);
     }
-    let res = unsafe { real((*gd).real, cache, count, infos.as_ptr(), alloc, out) };
-    if flipped > 0 {
-        crate::logf!("proxy: winding compensation applied to {flipped}/{count} pipeline(s)");
+    let res = unsafe { real((*gd).real, cache, count, cis, alloc, out) };
+    if culled > 0 {
+        crate::logf!("proxy: winding compensation skipped on {culled}/{count} culling pipeline(s)");
     }
     res
 }

@@ -57,13 +57,14 @@ pub const LOCK_SCANOUT_POOL: usize = 0;
 pub enum Role {
     /// The RPC serve loop (also owns presenter teardown).
     Serve = 0,
-    /// The commit worker that publishes and waits for the presenter latch.
+    /// The commit worker that publishes and emits the flip event.
     Commit = 1,
     /// The warm-spare worker that keeps a pre-allocated scan-out buffer ready.
     Warm = 2,
     /// The scan-out channel thread (accept loop + request/response).
     Scanout = 3,
-    /// The SurfaceFlinger `setOnComplete` callback, which fires the latch.
+    /// The SurfaceFlinger `setOnComplete` callback, which reports the frame's
+    /// completion.
     PresenterCallback = 4,
 }
 
@@ -122,7 +123,8 @@ pub enum State {
     CommitWaitingJob,
     /// Commit worker inside `presenter.publish` (the SurfaceFlinger path).
     CommitPublishing,
-    /// Commit worker waiting (bounded) for the presenter's latch.
+    /// Commit worker's flip-completion slot; the worker never waits on the
+    /// presenter.
     CommitWaitingLatch,
     /// Commit worker queueing the flip event / releasing in-flight state.
     CommitFlushing,

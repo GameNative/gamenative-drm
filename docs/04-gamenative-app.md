@@ -279,14 +279,14 @@ anyway).
 ## 5. Display screen hosting (gamenative-drm lifecycle)
 
 - JNI binding: **`app.gamenative.display.GameNativeDrm`** (Kotlin `object`) —
-  `nativeStart(socket, surface, w, h, refreshHz): Int`, `nativeStop()`,
-  `nativeSurfaceChanged(surface, w, h, hz)` + the injector calls (§3.7).
+  `nativeStart(socket, surface, w, h): Int`, `nativeStop()`,
+  `nativeRetargetSurface(surface, w, h)` + the injector calls (§3.7).
 - The game display screen is `XServerScreen.kt`; the SurfaceView is
   `com.winlator.widget.XServerView`. **The view instance is kept in gamescope
   mode** (60+ downstream references to `xServerView!!.getxServer()` stay valid)
   with `setGamescopeMode(true)` set right after construction, before `addView`:
   1. `surfaceCreated/Changed/Destroyed` route to `GameNativeDrm.nativeStart /
-     nativeSurfaceChanged / nativeStop` **instead of** the X11 renderer (two
+     nativeRetargetSurface / nativeStop` **instead of** the X11 renderer (two
      producers on one Surface would be invalid). Same Surface, different
      consumer.
   2. Renderer-selection logic (`displayRenderer`, Vulkan scanout) is skipped; the

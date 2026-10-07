@@ -206,9 +206,9 @@ pub struct Device {
     /// learn one is pending (then [`Device::drain_flip_events`]).
     flip_event_fd: RawFd,
     /// Primary fbs committed but whose flip event has not fired yet — a buffer
-    /// is in-flight from commit until its latch (real GEM semantics).
+    /// is in-flight from commit until its flip event fires (real GEM semantics).
     in_flight: Arc<Mutex<HashSet<u32>>>,
-    /// Set on drop to interrupt the worker's latch wait.
+    /// Set on drop; the worker checks it before servicing each commit.
     shutdown: Arc<AtomicBool>,
     /// The commit worker (owns the presenter for its whole lifetime).
     worker: Option<thread::JoinHandle<()>>,
@@ -216,8 +216,7 @@ pub struct Device {
     /// Optional diagnostics sink (Android glue → GN_DRM logcat, hostd →
     /// stderr). Rejections are always reported; successes stay silent. Shared
     /// behind an `Arc<Mutex<_>>` with the commit worker, which is spawned
-    /// before `set_logger` runs and must observe it (a withheld latch is a
-    /// diagnostic, not a rejection, but it belongs in the same channel).
+    /// before `set_logger` runs and must observe it.
     logger: Arc<Mutex<Option<LogFn>>>,
     /// Optional sink for framebuffer geometries (`ADDFB2`); see
     /// [`Device::set_addfb_geometry`]. Called on the serve thread only.
@@ -438,7 +437,7 @@ impl Device {
         }
     }
 
-    /// Mark `fb_id` in-flight: committed but not yet latched.
+    /// Mark `fb_id` in-flight: committed but its flip event has not fired yet.
     pub(crate) fn mark_in_flight(&self, fb_id: u32) {
         self.in_flight
             .lock()
@@ -1497,9 +1496,9 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        // Interrupt a stalled latch wait, end the worker's recv, then join it
-        // so the presenter (SurfaceControl layer + buffers) is released on the
-        // thread that owns it before we go away.
+        // End the worker's recv, then join it so the presenter (SurfaceControl
+        // layer + buffers) is released on the thread that owns it before we go
+        // away.
         self.shutdown.store(true, Ordering::Relaxed);
         drop(self.commit_tx.take());
         if let Some(worker) = self.worker.take() {
@@ -1528,11 +1527,11 @@ struct CommitJob {
     /// Acquire fence from `IN_FENCE_FD`.
     fence: Option<RawFd>,
     /// Built at commit time when `PAGE_FLIP_EVENT` was requested; the worker
-    /// emits it after the latch.
+    /// stamps its vblank and emits it with the publish.
     event: Option<DrmEventVblank>,
     /// TEMPORARY (pacing work): when the commit reached the daemon, so a
     /// published frame's interval can be decomposed into queue wait, publish
-    /// work and the presenter's latch. Remove with the `pace` diagnostics.
+    /// work and the emit tail. Remove with the `pace` diagnostics.
     t_commit: Instant,
 }
 
@@ -1691,18 +1690,12 @@ fn commit_worker_loop(
         }
         let t_pub = Instant::now();
         // The frame is now queued to SurfaceFlinger. Emit the page-flip event
-        // here, not after the presenter reports its completion: gamescope's DRM
-        // backend blocks its present loop on this event
-        // (`drm->uPendingFlipCount.wait`, Backends/DRMBackend.cpp), so gating the
-        // event on the SurfaceFlinger completion callback serialises the whole
-        // SurfaceFlinger round-trip into every paced frame. On this port that
-        // round trip is ~9.8 ms (median, measured on device) and it is the
-        // additive term C that pacing fits as `1/(1/target + C)`: a 60 target
-        // measured 39.9 presents/s before this change and 55.4 after. A real KMS
-        // page-flip event is delivered when the flip is *queued* for the next
-        // vblank, which is what emitting here now means. (The uncapped rate is
-        // unchanged: it is bounded upstream by the client's own present lap, not
-        // by this event.)
+        // here, with the publish: a real KMS page-flip event is delivered when
+        // the flip is *queued* for the next vblank. gamescope's DRM backend
+        // blocks its present loop on this event
+        // (`drm->uPendingFlipCount.wait`, Backends/DRMBackend.cpp), so gating it
+        // on SurfaceFlinger's completion round trip would serialise that round
+        // trip (~8.4 ms median here) into every paced frame.
         //
         // Correctness is unchanged: nothing is reusable before the compositor
         // has released it. A buffer is handed back out only once the client has
@@ -1733,9 +1726,8 @@ fn commit_worker_loop(
             write_eventfd(flip_event_fd);
         }
         // TEMPORARY (pacing work): one line per published frame — the effective
-        // present period plus where it went. `pl` is publish→flip-event, which
-        // is immediate now that the worker does not wait on the completion.
-        // Remove with `Pace`.
+        // present period plus where it went. `pl` is publish→flip-event, the
+        // worker's immediate post-publish tail. Remove with `Pace`.
         if in_flight_fb.is_some() {
             pace.log(&logger, t_commit, t_pick, t_pub, Instant::now());
         }
@@ -1751,8 +1743,8 @@ fn commit_worker_loop(
 /// - `dc` commit-to-commit — the rate the compositor hands frames to the daemon
 /// - `q`  commit→pick — how long the job waited behind the previous frame
 /// - `cp` pick→publish — the presenter's own work
-/// - `pl` publish→flip-event — the worker's post-publish tail (immediate: it no
-///   longer waits for the presenter's completion)
+/// - `pl` publish→flip-event — the worker's post-publish tail (immediate: the
+///   worker does not wait for the presenter's completion)
 /// - `dp` publish-to-publish — the effective present period
 ///
 /// The state lives per worker, not in a static: several workers can exist in one
