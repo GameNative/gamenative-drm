@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use gndrm_uapi::drm::*;
 use gndrm_uapi::mode::*;
@@ -37,7 +37,7 @@ pub use objects::{CrtcState, Framebuffer, GemObject, PanelDesc, PlaneState, Stor
 pub use objects::{CONNECTOR_ID, CRTC_ID, ENCODER_ID, PLANE_CURSOR_ID, PLANE_PRIMARY_ID};
 pub use props::find_prop_id;
 
-use objects::{Blob, Syncobj};
+use objects::{Blob, Syncobj, SESSION_REFRESH_MHZ};
 use pod::*;
 
 use crate::diag::{diag, Role, State};
@@ -97,82 +97,16 @@ impl DispatchResult {
     }
 }
 
-/// A completion handle for one published frame. The commit worker waits on it
-/// before emitting the `PAGE_FLIP_EVENT`, so a flip event means "the presenter
-/// reports the buffer was latched", exactly like a real vblank event.
-///
-/// The handle is the receive end of a private one-shot channel: the presenter
-/// signals the paired [`FlipLatch`] (from its SurfaceFlinger completion
-/// callback, or inline when a frame is dropped) and the worker observes it.
-pub struct FlipHandle {
-    rx: mpsc::Receiver<()>,
-}
-
-impl FlipHandle {
-    /// A pending handle and the latch the presenter fires when SurfaceFlinger
-    /// latches the frame.
-    #[must_use]
-    pub fn new() -> (Self, FlipLatch) {
-        let (tx, rx) = mpsc::channel();
-        (Self { rx }, FlipLatch { tx })
-    }
-
-    /// A handle that is already latched, for presenters that complete
-    /// synchronously (a dropped/hidden frame, or the default presenter).
-    #[must_use]
-    pub fn latched_now() -> Self {
-        let (tx, rx) = mpsc::channel();
-        let _ = tx.send(());
-        Self { rx }
-    }
-
-    /// Block until the presenter signals the latch. `false` when the latch was
-    /// dropped without ever firing (the frame can never complete).
-    pub fn wait_latched(&mut self) -> bool {
-        self.rx.recv().is_ok()
-    }
-
-    /// Wait up to `timeout`; `false` on timeout or a dropped latch. The worker
-    /// uses this so teardown can interrupt a stalled latch.
-    pub fn wait_latched_timeout(&mut self, timeout: Duration) -> bool {
-        matches!(self.rx.recv_timeout(timeout), Ok(()))
-    }
-
-    /// Non-blocking poll: `true` once the latch has fired.
-    pub fn is_latched(&mut self) -> bool {
-        self.rx.try_recv().is_ok()
-    }
-
-    /// Non-blocking poll: `true` when the paired [`FlipLatch`] has been dropped
-    /// without firing, so this frame can never complete. The worker uses this
-    /// to degrade to "treat as latched" at once instead of waiting out its
-    /// budget.
-    pub fn latch_lost(&mut self) -> bool {
-        matches!(self.rx.try_recv(), Err(mpsc::TryRecvError::Disconnected))
-    }
-}
-
-/// The signalling half of a [`FlipHandle`], handed to a presenter to fire from
-/// its completion callback.
-pub struct FlipLatch {
-    tx: mpsc::Sender<()>,
-}
-
-impl FlipLatch {
-    /// Signal that the frame was latched. Idempotent and safe to call from a
-    /// completion callback.
-    pub fn fire(&self) {
-        let _ = self.tx.send(());
-    }
-}
-
 /// Sink for committed frames. The Android side implements this with
 /// the native SurfaceControl presenter; tests use [`NullPresenter`] or a
 /// controllable mock.
 ///
 /// `publish` is called on the commit worker thread (never the serve thread) and
-/// must not block the serve loop: it returns a [`FlipHandle`] immediately and
-/// lets the worker wait for the latch.
+/// must not block the serve loop: it hands the frame to the compositor and
+/// returns at once. The worker never waits for the presenter's completion —
+/// buffer reuse is gated on the compositor's own release signal (the previous
+/// release fence the presenter waits on before re-using a slot), not on the
+/// commit worker's progress.
 ///
 /// `ino` is the committed framebuffer's buffer identity, resolved from the
 /// object store by the caller before the commit was queued. `live_inos` is the
@@ -189,7 +123,7 @@ pub trait Presenter: Send {
         ino: Option<u64>,
         live_inos: &HashSet<u64>,
         fence: Option<RawFd>,
-    ) -> FlipHandle;
+    );
 }
 
 /// Default presenter: drops frames and completes them immediately. Phase-1
@@ -208,12 +142,11 @@ impl Presenter for NullPresenter {
         _ino: Option<u64>,
         _live_inos: &HashSet<u64>,
         fence: Option<RawFd>,
-    ) -> FlipHandle {
+    ) {
         self.frames += 1;
         if let Some(fd) = fence {
             close_fd(fd);
         }
-        FlipHandle::latched_now()
     }
 }
 
@@ -334,9 +267,6 @@ impl Device {
         // The event clock is shared with the commit worker, which re-stamps a
         // page-flip event when it emits it (see `commit_worker_loop`).
         let clock: SharedClock = Arc::new(Mutex::new(Box::new(monotonic_now)));
-        // The mode's rate is what the flip events quantize their claimed vblank
-        // timeline to (see `VblankTimeline`).
-        let refresh_mhz = panel.refresh_mhz;
         let worker = thread::Builder::new()
             .name("gndrm-commit".into())
             .spawn({
@@ -347,15 +277,8 @@ impl Device {
                 let clock = Arc::clone(&clock);
                 move || {
                     commit_worker(
-                        presenter,
-                        commit_rx,
-                        flip_queue,
-                        worker_fd,
-                        in_flight,
-                        shutdown,
-                        logger,
+                        presenter, commit_rx, flip_queue, worker_fd, in_flight, shutdown, logger,
                         clock,
-                        refresh_mhz,
                     )
                 }
             })
@@ -1623,23 +1546,6 @@ impl Drop for CommitJob {
     }
 }
 
-/// How long the worker waits for the presenter to report the latch before it
-/// treats the frame as latched anyway.
-///
-/// The wait *must* be bounded. A completion the presenter never reports — a
-/// lost `ASurfaceTransaction` callback, or SurfaceFlinger never latching the
-/// transaction — must degrade, never deadlock: a worker parked on a latch
-/// stops servicing commits entirely (no more presentation, no more
-/// `PAGE_FLIP_EVENT`), which is exactly the on-device failure where the panel
-/// froze and then the scan-out reply path timed out behind the wedged worker.
-/// 100 ms is ~6 frames at 60 Hz, so a merely slow composition is absorbed,
-/// while a genuinely lost completion costs at most one frame of latency and
-/// always leaves the worker free to service the next commit.
-const LATCH_TIMEOUT: Duration = Duration::from_millis(100);
-
-/// Latch-wait poll granularity: short enough to notice `shutdown` promptly.
-const LATCH_POLL: Duration = Duration::from_millis(20);
-
 /// The vblank timeline a page-flip event claims.
 ///
 /// A real KMS page-flip event is delivered at the vblank the flip takes effect
@@ -1662,15 +1568,9 @@ struct VblankTimeline {
 }
 
 impl VblankTimeline {
-    fn new(refresh_mhz: u32) -> Self {
-        // A missing or absurd rate falls back to 60 Hz.
-        let mhz = if refresh_mhz == 0 {
-            60_000
-        } else {
-            refresh_mhz
-        };
+    fn new() -> Self {
         Self {
-            interval_ns: 1_000_000_000_000 / u64::from(mhz),
+            interval_ns: 1_000_000_000_000 / u64::from(SESSION_REFRESH_MHZ),
             claimed_ns: 0,
             started: false,
         }
@@ -1710,7 +1610,6 @@ fn commit_worker(
     shutdown: Arc<AtomicBool>,
     logger: Arc<Mutex<Option<LogFn>>>,
     clock: SharedClock,
-    refresh_mhz: u32,
 ) {
     let report = Arc::clone(&logger);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1723,7 +1622,6 @@ fn commit_worker(
             shutdown,
             logger,
             clock,
-            refresh_mhz,
         );
     }));
     if caught.is_err() {
@@ -1739,10 +1637,12 @@ fn commit_worker(
     close_fd(flip_event_fd);
 }
 
-/// The commit worker: one serial loop that pops a commit, publishes it, waits
-/// for the presenter's latch, then emits the flip event and frees the buffer.
-/// The latch wait is bounded — see [`LATCH_TIMEOUT`] — so a lost completion
-/// degrades to "treat the frame as latched" instead of stalling the loop.
+/// The commit worker: one serial loop that pops a commit, publishes it, and
+/// emits the flip event. It never waits for the presenter's completion: the
+/// flip event is emitted with the publish (a real KMS page-flip event is
+/// delivered when the flip is queued for the next vblank), and a buffer's
+/// lifetime is gated by the presenter's own release-fence wait, not by this
+/// loop.
 #[allow(clippy::too_many_arguments)]
 fn commit_worker_loop(
     mut presenter: Box<dyn Presenter>,
@@ -1753,20 +1653,17 @@ fn commit_worker_loop(
     shutdown: Arc<AtomicBool>,
     logger: Arc<Mutex<Option<LogFn>>>,
     clock: SharedClock,
-    refresh_mhz: u32,
 ) {
-    // One-shot: a withheld latch is reported once, not once per frame.
-    let mut warned_latch = false;
     // Publish what this worker is doing for the scan-out snapshot: "the commit
     // worker was <state>" is one of the facts a stalled request has to explain.
     // Atomics only, so this cannot perturb the flip path.
     let d = diag();
     d.set_role(Role::Commit, State::CommitWaitingJob);
     // The vblank schedule the flip events claim (see `VblankTimeline`).
-    let mut vblank = VblankTimeline::new(refresh_mhz);
+    let mut vblank = VblankTimeline::new();
     // TEMPORARY (pacing work): this worker's pacing counters. Remove with `Pace`.
     let mut pace = Pace::new();
-    'outer: while let Ok(mut job) = commit_rx.recv() {
+    while let Ok(mut job) = commit_rx.recv() {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
@@ -1775,23 +1672,23 @@ fn commit_worker_loop(
         // wait from publish work. Remove with the `pace` diagnostics.
         let t_commit = job.t_commit;
         let t_pick = Instant::now();
-        // The fb id to free once the latch lands (None when nothing published).
+        // The fb id this commit published, if any (used for the pacing line).
         let in_flight_fb = job.fb.as_ref().map(|fb| fb.id);
-        // Publish the buffer when there is one; otherwise the commit is already
-        // complete (the frame is dropped/hidden and its latch is immediate).
+        // Publish the buffer when there is one; otherwise the commit carries no
+        // presentation (the frame is dropped/hidden) and only its fence is
+        // released.
         d.set_role(Role::Commit, State::CommitPublishing);
-        let mut handle = match job.fb.take() {
+        match job.fb.take() {
             Some(fb) => {
                 let fence = job.fence.take();
-                presenter.publish(&fb, &job.plane, job.ino, &job.live_inos, fence)
+                presenter.publish(&fb, &job.plane, job.ino, &job.live_inos, fence);
             }
             None => {
                 if let Some(fd) = job.fence.take() {
                     close_fd(fd);
                 }
-                FlipHandle::latched_now()
             }
-        };
+        }
         let t_pub = Instant::now();
         // The frame is now queued to SurfaceFlinger. Emit the page-flip event
         // here, not after the presenter reports its completion: gamescope's DRM
@@ -1808,12 +1705,12 @@ fn commit_worker_loop(
         // by this event.)
         //
         // Correctness is unchanged: nothing is reusable before the compositor
-        // has released it. The pool still caches a buffer for reuse only once
-        // the presenter reports SurfaceFlinger's completion (the slot's
-        // `latched` flag), and the next publish still blocks on the previous
-        // release fence. This only stops the *event* — a pacing/visibility
-        // signal to the client — from carrying the round trip; the buffer's
-        // lifetime is still pinned to the real completion.
+        // has released it. A buffer is handed back out only once the client has
+        // stopped importing it (the pool's liveness gate), and the next publish
+        // onto that slot still waits on the previous release fence the
+        // presenter's completion stored. This loop never blocks on the
+        // completion itself — the flip event is a client pacing signal, and the
+        // buffer's lifetime is pinned to the compositor's release signal.
         d.set_role(Role::Commit, State::CommitFlushing);
         if let Some(fb_id) = in_flight_fb {
             in_flight
@@ -1835,46 +1732,12 @@ fn commit_worker_loop(
                 .push_back(ev);
             write_eventfd(flip_event_fd);
         }
-        // Acknowledge SurfaceFlinger's completion after the event, bounded. The
-        // wait is no longer on the client's critical path; it keeps at most one
-        // frame in flight (back-pressure) and lets teardown interrupt a stalled
-        // completion. A completion the presenter never reports degrades to
-        // "treat as latched" instead of stalling the loop.
-        d.set_role(Role::Commit, State::CommitWaitingLatch);
-        let wait_started = Instant::now();
-        let deadline = wait_started + LATCH_TIMEOUT;
-        let mut latched = handle.is_latched();
-        while !latched {
-            if shutdown.load(Ordering::Relaxed) {
-                break 'outer;
-            }
-            if handle.latch_lost() {
-                break;
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            let slice = LATCH_POLL.min(deadline.saturating_duration_since(now));
-            latched = handle.wait_latched_timeout(slice);
-        }
         // TEMPORARY (pacing work): one line per published frame — the effective
-        // present period plus where it went. Remove with `Pace`.
+        // present period plus where it went. `pl` is publish→flip-event, which
+        // is immediate now that the worker does not wait on the completion.
+        // Remove with `Pace`.
         if in_flight_fb.is_some() {
-            pace.log(&logger, t_commit, t_pick, t_pub, Instant::now(), latched);
-        }
-        if !latched && !shutdown.load(Ordering::Relaxed) && !warned_latch {
-            warned_latch = true;
-            if let Some(log) = logger
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .as_ref()
-            {
-                log(&format!(
-                    "commit: presenter reported no latch after {} ms; completing the frame anyway (a lost completion must not stall the flip loop)",
-                    wait_started.elapsed().as_millis()
-                ));
-            }
+            pace.log(&logger, t_commit, t_pick, t_pub, Instant::now());
         }
         d.set_role(Role::Commit, State::CommitWaitingJob);
     }
@@ -1888,9 +1751,9 @@ fn commit_worker_loop(
 /// - `dc` commit-to-commit — the rate the compositor hands frames to the daemon
 /// - `q`  commit→pick — how long the job waited behind the previous frame
 /// - `cp` pick→publish — the presenter's own work
-/// - `pl` publish→latch — SurfaceFlinger's completion round trip
+/// - `pl` publish→flip-event — the worker's post-publish tail (immediate: it no
+///   longer waits for the presenter's completion)
 /// - `dp` publish-to-publish — the effective present period
-/// - `lt` 1 when the latch timed out and the frame was completed anyway
 ///
 /// The state lives per worker, not in a static: several workers can exist in one
 /// process (the tests run them concurrently) and a shared "previous stamp" would
@@ -1919,20 +1782,18 @@ impl Pace {
         t_commit: Instant,
         t_pick: Instant,
         t_pub: Instant,
-        t_latch: Instant,
-        latched: bool,
+        t_done: Instant,
     ) {
         let us = |t: Instant| t.saturating_duration_since(self.base).as_micros() as u64;
-        let (c, p, l) = (us(t_commit), us(t_pub), us(t_latch));
+        let (c, p, l) = (us(t_commit), us(t_pub), us(t_done));
         let line = format!(
-            "pace n={} dc={} q={} cp={} pl={} dp={} lt={}",
+            "pace n={} dc={} q={} cp={} pl={} dp={}",
             self.n,
             c.saturating_sub(self.prev_commit),
             us(t_pick).saturating_sub(c),
             p.saturating_sub(us(t_pick)),
             l.saturating_sub(p),
             p.saturating_sub(self.prev_pub),
-            u8::from(latched),
         );
         self.prev_commit = c;
         self.prev_pub = p;

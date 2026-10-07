@@ -395,6 +395,26 @@ pub struct VkExtent2D {
     pub height: u32,
 }
 
+/// `VkPhysicalDeviceSurfaceInfo2KHR`: what a caller asks surface capabilities
+/// *for* in the `2` variant of the query. VKD3D-Proton (D3D12) goes through this
+/// form where DXVK (D3D11) uses the plain one.
+#[repr(C)]
+pub struct VkPhysicalDeviceSurfaceInfo2KHR {
+    pub sType: u32,
+    pub pNext: *const c_void,
+    pub surface: VkSurfaceKHR,
+}
+
+/// `VkSurfaceCapabilities2KHR`: the `2` variant's out-structure. Any further
+/// structures a caller chains are left untouched: this implementation fills only
+/// what it supports, which is the contract.
+#[repr(C)]
+pub struct VkSurfaceCapabilities2KHR {
+    pub sType: u32,
+    pub pNext: *mut c_void,
+    pub surfaceCapabilities: VkSurfaceCapabilitiesKHR,
+}
+
 #[repr(C)]
 pub struct VkSurfaceCapabilitiesKHR {
     pub minImageCount: u32,

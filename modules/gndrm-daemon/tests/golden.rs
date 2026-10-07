@@ -10,9 +10,8 @@ use std::time::{Duration, Instant};
 
 use gndrm_daemon::pod::{pod_read, pod_write};
 use gndrm_daemon::{
-    find_prop_id, Device, DispatchResult, FlipHandle, FlipLatch, Framebuffer, NullPresenter,
-    PanelDesc, PlaneState, Presenter, CONNECTOR_ID, CRTC_ID, ENCODER_ID, PLANE_CURSOR_ID,
-    PLANE_PRIMARY_ID,
+    find_prop_id, Device, DispatchResult, Framebuffer, NullPresenter, PanelDesc, PlaneState,
+    Presenter, CONNECTOR_ID, CRTC_ID, ENCODER_ID, PLANE_CURSOR_ID, PLANE_PRIMARY_ID,
 };
 use gndrm_uapi::drm::*;
 use gndrm_uapi::mode::*;
@@ -28,24 +27,20 @@ fn dev() -> Device {
     d
 }
 
-/// A presenter that latches on command: each `publish` returns a pending
-/// [`FlipHandle`] and parks its [`FlipLatch`] in a shared queue the test fires.
-/// This is the controllable mock the async-semantics tests drive.
-struct LatchPresenter {
-    latches: Arc<Mutex<Vec<FlipLatch>>>,
+/// A presenter whose only job is to count the frames it is handed. The device
+/// never waits on a presenter completion, so the mocks need only accept the
+/// publish.
+struct CountPresenter {
     frames: Arc<AtomicU64>,
 }
 
-impl LatchPresenter {
-    fn new(latches: Arc<Mutex<Vec<FlipLatch>>>) -> Self {
-        Self {
-            latches,
-            frames: Arc::new(AtomicU64::new(0)),
-        }
+impl CountPresenter {
+    fn new(frames: Arc<AtomicU64>) -> Self {
+        Self { frames }
     }
 }
 
-impl Presenter for LatchPresenter {
+impl Presenter for CountPresenter {
     fn publish(
         &mut self,
         _fb: &Framebuffer,
@@ -53,27 +48,23 @@ impl Presenter for LatchPresenter {
         _ino: Option<u64>,
         _live_inos: &HashSet<u64>,
         fence: Option<RawFd>,
-    ) -> FlipHandle {
+    ) {
         if let Some(fd) = fence {
             // SAFETY: the mock owns the fence the device handed it.
             unsafe { libc::close(fd) };
         }
         self.frames.fetch_add(1, Ordering::Relaxed);
-        let (handle, latch) = FlipHandle::new();
-        self.latches.lock().unwrap().push(latch);
-        handle
     }
 }
 
-/// A device whose presenter latches on command.
-fn dev_latch() -> (Device, Arc<Mutex<Vec<FlipLatch>>>) {
-    let latches = Arc::new(Mutex::new(Vec::new()));
+/// A device with a counting presenter.
+fn dev_async() -> Device {
     let mut d = Device::new(
         PanelDesc::default(),
-        Box::new(LatchPresenter::new(Arc::clone(&latches))),
+        Box::new(CountPresenter::new(Arc::new(AtomicU64::new(0)))),
     );
     d.set_clock(Box::new(|| (1000, 500)));
-    (d, latches)
+    d
 }
 
 /// Block (up to `timeout_ms`) until the worker has produced at least one flip
@@ -93,20 +84,6 @@ fn wait_flip(d: &mut Device, timeout_ms: u64) -> Vec<DrmEventVblank> {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-}
-
-/// Fire the next latch the mock presenter has parked. The worker publishes
-/// asynchronously, so this waits (briefly) for a latch to appear rather than
-/// assuming it is already there.
-fn fire_next(latches: &Arc<Mutex<Vec<FlipLatch>>>) {
-    for _ in 0..1000 {
-        if let Some(latch) = latches.lock().unwrap().pop() {
-            latch.fire();
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    panic!("no latch became available from the presenter");
 }
 
 fn call(d: &mut Device, nr: u32, payload: &[u8]) -> DispatchResult {
@@ -474,7 +451,7 @@ fn connector_encoder_plane_queries() {
     assert_eq!(ext.len(), want);
     let m: DrmModeModeinfo = pod_read(&ext[4..]).unwrap();
     assert_eq!((m.hdisplay, m.vdisplay), (1280, 720));
-    assert_eq!(m.vrefresh, 60);
+    assert_eq!(m.vrefresh, 1200);
     assert_ne!(m.ty & DRM_MODE_TYPE_PREFERRED, 0);
 
     // Unknown connector id.
@@ -1053,8 +1030,8 @@ fn gem_close_with_live_fb_then_modeset_and_rmfb() {
     );
     let r = call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req);
     ok(&r);
-    // The flip event arrives asynchronously, after the worker's latch (the
-    // default presenter latches immediately).
+    // The commit has been published; the flip event is emitted asynchronously
+    // once the worker has run.
     assert_eq!(
         wait_flip(&mut d, 2000).len(),
         1,
@@ -1296,7 +1273,7 @@ impl Presenter for PanicPresenter {
         _ino: Option<u64>,
         _live_inos: &HashSet<u64>,
         fence: Option<RawFd>,
-    ) -> FlipHandle {
+    ) {
         if let Some(fd) = fence {
             // SAFETY: the mock owns the fence the device handed it.
             unsafe { libc::close(fd) };
@@ -1470,7 +1447,7 @@ fn modeset_sets(d: &Device, blob: u32, fb: u32) -> Vec<(u32, u32, u64)> {
 
 #[test]
 fn atomic_test_only_then_modeset_then_flip() {
-    let (mut d, latches) = dev_latch();
+    let mut d = dev_async();
     let blob = create_mode_blob(&mut d).0;
     let (_handle, fb, fd) = import_fb(&mut d);
 
@@ -1541,13 +1518,6 @@ fn atomic_test_only_then_modeset_then_flip() {
     assert_eq!(c.fb_id, fb);
     assert_eq!((c.mode.hdisplay, c.mode.vdisplay), (1280, 720));
 
-    // Firing the latch completes that frame; it emits no event of its own.
-    fire_next(&latches);
-    assert!(
-        d.drain_flip_events().is_empty(),
-        "the latch must not emit a second event"
-    );
-
     // Page-flip-only commit (no ALLOW_MODESET, same FB → no re-present) emits
     // the next event immediately, still ordered after the first.
     let req = atomic_req(
@@ -1567,10 +1537,10 @@ fn atomic_test_only_then_modeset_then_flip() {
     assert_eq!(events[0].user_data, 0xBEEF);
     // The claimed vblank advanced by exactly one mode interval (the mocked clock
     // does not move), which is what keeps gamescope's grid on the mode's rate:
-    // the 60 Hz default panel is 16 666 666 ns per frame.
+    // the 1200 Hz session constant is 833 333 ns per frame.
     assert_eq!(
         (events[0].tv_sec, events[0].tv_usec),
-        (1000, 17_166),
+        (1000, 1_333),
         "the next claim is one interval after the previous vblank"
     );
 
@@ -1717,7 +1687,7 @@ fn unsignalled_fence() -> RawFd {
 /// primary still refuses RMFB.
 #[test]
 fn async_commit_returns_before_latch_event_follows_publish() {
-    let (mut d, latches) = dev_latch();
+    let mut d = dev_async();
     let blob = create_mode_blob(&mut d).0;
     let (_handle, fb, fd) = import_fb(&mut d);
 
@@ -1753,10 +1723,6 @@ fn async_commit_returns_before_latch_event_follows_publish() {
 
     // The committed fb is the current primary, still scanned out: RMFB refuses.
     is_err(&call(&mut d, DRM_IOCTL_MODE_RMFB, &pod(&fb)), errno::EBUSY);
-
-    // The latch is still consumed (the worker's completion acknowledgement); it
-    // no longer gates the event.
-    fire_next(&latches);
 
     // The buffer becomes reusable once it is moved off the plane: RMFB succeeds.
     let zero = [
@@ -1794,7 +1760,7 @@ fn async_commit_returns_before_latch_event_follows_publish() {
 /// primary refuses RMFB; a superseded buffer is no longer in flight.
 #[test]
 fn async_commits_stay_ordered_and_events_follow_publish() {
-    let (mut d, latches) = dev_latch();
+    let mut d = dev_async();
     let blob = create_mode_blob(&mut d).0;
     let (_ha, fb_a, fd_a) = import_fb(&mut d);
     let (_hb, fb_b, fd_b) = import_fb(&mut d);
@@ -1845,10 +1811,6 @@ fn async_commits_stay_ordered_and_events_follow_publish() {
     );
     ok(&call(&mut d, DRM_IOCTL_MODE_RMFB, &pod(&fb_a)));
 
-    // Drain the two latches so the worker's acknowledgements complete.
-    fire_next(&latches);
-    fire_next(&latches);
-
     // SAFETY: caller's fds.
     unsafe {
         libc::close(fd_a);
@@ -1860,7 +1822,7 @@ fn async_commits_stay_ordered_and_events_follow_publish() {
 /// rather than stalling; a signalled fence (or no fence) queues normally.
 #[test]
 fn nonblocking_unsignalled_fence_returns_ebusy() {
-    let (mut d, latches) = dev_latch();
+    let mut d = dev_async();
     let blob = create_mode_blob(&mut d).0;
     let (_handle, fb, fd) = import_fb(&mut d);
     let mut sets = modeset_sets(&d, blob, fb);
@@ -1892,7 +1854,6 @@ fn nonblocking_unsignalled_fence_returns_ebusy() {
         0xF00D,
     );
     ok(&call_fd(&mut d, DRM_IOCTL_MODE_ATOMIC, &req, fence));
-    fire_next(&latches);
     let events = wait_flip(&mut d, 2000);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].user_data, 0xF00D);
@@ -1901,100 +1862,8 @@ fn nonblocking_unsignalled_fence_returns_ebusy() {
     unsafe { libc::close(fd) };
 }
 
-/// A presenter that never reports a completion: its latches are parked and
-/// never fired — the on-device signature of a completion callback that never
-/// arrives.
-struct StuckPresenter {
-    latches: Arc<Mutex<Vec<FlipLatch>>>,
-}
-
-impl Presenter for StuckPresenter {
-    fn publish(
-        &mut self,
-        _fb: &Framebuffer,
-        _plane: &PlaneState,
-        _ino: Option<u64>,
-        _live_inos: &HashSet<u64>,
-        fence: Option<RawFd>,
-    ) -> FlipHandle {
-        if let Some(fd) = fence {
-            // SAFETY: the mock owns the fence the device handed it.
-            unsafe { libc::close(fd) };
-        }
-        let (handle, latch) = FlipHandle::new();
-        // Kept alive but never fired: the latch stays *connected*, so the
-        // worker must run out its bounded budget rather than see a disconnect.
-        self.latches.lock().unwrap().push(latch);
-        handle
-    }
-}
-
-/// The latch wait is bounded. A presenter that never reports a completion must
-/// not deadlock the commit worker: the flip event still fires (the frame
-/// degrades to "treated as latched"), and the worker keeps servicing later
-/// commits. Before the bounded wait this test hung forever on the first commit
-/// — the same stall that froze the panel on device.
-#[test]
-fn latch_wait_degrades_when_completion_never_arrives() {
-    let latches = Arc::new(Mutex::new(Vec::new()));
-    let mut d = Device::new(
-        PanelDesc::default(),
-        Box::new(StuckPresenter {
-            latches: Arc::clone(&latches),
-        }),
-    );
-    d.set_clock(Box::new(|| (1000, 500)));
-    let blob = create_mode_blob(&mut d).0;
-    let (_h1, fb1, fd1) = import_fb(&mut d);
-
-    let sets1 = modeset_sets(&d, blob, fb1);
-    ok(&call(
-        &mut d,
-        DRM_IOCTL_MODE_ATOMIC,
-        &atomic_req(
-            &sets1,
-            DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
-            0xB1,
-        ),
-    ));
-    // No latch is ever fired; the event must still arrive, within the bound.
-    let events = wait_flip(&mut d, 2000);
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].user_data, 0xB1);
-
-    // The worker is not wedged: a second commit completes too.
-    let (_h2, fb2, fd2) = import_fb(&mut d);
-    ok(&call(
-        &mut d,
-        DRM_IOCTL_MODE_ATOMIC,
-        &atomic_req(
-            &[(
-                PLANE_PRIMARY_ID,
-                find_prop_id(PLANE_PRIMARY_ID, "FB_ID").unwrap(),
-                u64::from(fb2),
-            )],
-            DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
-            0xB2,
-        ),
-    ));
-    let events = wait_flip(&mut d, 2000);
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].user_data, 0xB2);
-
-    // Both publishes happened and both latches are still parked, unfired.
-    assert_eq!(latches.lock().unwrap().len(), 2);
-
-    // SAFETY: caller's fds.
-    unsafe {
-        libc::close(fd1);
-        libc::close(fd2);
-    }
-}
-
-/// A presenter that records whether each publish was handed an acquire fence,
-/// then latches on command.
+/// A presenter that records whether each publish was handed an acquire fence.
 struct FenceSpyPresenter {
-    latches: Arc<Mutex<Vec<FlipLatch>>>,
     fences: Arc<Mutex<Vec<bool>>>,
 }
 
@@ -2006,15 +1875,12 @@ impl Presenter for FenceSpyPresenter {
         _ino: Option<u64>,
         _live_inos: &HashSet<u64>,
         fence: Option<RawFd>,
-    ) -> FlipHandle {
+    ) {
         self.fences.lock().unwrap().push(fence.is_some());
         if let Some(fd) = fence {
             // SAFETY: the mock owns the fence the device handed it.
             unsafe { libc::close(fd) };
         }
-        let (handle, latch) = FlipHandle::new();
-        self.latches.lock().unwrap().push(latch);
-        handle
     }
 }
 
@@ -2026,12 +1892,10 @@ impl Presenter for FenceSpyPresenter {
 /// passed through untouched.
 #[test]
 fn emulated_signalled_fence_is_not_forwarded_to_the_presenter() {
-    let latches = Arc::new(Mutex::new(Vec::new()));
     let fences = Arc::new(Mutex::new(Vec::new()));
     let mut d = Device::new(
         PanelDesc::default(),
         Box::new(FenceSpyPresenter {
-            latches: Arc::clone(&latches),
             fences: Arc::clone(&fences),
         }),
     );
@@ -2079,7 +1943,6 @@ fn emulated_signalled_fence_is_not_forwarded_to_the_presenter() {
         ),
         export,
     ));
-    fire_next(&latches);
     let _ = wait_flip(&mut d, 2000);
     assert!(
         !fences.lock().unwrap()[0],
@@ -2104,7 +1967,6 @@ fn emulated_signalled_fence_is_not_forwarded_to_the_presenter() {
         ),
         other,
     ));
-    fire_next(&latches);
     let _ = wait_flip(&mut d, 2000);
     assert!(
         fences.lock().unwrap()[1],
@@ -2125,7 +1987,7 @@ fn emulated_signalled_fence_is_not_forwarded_to_the_presenter() {
 /// latch.
 #[test]
 fn full_gamescope_chain_discovery_to_syncobj_async() {
-    let (mut d, latches) = dev_latch();
+    let mut d = dev_async();
 
     // 1. Discovery — assert a coherent topology.
     let r = call(
@@ -2224,7 +2086,6 @@ fn full_gamescope_chain_discovery_to_syncobj_async() {
             0x100,
         ),
     ));
-    fire_next(&latches);
     let events = wait_flip(&mut d, 2000);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].user_data, 0x100);

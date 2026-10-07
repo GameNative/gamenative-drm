@@ -50,14 +50,25 @@ const FIRST_SYNCOBJ_HANDLE: u32 = 0x4000;
 /// Exclusive end of the syncobj handle space.
 const END_SYNCOBJ_HANDLE: u32 = 0x5000;
 
-/// Physical panel description, supplied by the Android side (surface size +
-/// refresh) — phase 3 wires this to `ANativeWindow` metrics.
+/// The session's advertised refresh rate, in millihertz (1200 Hz = 1_200_000).
+///
+/// gamescope builds its entire vblank grid from the exposed mode's `vrefresh`
+/// and honours only integer divisors of it for an fps cap, so this one value
+/// sets both the guest's uncapped ceiling and every cap's granularity. It is
+/// deliberately high: the grid is a timer, so a finite value is required, and
+/// 1200 Hz is ~13x the present pipeline's measured throughput (~93 presents/s),
+/// so it cannot bind once the commit path no longer latches. The only real cap
+/// on the guest is the user's own fps limit in the QuickMenu; the physical panel
+/// is downstream and coalesces whatever the session sends.
+pub const SESSION_REFRESH_MHZ: u32 = 1_200_000;
+
+/// Physical panel description: the surface size the session presents into. The
+/// session refresh rate is the daemon's own constant (`SESSION_REFRESH_MHZ`),
+/// not a caller-supplied value.
 #[derive(Debug, Clone, Copy)]
 pub struct PanelDesc {
     pub width: u16,
     pub height: u16,
-    /// Refresh in millihertz (60 Hz = 60_000).
-    pub refresh_mhz: u32,
     /// Physical size in millimetres (0 = unknown).
     pub mm_width: u32,
     pub mm_height: u32,
@@ -68,7 +79,6 @@ impl Default for PanelDesc {
         Self {
             width: 1280,
             height: 720,
-            refresh_mhz: 60_000,
             mm_width: 0,
             mm_height: 0,
         }
@@ -90,7 +100,7 @@ impl PanelDesc {
         let vsync_end = vdisplay + 6;
         let vtotal = vdisplay + 20;
         // clock[kHz] = total_px * refresh / 1000, rounded.
-        let clock = (u64::from(htotal) * u64::from(vtotal) * u64::from(self.refresh_mhz)
+        let clock = (u64::from(htotal) * u64::from(vtotal) * u64::from(SESSION_REFRESH_MHZ)
             / 1_000_000) as u32;
         let mut name = [0u8; DRM_DISPLAY_MODE_LEN];
         let label = format!("{}x{}", self.width, self.height);
@@ -107,7 +117,7 @@ impl PanelDesc {
             vsync_end,
             vtotal,
             vscan: 0,
-            vrefresh: self.refresh_mhz.div_ceil(1000),
+            vrefresh: SESSION_REFRESH_MHZ.div_ceil(1000),
             flags: 0,
             ty: DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DRIVER,
             name,

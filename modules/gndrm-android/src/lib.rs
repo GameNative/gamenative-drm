@@ -7,7 +7,7 @@
 //!
 //! JNI class: `app.gamenative.display.GameNativeDrm`.
 //!
-//! Lifecycle: `nativeStart(socket, surface, w, h, hz)` → the SurfaceControl
+//! Lifecycle: `nativeStart(socket, surface, w, h)` → the SurfaceControl
 //! layer is created on a dedicated server thread → accept the RPC and event
 //! connections → `serve()`, while a second thread accepts the scan-out
 //! allocator channel for as long as the session runs. `nativeStop()` shuts the
@@ -15,9 +15,12 @@
 //! happens on the server thread), releases the window.
 //!
 //! A display power cycle is not a teardown. `nativeRetargetSurface(surface, w,
-//! h, hz)` rebuilds only the publish layer from the new window and re-presents
+//! h)` rebuilds only the publish layer from the new window and re-presents
 //! the retained last frame, keeping the listen sockets, the object stores and
 //! the gamescope connection alive; `nativeStop()` stays the session-exit path.
+//!
+//! The session's refresh rate is not a caller concern: the daemon owns it as
+//! its own constant (`gndrm_daemon::SESSION_REFRESH_MHZ`).
 //!
 //! On non-Android targets this crate is an empty stub so host-side
 //! workspace gates (fmt/clippy/test) stay green; the real gates for this
@@ -494,7 +497,6 @@ fn start(
     surface: &JObject,
     width: jint,
     height: jint,
-    refresh_hz: jfloat,
 ) -> jint {
     PRESENTED_FRAMES.store(0, Ordering::Relaxed);
     // First JNI entry point to run: capture the VM so the presenter thread can
@@ -504,8 +506,8 @@ fn start(
         Ok(s) => s.to_string_lossy().into_owned(),
         Err(_) => return E_INVAL,
     };
-    if width < 64 || height < 64 || !(1.0..=480.0).contains(&refresh_hz) {
-        log_error!("bad geometry {width}x{height} @{refresh_hz}");
+    if width < 64 || height < 64 {
+        log_error!("bad geometry {width}x{height}");
         return E_INVAL;
     }
 
@@ -585,7 +587,6 @@ fn start(
     let panel = PanelDesc {
         width: panel_w,
         height: panel_h,
-        refresh_mhz: (refresh_hz * 1000.0) as u32,
         mm_width: 0,
         mm_height: 0,
     };
@@ -675,7 +676,7 @@ fn start(
         }
     };
 
-    log_info!("started: socket={name} {panel_w}x{panel_h} @{refresh_hz}Hz");
+    log_info!("started: socket={name} {panel_w}x{panel_h}");
     log_info!("gndrm build 20260926-1: ADDFB2_MODIFIERS + IN_FORMATS (LINEAR) on both planes");
     let asc = Arc::downgrade(&asc);
     *slot = Some(Runtime {
@@ -760,15 +761,9 @@ fn stop() {
 /// Returns 0, [`E_NOENT`] when no session is running (the caller starts one),
 /// or a negative code when the surface is unusable or the layer could not be
 /// rebuilt (the current layer is then kept).
-fn retarget(
-    env: &mut JNIEnv,
-    surface: &JObject,
-    width: jint,
-    height: jint,
-    refresh_hz: jfloat,
-) -> jint {
-    if width < 64 || height < 64 || !(1.0..=480.0).contains(&refresh_hz) {
-        log_error!("bad retarget geometry {width}x{height} @{refresh_hz}");
+fn retarget(env: &mut JNIEnv, surface: &JObject, width: jint, height: jint) -> jint {
+    if width < 64 || height < 64 {
+        log_error!("bad retarget geometry {width}x{height}");
         return E_INVAL;
     }
     let mut slot = RUNTIME.lock().expect("runtime poisoned");
@@ -847,10 +842,9 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeStart(
     surface: JObject,
     width: jint,
     height: jint,
-    refresh_hz: jfloat,
 ) -> jint {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        start(&mut env, &socket_name, &surface, width, height, refresh_hz)
+        start(&mut env, &socket_name, &surface, width, height)
     }))
     .unwrap_or(E_FAULT)
 }
@@ -875,10 +869,9 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeRetargetS
     surface: JObject,
     width: jint,
     height: jint,
-    refresh_hz: jfloat,
 ) -> jint {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        retarget(&mut env, &surface, width, height, refresh_hz)
+        retarget(&mut env, &surface, width, height)
     }))
     .unwrap_or(E_FAULT)
 }

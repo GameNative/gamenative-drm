@@ -1130,9 +1130,18 @@ unsafe extern "C" fn gn_vkDestroySwapchainKHR(
 // imported dma-buf image directly.
 const REAP_SLICE: Duration = Duration::from_millis(4);
 
-/// Claim the first swapchain slot that is neither held by the app nor awaiting
-/// a compositor release. On success `idx` is set to the slot (marked acquired);
+/// Claim the first swapchain slot that is neither held by the app nor awaiting a
+/// compositor release. On success `idx` is set to the slot (marked acquired);
 /// when none is free `idx` is left unchanged.
+///
+/// Withholding an in-flight slot is what paces the guest to gamescope's vblank
+/// grid, i.e. to the panel refresh. Letting the app acquire one instead is not a
+/// safe way to decouple the guest's rate: this scan hands out the *first* free
+/// slot, so the app takes slot 0, presents it, re-acquires slot 0 and presents it
+/// again — the compositor is handed the same buffer repeatedly and starves, which
+/// measured as 8 commits against 5334 for the gated path on the same title. Any
+/// free-running scheme needs a rotating slot choice (so each commit carries a
+/// newer buffer) and its own back-pressure, not just this condition relaxed.
 unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
     for k in 0..unsafe { (*sc).slots.len() } {
         let s = unsafe { (*sc).slots.as_mut_ptr().add(k) };
@@ -3107,6 +3116,20 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
                         VkPhysicalDevice,
                         VkSurfaceKHR,
                         *mut VkSurfaceCapabilitiesKHR,
+                    ) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkGetPhysicalDeviceSurfaceCapabilities2KHR",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                gn_vkGetPhysicalDeviceSurfaceCapabilities2KHR
+                    as unsafe extern "C" fn(
+                        VkPhysicalDevice,
+                        *const VkPhysicalDeviceSurfaceInfo2KHR,
+                        *mut VkSurfaceCapabilities2KHR,
                     ) -> VkResult,
             )
         },
@@ -5870,6 +5893,38 @@ struct AdvertisedCaps {
 }
 static ADVERTISED_CAPS: Mutex<Option<AdvertisedCaps>> = Mutex::new(None);
 static CAPS_COMPARE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// `vkGetPhysicalDeviceSurfaceCapabilities2KHR`: the `2` form of the query, which
+/// D3D12 (VKD3D-Proton) uses where D3D11 (DXVK) uses the plain one.
+///
+/// It must not fall through to the driver. The `surface` a caller passes here is a
+/// shim wrapper, so the driver's own entry point would dereference a handle it
+/// never issued — that fault surfaces as an access violation inside the Unix call,
+/// which is how a D3D12 title died at surface-capability negotiation. The values
+/// come from the same source as the plain KHR query: the proxy owns the wayland
+/// presentation contract, so there is no delegate surface to forward from. Only
+/// `surfaceCapabilities` is written; any further structure a caller chains is left
+/// untouched, which is the contract for structures an implementation does not
+/// support.
+unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilities2KHR(
+    pd: VkPhysicalDevice,
+    info: *const VkPhysicalDeviceSurfaceInfo2KHR,
+    caps: *mut VkSurfaceCapabilities2KHR,
+) -> VkResult {
+    if info.is_null() || caps.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: `info` is the caller's in-structure and `caps` its out-structure;
+    // the KHR handler writes exactly the field handed to it, and both pointers
+    // are checked non-null above.
+    unsafe {
+        gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+            pd,
+            (*info).surface,
+            &mut (*caps).surfaceCapabilities,
+        )
+    }
+}
 
 unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     _pd: VkPhysicalDevice,

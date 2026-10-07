@@ -65,7 +65,7 @@ use std::time::{Duration, Instant};
 
 use gndrm_daemon::diag::{self, Diag, Reply, Role, Stage, State, TrackedMutex, LOCK_SCANOUT_POOL};
 use gndrm_daemon::scanout::{Geometry, Removed, Reservation as CacheReservation, ReusePool};
-use gndrm_daemon::{FlipHandle, FlipLatch, Framebuffer, PlaneState, Presenter};
+use gndrm_daemon::{Framebuffer, PlaneState, Presenter};
 use gndrm_uapi::wire::{ScanoutAllocReq, ScanoutAllocResp, SCANOUT_FORMAT_BGRA_8888};
 
 use crate::ffi;
@@ -150,10 +150,6 @@ struct ReleaseCtx {
     previous_release: ffi::FnStStatsGetPreviousReleaseFenceFd,
     /// fd of the previous release fence, `-1` when none is waiting.
     release_fd: AtomicI32,
-    /// The latch for the publish currently in flight through this slot. The
-    /// completion callback fires it, which is the signal the worker waits on
-    /// before emitting the flip event.
-    latch: Mutex<Option<FlipLatch>>,
     /// Set by the completion callback: SurfaceFlinger reported the flip event
     /// for this registration, so the buffer is safe to hand back out (the
     /// reuse cache keys on it). Never cleared: the flag belongs to this
@@ -161,20 +157,17 @@ struct ReleaseCtx {
     latched: Arc<AtomicBool>,
 }
 
-// SAFETY: after construction the only mutation is the atomic and the latch
-// slot (a `Mutex`), and the other fields are immutable — so the mailbox is
-// safe to share with the callback thread.
+// SAFETY: after construction the only mutations are the atomic and the release
+// fd, and the other fields are immutable — so the mailbox is safe to share with
+// the callback thread.
 unsafe impl Send for ReleaseCtx {}
 unsafe impl Sync for ReleaseCtx {}
 
 /// TEMPORARY (pacing work): how many completions SurfaceFlinger has delivered to
-/// this presenter, and how many times an armed latch was replaced before it
-/// fired. These two numbers explain why the commit worker's latch wait always
-/// ends in `latch_lost` — the completion never setting `latched` is also what
-/// makes a retired buffer look unreleased to the reuse cache. Remove with the
+/// this presenter. Kept to confirm the completion still lands 1:1 with publishes
+/// now that the commit worker no longer consumes a latch for it. Remove with the
 /// pace diagnostics.
 static COMPLETIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static LATCHES_REPLACED_ARMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PUBLISH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `ASurfaceTransaction_setOnComplete`: capture the fence that says
@@ -185,16 +178,13 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
     if context.is_null() {
         return;
     }
-    // Publish the callback's activity: the completion is what fires the latch
-    // the commit worker waits on, so a snapshot must be able to say whether a
-    // callback was running when a request stalled.
+    // Publish the callback's activity: the completion is SurfaceFlinger's
+    // release signal for this frame, so a snapshot must be able to say whether
+    // a callback was running when a request stalled.
     diag::diag().set_role(Role::PresenterCallback, State::PresenterCallback);
     // TEMPORARY (pacing work): count the completions this presenter actually
     // receives (see `COMPLETIONS`).
-    let n = COMPLETIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n < 10 {
-        crate::log::pace_info(&format!("asc: completion #{n} ctx={context:p}"));
-    }
+    COMPLETIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: `context` is the leaked ReleaseCtx this presenter handed to
     // setOnComplete; it outlives every callback by construction.
     let ctx = unsafe { &*context.cast::<ReleaseCtx>() };
@@ -240,32 +230,14 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
         unsafe { libc::close(fd) };
     }
     // The transaction completed: SurfaceFlinger has reported this publish's
-    // completion. Publish that as the reuse gate before firing the latch — a
-    // retirement that observes the flag may then cache the buffer.
+    // completion. This is the frame's release signal — the return path the reuse
+    // cache and the next publish's release-fence wait key on.
     ctx.latched.store(true, Ordering::Release);
-    // Fire the latch the worker waits on for this publish. The worker is
-    // serial, so only one latch is ever in flight; a stray callback finds an
-    // empty slot and does nothing.
-    let took = if let Some(latch) = ctx
-        .latch
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take()
-    {
-        latch.fire();
-        true
-    } else {
-        false
-    };
-    // TEMPORARY (pacing work): `took=0` means the completion found no latch to
-    // fire for this registration — the other half of why the worker's wait
-    // ends in `latch_lost` (see `COMPLETIONS`).
+    // TEMPORARY (pacing work): one line per completion, so the completion rate
+    // can be read against the publish rate. Remove with `COMPLETIONS`.
     let c = COMPLETIONS.load(std::sync::atomic::Ordering::Relaxed);
     if c <= 10 || c.is_multiple_of(120) {
-        crate::log::pace_info(&format!(
-            "asc: completion #{c} ctx={context:p} took_latch={}",
-            u8::from(took)
-        ));
+        crate::log::pace_info(&format!("asc: completion #{c} ctx={context:p}"));
     }
     diag::diag().set_role(Role::PresenterCallback, State::Idle);
 }
@@ -503,7 +475,6 @@ impl ScanoutPool {
             stats_release_controls: api.st_stats_release_controls,
             previous_release: api.st_stats_previous_release_fence_fd,
             release_fd: AtomicI32::new(-1),
-            latch: Mutex::new(None),
             latched: Arc::clone(&latched),
         }));
         (ctx, latched)
@@ -660,25 +631,13 @@ fn ctx_release_fd(buf: &PoolBuf) -> RawFd {
 /// Whether SurfaceFlinger has reported the completion for this registration's
 /// last publish, so the buffer may be handed back out.
 ///
-/// TEMPORARY (pacing work): the flag is currently written by the completion and
-/// never read — the retire decision releases buffers regardless, which frees the
-/// mailbox (and any armed latch in it) while the commit worker is still waiting
-/// on it. This and [`ctx_latch_armed`] are what the retire policy must consult.
+/// TEMPORARY (pacing work): the flag is written by the completion callback and
+/// read only by the `FREE` line below. The reuse decision is currently gated on
+/// the release-fence wait in `publish`; wiring this flag into the retire policy
+/// is the remaining hardening. Remove the `FREE` line with the pace diagnostics.
 fn ctx_latched(buf: &PoolBuf) -> bool {
     // SAFETY: `buf.ctx` is a leaked mailbox owned by the pool for the session.
     unsafe { (*buf.ctx).latched.load(Ordering::Acquire) }
-}
-
-/// Whether a publish on this registration is still awaiting its completion.
-fn ctx_latch_armed(buf: &PoolBuf) -> bool {
-    // SAFETY: `buf.ctx` is a leaked mailbox owned by the pool for the session.
-    unsafe {
-        (*buf.ctx)
-            .latch
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some()
-    }
 }
 
 /// The last buffer actually put on the layer, with the geometry it went out
@@ -808,8 +767,10 @@ impl AscState {
         self.frames
     }
 
-    /// Publish the committed primary-plane framebuffer, returning the handle
-    /// the worker waits on before emitting the flip event.
+    /// Publish the committed primary-plane framebuffer to the layer. The
+    /// presenter does not hand the completion back to its caller: the commit
+    /// worker never waits on it, and the buffer is released by the compositor's
+    /// own release signal (the release fence the next publish waits on).
     ///
     /// `ino` is the buffer identity the device resolved from the object store;
     /// `live_inos` is the set of still-imported identities the pool retire keys
@@ -821,18 +782,18 @@ impl AscState {
         ino: Option<u64>,
         live_inos: &HashSet<u64>,
         fence: Option<RawFd>,
-    ) -> FlipHandle {
+    ) {
         let Some(api) = self.api else {
             close_fence(fence);
-            return FlipHandle::latched_now();
+            return;
         };
         if self.sc.is_null() {
             close_fence(fence);
-            return FlipHandle::latched_now();
+            return;
         }
         let Some(ino) = ino else {
             close_fence(fence);
-            return FlipHandle::latched_now();
+            return;
         };
 
         // KMS geometry: the FB's SRC rect (16.16 fixed point) is scaled into
@@ -886,7 +847,7 @@ impl AscState {
         let released = retire_to_release(&removed);
         release_retired(&released);
 
-        let handle = match resolved {
+        match resolved {
             None => {
                 // No buffer for this inode. Either the shim passed the
                 // allocation through to the kernel, or the table was rebuilt
@@ -906,7 +867,6 @@ impl AscState {
                     );
                 }
                 close_fence(fence);
-                FlipHandle::latched_now()
             }
             Some((buf, published_ino, stale)) => {
                 let PoolBuf {
@@ -924,8 +884,7 @@ impl AscState {
                 // The SurfaceFlinger completion callback does *not* depend on
                 // this looper: libgui delivers it on its own binder thread
                 // (`TransactionCompletedListener::onTransactionCompleted`) and
-                // it fires the latch across threads, which is why the commit
-                // worker can wait for it on another thread. The looper only
+                // it stores the release fence across threads. The looper only
                 // drains anything SurfaceFlinger queued to this thread.
                 if self.looper.is_none() {
                     if let Some(looper) = self.api.and_then(|api| api.looper) {
@@ -979,38 +938,14 @@ impl AscState {
                     }
                     match build_show(&api, self.sc, ahb, ctx, src, dst, fence) {
                         Some(tx) => {
-                            // Arm the latch before applying: the completion
-                            // callback fires it, and that is what the worker
-                            // waits on before emitting the flip event.
-                            let (handle, latch) = FlipHandle::new();
-                            // SAFETY: `ctx` is the leaked mailbox of this slot.
-                            // TEMPORARY (pacing work): a latch replaced while it is still
-                            // armed is dropped without firing, which is one way the worker's
-                            // wait ends in `latch_lost` (`LATCHES_REPLACED_ARMED`).
-                            let armed_prev = unsafe {
-                                (*ctx)
-                                    .latch
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .replace(latch)
-                            }
-                            .is_some();
-                            if armed_prev {
-                                let n = LATCHES_REPLACED_ARMED
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if n < 10 {
-                                    crate::log::pace_info(&format!(
-                                        "asc: armed latch replaced without firing (#{n})"
-                                    ));
-                                }
-                            }
+                            // TEMPORARY (pacing work): one line per published
+                            // frame so the publish rate can be read against the
+                            // completion rate. Remove with `PUBLISH_SEQ`.
                             let p = PUBLISH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if p < 5 || p.is_multiple_of(120) {
                                 crate::log::pace_info(&format!(
-                                    "asc: publish #{p} ctx={ctx:p} armed_prev={} completions={} replaced_armed={}",
-                                    u8::from(armed_prev),
-                                    COMPLETIONS.load(std::sync::atomic::Ordering::Relaxed),
-                                    LATCHES_REPLACED_ARMED.load(std::sync::atomic::Ordering::Relaxed)
+                                    "asc: publish #{p} ctx={ctx:p} completions={}",
+                                    COMPLETIONS.load(std::sync::atomic::Ordering::Relaxed)
                                 ));
                             }
                             apply_transaction(&api, tx);
@@ -1024,13 +959,11 @@ impl AscState {
                             // The frame is on the layer; dump what we
                             // published (rate-limited, off the reply path).
                             self.dump_published(ahb, fb.width, fb.height, stride);
-                            handle
                         }
                         // Transaction creation failed: nothing went out, so the
                         // acquire fence was not consumed and must be closed here.
                         None => {
                             close_fence(fence);
-                            FlipHandle::latched_now()
                         }
                     }
                 } else {
@@ -1043,10 +976,9 @@ impl AscState {
                         apply_transaction(&api, tx);
                     }
                     close_fence(fence);
-                    FlipHandle::latched_now()
                 }
             }
-        };
+        }
 
         self.frames += 1;
         if fb.id != 0 {
@@ -1055,7 +987,6 @@ impl AscState {
                 crate::clear_booting_splash();
             }
         }
-        handle
     }
 
     /// Keep a rolling PPM of the frame the presenter just published as
@@ -1249,8 +1180,8 @@ impl Presenter for AscPresenter {
         ino: Option<u64>,
         live_inos: &HashSet<u64>,
         fence: Option<RawFd>,
-    ) -> FlipHandle {
-        self.lock().publish(fb, plane, ino, live_inos, fence)
+    ) {
+        self.lock().publish(fb, plane, ino, live_inos, fence);
     }
 }
 
@@ -1673,13 +1604,12 @@ fn retire_to_release(removed: &[Removed<PoolBuf>]) -> Vec<Retired> {
                 }
             }
             Removed::Released { ino, payload } => {
-                // TEMPORARY (pacing work): the registration is about to be freed —
-                // and with it any armed latch, which is what the commit worker's
-                // wait sees as `latch_lost`. `armed=1` here is the whole defect.
+                // TEMPORARY (pacing work): the registration is about to be
+                // freed; `latched` says whether its completion had already
+                // landed. Remove with the pace diagnostics.
                 crate::log::pace_info(&format!(
-                    "asc: FREE ino={ino} ctx={:p} armed={} latched={}",
+                    "asc: FREE ino={ino} ctx={:p} latched={}",
                     payload.ctx,
-                    u8::from(ctx_latch_armed(payload)),
                     u8::from(ctx_latched(payload))
                 ));
                 log_info!("asc: dma-buf ino {ino} retired; releasing its AHardwareBuffer");
