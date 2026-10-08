@@ -973,11 +973,11 @@ pub type PFN_vkGetPhysicalDeviceMemoryProperties =
 pub type PFN_vkGetPhysicalDeviceFormatProperties2 =
     unsafe extern "C" fn(VkPhysicalDevice, VkFormat, *mut VkFormatProperties2);
 
-// ------------------------------------------- driver read-back (bring-up probe)
+// ---- driver read-back (used by the bounded `x11 view` line) --------------
 //
-// Used only by the bounded one-shot two-view probe: copy a slot image into a
-// host-visible staging buffer through the driver itself, so what the driver
-// believes the image contains can be compared with the shim's own linear mmap.
+// Copy a slot image into a host-visible staging buffer through the driver
+// itself, so the driver's own view of the image can be compared with the
+// shim's linear mmap.
 pub type VkBuffer = u64;
 pub type VkBufferUsageFlags = u32;
 pub type VkBufferCreateFlags = u32;

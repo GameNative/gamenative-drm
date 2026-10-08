@@ -1749,8 +1749,7 @@ fn commit_worker_loop(
 ///
 /// The state lives per worker, not in a static: several workers can exist in one
 /// process (the tests run them concurrently) and a shared "previous stamp" would
-/// then mix two streams. Removed when the pacing work closes (the tag is ungated
-/// by design; see `gndrm_android::log::daemon_info`).
+/// then mix two streams. Removed when the pacing work closes.
 struct Pace {
     base: Instant,
     prev_commit: u64,

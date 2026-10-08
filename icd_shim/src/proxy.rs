@@ -51,97 +51,6 @@ static LOUD_SUBMIT2: AtomicUsize = AtomicUsize::new(0);
 static LOUD_PRESENT: AtomicUsize = AtomicUsize::new(0);
 static LOUD_INSTANCE: AtomicBool = AtomicBool::new(false);
 
-// ------------------------------------------------ bring-up diagnostics (strip)
-// An entry point that never returns means the fault is inside that call: wine
-// turns the access violation into an SEH exception, so the shim's frame is
-// abandoned and nothing after the call runs. The next shim entry reports it
-// with the arguments, which distinguishes "our wrapper faulted" from "the
-// driver faulted on what we passed it". Entries are timestamped so a call that
-// is merely still running on another thread is never mistaken for one that was
-// abandoned. Also stamped into the frame dumps, because the startup line
-// rotates out of logcat long before a crash.
-pub const E_SUBMIT2: usize = 1;
-pub const E_SUBMIT: usize = 2;
-pub const E_PRESENT: usize = 3;
-pub const E_ACQUIRE: usize = 4;
-pub const E_PIPELINES: usize = 5;
-pub const E_ALLOC_CMD: usize = 6;
-pub const E_SCR_CREATE: usize = 7;
-pub const E_SCR_DESTROY: usize = 8;
-
-fn entry_name(id: usize) -> &'static str {
-    match id {
-        E_SUBMIT2 => "vkQueueSubmit2",
-        E_SUBMIT => "vkQueueSubmit",
-        E_PRESENT => "vkQueuePresentKHR",
-        E_ACQUIRE => "vkAcquireNextImageKHR",
-        E_PIPELINES => "vkCreateGraphicsPipelines",
-        E_ALLOC_CMD => "vkAllocateCommandBuffers",
-        E_SCR_CREATE => "vkCreateSwapchainKHR",
-        E_SCR_DESTROY => "vkDestroySwapchainKHR",
-        _ => "?",
-    }
-}
-
-struct InFlight {
-    id: usize,
-    args: [usize; 5],
-    at: std::time::Instant,
-    token: usize,
-}
-
-static IN_FLIGHT: Mutex<Vec<InFlight>> = Mutex::new(Vec::new());
-static ENTRY_SEQ: AtomicUsize = AtomicUsize::new(0);
-
-/// Two seconds is far longer than any shim call takes; past that the call was
-/// abandoned rather than merely in progress.
-const ABANDONED_MS: u128 = 2000;
-
-fn report_abandoned(now_entry: Option<usize>) {
-    let Ok(mut v) = IN_FLIGHT.lock() else {
-        return;
-    };
-    let now = std::time::Instant::now();
-    v.retain(|e| {
-        if now.duration_since(e.at).as_millis() > ABANDONED_MS {
-            crate::logf!(
-                "proxy: ABANDONED {} args={:x} {:x} {:x} {:x} {:x} -> now in {}",
-                entry_name(e.id),
-                e.args[0],
-                e.args[1],
-                e.args[2],
-                e.args[3],
-                e.args[4],
-                now_entry.map_or("(flush)".to_string(), |i| entry_name(i).to_string())
-            );
-            false
-        } else {
-            true
-        }
-    });
-}
-
-fn enter(id: usize, args: [usize; 5]) -> usize {
-    report_abandoned(Some(id));
-    ring_push(entry_name(id), args);
-    let token = ENTRY_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-    if let Ok(mut v) = IN_FLIGHT.lock() {
-        v.push(InFlight {
-            id,
-            args,
-            at: std::time::Instant::now(),
-            token,
-        });
-    }
-    token
-}
-
-fn leave(token: usize) {
-    if let Ok(mut v) = IN_FLIGHT.lock() {
-        v.retain(|e| e.token != token);
-    }
-}
-
 // --------------------------------------- last-calls ring (bounded, gated off)
 //
 // A tiny per-thread history of the last entry points the guest invoked, so
@@ -315,151 +224,12 @@ extern "C" fn gn_wl_log(fmt: *const c_char, ap: *mut c_void) {
     crate::logf!("libwayland: {}", msg.trim_end());
 }
 
-// -------------------------------- bring-up frame dumps
 // dma-buf sync ioctl (same values as the daemon's EGL presenter).
 const DMA_BUF_SYNC_READ: u64 = 1 << 0;
 const DMA_BUF_SYNC_START: u64 = 0 << 2;
 const DMA_BUF_SYNC_END: u64 = 1 << 2;
 const DMA_BUF_IOCTL_SYNC: u64 = 0x4008_6200;
 
-/// With GAMENATIVE_DUMP_DIR set, a rolling dump of the game's committed
-/// buffers is kept as gn-buf-latest.ppm (every DUMP_EVERY-th commit, plus an
-/// alpha census and probe pixels in logcat) — so what the game itself
-/// rendered can be compared with the compositor's output (the daemon's
-/// GNDRM_DUMP_DIR dumps). Slots are LINEAR exports, so a plain mmap reads
-/// them correctly; the bytes are R,G,B,X for our XBGR8888 buffers.
-static DUMP_DIR: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
-static DUMP_N: AtomicUsize = AtomicUsize::new(0);
-const DUMP_EVERY: usize = 30;
-
-/// One-shot dump core shared by both present routes: mmap a LINEAR slot's
-/// dma-buf, log an alpha census + probe pixels, and write a P6 PPM to
-/// `$GAMENATIVE_DUMP_DIR/gn-buf-latest.ppm` — the exact name/format/dir the
-/// wayland commit path has always used, so existing tooling keeps working.
-/// `tag` labels the log line, `n` is the caller's own accounting. The dump
-/// directory is read once from GAMENATIVE_DUMP_DIR; unset means the dumps are
-/// off. Never blocks: a failed mmap/write is logged and dropped.
-///
-/// Slots are LINEAR exports, so a plain mmap reads them correctly; the bytes
-/// are R,G,B,X for our XBGR8888 buffers (byte 2 is red).
-fn dump_slot_frame(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32, tag: &str, n: usize) {
-    let Some(dir) = DUMP_DIR
-        .get_or_init(|| std::env::var_os("GAMENATIVE_DUMP_DIR").filter(|v| !v.is_empty()))
-        .as_ref()
-    else {
-        return;
-    };
-    if unsafe { (*s).modifier } != GN_DRM_MOD_LINEAR {
-        static TILED: OnceLock<()> = OnceLock::new();
-        TILED.get_or_init(|| crate::logf!("dump: tiled present image, CPU dump disabled"));
-        return;
-    }
-    unsafe {
-        let w = (*sc).extent.width as usize;
-        let h = (*sc).extent.height as usize;
-        let stride = (*s).stride as usize;
-        let fd = (*s).fd;
-        let len = stride * h;
-        let base = libc::mmap(
-            ptr::null_mut(),
-            len,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            fd,
-            0,
-        );
-        if base == libc::MAP_FAILED {
-            crate::logf!(
-                "dump {tag} {n}: mmap failed: {}",
-                std::io::Error::last_os_error()
-            );
-            return;
-        }
-        let begin = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_START;
-        libc::ioctl(fd, DMA_BUF_IOCTL_SYNC as _, &begin);
-        let p = (base as *const u8).add((*s).offset as usize);
-        let px = |x: usize, y: usize| {
-            let q = p.add(y * stride + x * 4);
-            (*q, *q.add(1), *q.add(2), *q.add(3))
-        };
-        let mut a0 = 0usize;
-        for y in 0..h {
-            for x in 0..w {
-                if *p.add(y * stride + x * 4 + 3) == 0 {
-                    a0 += 1;
-                }
-            }
-        }
-        crate::logf!(
-            "dump {tag} {n} [shim {}]: slot={idx} {w}x{h} stride={stride} alpha0={a0}/{} px(w/16,h/8)={:?} px(centre)={:?} px(3w/4,3h/4)={:?}",
-            crate::SHIM_BUILD,
-            w * h,
-            px(w / 16, h / 8),
-            px(w / 2, h / 2),
-            px(3 * w / 4, 3 * h / 4)
-        );
-        let mut out = Vec::with_capacity(w * h * 3 + 16);
-        out.extend_from_slice(format!("P6\n{w} {h}\n255\n").as_bytes());
-        for y in 0..h {
-            for x in 0..w {
-                // The slot is BGRA in memory (the pool's layout), so the red
-                // channel is byte 2 — writing 0,1,2 as P6 "R,G,B" would swap
-                // red and blue in the dump and every colour read from it.
-                let q = p.add(y * stride + x * 4);
-                out.extend_from_slice(&[*q.add(2), *q.add(1), *q]);
-            }
-        }
-        let path = std::path::Path::new(dir).join("gn-buf-latest.ppm");
-        match std::fs::write(&path, &out) {
-            Ok(()) => crate::logf!("dump {tag} {n}: wrote {}", path.display()),
-            Err(e) => crate::logf!("dump {tag} {n}: write failed: {e}"),
-        }
-        let end = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END;
-        libc::ioctl(fd, DMA_BUF_IOCTL_SYNC as _, &end);
-        libc::munmap(base, len);
-    }
-}
-
-/// Wayland route: rolling dump every DUMP_EVERY-th commit (existing behaviour).
-fn dump_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) {
-    let n = DUMP_N.fetch_add(1, Ordering::Relaxed);
-    if !n.is_multiple_of(DUMP_EVERY) {
-        return;
-    }
-    dump_slot_frame(sc, s, idx, "commit", n);
-}
-
-/// X11 route: bounded dump of a *rendered* frame. The route engages at the
-/// first present, so the earliest slots are the cleared/pre-title buffer and
-/// say nothing about the game. Wait out a warm-up (`X11_DUMP_AFTER` presents),
-/// then capture the next `X11_DUMP_COUNT` presents. Bounded by design — a
-/// diagnostic, not a knob: never per-frame, never blocking.
-const X11_DUMP_AFTER: u32 = 120;
-const X11_DUMP_COUNT: u32 = 3;
-/// After the early captures, keep sampling sparsely so the rolling file ends on
-/// a *recent* frame (a stuck-early dump would only ever show the loading
-/// screen). Bounded by `X11_DUMP_CAP`; never per-frame.
-const X11_DUMP_LATE_EVERY: u32 = 300;
-const X11_DUMP_CAP: u32 = 60;
-
-fn x11_dump_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) {
-    let seen = unsafe { (*sc).x11_presents };
-    unsafe { (*sc).x11_presents = seen + 1 };
-    if seen < X11_DUMP_AFTER {
-        return;
-    }
-    let dumped = unsafe { (*sc).x11_dumped };
-    if dumped >= X11_DUMP_CAP {
-        return;
-    }
-    let early = dumped < X11_DUMP_COUNT;
-    let late = seen.is_multiple_of(X11_DUMP_LATE_EVERY);
-    if !early && !late {
-        return;
-    }
-    unsafe { (*sc).x11_dumped = dumped + 1 };
-    dump_slot_frame(sc, s, idx, "x11", seen as usize);
-}
 /// Forces every real device queue idle — a true GPU-completion barrier —
 /// before the shim hands a slot to Xwayland or reads it on the CPU. The
 /// per-slot fence cannot serve this: the guest never waits on a shim fence, so
@@ -667,11 +437,6 @@ unsafe fn x11_present_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) -> bo
     }
     match unsafe { (*present).present((*s).xpix, (*s).xfence) } {
         Some(serial) => {
-            // Bounded one-shot frame dump (GAMENATIVE_DUMP_DIR): capture the
-            // first X11_DUMP_FIRST frames of this swapchain so what the route
-            // hands the compositor is inspectable — the X11 route has no
-            // wl_surface and so no daemon-side dump to compare against.
-            x11_dump_slot(sc, s, idx);
             let n = LOG_COMMIT.fetch_add(1, Ordering::Relaxed);
             if n < LOG_FIRST_N || n.is_multiple_of(120) {
                 crate::logf!(
@@ -841,7 +606,6 @@ fn worker_main(sc: *mut GnSwapchain) {
                 wlproto::wl_display_flush((*(*sc).surf).dpy)
             };
             let commit_ms = t1.elapsed().as_millis();
-            dump_slot(sc, s, idx);
             let n = LOG_COMMIT.fetch_add(1, Ordering::Relaxed);
             let done = N_COMMIT_OK.fetch_add(1, Ordering::Relaxed);
             if n < LOG_FIRST_N || n.is_multiple_of(120) || fence_ms >= 100 {
@@ -912,6 +676,10 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         surf,
         dev: gd,
         format: ci.imageFormat,
+        // Exactly the extent the guest asked for. The shim must never allocate a
+        // different size: the guest renders into this image at its own chosen
+        // viewport, so a smaller allocation (e.g. clamped to the guest's window)
+        // is written out of bounds and the presented frame is corrupt.
         extent: ci.imageExtent,
         fourcc,
         present_mode: mode,
@@ -934,8 +702,6 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         }),
         cv_put: Condvar::new(),
         cv_free: Condvar::new(),
-        x11_dumped: 0,
-        x11_presents: 0,
         x11_trace: 0,
         next: ptr::null_mut(),
     });
@@ -1083,7 +849,6 @@ unsafe extern "C" fn gn_vkDestroySwapchainKHR(
     swapchain: VkSwapchainKHR,
     _alloc: *const VkAllocationCallbacks,
 ) {
-    report_abandoned(None);
     let sc = unsafe { find_swapchain(swapchain) };
     if sc.is_null() {
         return;
@@ -1298,7 +1063,6 @@ unsafe extern "C" fn gn_vkAcquireNextImageKHR(
     fence: VkFence,
     index: *mut u32,
 ) -> VkResult {
-    report_abandoned(None);
     let sc = unsafe { find_swapchain(swapchain) };
     if sc.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -1460,7 +1224,6 @@ unsafe fn present_dispatch(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
 
 // Present: the app's render completion
 unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentInfoKHR) -> VkResult {
-    report_abandoned(None);
     N_PRES.fetch_add(1, Ordering::Relaxed);
     let pi = unsafe { &*pi };
     let gq = unsafe { find_queue(queue) };
@@ -1571,8 +1334,8 @@ unsafe extern "C" fn gn_vkQueueSubmit(
     submits: *const VkSubmitInfo,
     fence: VkFence,
 ) -> VkResult {
-    let token = enter(
-        E_SUBMIT,
+    ring_push(
+        "vkQueueSubmit",
         [
             queue as usize,
             count as usize,
@@ -1581,9 +1344,7 @@ unsafe extern "C" fn gn_vkQueueSubmit(
             0,
         ],
     );
-    let res = unsafe { submit_impl(queue, count, submits, fence) };
-    leave(token);
-    res
+    unsafe { submit_impl(queue, count, submits, fence) }
 }
 
 unsafe fn submit_impl(
@@ -1651,7 +1412,6 @@ unsafe extern "C" fn gn_vkWaitSemaphores(
     wi: *const VkSemaphoreWaitInfo,
     timeout: u64,
 ) -> VkResult {
-    report_abandoned(None);
     let gd = unsafe { find_device(device) };
     if gd.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -1694,8 +1454,8 @@ unsafe extern "C" fn gn_vkQueueSubmit2(
     submits: *const VkSubmitInfo2,
     fence: VkFence,
 ) -> VkResult {
-    let token = enter(
-        E_SUBMIT2,
+    ring_push(
+        "vkQueueSubmit2",
         [
             queue as usize,
             count as usize,
@@ -1704,9 +1464,7 @@ unsafe extern "C" fn gn_vkQueueSubmit2(
             0,
         ],
     );
-    let res = unsafe { submit2_impl(queue, count, submits, fence) };
-    leave(token);
-    res
+    unsafe { submit2_impl(queue, count, submits, fence) }
 }
 
 unsafe fn submit2_impl(
@@ -1831,7 +1589,6 @@ unsafe extern "C" fn gn_vkAllocateCommandBuffers(
     ci: *const VkCommandBufferAllocateInfo,
     out: *mut VkCommandBuffer,
 ) -> VkResult {
-    report_abandoned(None);
     let ci = unsafe { &*ci };
     let gd = unsafe { find_device(device) };
     if gd.is_null() {
@@ -1875,14 +1632,6 @@ unsafe extern "C" fn gn_vkAllocateCommandBuffers(
     VK_SUCCESS
 }
 
-// Bring-up: log the first occurrence of each image format the guest creates.
-// Texture formats are the one Vulkan-level input we cannot see otherwise —
-// DXVK logs a format only when its own table lacks it, so emulation gaps in
-// the driver (e.g. BCn on Adreno) stay silent and show up as black elements.
-static SEEN_IMAGE: Mutex<Vec<(VkFormat, VkImageUsageFlags, VkImageTiling)>> =
-    Mutex::new(Vec::new());
-const LOG_IMAGE_FIRST_N: usize = 48;
-
 // ------------------------------ pipeline creation (winding passes through)
 //
 // The driver applies a negative-height (D3D-style) viewport but does not
@@ -1899,7 +1648,6 @@ unsafe extern "C" fn gn_vkCreateGraphicsPipelines(
     alloc: *const VkAllocationCallbacks,
     out: *mut VkPipeline,
 ) -> VkResult {
-    report_abandoned(None);
     let gd = unsafe { find_device(device) };
     if gd.is_null() || unsafe { (*gd).f.create_pipelines.is_none() } {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -1936,31 +1684,7 @@ unsafe extern "C" fn gn_vkCreateImage(
     if gd.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
-    let ci_ref = unsafe { &*ci };
-    let res = unsafe { (*gd).f.create_image.unwrap()((*gd).real, ci, alloc, out) };
-    if res == VK_SUCCESS {
-        let key = (ci_ref.format, ci_ref.usage, ci_ref.tiling);
-        let mut seen = SEEN_IMAGE.lock().unwrap();
-        if seen.len() < LOG_IMAGE_FIRST_N && !seen.contains(&key) {
-            seen.push(key);
-            let pnext = unsafe { pnext_image_create_summary(ci_ref.pNext) };
-            crate::logf!(
-                "guest image: fmt={} {}x{}x{} type={} mips={} layers={} samples={:#x} tiling={} usage={:#x} flags={:#x} pNext=[{pnext}]",
-                ci_ref.format,
-                ci_ref.extent.width,
-                ci_ref.extent.height,
-                ci_ref.extent.depth,
-                ci_ref.imageType,
-                ci_ref.mipLevels,
-                ci_ref.arrayLayers,
-                ci_ref.samples,
-                ci_ref.tiling,
-                ci_ref.usage,
-                ci_ref.flags
-            );
-        }
-    }
-    res
+    unsafe { (*gd).f.create_image.unwrap()((*gd).real, ci, alloc, out) }
 }
 
 // ---- guest-command trace (bounded one-shot, always on) -------------------
@@ -4392,6 +4116,9 @@ pub struct GnSurface {
     pub own_surface: *mut wl_proxy,   // X11 mode: shim-created wl_surface
     pub swapchain_obj: *mut wl_proxy, // X11 mode: gamescope_swapchain
     pub x11: *mut crate::x11::X11Present, // X11 route (DRI3+Present) presenter
+    // The guest's X window this surface presents for, queried for its live
+    // size by `surface_extent`; 0 on the wayland-surface route (no X window).
+    pub window: u32,
     pub next: *mut GnSurface,
 }
 
@@ -4439,8 +4166,6 @@ pub struct GnSwapchain {
     pub shared: Mutex<ScShared>,
     pub cv_put: Condvar,
     pub cv_free: Condvar,
-    pub x11_dumped: u32,
-    pub x11_presents: u32,
     pub x11_trace: u32,
     pub next: *mut GnSwapchain,
 }
@@ -5611,6 +5336,7 @@ unsafe extern "C" fn gn_vkCreateWaylandSurfaceKHR(
         own_surface: ptr::null_mut(),
         swapchain_obj: ptr::null_mut(),
         x11: ptr::null_mut(),
+        window: 0,
         next: ptr::null_mut(),
     });
     let s = Box::into_raw(s);
@@ -5723,6 +5449,9 @@ unsafe fn xlib_override_surface(
             own_surface: surf,
             swapchain_obj: scobj,
             x11: ptr::null_mut(),
+            // The size gamescope must see this layer at is the window's, not
+            // the guest's requested swapchain extent (see the note in caps).
+            window: bound_window,
             next: ptr::null_mut(),
         });
         let s = Box::into_raw(s);
@@ -5788,6 +5517,7 @@ unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
         own_surface: ptr::null_mut(),
         swapchain_obj: ptr::null_mut(),
         x11,
+        window: ci.window as u32,
         next: ptr::null_mut(),
     });
     let s = Box::into_raw(s);
@@ -5910,22 +5640,47 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilities2KHR(
     }
 }
 
+/// The guest's own window size for a surface, or `None` when the surface has
+/// no X window (the wayland route) or the window cannot be read.
+unsafe fn surface_extent(s: *mut GnSurface) -> Option<(u32, u32)> {
+    let w = unsafe { (*s).window };
+    if w == 0 {
+        return None;
+    }
+    unsafe { crate::x11::window_extent(w) }
+}
+
 unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     _pd: VkPhysicalDevice,
     surface: VkSurfaceKHR,
     caps: *mut VkSurfaceCapabilitiesKHR,
 ) -> VkResult {
-    if unsafe { find_surface(surface) }.is_null() {
+    let s = unsafe { find_surface(surface) };
+    if s.is_null() {
         crate::logf!("proxy surface caps query: {surface:#x} not one of ours");
         return VK_ERROR_SURFACE_LOST_KHR;
     }
+    // The guest's own window size is what gamescope must see the presented
+    // layer at: advertising it as `currentExtent` makes the guest size its
+    // swapchain to the container's resolution, so a guest desktop smaller than
+    // the output reaches the compositor as a smaller layer and is scaled with
+    // the selected filter, instead of a swapchain at the output size that
+    // gamescope scans out 1:1. `u32::MAX` ("app picks") is kept only for
+    // surfaces with no guest window (the wayland route).
+    let window_extent = unsafe { surface_extent(s) };
     let out = VkSurfaceCapabilitiesKHR {
         minImageCount: 2,
         maxImageCount: max_swapchain_images(),
-        currentExtent: VkExtent2D {
-            width: u32::MAX,
-            height: u32::MAX,
-        }, // wayland: app picks
+        currentExtent: match window_extent {
+            Some((w, h)) => VkExtent2D {
+                width: w,
+                height: h,
+            },
+            None => VkExtent2D {
+                width: u32::MAX,
+                height: u32::MAX,
+            },
+        },
         minImageExtent: VkExtent2D {
             width: 1,
             height: 1,

@@ -263,52 +263,20 @@ pub fn set_suspended(suspended: bool) {
     SUSPENDED.store(suspended, Ordering::SeqCst);
 }
 
-/// TEMPORARY diagnostics for the gamescope concommand bridge: emitted to logcat
-/// unconditionally (deliberately NOT behind a `GNDRM_LOG_*` gate) under the tag
-/// `gndrm-gscmd`, so a device run always shows whether a command reached the
-/// compositor. Remove together with the gscmd diagnostics.
-fn gslog(text: &str) {
-    let c = std::ffi::CString::new(text)
-        .unwrap_or_else(|_| std::ffi::CString::new("<log error>").unwrap());
-    // SAFETY: `c` is NUL-terminated and outlives the call.
-    unsafe {
-        crate::ffi::__android_log_write(
-            crate::ffi::ANDROID_LOG_INFO,
-            c"gndrm-gscmd".as_ptr(),
-            c.as_ptr(),
-        );
-    }
-}
-
 /// Queue a concommand for the injector thread. `command` is `"name [value]"`
 /// (see [`ALLOWED_COMMANDS`]). Returns true when queued, false when the command
 /// name is empty or not allowlisted. A queued command is run on the injector
-/// thread's next wakeup; if gamescope is absent it is logged and dropped.
+/// thread's next wakeup; if gamescope is absent it is dropped.
 pub fn gamescope_command(command: &str) -> bool {
     let mut parts = command.trim().splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("");
     let value = parts.next().unwrap_or("").trim();
     if name.is_empty() {
-        gslog(&format!(
-            "gscmd reject: empty command name (raw '{command}')"
-        ));
         return false;
     }
     if !ALLOWED_COMMANDS.contains(&name) {
-        gslog(&format!(
-            "gscmd reject: '{name}' not allowlisted (raw '{command}')"
-        ));
         return false;
     }
-    // The queue is a no-op when the injector thread is not running; report it so
-    // a returned 0 is not misread as "reached gamescope".
-    let injector_running = INPUT_TX
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_some();
-    gslog(&format!(
-        "gscmd queue: '{name}' value=\"{value}\" injector_running={injector_running}"
-    ));
     post(InputEvent::Command {
         name: name.to_string(),
         value: value.to_string(),
@@ -426,7 +394,6 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "gamescope_private" => {
                     state.gs_private =
                         Some(registry.bind::<GamescopePrivate, _, _>(name, 1, qh, ()));
-                    gslog("gscmd wayland: gamescope_private global bound (v1)");
                 }
                 _ => {}
             }
@@ -460,24 +427,13 @@ impl Dispatch<GamescopePrivate, ()> for State {
     fn event(
         _state: &mut Self,
         _private: &GamescopePrivate,
-        event: GsPrivateEvent,
+        _event: GsPrivateEvent,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        // TEMPORARY bridge diagnostics: these two events were previously ignored.
-        // `CommandExecuted` is the direct answer to "did gamescope run it" — the
-        // server only emits it when `ConCommand::Exec` found and invoked the
-        // command (wlserver.cpp `gamescope_private_execute`). `Log` carries the
-        // concommand's own output (e.g. a failed parse or a missing LUT file).
-        match event {
-            GsPrivateEvent::Log { text } => {
-                gslog(&format!("gamescope_private log: {text}"));
-            }
-            GsPrivateEvent::CommandExecuted => {
-                gslog("gamescope_private command_executed: gamescope RAN the concommand");
-            }
-        }
+        // `Log` (a concommand's own output) and `CommandExecuted` (gamescope ran
+        // it) need no action of ours.
     }
 }
 
@@ -702,16 +658,11 @@ fn apply(state: &State, ev: InputEvent) {
     }
 }
 
-/// Run one allowlisted concommand through gamescope, logging the outcome.
+/// Run one allowlisted concommand through gamescope. A command whose
+/// `gamescope_private` global is absent is dropped.
 fn apply_command(state: &State, name: String, value: String) {
-    match &state.gs_private {
-        Some(private) => {
-            gslog(&format!("gscmd exec: '{name}' value=\"{value}\""));
-            private.execute(name, value);
-        }
-        None => gslog(&format!(
-            "gscmd drop: '{name}' (gamescope_private not offered)"
-        )),
+    if let Some(private) = &state.gs_private {
+        private.execute(name, value);
     }
 }
 

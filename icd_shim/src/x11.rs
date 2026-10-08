@@ -617,6 +617,33 @@ pub unsafe fn resolve_override_target(named: u32) -> u32 {
     target
 }
 
+/// The pixel size of an X window, or `None` when it cannot be read or is
+/// degenerate (0 or 1 in either axis). Opens its own X connection, matching
+/// [`resolve_override_target`].
+///
+/// This is the guest's own window size — under winex11 the window is the
+/// container's desktop, so it is the size gamescope must see the presented
+/// layer at (see the swapchain-extent note in `proxy`).
+pub unsafe fn window_extent(window: u32) -> Option<(u32, u32)> {
+    if window == 0 {
+        return None;
+    }
+    let conn = unsafe { xcb_connect(ptr::null(), ptr::null_mut()) };
+    if conn.is_null() || unsafe { xcb_connection_has_error(conn) } != 0 {
+        if !conn.is_null() {
+            unsafe { xcb_disconnect(conn) };
+        }
+        return None;
+    }
+    let (w, h) = unsafe { window_size(conn, window) };
+    unsafe { xcb_disconnect(conn) };
+    if is_degenerate(w, h) {
+        None
+    } else {
+        Some((u32::from(w), u32::from(h)))
+    }
+}
+
 /// The selection rule, on a caller-provided connection (host tests drive it).
 ///
 ///  1. Resolve the named window's root-child ancestor, as gamescope does.
@@ -992,8 +1019,7 @@ impl X11Present {
     /// once the request is sent (verified against libxcb: the fd answers EBADF
     /// immediately after the checked request). The slot owns its fd for the
     /// swapchain's whole life, so a dup is handed over instead - otherwise the
-    /// slot's fd is dead for every later user, which is exactly how the
-    /// one-shot frame dump came to fail with `mmap: Bad file descriptor`.
+    /// slot's fd is dead for every later user of it.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn make_pixmap(
         &self,
@@ -1493,8 +1519,7 @@ mod tests {
     }
 
     /// The DRI3 import must not consume the slot's fd: everything after it (the
-    /// one-shot frame dump, the slot's reuse) reads the same fd. This is the
-    /// regression guard for the `mmap: Bad file descriptor` dump failure.
+    /// present, the slot's reuse) reads the same fd.
     #[test]
     fn dri3_import_keeps_the_slots_fd_open() {
         use std::os::fd::AsRawFd;

@@ -28,30 +28,27 @@ pub(crate) fn write(prio: i32, module: &'static str, args: fmt::Arguments<'_>) {
 
 /// Log a line the daemon produced (its logger callbacks land here), tagged with
 /// the daemon's own module path so it classifies to the daemon gate rather than
-/// this library's.
+/// this library's, and so stays off unless `GNDRM_LOG_DAEMON` is set.
 ///
-/// TEMPORARY (pacing work): emitted unconditionally, NOT behind
-/// `GNDRM_LOG_DAEMON`. The daemon runs in the app process, whose environment a
-/// container cannot reach, so that gate cannot be opened for a device run.
-/// Restore the gated `write` path when the pacing diagnostics are removed.
+/// The per-frame pace line is the exception, and only it: a device run reads the
+/// pacing counters from that line, and the app process cannot open the daemon
+/// gate for a container launch. It rides the ungated [`pace_info`] tag instead.
 pub(crate) fn daemon_info(text: &str) {
-    let c = std::ffi::CString::new(text)
-        .unwrap_or_else(|_| std::ffi::CString::new("<log error>").unwrap());
-    // SAFETY: `c` is NUL-terminated and outlives the call.
-    unsafe {
-        crate::ffi::__android_log_write(
-            crate::ffi::ANDROID_LOG_INFO,
-            c"gndrm-daemon".as_ptr(),
-            c.as_ptr(),
-        );
+    if text.starts_with("pace ") {
+        pace_info(text);
+        return;
     }
+    write(
+        crate::ffi::ANDROID_LOG_INFO,
+        "gndrm_daemon",
+        format_args!("{text}"),
+    );
 }
 
-/// TEMPORARY (pacing work): an ungated line from the app-side modules, under the
-/// same `gndrm-pace` tag the daemon's pace line uses. Needed for the same reason
-/// as [`daemon_info`]: this crate's own gates (`GNDRM_LOG_ASC`, …) are read from
-/// the app process, which a container cannot reach. Remove with the pace
-/// diagnostics.
+/// TEMPORARY (pacing work): an ungated line on the `gndrm-pace` tag — the
+/// app-side modules' counters and the daemon's per-frame pace line — so a device
+/// run can read the pacing counters without the app-process gates being opened.
+/// Remove with the pace diagnostics.
 pub(crate) fn pace_info(text: &str) {
     let c = std::ffi::CString::new(text)
         .unwrap_or_else(|_| std::ffi::CString::new("<log error>").unwrap());
