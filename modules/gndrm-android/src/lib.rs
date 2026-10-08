@@ -46,7 +46,7 @@ use std::thread;
 use std::time::Duration;
 
 use jni::objects::{GlobalRef, JClass, JObject, JString};
-use jni::sys::{jboolean, jfloat, jint, jlong, jstring};
+use jni::sys::{jboolean, jfloat, jint, jstring};
 use jni::{JNIEnv, JavaVM};
 
 use gndrm_daemon::diag;
@@ -62,15 +62,15 @@ const E_IO: jint = -5;
 const E_NOENT: jint = -2;
 
 /// Real frames put on the panel (fb != 0 commits — gamescope's blank fb=0
-/// commits excluded). Reset by `nativeStart`/`nativeStop`; polled by the app
-/// via `nativeFramesPresented` for first-frame splash dismissal.
+/// commits excluded). Reset by `nativeStart`/`nativeStop`; its 0->1 edge drives
+/// the booting-splash dismissal upcall ([`clear_booting_splash`]).
 pub(crate) static PRESENTED_FRAMES: AtomicU64 = AtomicU64::new(0);
 
 /// The app's `JavaVM`, cached from the first JNI entry point (`nativeStart`).
 /// Needed by the presenter thread, which is a Rust-spawned thread with no
 /// `JNIEnv` of its own: it attaches with [`JavaVM::attach_current_thread`] to
 /// emit the booting-splash event. Set once per process; a missing VM only means
-/// the event cannot be pushed (the app still polls `nativeFramesPresented`).
+/// the event cannot be pushed.
 static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
 
 /// Global ref to `GameNativeDrm`, resolved on a Java thread by
@@ -113,9 +113,19 @@ pub(crate) fn clear_booting_splash() {
     call_app_static("clearBootingSplash");
 }
 
-/// Attach the calling thread, call a no-arg static method on `GameNativeDrm`,
-/// detach. Attaching needs the class resolved on a Java thread, so it comes from
-/// [`CALLBACK_CLASS`]; every failure is logged and swallowed.
+/// Notify the app that the daemon published a new frame, so its frame-time ring
+/// sees gamescope's frames — the X11 present hook never ticks for them. Called
+/// on the commit worker per new frame; best-effort, and a no-op on the app side
+/// when the metrics collector is not running.
+pub(crate) fn notify_frame_published() {
+    call_app_static("onFramePublished");
+}
+
+/// Attach the calling thread (kept attached — a per-frame caller keeps one
+/// attachment instead of re-attaching each call, and the thread dies with the
+/// session), call a no-arg static method on `GameNativeDrm`. The class must be
+/// resolved on a Java thread, so it comes from [`CALLBACK_CLASS`]; every failure
+/// is logged and swallowed.
 fn call_app_static(method: &str) {
     let Some(vm) = JAVA_VM.get() else {
         log_warn!("{method}: no cached JavaVM; call skipped");
@@ -125,8 +135,7 @@ fn call_app_static(method: &str) {
         log_warn!("{method}: GameNativeDrm class not cached; call skipped");
         return;
     };
-    // AttachGuard detaches on drop, including on the early returns below.
-    let mut env = match vm.attach_current_thread() {
+    let mut env = match vm.attach_current_thread_permanently() {
         Ok(env) => env,
         Err(e) => {
             log_warn!("{method}: attach_current_thread failed: {e}");
@@ -876,16 +885,6 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeRetargetS
     .unwrap_or(E_FAULT)
 }
 
-/// `GameNativeDrm.nativeFramesPresented` — real frames put on the panel so
-/// far (see [`PRESENTED_FRAMES`]); 0 before the first start and after stop.
-#[no_mangle]
-pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeFramesPresented(
-    _env: JNIEnv,
-    _class: JClass,
-) -> jlong {
-    std::panic::catch_unwind(|| PRESENTED_FRAMES.load(Ordering::Relaxed) as jlong).unwrap_or(0)
-}
-
 // ---------------------------------------------------------------------------
 // input injector (wayland virtual pointer/keyboard; see injector.rs)
 // ---------------------------------------------------------------------------
@@ -899,7 +898,6 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeInjectorS
     _class: JClass,
     xdg_runtime_dir: JString,
     wayland_display: JString,
-    app_id: jint,
 ) -> jint {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let dir: String = match env.get_string(&xdg_runtime_dir) {
@@ -910,27 +908,9 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeInjectorS
             Ok(s) => s.to_string_lossy().into_owned(),
             Err(_) => return E_INVAL,
         };
-        injector::start(dir, display, app_id as u32)
+        injector::start(dir, display)
     }))
     .unwrap_or(E_FAULT)
-}
-
-/// `GameNativeDrm.nativeFps()` — gamescope's most recently reported app
-/// frametime as a rate. 0 until gamescope has answered a stats request.
-#[no_mangle]
-pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeFps(
-    _env: JNIEnv,
-    _class: JClass,
-) -> jfloat {
-    std::panic::catch_unwind(|| {
-        let ns = injector::app_frametime_ns();
-        if ns == 0 {
-            0.0
-        } else {
-            (1_000_000_000f64 / ns as f64) as jfloat
-        }
-    })
-    .unwrap_or(0.0)
 }
 
 /// `GameNativeDrm.nativeInjectorStop()`.

@@ -984,6 +984,12 @@ impl AscState {
             if crate::PRESENTED_FRAMES.fetch_add(1, Ordering::Relaxed) == 0 {
                 crate::clear_booting_splash();
             }
+            // Announce the daemon's new-frame decision to the app's frame-time
+            // ring: only a changed primary FB is published (a re-commit of the
+            // frame already shown is not — see `apply_commit` in `commit.rs`),
+            // so this lands one entry per new app frame, not one per present.
+            // gamescope's frames never tick the X11 present hook.
+            crate::notify_frame_published();
         }
     }
 

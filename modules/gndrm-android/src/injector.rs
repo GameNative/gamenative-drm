@@ -9,7 +9,7 @@
 //! is worse than lost input.
 
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -45,8 +45,8 @@ use virtual_keyboard::v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
 
 // gamescope's private control protocol is not published as a wayland-protocols
 // package; the XML is vendored (from gamescope, MIT) and bindings generated
-// the same way as the keyboard above. Used for its performance-stats request:
-// the only frame-pacing source that reflects what gamescope actually presents.
+// the same way as the keyboard above. Used for `set_app_target_refresh_cycle`
+// (the fps cap) and its feature/display-info answers.
 // The control protocol's enums are bitfields (hence bitflags) and it declares
 // no external interfaces, so the usual glob imports are partly unused here.
 #[allow(dead_code, non_camel_case_types, unused_imports, clippy::all)]
@@ -118,11 +118,6 @@ struct InjectorHandle {
 static INPUT_TX: Mutex<Option<mpsc::Sender<InputEvent>>> = Mutex::new(None);
 static INJECTOR: Mutex<Option<InjectorHandle>> = Mutex::new(None);
 
-/// gamescope's most recent app frametime in ns — the delta between the two
-/// frames it presented most recently. 0 = not reported yet. Written by the
-/// injector thread, read from JNI.
-static APP_FRAMETIME_NS: AtomicU64 = AtomicU64::new(0);
-
 /// Monotonic clock in milliseconds (wayland timestamp convention).
 fn now_ms() -> u32 {
     // SAFETY: standard clock_gettime on a valid timespec.
@@ -136,7 +131,7 @@ fn now_ms() -> u32 {
 
 /// `GameNativeDrm.nativeInjectorStart(xdgRuntimeDir, waylandDisplay)`.
 /// Idempotent; returns 0 or a negative code.
-pub fn start(runtime_dir: String, display: String, app_id: u32) -> i32 {
+pub fn start(runtime_dir: String, display: String) -> i32 {
     // Poison-tolerant: a panic elsewhere must not turn this lock into a
     // process-killing panic on the next JNI call (see lib.rs containment).
     let mut slot = INJECTOR
@@ -163,7 +158,7 @@ pub fn start(runtime_dir: String, display: String, app_id: u32) -> i32 {
             // protocol error, a poisoned lock) is reported and ends the
             // thread, never the app process.
             if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run(&thread_path, &rx, &thread_stop, app_id);
+                run(&thread_path, &rx, &thread_stop);
             })) {
                 crate::report_panic("gndrm-input", e.as_ref());
             }
@@ -229,11 +224,6 @@ pub fn pointer_axis(axis: i32, value: f32) {
 }
 pub fn key(code: i32, pressed: bool) {
     post(InputEvent::Key(code, pressed));
-}
-
-/// gamescope's last reported frametime in ns (0 = none reported yet).
-pub fn app_frametime_ns() -> u64 {
-    APP_FRAMETIME_NS.load(Ordering::Relaxed)
 }
 
 /// Frame-rate cap asked of gamescope; u32::MAX = nothing pending.
@@ -397,9 +387,6 @@ struct State {
     gs_control: Option<GamescopeControl>,
     /// gamescope's private concommand global; absent if not offered.
     gs_private: Option<GamescopePrivate>,
-    /// App id whose frame pacing we ask for. Gamescope assigns every game
-    /// window the same fixed id (`GAMESCOPE_APP_ID` in GameNativeDrm.kt).
-    app_id: u32,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
@@ -430,9 +417,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     state.kbd_mgr =
                         Some(registry.bind::<ZwpVirtualKeyboardManagerV1, _, _>(name, 1, qh, ()));
                 }
-                // v6 added request_app_performance_stats; older versions
-                // cannot answer it, so don't bind them at all.
-                "gamescope_control" if version >= 6 => {
+                // The fps cap (`set_app_target_refresh_cycle`) is since v2, so
+                // bind any version that carries it.
+                "gamescope_control" if version >= 2 => {
                     state.gs_control =
                         Some(registry.bind::<GamescopeControl, _, _>(name, version.min(7), qh, ()));
                 }
@@ -496,31 +483,14 @@ impl Dispatch<GamescopePrivate, ()> for State {
 
 impl Dispatch<GamescopeControl, ()> for State {
     fn event(
-        state: &mut Self,
-        control: &GamescopeControl,
+        _state: &mut Self,
+        _control: &GamescopeControl,
         event: GsControlEvent,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
         match event {
-            GsControlEvent::AppPerformanceStats {
-                frametime_ns_lo,
-                frametime_ns_hi,
-                ..
-            } => {
-                let ns = (u64::from(frametime_ns_hi) << 32) | u64::from(frametime_ns_lo);
-                APP_FRAMETIME_NS.store(ns, Ordering::Relaxed);
-                // The first few are logged so the app id gamescope answers for is
-                // verifiable on device; then it goes quiet.
-                static EVENTS: AtomicUsize = AtomicUsize::new(0);
-                if EVENTS.fetch_add(1, Ordering::Relaxed) < 3 {
-                    log_info!("gamescope stats: app_id={} frametime={ns}ns", state.app_id);
-                }
-                // gamescope answers once per request (it drops it when it fires),
-                // so re-arm to be told about the next presented frame.
-                control.request_app_performance_stats(state.app_id);
-            }
             // One entry per supported feature, terminated by "done". Cache the
             // bitmask the UI gates its controls on (ids are 0..=9; anything
             // wider is dropped rather than shifted out of range).
@@ -559,10 +529,10 @@ impl Dispatch<GamescopeControl, ()> for State {
 }
 
 /// Outer retry loop: connect → run until socket death or stop → repeat.
-fn run(path: &str, rx: &mpsc::Receiver<InputEvent>, stop: &AtomicBool, app_id: u32) {
+fn run(path: &str, rx: &mpsc::Receiver<InputEvent>, stop: &AtomicBool) {
     let mut logged_wait = false;
     while !stop.load(Ordering::SeqCst) {
-        match connect_and_run(path, rx, stop, app_id) {
+        match connect_and_run(path, rx, stop) {
             Ok(()) => return, // stop requested
             Err(e) => {
                 if !logged_wait {
@@ -584,7 +554,6 @@ fn connect_and_run(
     path: &str,
     rx: &mpsc::Receiver<InputEvent>,
     stop: &AtomicBool,
-    app_id: u32,
 ) -> Result<(), String> {
     let stream = UnixStream::connect(path).map_err(|e| e.to_string())?;
     let conn = Connection::from_socket(stream).map_err(|e| format!("from_socket: {e}"))?;
@@ -601,7 +570,6 @@ fn connect_and_run(
         keyboard: None,
         gs_control: None,
         gs_private: None,
-        app_id,
     };
     event_queue
         .roundtrip(&mut state)
@@ -621,13 +589,8 @@ fn connect_and_run(
     state.keyboard = Some(kbd_mgr.create_virtual_keyboard(seat, &qh, ()));
     let keyboard = state.keyboard.as_ref().expect("keyboard just created");
     upload_keymap(keyboard);
-    // Ask gamescope for this app's frame pacing. It answers once per
-    // request, so the event handler above re-arms; the value is published in
-    // APP_FRAMETIME_NS for JNI to read. app_id is the fixed id gamescope
-    // assigns every game window (not a per-store Steam app id).
-    match &state.gs_control {
-        Some(control) => control.request_app_performance_stats(app_id),
-        None => log_warn!("gamescope_control not offered; fps unavailable"),
+    if state.gs_control.is_none() {
+        log_warn!("gamescope_control not offered; fps cap unavailable");
     }
     conn.flush().map_err(|e| format!("flush: {e}"))?;
     log_info!("injector connected: virtual pointer + keyboard created");
