@@ -415,6 +415,30 @@ pub struct VkSurfaceCapabilities2KHR {
     pub surfaceCapabilities: VkSurfaceCapabilitiesKHR,
 }
 
+/// `VkSurfaceFormat2KHR`: the `2` variant's out-structure array element (used by
+/// `vkGetPhysicalDeviceSurfaceFormats2KHR`, which VKD3D-Proton goes through
+/// where DXVK uses the plain form). Only `surfaceFormat` is the implementation's
+/// output; `sType`/`pNext` are the caller's and are left untouched.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkSurfaceFormat2KHR {
+    pub sType: u32,
+    pub pNext: *mut c_void,
+    pub surfaceFormat: VkSurfaceFormatKHR,
+}
+
+/// `VkSurfaceCapabilities2EXT`: the `2EXT` variant's out-structure. Only
+/// `surfaceCapabilities` is filled; `supportedSurfaceCounters` is left at the
+/// caller's zero ("no counters"), which is the contract for a structure field
+/// the implementation does not support.
+#[repr(C)]
+pub struct VkSurfaceCapabilities2EXT {
+    pub sType: u32,
+    pub pNext: *mut c_void,
+    pub surfaceCapabilities: VkSurfaceCapabilitiesKHR,
+    pub supportedSurfaceCounters: u32,
+}
+
 #[repr(C)]
 pub struct VkSurfaceCapabilitiesKHR {
     pub minImageCount: u32,

@@ -403,6 +403,24 @@ impl ScanoutPool {
         self.cache.abort_cold();
     }
 
+    /// Reserve capacity for one cold allocation, for a request whose first
+    /// answer (a reused buffer or the spare) could not satisfy it. Same policy
+    /// as the tail of [`Self::begin_alloc`]: evict the longest-free buffer at
+    /// the cap, `ENOSPC` only when nothing free can be evicted.
+    fn begin_cold(&mut self) -> io::Result<Reservation> {
+        match self.cache.reserve() {
+            CacheReservation::Cold { evicted } => Ok(Reservation::Cold { evicted }),
+            CacheReservation::Reuse { ino, payload } => Ok(Reservation::Reuse { ino, payload }),
+            CacheReservation::Full => Err(io::Error::from_raw_os_error(libc::ENOSPC)),
+        }
+    }
+
+    /// Put the spare back after it could not satisfy a request, so it is not
+    /// lost when the cold fall-through runs in its place.
+    fn put_warm(&mut self, warm: Warm) {
+        self.warm.replace(warm);
+    }
+
     /// Resolve a length-only request to a geometry the pool knows, then reserve
     /// its answer. `EINVAL` when the length resolves to no known geometry (not
     /// a scan-out allocation: the shim leaves it to the kernel), and whatever
@@ -1327,153 +1345,208 @@ pub fn serve_scanout(
         };
         d.note_stage(Stage::Lock, lock_waited_ms);
 
-        let (resp, fd_out, handed_out, refill_spare) = match began {
-            // A retired buffer of this geometry: no allocation, just a fresh
-            // client descriptor duplicated from the buffer the pool already
-            // holds. This is the steady state.
-            Ok(Reservation::Reuse {
-                ino: cached_ino,
-                payload,
-            }) => {
-                d.step(State::ScanoutLocked);
-                let api = pool.lock(Role::Scanout).api();
-                let dup_started = Instant::now();
-                let resolved = api.and_then(|api| dup_scanout_fd(&api, payload.ahb));
-                d.note_stage(Stage::Alloc, dup_started.elapsed().as_millis() as u64);
-                match resolved {
-                    Some((fd, ino, size)) => {
-                        // The cached buffer was registered under `cached_ino`,
-                        // and a dup of its dma-buf keeps the inode — so the
-                        // fresh descriptor should carry the same identity.
-                        // Verify rather than trust the assumption: if it moved,
-                        // the registration key the client will import has
-                        // changed, and the commit below re-registers under the
-                        // identity actually handed out so the next commit for
-                        // this buffer still resolves.
-                        if ino != cached_ino {
-                            log_warn!(
+        // A length-only request must be answered with a buffer whose real
+        // allocation length is at least the length it asked for. The length
+        // index resolves a length to a geometry, but a geometry's actual
+        // allocation can be shorter than the length that resolved to it: the
+        // same geometry is registered under several lengths, and a client
+        // framebuffer can register a geometry under a length longer than its
+        // own allocation. A buffer shorter than the request describes a dma-buf
+        // larger than it is, so it is not handed out — the allocation falls
+        // through to the kernel instead.
+        let mut next = began;
+        let (resp, fd_out, handed_out, refill_spare) = loop {
+            let began =
+                core::mem::replace(&mut next, Err(io::Error::from_raw_os_error(libc::EINVAL)));
+            match began {
+                // A retired buffer of this geometry: no allocation, just a fresh
+                // client descriptor duplicated from the buffer the pool already
+                // holds. This is the steady state.
+                Ok(Reservation::Reuse {
+                    ino: cached_ino,
+                    payload,
+                }) => {
+                    d.step(State::ScanoutLocked);
+                    let api = pool.lock(Role::Scanout).api();
+                    let dup_started = Instant::now();
+                    let resolved = api.and_then(|api| dup_scanout_fd(&api, payload.ahb));
+                    d.note_stage(Stage::Alloc, dup_started.elapsed().as_millis() as u64);
+                    match resolved {
+                        Some((fd, ino, size)) => {
+                            // A length-only request needs a buffer at least as long
+                            // as it asked for; this one is shorter, so it cannot
+                            // satisfy the request. Hand it back for a request it
+                            // does fit and allocate instead.
+                            if req.is_length_only() && size < req.len {
+                                // SAFETY: `fd` is a fresh descriptor this call owns.
+                                unsafe { libc::close(fd) };
+                                let geom = Geometry {
+                                    width,
+                                    height,
+                                    format: req.format,
+                                };
+                                pool.lock(Role::Scanout).recycle(geom, cached_ino, payload);
+                                next = pool.lock(Role::Scanout).begin_cold();
+                                continue;
+                            }
+                            // The cached buffer was registered under `cached_ino`,
+                            // and a dup of its dma-buf keeps the inode — so the
+                            // fresh descriptor should carry the same identity.
+                            // Verify rather than trust the assumption: if it moved,
+                            // the registration key the client will import has
+                            // changed, and the commit below re-registers under the
+                            // identity actually handed out so the next commit for
+                            // this buffer still resolves.
+                            if ino != cached_ino {
+                                log_warn!(
                                 "asc: scan-out reuse ino moved ({cached_ino} -> {ino}); the free-list identity is stale, re-registering"
                             );
+                            }
+                            let buffer = ScanoutBuffer {
+                                fd,
+                                ino,
+                                stride: payload.stride,
+                                size,
+                            };
+                            let replaced = pool.lock(Role::Scanout).commit(
+                                width,
+                                height,
+                                &buffer,
+                                payload.ahb,
+                                false,
+                                "reused",
+                            );
+                            if let Some(old) = replaced {
+                                release_retired(core::slice::from_ref(&retire_buf(old)));
+                            }
+                            break (
+                                ScanoutAllocResp {
+                                    ret: 0,
+                                    ino: buffer.ino,
+                                    stride: buffer.stride,
+                                },
+                                Some(buffer.fd),
+                                true,
+                                false,
+                            );
                         }
-                        let buffer = ScanoutBuffer {
-                            fd,
-                            ino,
-                            stride: payload.stride,
-                            size,
-                        };
-                        let replaced = pool.lock(Role::Scanout).commit(
-                            width,
-                            height,
-                            &buffer,
-                            payload.ahb,
-                            false,
-                            "reused",
-                        );
-                        if let Some(old) = replaced {
-                            release_retired(core::slice::from_ref(&retire_buf(old)));
+                        None => {
+                            // The cached buffer could not be turned into a client
+                            // descriptor: put it back so the pool does not lose it.
+                            let geom = Geometry {
+                                width,
+                                height,
+                                format: req.format,
+                            };
+                            pool.lock(Role::Scanout).recycle(geom, cached_ino, payload);
+                            let refused = refuse_scanout(req, libc::EIO, lock_waited_ms, pool, d);
+                            break (refused.0, refused.1, false, false);
                         }
-                        (
-                            ScanoutAllocResp {
-                                ret: 0,
-                                ino: buffer.ino,
-                                stride: buffer.stride,
-                            },
-                            Some(buffer.fd),
-                            true,
-                            false,
-                        )
-                    }
-                    None => {
-                        // The cached buffer could not be turned into a client
-                        // descriptor: put it back so the pool does not lose it.
-                        let geom = Geometry {
-                            width,
-                            height,
-                            format: req.format,
-                        };
-                        pool.lock(Role::Scanout).recycle(geom, cached_ino, payload);
-                        let refused = refuse_scanout(req, libc::EIO, lock_waited_ms, pool, d);
-                        (refused.0, refused.1, false, false)
                     }
                 }
-            }
-            // A pre-allocated spare matches: hand it over with no gralloc
-            // allocation, and rebuild the spare afterwards.
-            Ok(Reservation::Warm(warm)) => {
-                d.step(State::ScanoutLocked);
-                let replaced = pool.lock(Role::Scanout).commit(
-                    width,
-                    height,
-                    &warm.buffer,
-                    warm.ahb,
-                    false,
-                    "from spare",
-                );
-                if let Some(old) = replaced {
-                    release_retired(core::slice::from_ref(&retire_buf(old)));
+                // A pre-allocated spare matches: hand it over with no gralloc
+                // allocation, and rebuild the spare afterwards.
+                Ok(Reservation::Warm(warm)) => {
+                    // The spare must satisfy a length-only request just like a
+                    // reused buffer; put it back and allocate when it does not.
+                    if req.is_length_only() && warm.buffer.size < req.len {
+                        pool.lock(Role::Scanout).put_warm(warm);
+                        next = pool.lock(Role::Scanout).begin_cold();
+                        continue;
+                    }
+                    d.step(State::ScanoutLocked);
+                    let replaced = pool.lock(Role::Scanout).commit(
+                        width,
+                        height,
+                        &warm.buffer,
+                        warm.ahb,
+                        false,
+                        "from spare",
+                    );
+                    if let Some(old) = replaced {
+                        release_retired(core::slice::from_ref(&retire_buf(old)));
+                    }
+                    break (
+                        ScanoutAllocResp {
+                            ret: 0,
+                            ino: warm.buffer.ino,
+                            stride: warm.buffer.stride,
+                        },
+                        Some(warm.buffer.fd),
+                        true,
+                        true,
+                    );
                 }
-                (
-                    ScanoutAllocResp {
-                        ret: 0,
-                        ino: warm.buffer.ino,
-                        stride: warm.buffer.stride,
-                    },
-                    Some(warm.buffer.fd),
-                    true,
-                    true,
-                )
-            }
-            // Nothing matched: allocate and register with the lock dropped
-            // across the gralloc work.
-            Ok(Reservation::Cold { evicted }) => {
-                // The cache dropped the longest-free buffer to stay under the
-                // cap; release it before allocating its replacement.
-                if let Some(payload) = evicted {
-                    release_retired(core::slice::from_ref(&retire_buf(payload)));
-                }
-                let api = pool.lock(Role::Scanout).api();
-                d.step(State::ScanoutAllocating);
-                d.set_role(Role::Scanout, State::ScanoutAllocating);
-                let alloc_started = Instant::now();
-                let allocated = api.map_or(Err(libc::ENOSYS), |api| {
-                    allocate_buffer(api, width, height, req.format)
-                });
-                d.note_stage(Stage::Alloc, alloc_started.elapsed().as_millis() as u64);
-                match allocated {
-                    Ok((buffer, ahb)) => {
-                        let replaced = pool.lock(Role::Scanout).commit(
-                            width,
-                            height,
-                            &buffer,
-                            ahb,
-                            true,
-                            "allocated",
-                        );
-                        if let Some(old) = replaced {
-                            release_retired(core::slice::from_ref(&retire_buf(old)));
+                // Nothing matched: allocate and register with the lock dropped
+                // across the gralloc work.
+                Ok(Reservation::Cold { evicted }) => {
+                    // The cache dropped the longest-free buffer to stay under the
+                    // cap; release it before allocating its replacement.
+                    if let Some(payload) = evicted {
+                        release_retired(core::slice::from_ref(&retire_buf(payload)));
+                    }
+                    let api = pool.lock(Role::Scanout).api();
+                    d.step(State::ScanoutAllocating);
+                    d.set_role(Role::Scanout, State::ScanoutAllocating);
+                    let alloc_started = Instant::now();
+                    let allocated = api.map_or(Err(libc::ENOSYS), |api| {
+                        allocate_buffer(api, width, height, req.format)
+                    });
+                    d.note_stage(Stage::Alloc, alloc_started.elapsed().as_millis() as u64);
+                    match allocated {
+                        Ok((buffer, ahb)) => {
+                            // A length-only request the resolved geometry cannot
+                            // satisfy: the buffer is shorter than the request. Give
+                            // the capacity and the buffer back so the allocation
+                            // falls through to the kernel rather than describing a
+                            // dma-buf larger than it is.
+                            if req.is_length_only() && buffer.size < req.len {
+                                pool.lock(Role::Scanout).abort_alloc();
+                                // SAFETY: `buffer.fd` is a fresh descriptor this
+                                // call owns, and `ahb` holds the one reference the
+                                // allocation returned.
+                                unsafe {
+                                    libc::close(buffer.fd);
+                                    ffi::AHardwareBuffer_release(ahb);
+                                }
+                                let refused =
+                                    refuse_scanout(req, libc::EINVAL, lock_waited_ms, pool, d);
+                                break (refused.0, refused.1, false, false);
+                            }
+                            let replaced = pool.lock(Role::Scanout).commit(
+                                width,
+                                height,
+                                &buffer,
+                                ahb,
+                                true,
+                                "allocated",
+                            );
+                            if let Some(old) = replaced {
+                                release_retired(core::slice::from_ref(&retire_buf(old)));
+                            }
+                            break (
+                                ScanoutAllocResp {
+                                    ret: 0,
+                                    ino: buffer.ino,
+                                    stride: buffer.stride,
+                                },
+                                Some(buffer.fd),
+                                true,
+                                true,
+                            );
                         }
-                        (
-                            ScanoutAllocResp {
-                                ret: 0,
-                                ino: buffer.ino,
-                                stride: buffer.stride,
-                            },
-                            Some(buffer.fd),
-                            true,
-                            true,
-                        )
-                    }
-                    Err(errno) => {
-                        pool.lock(Role::Scanout).abort_alloc();
-                        let refused = refuse_scanout(req, errno, lock_waited_ms, pool, d);
-                        (refused.0, refused.1, false, false)
+                        Err(errno) => {
+                            pool.lock(Role::Scanout).abort_alloc();
+                            let refused = refuse_scanout(req, errno, lock_waited_ms, pool, d);
+                            break (refused.0, refused.1, false, false);
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                let errno = e.raw_os_error().unwrap_or(libc::EIO).abs();
-                let refused = refuse_scanout(req, errno, lock_waited_ms, pool, d);
-                (refused.0, refused.1, false, false)
+                Err(e) => {
+                    let errno = e.raw_os_error().unwrap_or(libc::EIO).abs();
+                    let refused = refuse_scanout(req, errno, lock_waited_ms, pool, d);
+                    break (refused.0, refused.1, false, false);
+                }
             }
         };
 

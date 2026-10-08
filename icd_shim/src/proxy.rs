@@ -3326,6 +3326,129 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
             )
         },
     ),
+    // The WSI dispatch-coverage set (see the block above `gn_vkSetHdrMetadataEXT`):
+    // each takes a shim surface/swapchain in a non-argument-0 position, so the
+    // unlisted wrapper-swapping thunk would hand the driver a handle it never
+    // issued. `Always` for the device-level swapchain commands, `ProxyOnly` for
+    // the physical-device surface queries, matching the other WSI wrappers.
+    (c"vkSetHdrMetadataEXT", HandlerScope::Always, unsafe {
+        std::mem::transmute(
+            gn_vkSetHdrMetadataEXT
+                as unsafe extern "C" fn(
+                    VkDevice,
+                    u32,
+                    *const VkSwapchainKHR,
+                    *const c_void,
+                ) -> VkResult,
+        )
+    }),
+    (c"vkSetLocalDimmingAMD", HandlerScope::Always, unsafe {
+        std::mem::transmute(
+            gn_vkSetLocalDimmingAMD
+                as unsafe extern "C" fn(VkDevice, VkSwapchainKHR, VkBool32) -> VkResult,
+        )
+    }),
+    (c"vkGetSwapchainStatusKHR", HandlerScope::Always, unsafe {
+        std::mem::transmute(
+            gn_vkGetSwapchainStatusKHR
+                as unsafe extern "C" fn(VkDevice, VkSwapchainKHR) -> VkResult,
+        )
+    }),
+    (c"vkGetSwapchainCounterEXT", HandlerScope::Always, unsafe {
+        std::mem::transmute(
+            gn_vkGetSwapchainCounterEXT
+                as unsafe extern "C" fn(VkDevice, VkSwapchainKHR, u32, *mut u64) -> VkResult,
+        )
+    }),
+    (
+        c"vkGetDeviceGroupSurfacePresentModesKHR",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                gn_vkGetDeviceGroupSurfacePresentModesKHR
+                    as unsafe extern "C" fn(VkDevice, VkSurfaceKHR, *mut u32) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkAcquireFullScreenExclusiveModeEXT",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                gn_vkAcquireFullScreenExclusiveModeEXT
+                    as unsafe extern "C" fn(VkDevice, VkSwapchainKHR) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkReleaseFullScreenExclusiveModeEXT",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                gn_vkReleaseFullScreenExclusiveModeEXT
+                    as unsafe extern "C" fn(VkDevice, VkSwapchainKHR) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkGetPhysicalDeviceSurfaceFormats2KHR",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                gn_vkGetPhysicalDeviceSurfaceFormats2KHR
+                    as unsafe extern "C" fn(
+                        VkPhysicalDevice,
+                        *const VkPhysicalDeviceSurfaceInfo2KHR,
+                        *mut u32,
+                        *mut VkSurfaceFormat2KHR,
+                    ) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkGetPhysicalDeviceSurfacePresentModes2EXT",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                gn_vkGetPhysicalDeviceSurfacePresentModes2EXT
+                    as unsafe extern "C" fn(
+                        VkPhysicalDevice,
+                        *const VkPhysicalDeviceSurfaceInfo2KHR,
+                        *mut u32,
+                        *mut VkPresentModeKHR,
+                    ) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkGetPhysicalDeviceSurfaceCapabilities2EXT",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                gn_vkGetPhysicalDeviceSurfaceCapabilities2EXT
+                    as unsafe extern "C" fn(
+                        VkPhysicalDevice,
+                        VkSurfaceKHR,
+                        *mut VkSurfaceCapabilities2EXT,
+                    ) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkGetPhysicalDevicePresentRectanglesKHR",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                gn_vkGetPhysicalDevicePresentRectanglesKHR
+                    as unsafe extern "C" fn(
+                        VkPhysicalDevice,
+                        VkSurfaceKHR,
+                        *mut u32,
+                        *mut VkRect2D,
+                    ) -> VkResult,
+            )
+        },
+    ),
 ];
 
 /// Handler-registry lookup for GIPA and GPDPA: the proxy-only handlers
@@ -3499,6 +3622,45 @@ mod tests {
         assert!(device_func(c"vkCreateSamplerYcbcrConversion").is_some());
         assert!(instance_func(c"vkGetDeviceProcAddr").is_some());
         assert!(SHIM_HANDLERS.len() >= 61);
+    }
+
+    /// The WSI commands whose wrapper handle (surface/swapchain) sits in a
+    /// non-argument-0 position can never be served by the unlisted
+    /// wrapper-swapping thunk: it swaps only argument 0 and the driver then
+    /// dereferences a handle it never issued (the `vkSetHdrMetadataEXT`
+    /// 0xc0000005 class). Each must stay in the handler registry, in the scope
+    /// its level dictates.
+    #[test]
+    fn wsi_handle_commands_are_intercepted() {
+        let device_level: [&CStr; 7] = [
+            c"vkSetHdrMetadataEXT",
+            c"vkSetLocalDimmingAMD",
+            c"vkGetSwapchainStatusKHR",
+            c"vkGetSwapchainCounterEXT",
+            c"vkGetDeviceGroupSurfacePresentModesKHR",
+            c"vkAcquireFullScreenExclusiveModeEXT",
+            c"vkReleaseFullScreenExclusiveModeEXT",
+        ];
+        for name in device_level {
+            assert!(
+                device_func(name).is_some(),
+                "device_func({}) is empty: the shim no longer intercepts it",
+                name.to_str().unwrap()
+            );
+        }
+        let physical_device_level: [&CStr; 4] = [
+            c"vkGetPhysicalDeviceSurfaceFormats2KHR",
+            c"vkGetPhysicalDeviceSurfacePresentModes2EXT",
+            c"vkGetPhysicalDeviceSurfaceCapabilities2EXT",
+            c"vkGetPhysicalDevicePresentRectanglesKHR",
+        ];
+        for name in physical_device_level {
+            assert!(
+                instance_func(name).is_some(),
+                "instance_func({}) is empty: the shim no longer intercepts it",
+                name.to_str().unwrap()
+            );
+        }
     }
 
     /// A shim handler may only be handed out while the WSI proxy is active:
@@ -5737,16 +5899,11 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     VK_SUCCESS
 }
 
-unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceFormatsKHR(
-    _pd: VkPhysicalDevice,
-    surface: VkSurfaceKHR,
-    count: *mut u32,
-    formats: *mut VkSurfaceFormatKHR,
-) -> VkResult {
-    if unsafe { find_surface(surface) }.is_null() {
-        crate::logf!("proxy surface formats query: {surface:#x} not one of ours");
-        return VK_ERROR_SURFACE_LOST_KHR;
-    }
+/// The surface formats the proxy serves: `B8G8R8A8_UNORM` in the scan-out
+/// pool's own layout, plus `R8G8B8A8_UNORM` only under the RGBA opt-in (see
+/// `advertises_rgba`). Shared by the plain and `2` query forms so both forms
+/// advertise exactly the same set.
+fn served_surface_formats() -> &'static [VkSurfaceFormatKHR] {
     const K_FMTS: [VkSurfaceFormatKHR; 2] = [
         VkSurfaceFormatKHR {
             format: VK_FORMAT_B8G8R8A8_UNORM,
@@ -5761,14 +5918,32 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceFormatsKHR(
     // own layout (see `advertises_rgba` — offering RGBA let Nidhogg render
     // R/B-exchanged into a daemon BGRA buffer, which reached the panel as
     // cyan). RGBA is offered only under `GN_VKSHIM_ALLOW_RGBA`.
-    let n_formats = if advertises_rgba() { K_FMTS.len() } else { 1 };
+    if advertises_rgba() {
+        &K_FMTS
+    } else {
+        &K_FMTS[..1]
+    }
+}
+
+unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceFormatsKHR(
+    _pd: VkPhysicalDevice,
+    surface: VkSurfaceKHR,
+    count: *mut u32,
+    formats: *mut VkSurfaceFormatKHR,
+) -> VkResult {
+    if unsafe { find_surface(surface) }.is_null() {
+        crate::logf!("proxy surface formats query: {surface:#x} not one of ours");
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
+    let served = served_surface_formats();
+    let n_formats = served.len();
     unsafe {
         if formats.is_null() {
             *count = n_formats as u32;
             return VK_SUCCESS;
         }
         let n = (*count).min(n_formats as u32) as usize;
-        ptr::copy_nonoverlapping(K_FMTS.as_ptr(), formats, n);
+        ptr::copy_nonoverlapping(served.as_ptr(), formats, n);
         *count = n as u32;
         if n < n_formats {
             VK_INCOMPLETE
@@ -5879,6 +6054,208 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceSupportKHR(
     supported: *mut VkBool32,
 ) -> VkResult {
     unsafe { *supported = VK_TRUE };
+    VK_SUCCESS
+}
+
+// ------------------------------------------------- WSI dispatch-coverage set
+//
+// Every entry point here takes a shim-owned wrapper handle (a surface or a
+// swapchain) in a position other than argument 0, so the wrapper-swapping thunk
+// in `serve_unlisted` cannot serve it: it swaps only argument 0 and hands the
+// driver a handle it never issued. Without an entry the driver dereferences the
+// shim's surface/swapchain and the call faults with 0xc0000005 (the class the
+// `vkGetPhysicalDeviceSurfaceCapabilities2KHR` bug and `vkSetHdrMetadataEXT`
+// were both instances of). Each handler validates the wrapper is one the proxy
+// owns and answers from the proxy's own presentation contract; there is no
+// driver surface or swapchain to forward to, because the proxy creates neither.
+
+/// `VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR`: the only device-group present
+/// mode a single-device implementation offers, and the honest answer here.
+const VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR: u32 = 4;
+
+/// `vkSetHdrMetadataEXT` (VK_EXT_hdr_metadata): the swapchain-count array form.
+/// A successful no-op — the compositor owns the output's HDR state, so there is
+/// nothing to forward to; forwarding the shim swapchains to the driver is
+/// exactly the fault. Each swapchain is validated so a foreign handle is not
+/// silently accepted.
+unsafe extern "C" fn gn_vkSetHdrMetadataEXT(
+    _device: VkDevice,
+    swapchain_count: u32,
+    swapchains: *const VkSwapchainKHR,
+    _metadata: *const c_void,
+) -> VkResult {
+    if swapchain_count != 0 && swapchains.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    for i in 0..swapchain_count as usize {
+        let sc = unsafe { *swapchains.add(i) };
+        if unsafe { find_swapchain(sc) }.is_null() {
+            crate::logf!("proxy setHdrMetadata: swapchain {sc:#x} not one of ours");
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+    }
+    VK_SUCCESS
+}
+
+/// `vkSetLocalDimmingAMD`: a display hint with no driver swapchain to carry it.
+unsafe extern "C" fn gn_vkSetLocalDimmingAMD(
+    _device: VkDevice,
+    swapchain: VkSwapchainKHR,
+    _enable: VkBool32,
+) -> VkResult {
+    if unsafe { find_swapchain(swapchain) }.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    VK_SUCCESS
+}
+
+/// `vkGetSwapchainStatusKHR`: the proxy's swapchain is always healthy.
+unsafe extern "C" fn gn_vkGetSwapchainStatusKHR(
+    _device: VkDevice,
+    swapchain: VkSwapchainKHR,
+) -> VkResult {
+    if unsafe { find_swapchain(swapchain) }.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    VK_SUCCESS
+}
+
+/// `vkGetSwapchainCounterEXT` (VK_EXT_display_surface_counter): the proxy
+/// exposes no surface counters, so the value is 0.
+unsafe extern "C" fn gn_vkGetSwapchainCounterEXT(
+    _device: VkDevice,
+    swapchain: VkSwapchainKHR,
+    _counter: u32,
+    value: *mut u64,
+) -> VkResult {
+    if value.is_null() || unsafe { find_swapchain(swapchain) }.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    unsafe { *value = 0 };
+    VK_SUCCESS
+}
+
+/// `vkGetDeviceGroupSurfacePresentModesKHR` (VK_KHR_device_group): a single
+/// device offers only its own local present mode.
+unsafe extern "C" fn gn_vkGetDeviceGroupSurfacePresentModesKHR(
+    _device: VkDevice,
+    surface: VkSurfaceKHR,
+    modes: *mut u32,
+) -> VkResult {
+    if modes.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if unsafe { find_surface(surface) }.is_null() {
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
+    unsafe { *modes = VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR };
+    VK_SUCCESS
+}
+
+/// `vkAcquireFullScreenExclusiveModeEXT` (VK_EXT_full_screen_exclusive): the
+/// compositor owns the display, so exclusive mode is always granted.
+unsafe extern "C" fn gn_vkAcquireFullScreenExclusiveModeEXT(
+    _device: VkDevice,
+    swapchain: VkSwapchainKHR,
+) -> VkResult {
+    if unsafe { find_swapchain(swapchain) }.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    VK_SUCCESS
+}
+
+/// `vkReleaseFullScreenExclusiveModeEXT`: the symmetric counterpart.
+unsafe extern "C" fn gn_vkReleaseFullScreenExclusiveModeEXT(
+    _device: VkDevice,
+    swapchain: VkSwapchainKHR,
+) -> VkResult {
+    if unsafe { find_swapchain(swapchain) }.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    VK_SUCCESS
+}
+
+/// `vkGetPhysicalDeviceSurfaceFormats2KHR`: the `2` form of the formats query
+/// (VKD3D-Proton's form). Forwards onto the plain set so both advertise the same
+/// formats; only each element's `surfaceFormat` is written.
+unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceFormats2KHR(
+    _pd: VkPhysicalDevice,
+    info: *const VkPhysicalDeviceSurfaceInfo2KHR,
+    count: *mut u32,
+    formats: *mut VkSurfaceFormat2KHR,
+) -> VkResult {
+    if info.is_null() || count.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let surface = unsafe { (*info).surface };
+    if unsafe { find_surface(surface) }.is_null() {
+        crate::logf!("proxy surface formats2 query: {surface:#x} not one of ours");
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
+    let served = served_surface_formats();
+    unsafe {
+        if formats.is_null() {
+            *count = served.len() as u32;
+            return VK_SUCCESS;
+        }
+        let n = (*count).min(served.len() as u32) as usize;
+        for (i, fmt) in served.iter().enumerate().take(n) {
+            (*formats.add(i)).surfaceFormat = *fmt;
+        }
+        *count = n as u32;
+        if n < served.len() {
+            VK_INCOMPLETE
+        } else {
+            VK_SUCCESS
+        }
+    }
+}
+
+/// `vkGetPhysicalDeviceSurfacePresentModes2EXT`: same out layout as the plain
+/// form, so it forwards onto the plain handler.
+unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfacePresentModes2EXT(
+    pd: VkPhysicalDevice,
+    info: *const VkPhysicalDeviceSurfaceInfo2KHR,
+    count: *mut u32,
+    modes: *mut VkPresentModeKHR,
+) -> VkResult {
+    if info.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    unsafe { gn_vkGetPhysicalDeviceSurfacePresentModesKHR(pd, (*info).surface, count, modes) }
+}
+
+/// `vkGetPhysicalDeviceSurfaceCapabilities2EXT`: fills only the shared
+/// `surfaceCapabilities` member, leaving `supportedSurfaceCounters` at the
+/// caller's zero.
+unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilities2EXT(
+    pd: VkPhysicalDevice,
+    surface: VkSurfaceKHR,
+    caps: *mut VkSurfaceCapabilities2EXT,
+) -> VkResult {
+    if caps.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    unsafe {
+        gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd, surface, &mut (*caps).surfaceCapabilities)
+    }
+}
+
+/// `vkGetPhysicalDevicePresentRectanglesKHR` (VK_KHR_device_group): a single
+/// device presents the whole surface, so it advertises no present rectangles.
+unsafe extern "C" fn gn_vkGetPhysicalDevicePresentRectanglesKHR(
+    _pd: VkPhysicalDevice,
+    surface: VkSurfaceKHR,
+    count: *mut u32,
+    _rects: *mut VkRect2D,
+) -> VkResult {
+    if count.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if unsafe { find_surface(surface) }.is_null() {
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
+    unsafe { *count = 0 };
     VK_SUCCESS
 }
 
