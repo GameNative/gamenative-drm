@@ -402,8 +402,8 @@ pub fn serve(dev: &mut Device, rpc_fd: RawFd, event_fd: RawFd, log: Log) {
             for ev in dev.drain_flip_events() {
                 let mut bytes = Vec::new();
                 pod_write(&mut bytes, &ev);
-                if send_frame(event_fd, &bytes, None).is_err() {
-                    log("event send failed");
+                if let Err(e) = send_frame(event_fd, &bytes, None) {
+                    log(&format!("event send failed: {e}"));
                     return;
                 }
             }
@@ -446,8 +446,8 @@ pub fn serve(dev: &mut Device, rpc_fd: RawFd, event_fd: RawFd, log: Log) {
         if let Some(fd) = result.fd_out {
             close_fd(fd);
         }
-        if sent.is_err() {
-            log("send failed");
+        if let Err(e) = sent {
+            log(&format!("send failed: {e}"));
             return;
         }
     }

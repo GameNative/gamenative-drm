@@ -955,6 +955,19 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeInjectorS
     let _ = std::panic::catch_unwind(injector::stop);
 }
 
+/// `GameNativeDrm.nativeInjectorSetSuspended(suspended)` — mark the session
+/// suspended (`true`) or resumed (`false`). A suspend freezes gamescope, so
+/// while suspended the injector holds concommands and replays them on resume
+/// (see `injector::set_suspended`).
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeInjectorSetSuspended(
+    _env: JNIEnv,
+    _class: JClass,
+    suspended: jboolean,
+) {
+    let _ = std::panic::catch_unwind(|| injector::set_suspended(suspended != 0));
+}
+
 /// `GameNativeDrm.nativeGamescopeCommand(command)` — run one allowlisted
 /// gamescope concommand, e.g. `"scaling_filter fsr"` or `"scaling_sharpness 5"`
 /// (see `injector::ALLOWED_COMMANDS`). Returns 0 when queued, [`E_INVAL`] when

@@ -542,7 +542,14 @@ static int send_frame(uint32_t ioctl_nr, const void *payload, uint32_t len,
         c->cmsg_len = CMSG_LEN(sizeof(int));
         memcpy(CMSG_DATA(c), &fd_to_send, sizeof(int));
     }
-    if (sendmsg(g_rpc_fd, &msg, 0) < 0)
+    /* Retry on EINTR: same signal boundary as recv_frame. A SEQPACKET sendmsg
+     * is all-or-nothing, so an interrupted send delivered nothing and a fresh
+     * one is the correct continuation. */
+    ssize_t n;
+    do {
+        n = sendmsg(g_rpc_fd, &msg, 0);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0)
         return -errno;
     return 0;
 }
@@ -557,7 +564,24 @@ static int recv_frame(uint8_t *buf, uint32_t cap, uint32_t *len_io, int *fd_out,
     msg.msg_control = cbuf;
     msg.msg_controllen = sizeof(cbuf);
 
-    ssize_t n = recvmsg(g_rpc_fd, &msg, 0);
+    ssize_t n;
+    for (;;) {
+        /* A guest SIGSTOP/SIGCONT interrupts the wait with EINTR. The request
+         * is already sent and the daemon's reply is on its way, so this is not
+         * the exchange failing: resume the wait. Surfacing EINTR would make
+         * libdrm re-issue the ioctl while that first reply stays queued, and
+         * the next exchange would read it as a sequence mismatch (EPROTO) and
+         * retire the channel - which is the fatal flip error. Re-arm the
+         * control buffer each time: a failed recvmsg may still have touched it. */
+        msg.msg_controllen = sizeof(cbuf);
+        msg.msg_flags = 0;
+        n = recvmsg(g_rpc_fd, &msg, 0);
+        if (n < 0 && errno == EINTR) {
+            LOG("RPC recv interrupted (EINTR); resuming wait\n");
+            continue;
+        }
+        break;
+    }
     if (n < 0)
         return -errno;
     /* SEQPACKET truncates oversized records: detect before trusting n. */

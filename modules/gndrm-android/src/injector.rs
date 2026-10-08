@@ -145,6 +145,12 @@ pub fn start(runtime_dir: String, display: String, app_id: u32) -> i32 {
     if slot.is_some() {
         return 0;
     }
+    // A fresh injector is never suspended. The flag is process-global, so a
+    // session that ended while suspended would otherwise leave the next one
+    // frozen: its commands would be applied and logged but never flushed to
+    // the compositor. The app-side queue resets with the session; this mirrors
+    // that at the daemon's own session boundary.
+    SUSPENDED.store(false, Ordering::SeqCst);
     let (tx, rx) = mpsc::channel::<InputEvent>();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
@@ -251,6 +257,21 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "screenshot",
     "debug_force_repaint",
 ];
+
+/// Whether the session is suspended. Under the `auto`/`manual` suspend policy
+/// the QuickMenu freezes the session's processes, gamescope among them, so while
+/// suspended this loop must not touch the wayland socket: a flush or roundtrip to
+/// the frozen compositor would block until it resumes. Commands issued then are
+/// held app-side (GameNative's `GamescopeCommandQueue`) and arrive here on resume,
+/// so nothing is queued on this thread.
+static SUSPENDED: AtomicBool = AtomicBool::new(false);
+
+/// `GameNativeDrm.nativeInjectorSetSuspended(suspended)` — mark the session
+/// suspended (`true`) or resumed (`false`). A plain store, so it never blocks the
+/// caller; it only gates the socket I/O in the loop below.
+pub fn set_suspended(suspended: bool) {
+    SUSPENDED.store(suspended, Ordering::SeqCst);
+}
 
 /// TEMPORARY diagnostics for the gamescope concommand bridge: emitted to logcat
 /// unconditionally (deliberately NOT behind a `GNDRM_LOG_*` gate) under the tag
@@ -621,10 +642,27 @@ fn connect_and_run(
         if stop.load(Ordering::SeqCst) {
             return Ok(());
         }
+        let suspended = SUSPENDED.load(Ordering::SeqCst);
         match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(ev) => apply(&state, ev),
+            Ok(ev) => {
+                // Input for a frozen session is dropped — stale input is worse
+                // than lost input. A gamescope command is applied even while
+                // suspended: the app queues commands app-side, so one arriving
+                // here during the resume transition (this thread still holding
+                // the pre-resume flag) is one the app just flushed. Left in the
+                // connection's outgoing buffer, the next flush delivers it.
+                if !suspended || matches!(ev, InputEvent::Command { .. }) {
+                    apply(&state, ev);
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+        // While suspended, leave the socket alone: a flush or roundtrip to the
+        // frozen gamescope would block this loop until it resumes. The pending
+        // commands live app-side and arrive after resume.
+        if suspended {
+            continue;
         }
         // gamescope takes the cap as a request, so re-issue it only when the
         // value changes (including the first pass after connecting) or when the
@@ -697,15 +735,20 @@ fn apply(state: &State, ev: InputEvent) {
                 kbd.key(t, code as u32, u32::from(pressed));
             }
         }
-        InputEvent::Command { name, value } => match &state.gs_private {
-            Some(private) => {
-                gslog(&format!("gscmd exec: '{name}' value=\"{value}\""));
-                private.execute(name, value);
-            }
-            None => gslog(&format!(
-                "gscmd drop: '{name}' (gamescope_private not offered)"
-            )),
-        },
+        InputEvent::Command { name, value } => apply_command(state, name, value),
+    }
+}
+
+/// Run one allowlisted concommand through gamescope, logging the outcome.
+fn apply_command(state: &State, name: String, value: String) {
+    match &state.gs_private {
+        Some(private) => {
+            gslog(&format!("gscmd exec: '{name}' value=\"{value}\""));
+            private.execute(name, value);
+        }
+        None => gslog(&format!(
+            "gscmd drop: '{name}' (gamescope_private not offered)"
+        )),
     }
 }
 
