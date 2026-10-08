@@ -163,12 +163,6 @@ struct ReleaseCtx {
 unsafe impl Send for ReleaseCtx {}
 unsafe impl Sync for ReleaseCtx {}
 
-/// TEMPORARY (pacing work): how many completions SurfaceFlinger has delivered to
-/// this presenter. Kept to read the completion rate against the publish rate.
-/// Remove with the pace diagnostics.
-static COMPLETIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PUBLISH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// `ASurfaceTransaction_setOnComplete`: capture the fence that says
 /// SurfaceFlinger has finished with the buffer published in the previous
 /// transaction. First writer wins; a second fence arriving before the present
@@ -181,9 +175,6 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
     // release signal for this frame, so a snapshot must be able to say whether
     // a callback was running when a request stalled.
     diag::diag().set_role(Role::PresenterCallback, State::PresenterCallback);
-    // TEMPORARY (pacing work): count the completions this presenter actually
-    // receives (see `COMPLETIONS`).
-    COMPLETIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: `context` is the leaked ReleaseCtx this presenter handed to
     // setOnComplete; it outlives every callback by construction.
     let ctx = unsafe { &*context.cast::<ReleaseCtx>() };
@@ -232,12 +223,6 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
     // completion. This is the frame's release signal — the return path the reuse
     // cache and the next publish's release-fence wait key on.
     ctx.latched.store(true, Ordering::Release);
-    // TEMPORARY (pacing work): one line per completion, so the completion rate
-    // can be read against the publish rate. Remove with `COMPLETIONS`.
-    let c = COMPLETIONS.load(std::sync::atomic::Ordering::Relaxed);
-    if c <= 10 || c.is_multiple_of(120) {
-        crate::log::pace_info(&format!("asc: completion #{c} ctx={context:p}"));
-    }
     diag::diag().set_role(Role::PresenterCallback, State::Idle);
 }
 
@@ -627,17 +612,6 @@ fn ctx_release_fd(buf: &PoolBuf) -> RawFd {
     unsafe { (*buf.ctx).release_fd.swap(-1, Ordering::AcqRel) }
 }
 
-/// Whether SurfaceFlinger has reported the completion for this registration's
-/// last publish, so the buffer may be handed back out.
-///
-/// TEMPORARY (pacing work): the flag is written by the completion callback and
-/// read by the pool's reuse rule (`gndrm_daemon::scanout::ReusePool`) and by the
-/// `FREE` line below. Remove the `FREE` line with the pace diagnostics.
-fn ctx_latched(buf: &PoolBuf) -> bool {
-    // SAFETY: `buf.ctx` is a leaked mailbox owned by the pool for the session.
-    unsafe { (*buf.ctx).latched.load(Ordering::Acquire) }
-}
-
 /// The last buffer actually put on the layer, with the geometry it went out
 /// with. A commit for an inode that is not registered re-publishes this rather
 /// than leaving the layer empty: SurfaceFlinger compositing nothing drops the
@@ -936,16 +910,6 @@ impl AscState {
                     }
                     match build_show(&api, self.sc, ahb, ctx, src, dst, fence) {
                         Some(tx) => {
-                            // TEMPORARY (pacing work): one line per published
-                            // frame so the publish rate can be read against the
-                            // completion rate. Remove with `PUBLISH_SEQ`.
-                            let p = PUBLISH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if p < 5 || p.is_multiple_of(120) {
-                                crate::log::pace_info(&format!(
-                                    "asc: publish #{p} ctx={ctx:p} completions={}",
-                                    COMPLETIONS.load(std::sync::atomic::Ordering::Relaxed)
-                                ));
-                            }
                             apply_transaction(&api, tx);
                             // What is on the layer is what a later commit falls
                             // back to.
@@ -1608,14 +1572,6 @@ fn retire_to_release(removed: &[Removed<PoolBuf>]) -> Vec<Retired> {
                 }
             }
             Removed::Released { ino, payload } => {
-                // TEMPORARY (pacing work): the registration is about to be
-                // freed; `latched` says whether its completion had already
-                // landed. Remove with the pace diagnostics.
-                crate::log::pace_info(&format!(
-                    "asc: FREE ino={ino} ctx={:p} latched={}",
-                    payload.ctx,
-                    u8::from(ctx_latched(payload))
-                ));
                 log_info!("asc: dma-buf ino {ino} retired; releasing its AHardwareBuffer");
                 out.push(retire_buf(*payload));
             }

@@ -29,37 +29,12 @@ pub(crate) fn write(prio: i32, module: &'static str, args: fmt::Arguments<'_>) {
 /// Log a line the daemon produced (its logger callbacks land here), tagged with
 /// the daemon's own module path so it classifies to the daemon gate rather than
 /// this library's, and so stays off unless `GNDRM_LOG_DAEMON` is set.
-///
-/// The per-frame pace line is the exception, and only it: a device run reads the
-/// pacing counters from that line, and the app process cannot open the daemon
-/// gate for a container launch. It rides the ungated [`pace_info`] tag instead.
 pub(crate) fn daemon_info(text: &str) {
-    if text.starts_with("pace ") {
-        pace_info(text);
-        return;
-    }
     write(
         crate::ffi::ANDROID_LOG_INFO,
         "gndrm_daemon",
         format_args!("{text}"),
     );
-}
-
-/// TEMPORARY (pacing work): an ungated line on the `gndrm-pace` tag — the
-/// app-side modules' counters and the daemon's per-frame pace line — so a device
-/// run can read the pacing counters without the app-process gates being opened.
-/// Remove with the pace diagnostics.
-pub(crate) fn pace_info(text: &str) {
-    let c = std::ffi::CString::new(text)
-        .unwrap_or_else(|_| std::ffi::CString::new("<log error>").unwrap());
-    // SAFETY: `c` is NUL-terminated and outlives the call.
-    unsafe {
-        crate::ffi::__android_log_write(
-            crate::ffi::ANDROID_LOG_INFO,
-            c"gndrm-pace".as_ptr(),
-            c.as_ptr(),
-        );
-    }
 }
 
 /// One log line at `prio`; `fmt`/`args` go through `format_args!`.

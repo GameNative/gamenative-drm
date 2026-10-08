@@ -27,7 +27,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::Instant;
 
 use gndrm_uapi::drm::*;
 use gndrm_uapi::mode::*;
@@ -1529,10 +1528,6 @@ struct CommitJob {
     /// Built at commit time when `PAGE_FLIP_EVENT` was requested; the worker
     /// stamps its vblank and emits it with the publish.
     event: Option<DrmEventVblank>,
-    /// TEMPORARY (pacing work): when the commit reached the daemon, so a
-    /// published frame's interval can be decomposed into queue wait, publish
-    /// work and the emit tail. Remove with the `pace` diagnostics.
-    t_commit: Instant,
 }
 
 impl Drop for CommitJob {
@@ -1619,7 +1614,6 @@ fn commit_worker(
             flip_event_fd,
             in_flight,
             shutdown,
-            logger,
             clock,
         );
     }));
@@ -1650,7 +1644,6 @@ fn commit_worker_loop(
     flip_event_fd: RawFd,
     in_flight: Arc<Mutex<HashSet<u32>>>,
     shutdown: Arc<AtomicBool>,
-    logger: Arc<Mutex<Option<LogFn>>>,
     clock: SharedClock,
 ) {
     // Publish what this worker is doing for the scan-out snapshot: "the commit
@@ -1660,18 +1653,11 @@ fn commit_worker_loop(
     d.set_role(Role::Commit, State::CommitWaitingJob);
     // The vblank schedule the flip events claim (see `VblankTimeline`).
     let mut vblank = VblankTimeline::new();
-    // TEMPORARY (pacing work): this worker's pacing counters. Remove with `Pace`.
-    let mut pace = Pace::new();
     while let Ok(mut job) = commit_rx.recv() {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        // TEMPORARY (pacing work): the commit's arrival stamp and the moment the
-        // worker picked it up, so a published frame's interval separates queue
-        // wait from publish work. Remove with the `pace` diagnostics.
-        let t_commit = job.t_commit;
-        let t_pick = Instant::now();
-        // The fb id this commit published, if any (used for the pacing line).
+        // The fb id this commit published, if any.
         let in_flight_fb = job.fb.as_ref().map(|fb| fb.id);
         // Publish the buffer when there is one; otherwise the commit carries no
         // presentation (the frame is dropped/hidden) and only its fence is
@@ -1688,7 +1674,6 @@ fn commit_worker_loop(
                 }
             }
         }
-        let t_pub = Instant::now();
         // The frame is now queued to SurfaceFlinger. Emit the page-flip event
         // here, with the publish: a real KMS page-flip event is delivered when
         // the flip is *queued* for the next vblank. gamescope's DRM backend
@@ -1725,77 +1710,7 @@ fn commit_worker_loop(
                 .push_back(ev);
             write_eventfd(flip_event_fd);
         }
-        // TEMPORARY (pacing work): one line per published frame — the effective
-        // present period plus where it went. `pl` is publish→flip-event, the
-        // worker's immediate post-publish tail. Remove with `Pace`.
-        if in_flight_fb.is_some() {
-            pace.log(&logger, t_commit, t_pick, t_pub, Instant::now());
-        }
         d.set_role(Role::Commit, State::CommitWaitingJob);
-    }
-}
-
-/// TEMPORARY diagnostics for the fps-limiter/pacing work: one line per published
-/// frame, decomposing its interval so an fps target's accuracy can be read off a
-/// device run instead of inferred. Fields, all in microseconds from this
-/// worker's start:
-///
-/// - `dc` commit-to-commit — the rate the compositor hands frames to the daemon
-/// - `q`  commit→pick — how long the job waited behind the previous frame
-/// - `cp` pick→publish — the presenter's own work
-/// - `pl` publish→flip-event — the worker's post-publish tail (immediate: the
-///   worker does not wait for the presenter's completion)
-/// - `dp` publish-to-publish — the effective present period
-///
-/// The state lives per worker, not in a static: several workers can exist in one
-/// process (the tests run them concurrently) and a shared "previous stamp" would
-/// then mix two streams. Removed when the pacing work closes.
-struct Pace {
-    base: Instant,
-    prev_commit: u64,
-    prev_pub: u64,
-    n: u64,
-}
-
-impl Pace {
-    fn new() -> Self {
-        Self {
-            base: Instant::now(),
-            prev_commit: 0,
-            prev_pub: 0,
-            n: 0,
-        }
-    }
-
-    fn log(
-        &mut self,
-        logger: &Arc<Mutex<Option<LogFn>>>,
-        t_commit: Instant,
-        t_pick: Instant,
-        t_pub: Instant,
-        t_done: Instant,
-    ) {
-        let us = |t: Instant| t.saturating_duration_since(self.base).as_micros() as u64;
-        let (c, p, l) = (us(t_commit), us(t_pub), us(t_done));
-        let line = format!(
-            "pace n={} dc={} q={} cp={} pl={} dp={}",
-            self.n,
-            c.saturating_sub(self.prev_commit),
-            us(t_pick).saturating_sub(c),
-            p.saturating_sub(us(t_pick)),
-            l.saturating_sub(p),
-            p.saturating_sub(self.prev_pub),
-        );
-        self.prev_commit = c;
-        self.prev_pub = p;
-        self.n += 1;
-        if let Some(log) = logger
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-        {
-            log(&line);
-        }
     }
 }
 
