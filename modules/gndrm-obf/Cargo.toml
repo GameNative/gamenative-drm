@@ -1,0 +1,20 @@
+# gndrm-obf — compile-time string obfuscation for the shipped libraries.
+#
+# Message/diagnostic literals are XOR-encoded at expansion so they never appear
+# in `.rodata`; the runtime half (`gndrm-obf`) decodes into a stack buffer at
+# the use site. `syn`/`quote`/`proc-macro2` are the standard proc-macro toolkit
+# and the only way to parse a Rust format string (escapes, capture idents,
+# specs) correctly without hand-rolling a lexer.
+
+[package]
+name = "gndrm-obf"
+description = "Compile-time string obfuscation: decode macro + runtime decode buffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "gndrm_obf"
+
+[dependencies]
+gndrm-obf-macros = { path = "../gndrm-obf-macros" }

@@ -468,9 +468,9 @@ impl ScanoutPool {
     /// A fresh completion mailbox for one registration, with the reuse gate
     /// the completion callback publishes into.
     fn new_ctx(&self) -> (*mut ReleaseCtx, Arc<AtomicBool>) {
-        let api = self
-            .api
-            .expect("a slot is only committed when the presenter is enabled");
+        let api = self.api.expect(&gndrm_obf::obf!(
+            "a slot is only committed when the presenter is enabled"
+        ));
         let latched = Arc::new(AtomicBool::new(false));
         let ctx = Box::into_raw(Box::new(ReleaseCtx {
             stats_get_controls: api.st_stats_get_controls,
@@ -522,12 +522,12 @@ impl ScanoutPool {
         // resolves to this geometry. Idempotent: the length index keeps the
         // first geometry noted for a (length, format) pair.
         self.cache.note_geometry(geom, buffer.size);
-        log_info!(
+        log_info!("{}", gndrm_obf::obf!(
             "asc: scan-out {width}x{height} {origin} (ino={}, stride={}, pool={}/{MAX_SCANOUT_POOL})",
             buffer.ino,
             buffer.stride,
             self.owned()
-        );
+        ));
         replaced
     }
 
@@ -693,11 +693,24 @@ impl AscState {
         });
         let api = if sc.is_null() { None } else { loaded };
         if loaded.is_none() {
-            log_warn!("asc: SurfaceControl API unavailable (pre-API-29?); publishing disabled");
+            log_warn!(
+                "{}",
+                gndrm_obf::obf!(
+                    "asc: SurfaceControl API unavailable (pre-API-29?); publishing disabled"
+                )
+            );
         } else if sc.is_null() {
-            log_warn!("asc: ASurfaceControl_createFromWindow failed; publishing disabled");
+            log_warn!(
+                "{}",
+                gndrm_obf::obf!(
+                    "asc: ASurfaceControl_createFromWindow failed; publishing disabled"
+                )
+            );
         } else {
-            log_info!("asc: SurfaceControl layer created ({panel_w}x{panel_h} panel)");
+            log_info!(
+                "{}",
+                gndrm_obf::obf!("asc: SurfaceControl layer created ({panel_w}x{panel_h} panel)")
+            );
         }
         // The `ALooper` is deliberately *not* prepared here. This function runs
         // on the serve thread, but `ALooper_pollOnce` must be called from the
@@ -845,15 +858,18 @@ impl AscState {
                 // back to, so the frame is dropped and the fence released.
                 if !self.logged_unregistered.contains(&ino) {
                     self.logged_unregistered.push(ino);
-                    log_warn!(
+                    log_warn!("{}", gndrm_obf::obf!(
                         "asc: no AHardwareBuffer for dma-buf ino {ino}; frame dropped (misses={misses})"
-                    );
+                    ));
                     log_warn!(
-                        "asc: unregistered framebuffer: {}x{} fmt={:#x} pitch={} (ino {ino})",
-                        fb.width,
-                        fb.height,
-                        fb.pixel_format,
-                        fb.pitches[0]
+                        "{}",
+                        gndrm_obf::obf!(
+                            "asc: unregistered framebuffer: {}x{} fmt={:#x} pitch={} (ino {ino})",
+                            fb.width,
+                            fb.height,
+                            fb.pixel_format,
+                            fb.pitches[0]
+                        )
                     );
                 }
                 close_fence(fence);
@@ -901,9 +917,9 @@ impl AscState {
                 if pending >= 0 {
                     if wait_fence(pending) && !self.warned_fence_timeout {
                         self.warned_fence_timeout = true;
-                        log_warn!(
+                        log_warn!("{}", gndrm_obf::obf!(
                             "asc: previous release fence timed out; reusing buffer anyway (logged once)"
-                        );
+                        ));
                     }
                     // SAFETY: `pending` is a valid descriptor owned by this call.
                     unsafe { libc::close(pending) };
@@ -915,15 +931,18 @@ impl AscState {
                     // panel).
                     if stale && !self.logged_stale.contains(&ino) {
                         self.logged_stale.push(ino);
-                        log_warn!(
+                        log_warn!("{}", gndrm_obf::obf!(
                             "asc: no AHardwareBuffer for dma-buf ino {ino}; re-publishing ino {published_ino} (misses={misses})"
-                        );
+                        ));
                         log_warn!(
+                            "{}",
+                            gndrm_obf::obf!(
                             "asc: unregistered framebuffer: {}x{} fmt={:#x} pitch={} (ino {ino})",
                             fb.width,
                             fb.height,
                             fb.pixel_format,
                             fb.pitches[0]
+                        )
                         );
                     }
                     match build_show(&api, self.sc, ahb, ctx, src, dst, fence) {
@@ -1016,7 +1035,10 @@ impl AscState {
             )
         };
         if rc != 0 || base.is_null() {
-            crate::log::daemon_info(&format!("dump {n}: AHardwareBuffer_lock failed (rc={rc})"));
+            crate::log::daemon_info(&format!(
+                "{}",
+                gndrm_obf::obf!("dump {n}: AHardwareBuffer_lock failed (rc={rc})")
+            ));
             return;
         }
         let len = stride as usize * height as usize;
@@ -1029,10 +1051,16 @@ impl AscState {
         let path = std::path::Path::new(dir).join("gn-fb-latest.ppm");
         match std::fs::write(&path, &ppm) {
             Ok(()) => crate::log::daemon_info(&format!(
-                "dump {n}: {width}x{height} stride={stride} wrote {}",
-                path.display()
+                "{}",
+                gndrm_obf::obf!(
+                    "dump {n}: {width}x{height} stride={stride} wrote {}",
+                    path.display()
+                )
             )),
-            Err(e) => crate::log::daemon_info(&format!("dump {n}: write failed: {e}")),
+            Err(e) => crate::log::daemon_info(&format!(
+                "{}",
+                gndrm_obf::obf!("dump {n}: write failed: {e}")
+            )),
         }
     }
 
@@ -1057,7 +1085,10 @@ impl AscState {
         if let Some(tx) = build_show(&api, self.sc, ahb, ctx, lp.src, lp.dst, None) {
             apply_transaction(&api, tx);
         }
-        log_info!("asc: re-published ino {} onto the layer", lp.ino);
+        log_info!(
+            "{}",
+            gndrm_obf::obf!("asc: re-published ino {} onto the layer", lp.ino)
+        );
     }
 
     /// Adopt a new display window without ending the session. The listen
@@ -1085,7 +1116,10 @@ impl AscState {
         let new_sc = unsafe { (api.sc_create_from_window)(window, SC_DEBUG_NAME.as_ptr()) };
         if new_sc.is_null() {
             log_warn!(
+                "{}",
+                gndrm_obf::obf!(
                 "asc: retarget: ASurfaceControl_createFromWindow failed; keeping the current layer"
+            )
             );
             return false;
         }
@@ -1103,7 +1137,10 @@ impl AscState {
         if !old_sc.is_null() {
             unsafe { (api.sc_release)(old_sc) };
         }
-        log_info!("asc: retargeted to the new window ({panel_w}x{panel_h})");
+        log_info!(
+            "{}",
+            gndrm_obf::obf!("asc: retargeted to the new window ({panel_w}x{panel_h})")
+        );
         // A layer with no buffer set composites nothing (the app's background
         // shows through as a blank panel), so the retained frame goes straight
         // back on before anything else can run.
@@ -1251,7 +1288,7 @@ pub fn serve_scanout(
             if e.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            log_info!("asc: scan-out channel poll: {e}");
+            log_info!("{}", gndrm_obf::obf!("asc: scan-out channel poll: {e}"));
             return ScanoutChannel::Closed;
         }
         if pfds[2].revents != 0 {
@@ -1260,7 +1297,12 @@ pub fn serve_scanout(
         if pfds[1].revents != 0 {
             // A newer connection is already queued: this fd has been superseded
             // and must be closed before the acceptor serves the newest one.
-            log_info!("asc: scan-out channel superseded (fd={fd}); adopting the newest connection");
+            log_info!(
+                "{}",
+                gndrm_obf::obf!(
+                    "asc: scan-out channel superseded (fd={fd}); adopting the newest connection"
+                )
+            );
             return ScanoutChannel::Superseded;
         }
         if pfds[0].revents == 0 {
@@ -1271,9 +1313,12 @@ pub fn serve_scanout(
             Ok(v) => v,
             Err(e) => {
                 log_info!(
-                    "asc: scan-out channel recv: {e} (requests={} replies={})",
-                    d.requests_seen(),
-                    d.replies_sent()
+                    "{}",
+                    gndrm_obf::obf!(
+                        "asc: scan-out channel recv: {e} (requests={} replies={})",
+                        d.requests_seen(),
+                        d.replies_sent()
+                    )
                 );
                 return ScanoutChannel::Closed;
             }
@@ -1285,14 +1330,20 @@ pub fn serve_scanout(
         }
         if n == 0 {
             log_info!(
-                "asc: scan-out channel closed by peer (requests={} replies={})",
-                d.requests_seen(),
-                d.replies_sent()
+                "{}",
+                gndrm_obf::obf!(
+                    "asc: scan-out channel closed by peer (requests={} replies={})",
+                    d.requests_seen(),
+                    d.replies_sent()
+                )
             );
             return ScanoutChannel::Closed;
         }
         let Some(req) = ScanoutAllocReq::decode(&buf[..n]) else {
-            log_warn!("asc: malformed scan-out request ({n} bytes); channel dropped");
+            log_warn!(
+                "{}",
+                gndrm_obf::obf!("asc: malformed scan-out request ({n} bytes); channel dropped")
+            );
             return ScanoutChannel::Closed;
         };
         // Open the request epoch. From here the watchdog samples this request,
@@ -1303,12 +1354,15 @@ pub fn serve_scanout(
         // thread at all — a channel/accept fault, not a slow reply path.
         if d.receipt_allowed() {
             log_info!(
-                "asc: scan-out request {}x{} len={} fmt={:#x} received (seq={})",
-                req.width,
-                req.height,
-                req.len,
-                req.format,
-                d.requests_seen()
+                "{}",
+                gndrm_obf::obf!(
+                    "asc: scan-out request {}x{} len={} fmt={:#x} received (seq={})",
+                    req.width,
+                    req.height,
+                    req.len,
+                    req.format,
+                    d.requests_seen()
+                )
             );
         }
         d.note_stage(Stage::Read, read_started.elapsed().as_millis() as u64);
@@ -1398,9 +1452,9 @@ pub fn serve_scanout(
                             // identity actually handed out so the next commit for
                             // this buffer still resolves.
                             if ino != cached_ino {
-                                log_warn!(
+                                log_warn!("{}", gndrm_obf::obf!(
                                 "asc: scan-out reuse ino moved ({cached_ino} -> {ino}); the free-list identity is stale, re-registering"
-                            );
+                            ));
                             }
                             let buffer = ScanoutBuffer {
                                 fd,
@@ -1414,7 +1468,7 @@ pub fn serve_scanout(
                                 &buffer,
                                 payload.ahb,
                                 false,
-                                "reused",
+                                &gndrm_obf::obf!("reused"),
                             );
                             if let Some(old) = replaced {
                                 release_retired(core::slice::from_ref(&retire_buf(old)));
@@ -1461,7 +1515,7 @@ pub fn serve_scanout(
                         &warm.buffer,
                         warm.ahb,
                         false,
-                        "from spare",
+                        &gndrm_obf::obf!("from spare"),
                     );
                     if let Some(old) = replaced {
                         release_retired(core::slice::from_ref(&retire_buf(old)));
@@ -1519,7 +1573,7 @@ pub fn serve_scanout(
                                 &buffer,
                                 ahb,
                                 true,
-                                "allocated",
+                                &gndrm_obf::obf!("allocated"),
                             );
                             if let Some(old) = replaced {
                                 release_retired(core::slice::from_ref(&retire_buf(old)));
@@ -1564,9 +1618,9 @@ pub fn serve_scanout(
         let elapsed_ms = d.request_elapsed_ms();
         let send_failed = sent.is_err();
         let diag_line = if send_failed {
-            Some(d.snapshot("reply-write-failed"))
+            Some(d.snapshot(&gndrm_obf::obf!("reply-write-failed")))
         } else if elapsed_ms >= diag::STALL_WARN_MS && d.slow_report_allowed() {
-            Some(d.snapshot("slow-reply"))
+            Some(d.snapshot(&gndrm_obf::obf!("slow-reply")))
         } else {
             None
         };
@@ -1576,7 +1630,10 @@ pub fn serve_scanout(
             Reply::Written
         });
         if let Some(line) = diag_line {
-            log_warn!("asc: scan-out request {total_ms} ms: {line}");
+            log_warn!(
+                "{}",
+                gndrm_obf::obf!("asc: scan-out request {total_ms} ms: {line}")
+            );
         }
         // The daemon's copy of the descriptor is closed on both paths.
         // `sendmsg` with `SCM_RIGHTS` installs a *duplicate* in the peer, so a
@@ -1600,7 +1657,7 @@ pub fn serve_scanout(
                     discard_returned(removed);
                 }
             }
-            log_warn!("asc: scan-out channel send: {e}");
+            log_warn!("{}", gndrm_obf::obf!("asc: scan-out channel send: {e}"));
             return ScanoutChannel::Closed;
         }
         // The spare is one short only when the request consumed it (or a cold
@@ -1633,9 +1690,12 @@ fn retire_to_release(removed: &[Removed<PoolBuf>]) -> Vec<Retired> {
         match r {
             Removed::Kept { ino, geom, payload } => {
                 log_info!(
-                    "asc: dma-buf ino {ino} retired; retained for reuse ({}x{})",
-                    geom.width,
-                    geom.height
+                    "{}",
+                    gndrm_obf::obf!(
+                        "asc: dma-buf ino {ino} retired; retained for reuse ({}x{})",
+                        geom.width,
+                        geom.height
+                    )
                 );
                 let fd = ctx_release_fd(payload);
                 if fd >= 0 {
@@ -1645,7 +1705,12 @@ fn retire_to_release(removed: &[Removed<PoolBuf>]) -> Vec<Retired> {
                 }
             }
             Removed::Released { ino, payload } => {
-                log_info!("asc: dma-buf ino {ino} retired; releasing its AHardwareBuffer");
+                log_info!(
+                    "{}",
+                    gndrm_obf::obf!(
+                        "asc: dma-buf ino {ino} retired; releasing its AHardwareBuffer"
+                    )
+                );
                 out.push(retire_buf(*payload));
             }
         }
@@ -1658,7 +1723,10 @@ fn retire_to_release(removed: &[Removed<PoolBuf>]) -> Vec<Retired> {
 fn discard_returned(removed: Removed<PoolBuf>) {
     match removed {
         Removed::Kept { ino, payload, .. } => {
-            log_info!("asc: dma-buf ino {ino} returned; retained for reuse");
+            log_info!(
+                "{}",
+                gndrm_obf::obf!("asc: dma-buf ino {ino} returned; retained for reuse")
+            );
             let fd = ctx_release_fd(&payload);
             if fd >= 0 {
                 // SAFETY: a stale release fence this registration owned.
@@ -1666,7 +1734,10 @@ fn discard_returned(removed: Removed<PoolBuf>) {
             }
         }
         Removed::Released { ino, payload } => {
-            log_info!("asc: dma-buf ino {ino} returned; releasing its AHardwareBuffer");
+            log_info!(
+                "{}",
+                gndrm_obf::obf!("asc: dma-buf ino {ino} returned; releasing its AHardwareBuffer")
+            );
             release_retired(core::slice::from_ref(&retire_buf(payload)));
         }
     }
@@ -1693,15 +1764,15 @@ fn refuse_scanout(
     // A length-only request has no geometry to name (it failed to resolve, or
     // resolved and then failed); report the length it carried instead.
     let what = if req.is_length_only() {
-        format!("len={} (unresolved)", req.len)
+        format!("{}", gndrm_obf::obf!("len={} (unresolved)", req.len))
     } else {
-        format!("{}x{}", req.width, req.height)
+        format!("{}", gndrm_obf::obf!("{}x{}", req.width, req.height))
     };
-    log_warn!(
+    log_warn!("{}", gndrm_obf::obf!(
         "asc: scan-out alloc {what} refused: {} (errno {errno}, waited {waited_ms} ms for the pool lock, pool={owned}/{MAX_SCANOUT_POOL} live={live} free={free}) {}",
         refusal_reason(errno),
-        d.snapshot("refused")
-    );
+        d.snapshot(&gndrm_obf::obf!("refused"))
+    ));
     (
         ScanoutAllocResp {
             ret: -errno,
@@ -1837,7 +1908,10 @@ fn allocate_buffer(
         // Distinct from a full pool: the pool had room, the allocator itself
         // refused. Without this line both failures read the same from the
         // shim's side ("daemon allocated no buffer").
-        log_warn!("asc: AHardwareBuffer_allocate {width}x{height} failed (rc={rc})");
+        log_warn!(
+            "{}",
+            gndrm_obf::obf!("asc: AHardwareBuffer_allocate {width}x{height} failed (rc={rc})")
+        );
         return Err(if rc != 0 { -rc } else { libc::ENOMEM });
     }
     let Some((fd, ino, size)) = dup_scanout_fd(&api, ahb) else {
@@ -1887,13 +1961,14 @@ fn release_warm(warm: Warm) {
 }
 
 /// Human label for a refusal, so the shim's bare "daemon allocated no buffer"
-/// can be traced back to the actual fault in the daemon log.
-fn refusal_reason(errno: i32) -> &'static str {
+/// can be traced back to the actual fault in the daemon log. The literals are
+/// obfuscated, so this returns an owned label (cold path: only on a refusal).
+fn refusal_reason(errno: i32) -> String {
     match errno {
-        libc::ENOSPC => "pool exhausted",
-        libc::ENOSYS => "presenter disabled (no publish API)",
-        libc::EINVAL => "unsupported geometry or format",
-        _ => "AHardwareBuffer allocation failed",
+        libc::ENOSPC => gndrm_obf::obf!("pool exhausted").to_string(),
+        libc::ENOSYS => gndrm_obf::obf!("presenter disabled (no publish API)").to_string(),
+        libc::EINVAL => gndrm_obf::obf!("unsupported geometry or format").to_string(),
+        _ => gndrm_obf::obf!("AHardwareBuffer allocation failed").to_string(),
     }
 }
 

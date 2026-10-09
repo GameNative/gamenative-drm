@@ -39,13 +39,14 @@
 #![allow(clippy::missing_transmute_annotations)]
 
 /// Emit a `gn-vkshim:` line to stderr, unless `GNDRM_LOG_VKSHIM` is off
-/// (unset, `""` or `"0"` — the default). The format arguments are only
-/// evaluated when the gate is on.
+/// (unset, `""` or `"0"` — the default). `$e` is a ready-to-format value: a
+/// call site passes `gndrm_obf::obf!(...)` so the message text is decoded at
+/// runtime and never lands in `.rodata`. The prefix is decoded likewise.
 #[macro_export]
 macro_rules! logf {
-    ($fmt:literal $(, $($arg:tt)*)?) => {
+    ($e:expr) => {
         if $crate::vkshim_enabled() {
-            eprintln!("gn-vkshim: {}", format_args!($fmt $(, $($arg)*)?));
+            eprintln!("{} {}", ::gndrm_obf::obf!("gn-vkshim:"), $e);
         }
     };
 }
@@ -189,19 +190,27 @@ fn try_adrenotools() {
     let path = std::env::var("ADRENOTOOLS_DRIVER_PATH").ok();
     let redirect = std::env::var("ADRENOTOOLS_REDIRECT_DIR").ok();
     let name = std::env::var("ADRENOTOOLS_DRIVER_NAME").ok();
-    let hooks = std::env::var("ADRENOTOOLS_HOOKS_PATH")
-        .ok()
-        .or_else(|| std::env::var("PREFIX").ok().map(|p| format!("{p}/lib")));
+    let hooks = std::env::var("ADRENOTOOLS_HOOKS_PATH").ok().or_else(|| {
+        std::env::var("PREFIX")
+            .ok()
+            .map(|p| format!("{}", gndrm_obf::obf!("{p}/lib")))
+    });
     let Some(hooks) = hooks else {
-        logf!("ADRENOTOOLS_HOOKS_PATH unset and no PREFIX — skipping adrenotools");
+        logf!(gndrm_obf::obf!(
+            "ADRENOTOOLS_HOOKS_PATH unset and no PREFIX — skipping adrenotools"
+        ));
         return;
     };
     let Some(path) = path else {
-        logf!("ADRENOTOOLS_DRIVER_PATH unset — skipping adrenotools");
+        logf!(gndrm_obf::obf!(
+            "ADRENOTOOLS_DRIVER_PATH unset — skipping adrenotools"
+        ));
         return;
     };
     if !std::path::Path::new(&path).exists() {
-        logf!("ADRENOTOOLS_DRIVER_PATH {path} not accessible — skipping adrenotools");
+        logf!(gndrm_obf::obf!(
+            "ADRENOTOOLS_DRIVER_PATH {path} not accessible — skipping adrenotools"
+        ));
         return;
     }
     let at = unsafe {
@@ -211,7 +220,10 @@ fn try_adrenotools() {
         )
     };
     if at.is_null() {
-        logf!("dlopen libadrenotools.so failed: {}", dlerror_str());
+        logf!(gndrm_obf::obf!(
+            "dlopen libadrenotools.so failed: {}",
+            dlerror_str()
+        ));
         return;
     }
     let open_vk: Option<AdrenotoolsOpenLibvulkanFn> = unsafe {
@@ -223,12 +235,17 @@ fn try_adrenotools() {
         }
     };
     let Some(open_vk) = open_vk else {
-        logf!("adrenotools_open_libvulkan not exported by libadrenotools.so");
+        logf!(gndrm_obf::obf!(
+            "adrenotools_open_libvulkan not exported by libadrenotools.so"
+        ));
         return;
     };
     // Patched copies live in a temp/ dir beside the driver (same layout the
     // wrapper creates); libadrenotools (re)generates them as needed.
-    let tmp = format!("{path}{}temp", if path.ends_with('/') { "" } else { "/" });
+    let tmp = format!(
+        "{}",
+        gndrm_obf::obf!("{path}{}temp", if path.ends_with('/') { "" } else { "/" })
+    );
     let _ = std::fs::create_dir_all(&tmp);
     let c_tmp = CString::new(tmp).unwrap();
     let c_hooks = CString::new(hooks).unwrap();
@@ -248,11 +265,11 @@ fn try_adrenotools() {
         )
     };
     if h.is_null() {
-        logf!(
+        logf!(gndrm_obf::obf!(
             "adrenotools_open_libvulkan failed for {}{}",
             path,
             name.as_deref().unwrap_or("")
-        );
+        ));
         return;
     }
     let exts = driver_instance_exts(h);
@@ -260,30 +277,32 @@ fn try_adrenotools() {
     let has_headless = ext_list_has(&exts, c"VK_EXT_headless_surface");
     let label = name.as_deref().unwrap_or(path.as_str()).to_string();
     if has_wayland {
-        logf!("using adrenotools driver {label} (VK_KHR_wayland_surface present)");
+        logf!(gndrm_obf::obf!(
+            "using adrenotools driver {label} (VK_KHR_wayland_surface present)"
+        ));
         unsafe { DRIVER.handle = h };
         return;
     }
     // No wayland WSI (the whole adrenotools turnip family): present through
     // the WSI proxy (proxy.rs) on top of VK_EXT_headless_surface instead.
     if !has_headless || std::env::var_os("GN_VKSHIM_NO_PROXY").is_some() {
-        logf!(
+        logf!(gndrm_obf::obf!(
             "adrenotools driver {label} lacks VK_KHR_wayland_surface{} — not usable in GameScope mode",
             if has_headless {
                 " (GN_VKSHIM_NO_PROXY set)"
             } else {
                 " and VK_EXT_headless_surface"
             }
-        );
+        ));
         return;
     }
     let Some(gipa) = (unsafe { resolve_gipa(h) }) else {
-        logf!("adrenotools driver {label} fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode");
+        logf!(gndrm_obf::obf!("adrenotools driver {label} fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode"));
         return;
     };
     let gipa_fn: GipaFn = gipa;
     if !proxy::device_prereqs(gipa_fn) {
-        logf!("adrenotools driver {label} fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode");
+        logf!(gndrm_obf::obf!("adrenotools driver {label} fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode"));
         return;
     }
     proxy::set_real_gipa(gipa_fn);
@@ -292,10 +311,10 @@ fn try_adrenotools() {
         DRIVER.proxy_active = true;
         DRIVER.handle = h;
     }
-    logf!(
+    logf!(gndrm_obf::obf!(
         "using adrenotools driver {label} via WSI proxy (headless surface + dma-buf export) [shim {}]",
         SHIM_BUILD
-    );
+    ));
 }
 
 /// The real driver .so handle the shim opened (adrenotools- or freedreno-
@@ -328,14 +347,14 @@ fn init_once() {
                 libc::RTLD_NOW | libc::RTLD_LOCAL,
             )
         };
-        logf!(
+        logf!(gndrm_obf::obf!(
             "gamescope process: payload freedreno {}",
             if h.is_null() {
                 dlerror_str()
             } else {
                 "loaded".into()
             }
-        );
+        ));
         unsafe { DRIVER.handle = h };
     } else {
         if std::env::var_os("GN_VKSHIM_NO_ADRENOTOOLS").is_none() {
@@ -348,14 +367,14 @@ fn init_once() {
                     libc::RTLD_NOW | libc::RTLD_LOCAL,
                 )
             };
-            logf!(
+            logf!(gndrm_obf::obf!(
                 "guest process: falling back to payload freedreno {}",
                 if h.is_null() {
                     dlerror_str()
                 } else {
                     "loaded".into()
                 }
-            );
+            ));
             unsafe { DRIVER.handle = h };
         }
     }
@@ -375,7 +394,9 @@ fn init_once() {
             }
         };
         if (*drv).gipa.is_none() {
-            logf!("driver exports no instance proc addr — ICD unusable");
+            logf!(gndrm_obf::obf!(
+                "driver exports no instance proc addr — ICD unusable"
+            ));
         }
     }
 }

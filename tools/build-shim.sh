@@ -14,7 +14,19 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/modules/gndrm-shim/gndrm_shim.c"
 OUT="$ROOT/target/shim"
-CFLAGS="-Wall -Wextra -Werror -O2 -fPIC"
+# Reproducibility: a caller-supplied SOURCE_DATE_EPOCH wins; otherwise pin to
+# the tree's last commit so identical inputs rebuild identically.
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || echo 0)}"
+# -ffile-prefix-map scrubs the build-host path from __FILE__/debug records so it
+# cannot leak into the shipped .so (the Rust side has --remap-path-prefix).
+CFLAGS="-Wall -Wextra -Werror -O2 -fPIC -ffile-prefix-map=$ROOT=. -ffile-prefix-map=$PWD=."
+# The shim's log text is obfuscated at build time: obf-shim.py rewrites each
+# LOG(...) site to decode an XOR-encoded literal, so `strings` on the shipped
+# .so no longer recovers the messages. The .c stays the readable source.
+GEN="$OUT/gen"
+mkdir -p "$GEN"
+CSRC="$GEN/gndrm_shim.c"
+python3 "$ROOT/tools/obf-shim.py" "$SRC" "$CSRC"
 # NOTE: no -fvisibility=hidden — the interposed symbols (open/ioctl/close)
 # must stay exported for LD_PRELOAD interposition to work at all. What pins the
 # exported set is the linker version script below: it makes everything except
@@ -25,7 +37,7 @@ LDFLAGS="-Wl,--version-script=$MAP -Wl,--exclude-libs,ALL"
 mkdir -p "$OUT"
 
 # --- host ----------------------------------------------------------------
-cc $CFLAGS -shared $LDFLAGS -o "$OUT/libgndrm_shim.so" "$SRC" -ldl -lpthread
+cc $CFLAGS -shared $LDFLAGS -o "$OUT/libgndrm_shim.so" "$CSRC" -ldl -lpthread
 echo "host:   $OUT/libgndrm_shim.so"
 
 # --- test client (host, real libdrm) --------------------------------------
@@ -65,7 +77,7 @@ if [ "${1:-}" = "android" ]; then
     # archive symbols. llvm-strip then removes the static symbol table from the
     # shipped .so (the leak this hardening closes).
     "$TC/bin/aarch64-linux-android$API-clang" $CFLAGS -shared $LDFLAGS \
-        -o "$AOUT/libgndrm_shim.so" "$SRC" -ldl -landroid
+        -o "$AOUT/libgndrm_shim.so" "$CSRC" -ldl -landroid
     "$TC/bin/llvm-strip" --strip-unneeded "$AOUT/libgndrm_shim.so"
     echo "android: $AOUT/libgndrm_shim.so (NDK $(basename "$NDK"), API $API)"
 

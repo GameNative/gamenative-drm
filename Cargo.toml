@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "modules/gndrm-obf",
+    "modules/gndrm-obf-macros",
     "modules/gndrm-uapi",
     "modules/gndrm-daemon",
     "modules/gndrm-android",

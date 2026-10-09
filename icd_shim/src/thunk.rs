@@ -117,7 +117,7 @@ pub fn thunk_for(name: &str, target: PFN_vkVoidFunction) -> PFN_vkVoidFunction {
     // answered by someone else (the loader's stub).
     if let Ok(mut seen) = THUNKED.lock() {
         if seen.len() < 128 && !seen.iter().any(|s| s == name) {
-            crate::logf!("proxy: thunk -> {name}");
+            crate::logf!(gndrm_obf::obf!("proxy: thunk -> {name}"));
             seen.push(name.to_string());
         }
     }
@@ -135,7 +135,10 @@ pub fn thunk_for(name: &str, target: PFN_vkVoidFunction) -> PFN_vkVoidFunction {
         let ret =
             unsafe { libc::mprotect(st.page.cast(), PAGE, libc::PROT_READ | libc::PROT_EXEC) };
         if ret != 0 {
-            crate::logf!("proxy: thunk page mprotect failed: {}", errno_str());
+            crate::logf!(gndrm_obf::obf!(
+                "proxy: thunk page mprotect failed: {}",
+                errno_str()
+            ));
         }
     }
     let fnptr = Some(f);

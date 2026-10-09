@@ -5,24 +5,46 @@
 //! subsystem (daemon/asc/input/…) can be switched on independently. A gated-off
 //! call returns before formatting; cold paths only — the per-frame hot path
 //! never logs.
+//!
+//! The logcat tag is decoded at runtime from an obfuscated literal
+//! ([`gndrm_obf::obfc`]), so the shipped library's tag strings are not
+//! recoverable with `strings`.
 
 use std::fmt;
 
-/// Emit `text` at `prio` under the tag/env `module` classifies to. Returns
-/// before formatting when the module's gate is off.
-pub(crate) fn write(prio: i32, module: &'static str, args: fmt::Arguments<'_>) {
-    let (tag, env) = crate::log_policy::classify(module);
-    if !crate::log_policy::enabled(env) {
+use crate::log_policy::Gate;
+
+/// Emit `text` at `prio` under `gate`. Returns before formatting when the
+/// gate is off.
+pub(crate) fn write(prio: i32, gate: Gate, args: fmt::Arguments<'_>) {
+    if !crate::log_policy::enabled(gate) {
         return;
     }
-    let text = fmt::format(args);
+    emit(prio, gate, &fmt::format(args));
+}
+
+/// Format `text` into a C string and hand it to logcat under the gate's tag.
+fn emit(prio: i32, gate: Gate, text: &str) {
     // CString::new fails only on interior NUL, which format! output of our
     // messages never contains; fall back to a fixed string.
     let c = std::ffi::CString::new(text)
         .unwrap_or_else(|_| std::ffi::CString::new("<log error>").unwrap());
-    // SAFETY: both pointers are NUL-terminated and outlive the call.
-    unsafe {
-        crate::ffi::__android_log_write(prio, tag.as_ptr(), c.as_ptr());
+    macro_rules! tag {
+        ($t:literal) => {{
+            let t = gndrm_obf::obfc!($t);
+            // SAFETY: `t` and `c` are NUL-terminated and outlive the call.
+            unsafe {
+                crate::ffi::__android_log_write(prio, t.as_cstr().as_ptr(), c.as_ptr());
+            }
+        }};
+    }
+    match gate {
+        Gate::Daemon => tag!("gndrm-daemon"),
+        Gate::Asc => tag!("gndrm-asc"),
+        Gate::Input => tag!("gndrm-input"),
+        Gate::Vkshim => tag!("gn-vkshim"),
+        Gate::Shim => tag!("gndrm-shim"),
+        Gate::Fallback => tag!("gndrm"),
     }
 }
 
@@ -32,16 +54,19 @@ pub(crate) fn write(prio: i32, module: &'static str, args: fmt::Arguments<'_>) {
 pub(crate) fn daemon_info(text: &str) {
     write(
         crate::ffi::ANDROID_LOG_INFO,
-        "gndrm_daemon",
+        Gate::Daemon,
         format_args!("{text}"),
     );
 }
 
-/// One log line at `prio`; `fmt`/`args` go through `format_args!`.
+/// One log line at `prio`; `fmt`/`args` go through `format_args!`. The
+/// call site's module path is classified at compile time (`const`), so it is
+/// never stored in the binary.
 #[macro_export]
 macro_rules! alog {
     ($prio:expr, $($arg:tt)*) => {{
-        $crate::log::write($prio, module_path!(), format_args!($($arg)*))
+        const GATE: $crate::log_policy::Gate = $crate::log_policy::gate_of(module_path!());
+        $crate::log::write($prio, GATE, format_args!($($arg)*))
     }};
 }
 

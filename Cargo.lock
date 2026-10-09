@@ -6,6 +6,7 @@ version = 4
 name = "adrenotools_gamescope"
 version = "0.1.0"
 dependencies = [
+ "gndrm-obf",
  "gndrm-uapi",
  "libc",
 ]
@@ -89,6 +90,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "gndrm-daemon",
+ "gndrm-obf",
  "gndrm-uapi",
  "jni",
  "libc",
@@ -102,8 +104,25 @@ dependencies = [
 name = "gndrm-daemon"
 version = "0.1.0"
 dependencies = [
+ "gndrm-obf",
  "gndrm-uapi",
  "libc",
+]
+
+[[package]]
+name = "gndrm-obf"
+version = "0.1.0"
+dependencies = [
+ "gndrm-obf-macros",
+]
+
+[[package]]
+name = "gndrm-obf-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -111,6 +130,7 @@ name = "gndrm-uapi"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "gndrm-obf",
 ]
 
 [[package]]

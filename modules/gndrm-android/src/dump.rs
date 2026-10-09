@@ -18,7 +18,7 @@ const BPP: usize = 4;
 #[must_use]
 pub(crate) fn ppm_bgra(src: &[u8], width: usize, height: usize, stride: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(width * height * 3 + 16);
-    out.extend_from_slice(format!("P6\n{width} {height}\n255\n").as_bytes());
+    out.extend_from_slice(format!("{}", gndrm_obf::obf!("P6\n{width} {height}\n255\n")).as_bytes());
     for row in src.chunks(stride).take(height) {
         for x in 0..width {
             let px = &row[x * BPP..];

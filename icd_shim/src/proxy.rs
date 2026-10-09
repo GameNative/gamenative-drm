@@ -96,10 +96,13 @@ fn ring_dump(reason: &str) {
     let Ok(r) = RING.lock() else {
         return;
     };
-    crate::logf!("x11 stall ring ({reason}): last {} entry points:", r.len());
+    crate::logf!(gndrm_obf::obf!(
+        "x11 stall ring ({reason}): last {} entry points:",
+        r.len()
+    ));
     let n = r.len();
     for (i, e) in r.iter().enumerate() {
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "x11 stall ring [{}/{}] tid={} {} args={:x} {:x} {:x} {:x} {:x}",
             i + 1,
             n,
@@ -110,7 +113,7 @@ fn ring_dump(reason: &str) {
             e.args[2],
             e.args[3],
             e.args[4]
-        );
+        ));
     }
 }
 static LOG_COMMIT: AtomicUsize = AtomicUsize::new(0);
@@ -183,25 +186,31 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
     }
     drop(g);
     format!(
-        "acq={} pres={} rel={} commit={} starved={} in_flight={in_flight} slots=[{}]",
-        N_ACQ.load(Ordering::Relaxed),
-        N_PRES.load(Ordering::Relaxed),
-        N_REL.load(Ordering::Relaxed),
-        N_COMMIT_OK.load(Ordering::Relaxed),
-        N_STARVE.load(Ordering::Relaxed),
-        flags.trim_end()
+        "{}",
+        gndrm_obf::obf!(
+            "acq={} pres={} rel={} commit={} starved={} in_flight={in_flight} slots=[{}]",
+            N_ACQ.load(Ordering::Relaxed),
+            N_PRES.load(Ordering::Relaxed),
+            N_REL.load(Ordering::Relaxed),
+            N_COMMIT_OK.load(Ordering::Relaxed),
+            N_STARVE.load(Ordering::Relaxed),
+            flags.trim_end()
+        )
     )
 }
 
 /// Counters only — safe to call while `shared` is held.
 fn counters() -> String {
     format!(
-        "acq={} pres={} rel={} commit={} starved={}",
-        N_ACQ.load(Ordering::Relaxed),
-        N_PRES.load(Ordering::Relaxed),
-        N_REL.load(Ordering::Relaxed),
-        N_COMMIT_OK.load(Ordering::Relaxed),
-        N_STARVE.load(Ordering::Relaxed)
+        "{}",
+        gndrm_obf::obf!(
+            "acq={} pres={} rel={} commit={} starved={}",
+            N_ACQ.load(Ordering::Relaxed),
+            N_PRES.load(Ordering::Relaxed),
+            N_REL.load(Ordering::Relaxed),
+            N_COMMIT_OK.load(Ordering::Relaxed),
+            N_STARVE.load(Ordering::Relaxed)
+        )
     )
 }
 
@@ -221,7 +230,7 @@ extern "C" fn gn_wl_log(fmt: *const c_char, ap: *mut c_void) {
     let mut buf = [0 as c_char; 512];
     unsafe { wlproto::vsnprintf(buf.as_mut_ptr(), buf.len(), fmt, ap) };
     let msg = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy();
-    crate::logf!("libwayland: {}", msg.trim_end());
+    crate::logf!(gndrm_obf::obf!("libwayland: {}", msg.trim_end()));
 }
 
 // dma-buf sync ioctl (same values as the daemon's EGL presenter).
@@ -373,7 +382,9 @@ unsafe fn x11_present_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) -> bo
     // slot to Xwayland and the bounded dump reads it on the CPU, so the render
     // must be complete (and its writes visible) first; see `gpu_idle`.
     if !unsafe { gpu_idle((*sc).dev) } {
-        crate::logf!("x11: slot {idx} present skipped - no GPU-completion wait available");
+        crate::logf!(gndrm_obf::obf!(
+            "x11: slot {idx} present skipped - no GPU-completion wait available"
+        ));
         return false;
     }
     // Bounded one-shot (always on): record the presented index, the acquire
@@ -385,7 +396,7 @@ unsafe fn x11_present_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) -> bo
         unsafe { (*sc).x11_trace = trace_n + 1 };
         let (a0, nz, px) = unsafe { slot_signature(sc, s) };
         let acq = unsafe { (*s).acq_seq };
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "x11 trace {trace_n}: sc={sc:?} idx={idx} acq#{acq} {}x{} alpha0={a0}/{} nz={nz} px0=({},{},{},{})",
             unsafe { (*sc).extent.width },
             unsafe { (*sc).extent.height },
@@ -394,21 +405,21 @@ unsafe fn x11_present_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) -> bo
             px[1],
             px[2],
             px[3]
-        );
+        ));
         // Bounded one-shot two-view probe (first presents): the shim's own
         // linear mmap above vs the driver's own mapping of the same dma-buf
         // (vkMapMemory of the slot's imported memory). They only differ if the
         // image's real layout/stride is not what the shim advertises/reads.
         if trace_n < X11_VIEW_N {
             if let Some((va0, vnz, vpx)) = unsafe { slot_mem_signature(sc, s) } {
-                crate::logf!(
+                crate::logf!(gndrm_obf::obf!(
                     "x11 view {trace_n}: idx={idx} driver(mapmem) alpha0={va0}/{} nz={vnz} px0=({},{},{},{})",
                     unsafe { (*sc).extent.width as usize * (*sc).extent.height as usize },
                     vpx[0],
                     vpx[1],
                     vpx[2],
                     vpx[3]
-                );
+                ));
             }
         }
     }
@@ -424,7 +435,9 @@ unsafe fn x11_present_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) -> bo
         } {
             Some(p) => unsafe { (*s).xpix = p },
             None => {
-                crate::logf!("x11: slot {idx} has no pixmap - frame dropped");
+                crate::logf!(gndrm_obf::obf!(
+                    "x11: slot {idx} has no pixmap - frame dropped"
+                ));
                 return false;
             }
         }
@@ -439,17 +452,19 @@ unsafe fn x11_present_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) -> bo
         Some(serial) => {
             let n = LOG_COMMIT.fetch_add(1, Ordering::Relaxed);
             if n < LOG_FIRST_N || n.is_multiple_of(120) {
-                crate::logf!(
+                crate::logf!(gndrm_obf::obf!(
                     "x11 present: sc={sc:?} idx={idx} pix={} serial={serial} {}x{} {}",
                     unsafe { (*s).xpix },
                     unsafe { (*sc).extent.width },
                     unsafe { (*sc).extent.height },
                     counters()
-                );
+                ));
             }
         }
         None => {
-            crate::logf!("x11: slot {idx} present refused - frame dropped");
+            crate::logf!(gndrm_obf::obf!(
+                "x11: slot {idx} present refused - frame dropped"
+            ));
             return false;
         }
     }
@@ -484,7 +499,7 @@ unsafe fn x11_reap(sc: *mut GnSwapchain) {
             }
             N_REL.fetch_add(1, Ordering::Relaxed);
             if rate_ok(&RATE_REL, RATE_EVERY) {
-                crate::logf!("x11 release: slot={i} {}", slot_flags(sc));
+                crate::logf!(gndrm_obf::obf!("x11 release: slot={i} {}", slot_flags(sc)));
             }
         }
     }
@@ -519,10 +534,10 @@ fn pop_job(sc: *mut GnSwapchain) -> i32 {
             // presenting: the fence fires when the server drops the pixmap.
             unsafe { x11_reap(sc) };
             if rate_ok(&RATE_IDLE, IDLE_EVERY) {
-                crate::logf!(
+                crate::logf!(gndrm_obf::obf!(
                     "gn-vkshim idle: present worker has no work {}",
                     slot_flags(sc)
-                );
+                ));
             }
             g = unsafe { (*sc).shared.lock().unwrap() };
         }
@@ -558,9 +573,9 @@ fn worker_main(sc: *mut GnSwapchain) {
                     x11_reap(sc);
                 } else {
                     if !X11_DROP_LOGGED.swap(true, Ordering::Relaxed) {
-                        crate::logf!(
+                        crate::logf!(gndrm_obf::obf!(
                             "x11 route: present unavailable - frames dropped, slots kept free (guest keeps running)"
-                        );
+                        ));
                     }
                     let _g = (*sc).shared.lock().unwrap();
                     (*s).in_flight = false;
@@ -573,7 +588,9 @@ fn worker_main(sc: *mut GnSwapchain) {
                 (*s).buf = slot_make_buffer(sc, s);
             }
             if (*s).buf.is_null() {
-                crate::logf!("proxy: wl_buffer creation failed — dropping frame");
+                crate::logf!(gndrm_obf::obf!(
+                    "proxy: wl_buffer creation failed — dropping frame"
+                ));
                 let _g = (*sc).shared.lock().unwrap();
                 (*s).in_flight = false;
                 (*sc).cv_free.notify_all();
@@ -609,14 +626,14 @@ fn worker_main(sc: *mut GnSwapchain) {
             let n = LOG_COMMIT.fetch_add(1, Ordering::Relaxed);
             let done = N_COMMIT_OK.fetch_add(1, Ordering::Relaxed);
             if n < LOG_FIRST_N || n.is_multiple_of(120) || fence_ms >= 100 {
-                crate::logf!(
+                crate::logf!(gndrm_obf::obf!(
                     "proxy commit: sc={sc:?} idx={idx} {}x{} flush_rc={flush_rc} dpy_err={} fence={fence_ms}ms commit={commit_ms}ms #{} {}",
                     (*sc).extent.width,
                     (*sc).extent.height,
                     wlproto::wl_display_get_error((*(*sc).surf).dpy),
                     done + 1,
                     counters(),
-                );
+                ));
             }
         }
     }
@@ -631,7 +648,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     let ci = unsafe { &*ci };
     let gd = unsafe { find_device(device) };
     let surf = unsafe { find_surface(ci.surface) };
-    crate::logf!(
+    crate::logf!(gndrm_obf::obf!(
         "proxy swapchain create: device={device:?} surface={:#x} {}x{} fmt={} -> gd={:?} surf={:?}",
         ci.surface,
         ci.imageExtent.width,
@@ -639,13 +656,16 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         ci.imageFormat,
         gd,
         surf
-    );
+    ));
     if gd.is_null() || surf.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let fourcc = vk_format_to_fourcc(ci.imageFormat);
     if fourcc == 0 {
-        crate::logf!("proxy: unsupported swapchain format {}", ci.imageFormat);
+        crate::logf!(gndrm_obf::obf!(
+            "proxy: unsupported swapchain format {}",
+            ci.imageFormat
+        ));
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
     // Only the scan-out pool's own layout can be served end to end (see
@@ -653,10 +673,10 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     // BGRA buffer, so a swapchain in any other channel order would publish
     // R/B-exchanged pixels. Refuse it loudly rather than render wrong colours.
     if !swapchain_format_allowed(ci.imageFormat, advertises_rgba()) {
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "proxy: refusing swapchain format {} (scan-out pool is B8G8R8A8; set GN_VKSHIM_ALLOW_RGBA to opt in)",
             ci.imageFormat
-        );
+        ));
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
     let mode = effective_present_mode(ci);
@@ -734,7 +754,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             for j in (0..=inited).rev() {
                 unsafe { slot_release(scp, sc.slots.as_mut_ptr().add(j)) };
             }
-            crate::logf!("proxy: slot init failed: {res}");
+            crate::logf!(gndrm_obf::obf!("proxy: slot init failed: {res}"));
             return res;
         }
     }
@@ -745,7 +765,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         if let Ok(adv) = ADVERTISED_CAPS.lock() {
             if let Some(a) = *adv {
                 let stride = sc.slots.first().map_or(0, |s| s.stride);
-                crate::logf!(
+                crate::logf!(gndrm_obf::obf!(
                     "x11 caps vs slot: advertised current={}x{} min={}x{} max={}x{} -> image {}x{} stride={} slots={}",
                     a.current.0,
                     a.current.1,
@@ -757,17 +777,17 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
                     ci.imageExtent.height,
                     stride,
                     sc.slots.len()
-                );
+                ));
             }
         }
     }
     let sc_addr = scp as usize;
     if !unsafe { (*(*scp).surf).x11 }.is_null() {
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "X11 present engages: swapchain {scp:?} {}x{} presents through DRI3 + Present",
             ci.imageExtent.width,
             ci.imageExtent.height
-        );
+        ));
     }
     let worker = std::thread::Builder::new()
         .name("gn-present".into())
@@ -789,7 +809,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     }
     unsafe {
         *out = sc as usize as VkSwapchainKHR;
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "proxy swapchain {:?}: {}x{} fmt {} -> fourcc {:#x}, {} images; requested usage={:#x} minImages={} presentMode={} compositeAlpha={:#x} colorspace={} clipped={} tiling=LINEAR effective_mode={}",
             sc,
             (*sc).extent.width,
@@ -804,7 +824,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             ci.imageColorSpace,
             ci.clipped,
             mode
-        );
+        ));
     }
     VK_SUCCESS
 }
@@ -833,7 +853,7 @@ unsafe extern "C" fn gn_vkGetSwapchainImagesKHR(
             let hs: Vec<String> = (0..n)
                 .map(|i| format!("{:#x}", *images.add(i) as usize))
                 .collect();
-            crate::logf!("x11 scimages: sc={sc:?} n={n} imgs={hs:?}");
+            crate::logf!(gndrm_obf::obf!("x11 scimages: sc={sc:?} n={n} imgs={hs:?}"));
         }
         *count = n as u32;
         if n < n_slots {
@@ -920,11 +940,11 @@ unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
                 (*s).acq_seq = seq as u64;
             }
             if seq < X11_TRACE_N {
-                crate::logf!(
+                crate::logf!(gndrm_obf::obf!(
                     "x11 acquire {seq}: sc={sc:?} idx={} img={:#x}",
                     *idx,
                     unsafe { (*s).image } as usize
-                );
+                ));
             }
             return;
         }
@@ -1004,10 +1024,10 @@ unsafe fn gn_acquire_common(
         // a wl_buffer.release that never comes.
         N_STARVE.fetch_add(1, Ordering::Relaxed);
         if rate_ok(&RATE_STALL, RATE_EVERY) {
-            crate::logf!(
+            crate::logf!(gndrm_obf::obf!(
                 "gn-vkshim stall: acquire found no free slot (timeout={timeout}) {}",
                 slot_flags(sc)
-            );
+            ));
         }
         return if timeout == 0 {
             VK_NOT_READY
@@ -1050,7 +1070,9 @@ unsafe fn gn_acquire_common(
     }
     let n = LOG_ACQ.fetch_add(1, Ordering::Relaxed);
     if n < LOG_FIRST_N || n.is_multiple_of(120) || acq_ms >= 100 {
-        crate::logf!("proxy acquire: sc={sc:?} slot={idx} wait={acq_ms}ms");
+        crate::logf!(gndrm_obf::obf!(
+            "proxy acquire: sc={sc:?} slot={idx} wait={acq_ms}ms"
+        ));
     }
     VK_SUCCESS
 }
@@ -1240,9 +1262,12 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
         loud(
             "present.queue_miss",
             format!(
-                "proxy: gn_vkQueuePresentKHR QUEUE MISS q={:#x} {}",
-                queue as usize,
-                unsafe { handle_note(false, queue as usize, first, n) }
+                "{}",
+                gndrm_obf::obf!(
+                    "proxy: gn_vkQueuePresentKHR QUEUE MISS q={:#x} {}",
+                    queue as usize,
+                    unsafe { handle_note(false, queue as usize, first, n) }
+                )
             ),
         );
         gd = G.lock().unwrap().devices;
@@ -1251,8 +1276,11 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
         loud(
             "present.device_miss",
             format!(
-                "proxy: gn_vkQueuePresentKHR DEVICE MISS q={:#x} — no device wrapper at all",
-                queue as usize
+                "{}",
+                gndrm_obf::obf!(
+                    "proxy: gn_vkQueuePresentKHR DEVICE MISS q={:#x} — no device wrapper at all",
+                    queue as usize
+                )
             ),
         );
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -1304,7 +1332,7 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
         };
         let res = unsafe { (*gd).f.submit.unwrap()(real_q, 1, &si, (*slot).fence) };
         if res != VK_SUCCESS {
-            crate::logf!("proxy: present wait submit failed: {res}");
+            crate::logf!(gndrm_obf::obf!("proxy: present wait submit failed: {res}"));
             return res;
         }
         if signal_chain {
@@ -1312,15 +1340,19 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
         }
         unsafe { present_dispatch(sc, slot, indices[i] as i32) };
         if LOG_PRESENT.fetch_add(1, Ordering::Relaxed) < LOG_FIRST_N {
-            crate::logf!("proxy present: sc={sc:?} idx={} {}", indices[i], counters());
+            crate::logf!(gndrm_obf::obf!(
+                "proxy present: sc={sc:?} idx={} {}",
+                indices[i],
+                counters()
+            ));
         }
         if LOUD_PRESENT.fetch_add(1, Ordering::Relaxed) < 4 {
-            crate::logf!(
+            crate::logf!(gndrm_obf::obf!(
                 "proxy: present flow pid={} sc={sc:?} idx={} {}",
                 std::process::id(),
                 indices[i],
                 counters()
-            );
+            ));
         }
     }
     VK_SUCCESS
@@ -1361,9 +1393,12 @@ unsafe fn submit_impl(
         loud(
             "submit.miss",
             format!(
-                "proxy: vkQueueSubmit QUEUE MISS q={:#x} {} — submitting guest CBs directly",
-                queue as usize,
-                unsafe { handle_note(false, queue as usize, first, n) }
+                "{}",
+                gndrm_obf::obf!(
+                    "proxy: vkQueueSubmit QUEUE MISS q={:#x} {} — submitting guest CBs directly",
+                    queue as usize,
+                    unsafe { handle_note(false, queue as usize, first, n) }
+                )
             ),
         );
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -1382,15 +1417,15 @@ unsafe fn submit_impl(
     ];
     unsafe { translate_nested("vkQueueSubmit", &mut args, &mut stage) };
     let seq = LOG_SUBMIT.fetch_add(1, Ordering::Relaxed);
-    crate::logf!(
+    crate::logf!(gndrm_obf::obf!(
         "proxy submit #{seq}: n={count} q={queue:?} entries={:?} fence={fence:?}",
         unsafe { slice_or_empty(submits, count as usize) }
             .iter()
             .map(|s| s.commandBufferCount)
             .collect::<Vec<_>>()
-    );
+    ));
     if LOUD_SUBMIT.fetch_add(1, Ordering::Relaxed) < 4 {
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "proxy: submit flow #{seq} pid={} q={queue:?} real_q={:?} n={count} ncmd={:?}",
             std::process::id(),
             unsafe { (*gq).real },
@@ -1398,7 +1433,7 @@ unsafe fn submit_impl(
                 .iter()
                 .map(|s| s.commandBufferCount)
                 .collect::<Vec<_>>()
-        );
+        ));
     }
     unsafe { (*gd).f.submit.unwrap()((*gq).real, count, args[2] as *const VkSubmitInfo, fence) }
 }
@@ -1437,13 +1472,15 @@ unsafe extern "C" fn gn_vkWaitSemaphores(
             .and_then(|g| g.clone())
             .map(|(s, v)| format!("{s}@{v}"))
             .unwrap_or_else(|| String::from("<none>"));
-        crate::logf!("proxy wait: n={n} want=[{wants}] last_signalled={last} timeout={timeout}");
+        crate::logf!(gndrm_obf::obf!(
+            "proxy wait: n={n} want=[{wants}] last_signalled={last} timeout={timeout}"
+        ));
     }
     let t0 = Instant::now();
     let res = unsafe { f((*gd).real, wi, timeout) };
     let ms = t0.elapsed().as_millis();
     if ms >= 1000 {
-        crate::logf!("proxy wait done: res={res} after={ms}ms");
+        crate::logf!(gndrm_obf::obf!("proxy wait done: res={res} after={ms}ms"));
     }
     res
 }
@@ -1479,9 +1516,12 @@ unsafe fn submit2_impl(
         loud(
             "submit2.miss",
             format!(
-                "proxy: vkQueueSubmit2 QUEUE MISS q={:#x} {} — batch dropped",
-                queue as usize,
-                unsafe { handle_note(false, queue as usize, first, n) }
+                "{}",
+                gndrm_obf::obf!(
+                    "proxy: vkQueueSubmit2 QUEUE MISS q={:#x} {} — batch dropped",
+                    queue as usize,
+                    unsafe { handle_note(false, queue as usize, first, n) }
+                )
             ),
         );
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -1507,7 +1547,7 @@ unsafe fn submit2_impl(
     unsafe { translate_nested("vkQueueSubmit2", &mut args, &mut stage) };
     let translated = args[2] as *const VkSubmitInfo2;
     if LOUD_SUBMIT2.fetch_add(1, Ordering::Relaxed) < 4 {
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "proxy: submit2 flow pid={} q={queue:?} real_q={:?} n={count} ncmd={:?}",
             std::process::id(),
             unsafe { (*gq).real },
@@ -1515,7 +1555,7 @@ unsafe fn submit2_impl(
                 .iter()
                 .map(|s| s.commandBufferInfoCount)
                 .collect::<Vec<_>>()
-        );
+        ));
     }
     {
         // Every submit, terse: the faulting call is the last line before the
@@ -1536,14 +1576,20 @@ unsafe fn submit2_impl(
                     slice_or_empty(si.pWaitSemaphoreInfos as *const VkSemaphoreSubmitInfo, nw)
                 };
                 for s in ws.iter().take(3) {
-                    sems.push(format!("W{:?}@{}", s.semaphore, s.value));
+                    sems.push(format!(
+                        "{}",
+                        gndrm_obf::obf!("W{:?}@{}", s.semaphore, s.value)
+                    ));
                 }
                 let ns = si.signalSemaphoreInfoCount as usize;
                 let ss = unsafe {
                     slice_or_empty(si.pSignalSemaphoreInfos as *const VkSemaphoreSubmitInfo, ns)
                 };
                 for s in ss.iter().take(3) {
-                    sems.push(format!("S{:?}@{}", s.semaphore, s.value));
+                    sems.push(format!(
+                        "{}",
+                        gndrm_obf::obf!("S{:?}@{}", s.semaphore, s.value)
+                    ));
                     if let Ok(mut g) = LAST_SIG.lock() {
                         *g = Some((format!("{:?}", s.semaphore), s.value));
                     }
@@ -1564,14 +1610,14 @@ unsafe fn submit2_impl(
                 }
             }
         }
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "proxy submit2 #{seq}: n={count} q={queue:?} real_q={:?} entries={:?} cbs={cbs:?} sems={sems:?} fence={fence:?}",
             unsafe { (*gq).real },
             unsafe { slice_or_empty(submits, count as usize) }
                 .iter()
                 .map(|s| s.commandBufferInfoCount)
                 .collect::<Vec<_>>()
-        );
+        ));
     }
     unsafe { real_fn((*gq).real, count, translated, fence) }
 }
@@ -1596,8 +1642,11 @@ unsafe extern "C" fn gn_vkAllocateCommandBuffers(
         loud(
             "alloc_cmd.miss",
             format!(
-                "proxy: vkAllocateCommandBuffers DEVICE MISS {} — guest CBs will be driver-raw",
-                unsafe { handle_note(false, device as usize, first, n) }
+                "{}",
+                gndrm_obf::obf!(
+                    "proxy: vkAllocateCommandBuffers DEVICE MISS {} — guest CBs will be driver-raw",
+                    unsafe { handle_note(false, device as usize, first, n) }
+                )
             ),
         );
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -1622,10 +1671,10 @@ unsafe extern "C" fn gn_vkAllocateCommandBuffers(
                 (*gd).cmds = gc;
                 noted_wrapper(gc as usize);
                 *out.add(i) = gc.cast::<c_void>();
-                crate::logf!(
+                crate::logf!(gndrm_obf::obf!(
                     "proxy alloc cmd: wrapper={:?} real={real:?}",
                     gc.cast::<c_void>()
-                );
+                ));
             }
         }
     }
@@ -1669,7 +1718,9 @@ unsafe extern "C" fn gn_vkCreateGraphicsPipelines(
     }
     let res = unsafe { real((*gd).real, cache, count, cis, alloc, out) };
     if culled > 0 {
-        crate::logf!("proxy: winding compensation skipped on {culled}/{count} culling pipeline(s)");
+        crate::logf!(gndrm_obf::obf!(
+            "proxy: winding compensation skipped on {culled}/{count} culling pipeline(s)"
+        ));
     }
     res
 }
@@ -1702,7 +1753,7 @@ unsafe extern "C" fn gn_vkCreateImage(
         if seen.len() < LOG_IMAGE_FIRST_N && !seen.contains(&key) {
             seen.push(key);
             let pnext = unsafe { pnext_image_create_summary(ci_ref.pNext) };
-            crate::logf!(
+            crate::logf!(gndrm_obf::obf!(
                 "guest image: fmt={} {}x{}x{} type={} mips={} layers={} samples={:#x} tiling={} usage={:#x} flags={:#x} pNext=[{pnext}]",
                 ci_ref.format,
                 ci_ref.extent.width,
@@ -1715,7 +1766,7 @@ unsafe extern "C" fn gn_vkCreateImage(
                 ci_ref.tiling,
                 ci_ref.usage,
                 ci_ref.flags
-            );
+            ));
         }
     }
     res
@@ -1759,7 +1810,7 @@ unsafe fn sc_slot_of(gd: *mut GnDevice, image: VkImage) -> Option<(*mut GnSwapch
 fn trace_sc_cmd(name: &str, cmd: VkCommandBuffer, hits: &str) {
     let n = TRACE_SC_CMD.fetch_add(1, Ordering::Relaxed);
     if n < TRACE_SC_CMD_N {
-        crate::logf!("x11 cmd {n}: {name} cb={cmd:?} {hits}");
+        crate::logf!(gndrm_obf::obf!("x11 cmd {n}: {name} cb={cmd:?} {hits}"));
     }
 }
 
@@ -1806,7 +1857,9 @@ static TRACE_SEEN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 fn trace_seen(name: &'static str) {
     if let Ok(mut v) = TRACE_SEEN.lock() {
         if v.len() < 32 && !v.contains(&name) {
-            crate::logf!("x11 cmd-seen: {name} (guest records it through the shim)");
+            crate::logf!(gndrm_obf::obf!(
+                "x11 cmd-seen: {name} (guest records it through the shim)"
+            ));
             v.push(name);
         }
     }
@@ -1826,14 +1879,14 @@ unsafe fn cmd_real_and_dev(cmd: VkCommandBuffer) -> (VkCommandBuffer, *mut GnDev
 
 fn slot_note(s: Option<(*mut GnSwapchain, usize)>) -> String {
     match s {
-        Some((sc, i)) => format!("SLOT sc={sc:?} slot={i}"),
+        Some((sc, i)) => format!("{}", gndrm_obf::obf!("SLOT sc={sc:?} slot={i}")),
         None => "guest".into(),
     }
 }
 
 /// A transfer region's extent, as a log field.
 fn extent_note(e: VkExtent3D) -> String {
-    format!("r0={}x{}", e.width, e.height)
+    format!("{}", gndrm_obf::obf!("r0={}x{}", e.width, e.height))
 }
 
 /// Extent of the first copy region of a v1 `VkImageCopy` array (does the
@@ -1860,11 +1913,14 @@ fn blit_extent(n: u32, regions: *const VkImageBlit) -> String {
     }
     let r = unsafe { &*regions };
     format!(
-        "blit={}x{} -> {}x{}",
-        r.srcOffsets[1].x - r.srcOffsets[0].x,
-        r.srcOffsets[1].y - r.srcOffsets[0].y,
-        r.dstOffsets[1].x - r.dstOffsets[0].x,
-        r.dstOffsets[1].y - r.dstOffsets[0].y
+        "{}",
+        gndrm_obf::obf!(
+            "blit={}x{} -> {}x{}",
+            r.srcOffsets[1].x - r.srcOffsets[0].x,
+            r.srcOffsets[1].y - r.srcOffsets[0].y,
+            r.dstOffsets[1].x - r.dstOffsets[0].x,
+            r.dstOffsets[1].y - r.dstOffsets[0].y
+        )
     )
 }
 
@@ -1987,7 +2043,7 @@ fn trace_viewports(name: &str, count: u32, vps: *const VkViewport) {
     }
     *last = Some(key);
     VP_LOGGED.fetch_add(1, Ordering::Relaxed);
-    crate::logf!(
+    crate::logf!(gndrm_obf::obf!(
         "x11 {name}: call={n} count={count} vp0 x={} y={} w={} h={} depth={}..{}",
         v.x,
         v.y,
@@ -1995,7 +2051,7 @@ fn trace_viewports(name: &str, count: u32, vps: *const VkViewport) {
         v.height,
         v.minDepth,
         v.maxDepth
-    );
+    ));
 }
 
 fn trace_scissors(name: &str, count: u32, rects: *const VkRect2D) {
@@ -2018,13 +2074,13 @@ fn trace_scissors(name: &str, count: u32, rects: *const VkRect2D) {
     }
     *last = Some(key);
     SC_LOGGED.fetch_add(1, Ordering::Relaxed);
-    crate::logf!(
+    crate::logf!(gndrm_obf::obf!(
         "x11 {name}: call={n} count={count} sc0 off=({},{}) ext={}x{}",
         r.offset.x,
         r.offset.y,
         r.extent.width,
         r.extent.height
-    );
+    ));
 }
 
 unsafe extern "C" fn gn_vkCmdSetViewport(
@@ -2257,23 +2313,34 @@ unsafe extern "C" fn gn_vkCmdBeginRendering(cmd: VkCommandBuffer, info: *const V
                 let img = unsafe { view_image(a.imageView) };
                 let note = match img {
                     Some(i) => match unsafe { sc_slot_of(gd, i) } {
-                        Some((sc, si)) => format!("SLOT sc={sc:?} slot={si}"),
-                        None => format!("img={:#x}", i as usize),
+                        Some((sc, si)) => {
+                            format!("{}", gndrm_obf::obf!("SLOT sc={sc:?} slot={si}"))
+                        }
+                        None => format!("{}", gndrm_obf::obf!("img={:#x}", i as usize)),
                     },
-                    None => format!("view={:#x}", a.imageView as usize),
+                    None => format!("{}", gndrm_obf::obf!("view={:#x}", a.imageView as usize)),
                 };
                 let c = a.clearValue.float32;
                 parts.push(format!(
-                    "a{k}[{note} layout={} load={} store={} clear=({},{},{},{})]",
-                    a.imageLayout, a.loadOp, a.storeOp, c[0], c[1], c[2], c[3]
+                    "{}",
+                    gndrm_obf::obf!(
+                        "a{k}[{note} layout={} load={} store={} clear=({},{},{},{})]",
+                        a.imageLayout,
+                        a.loadOp,
+                        a.storeOp,
+                        c[0],
+                        c[1],
+                        c[2],
+                        c[3]
+                    )
                 ));
             }
-            crate::logf!(
+            crate::logf!(gndrm_obf::obf!(
                 "x11 rndr {n}: {}x{} colors={na} {}",
                 ri.renderArea.extent.width,
                 ri.renderArea.extent.height,
                 parts.join(" ")
-            );
+            ));
         }
     }
     call_cmd!(gd, cmd_begin_rendering, "vkCmdBeginRendering", |f| f(
@@ -2299,7 +2366,7 @@ unsafe extern "C" fn gn_vkCmdBeginRenderPass2(
             } else {
                 [0f32; 4]
             };
-            crate::logf!(
+            crate::logf!(gndrm_obf::obf!(
                 "x11 rpb2 {n}: {}x{} off=({},{}) fb={:#x} rp={:#x} clears={} clear0=({},{},{},{}) rpOps={} slots={slots:?}",
                 bi.renderArea.extent.width,
                 bi.renderArea.extent.height,
@@ -2310,7 +2377,7 @@ unsafe extern "C" fn gn_vkCmdBeginRenderPass2(
                 bi.clearValueCount,
                 c[0], c[1], c[2], c[3],
                 rp_ops_note(bi.renderPass)
-            );
+            ));
         }
     }
     call_cmd!(gd, cmd_begin_render_pass2, "vkCmdBeginRenderPass2", |f| f(
@@ -2335,7 +2402,7 @@ unsafe extern "C" fn gn_vkCmdBeginRenderPass(
                 [0f32; 4]
             };
             let slots = unsafe { fb_slots(gd, bi.framebuffer) };
-            crate::logf!(
+            crate::logf!(gndrm_obf::obf!(
                 "x11 rpb {n}: {}x{} off=({},{}) fb={:#x} rp={:#x} clears={} clear0=({},{},{},{}) contents={contents} rpOps={} slots={slots:?}",
                 bi.renderArea.extent.width,
                 bi.renderArea.extent.height,
@@ -2346,7 +2413,7 @@ unsafe extern "C" fn gn_vkCmdBeginRenderPass(
                 bi.clearValueCount,
                 c[0], c[1], c[2], c[3],
                 rp_ops_note(bi.renderPass)
-            );
+            ));
         }
     }
     call_cmd!(gd, cmd_begin_render_pass, "vkCmdBeginRenderPass", |f| f(
@@ -2369,7 +2436,10 @@ unsafe extern "C" fn gn_vkCmdClearColorImage(
             static ANY: AtomicUsize = AtomicUsize::new(0);
             let n2 = ANY.fetch_add(1, Ordering::Relaxed);
             if n2 < 8 {
-                crate::logf!("x11 any clear: img={:#x} layout={layout}", image as usize);
+                crate::logf!(gndrm_obf::obf!(
+                    "x11 any clear: img={:#x} layout={layout}",
+                    image as usize
+                ));
             }
         }
         if let Some((sc, i)) = unsafe { sc_slot_of(gd, image) } {
@@ -2382,8 +2452,14 @@ unsafe extern "C" fn gn_vkCmdClearColorImage(
                 "vkCmdClearColorImage",
                 cmd,
                 &format!(
-                    "SLOT sc={sc:?} slot={i} layout={layout} n={n} clear=({},{},{},{})",
-                    c[0], c[1], c[2], c[3]
+                    "{}",
+                    gndrm_obf::obf!(
+                        "SLOT sc={sc:?} slot={i} layout={layout} n={n} clear=({},{},{},{})",
+                        c[0],
+                        c[1],
+                        c[2],
+                        c[3]
+                    )
                 ),
             );
         }
@@ -2411,14 +2487,14 @@ unsafe extern "C" fn gn_vkCmdCopyImage(
             trace_sc_cmd(
                 "vkCmdCopyImage",
                 cmd,
-                &format!(
+                &format!("{}", gndrm_obf::obf!(
                     "src={:#x}({}) dst={:#x}({}) srcLayout={src_layout} dstLayout={dst_layout} n={n} {}",
                     src as usize,
                     slot_note(s),
                     dst as usize,
                     slot_note(d),
                     copy_extent(n, regions)
-                ),
+                )),
             );
         }
     }
@@ -2436,7 +2512,7 @@ unsafe extern "C" fn gn_vkCmdCopyImage2(cmd: VkCommandBuffer, info: *const VkCop
             static ANY: AtomicUsize = AtomicUsize::new(0);
             let n2 = ANY.fetch_add(1, Ordering::Relaxed);
             if n2 < 12 {
-                crate::logf!(
+                crate::logf!(gndrm_obf::obf!(
                     "x11 any copyimg2: src={:#x} dst={:#x} {}x{}",
                     ci.srcImage as usize,
                     ci.dstImage as usize,
@@ -2446,7 +2522,7 @@ unsafe extern "C" fn gn_vkCmdCopyImage2(cmd: VkCommandBuffer, info: *const VkCop
                     } else {
                         0
                     }
-                );
+                ));
             }
         }
         let s = unsafe { sc_slot_of(gd, ci.srcImage) };
@@ -2456,15 +2532,18 @@ unsafe extern "C" fn gn_vkCmdCopyImage2(cmd: VkCommandBuffer, info: *const VkCop
                 "vkCmdCopyImage2",
                 cmd,
                 &format!(
-                    "src={:#x}({}) dst={:#x}({}) srcLayout={} dstLayout={} n={} {}",
-                    ci.srcImage as usize,
-                    slot_note(s),
-                    ci.dstImage as usize,
-                    slot_note(d),
-                    ci.srcImageLayout,
-                    ci.dstImageLayout,
-                    ci.regionCount,
-                    copy_extent2(ci.regionCount, ci.pRegions)
+                    "{}",
+                    gndrm_obf::obf!(
+                        "src={:#x}({}) dst={:#x}({}) srcLayout={} dstLayout={} n={} {}",
+                        ci.srcImage as usize,
+                        slot_note(s),
+                        ci.dstImage as usize,
+                        slot_note(d),
+                        ci.srcImageLayout,
+                        ci.dstImageLayout,
+                        ci.regionCount,
+                        copy_extent2(ci.regionCount, ci.pRegions)
+                    )
                 ),
             );
         }
@@ -2491,14 +2570,14 @@ unsafe extern "C" fn gn_vkCmdBlitImage(
             trace_sc_cmd(
                 "vkCmdBlitImage",
                 cmd,
-                &format!(
+                &format!("{}", gndrm_obf::obf!(
                     "src={:#x}({}) dst={:#x}({}) srcLayout={src_layout} dstLayout={dst_layout} n={n} filter={filter} {}",
                     src as usize,
                     slot_note(s),
                     dst as usize,
                     slot_note(d),
                     blit_extent(n, regions)
-                ),
+                )),
             );
         }
     }
@@ -2519,15 +2598,18 @@ unsafe extern "C" fn gn_vkCmdBlitImage2(cmd: VkCommandBuffer, info: *const VkBli
                 "vkCmdBlitImage2",
                 cmd,
                 &format!(
-                    "src={:#x}({}) dst={:#x}({}) srcLayout={} dstLayout={} n={} filter={}",
-                    ci.srcImage as usize,
-                    slot_note(s),
-                    ci.dstImage as usize,
-                    slot_note(d),
-                    ci.srcImageLayout,
-                    ci.dstImageLayout,
-                    ci.regionCount,
-                    ci.filter
+                    "{}",
+                    gndrm_obf::obf!(
+                        "src={:#x}({}) dst={:#x}({}) srcLayout={} dstLayout={} n={} filter={}",
+                        ci.srcImage as usize,
+                        slot_note(s),
+                        ci.dstImage as usize,
+                        slot_note(d),
+                        ci.srcImageLayout,
+                        ci.dstImageLayout,
+                        ci.regionCount,
+                        ci.filter
+                    )
                 ),
             );
         }
@@ -2549,22 +2631,22 @@ unsafe extern "C" fn gn_vkCmdPipelineBarrier2(cmd: VkCommandBuffer, dep: *const 
                     static ANY: AtomicUsize = AtomicUsize::new(0);
                     let n2 = ANY.fetch_add(1, Ordering::Relaxed);
                     if n2 < 12 {
-                        crate::logf!(
+                        crate::logf!(gndrm_obf::obf!(
                             "x11 any bar2: img={:#x} srcStage={:#x} dstStage={:#x}",
                             b.image as usize,
                             b.srcStageMask,
                             b.dstStageMask
-                        );
+                        ));
                     }
                 }
                 if let Some((sc, i)) = unsafe { sc_slot_of(gd, b.image) } {
                     trace_sc_cmd(
                         "vkCmdPipelineBarrier2(image)",
                         cmd,
-                        &format!(
+                        &format!("{}", gndrm_obf::obf!(
                             "SLOT sc={sc:?} slot={i} srcStage={:#x} srcAccess={:#x} dstStage={:#x} dstAccess={:#x}",
                             b.srcStageMask, b.srcAccessMask, b.dstStageMask, b.dstAccessMask
-                        ),
+                        )),
                     );
                 }
             }
@@ -2591,7 +2673,10 @@ unsafe extern "C" fn gn_vkCmdCopyBufferToImage(
                 "vkCmdCopyBufferToImage",
                 cmd,
                 &format!(
+                    "{}",
+                    gndrm_obf::obf!(
                     "buf={src_buffer:#x} -> SLOT sc={sc:?} slot={i} dstLayout={dst_layout} n={n}"
+                )
                 ),
             );
         }
@@ -2617,8 +2702,13 @@ unsafe extern "C" fn gn_vkCmdCopyBufferToImage2(
                 "vkCmdCopyBufferToImage2",
                 cmd,
                 &format!(
-                    "buf={:#x} -> SLOT sc={sc:?} slot={i} dstLayout={} n={}",
-                    ci.srcBuffer as usize, ci.dstImageLayout, ci.regionCount
+                    "{}",
+                    gndrm_obf::obf!(
+                        "buf={:#x} -> SLOT sc={sc:?} slot={i} dstLayout={} n={}",
+                        ci.srcBuffer as usize,
+                        ci.dstImageLayout,
+                        ci.regionCount
+                    )
                 ),
             );
         }
@@ -2655,10 +2745,10 @@ unsafe extern "C" fn gn_vkCmdPipelineBarrier(
                 trace_sc_cmd(
                     "vkCmdPipelineBarrier(image)",
                     cmd,
-                    &format!(
+                    &format!("{}", gndrm_obf::obf!(
                         "SLOT sc={sc:?} slot={i} {}->{} srcStage={src_stage:#x} dstStage={dst_stage:#x}",
                         b.oldLayout, b.newLayout
-                    ),
+                    )),
                 );
             }
         }
@@ -2684,10 +2774,10 @@ unsafe extern "C" fn gn_vkCmdExecuteCommands(
         // pointers before; dropping it is silent. Say it happened.
         loud(
             "exec_cmds.miss",
-            format!(
+            format!("{}", gndrm_obf::obf!(
                 "proxy: vkCmdExecuteCommands CB MISS cmd={:#x} count={count} — secondaries not translated",
                 cmd as usize
-            ),
+            )),
         );
         return;
     }
@@ -3605,7 +3695,9 @@ unsafe extern "C" fn gn_vkGetDeviceProcAddr(
         if let Ok(mut missed) = GDPA_MISSED.lock() {
             let n = name.to_string_lossy().into_owned();
             if missed.len() < 64 && !missed.contains(&n) {
-                crate::logf!("proxy: vkGetDeviceProcAddr MISS (no-op stub): {n}");
+                crate::logf!(gndrm_obf::obf!(
+                    "proxy: vkGetDeviceProcAddr MISS (no-op stub): {n}"
+                ));
                 missed.push(n);
             }
         }
@@ -3791,7 +3883,8 @@ mod tests {
             ("vkEnumerateInstanceVersion", Level::Global, Arg0::Other),
         ];
         for &(name, level, arg0) in cases {
-            let d = classify(name).unwrap_or_else(|| panic!("{name} missing from registry"));
+            let d = classify(name)
+                .unwrap_or_else(|| panic!("{}", gndrm_obf::obf!("{name} missing from registry")));
             assert_eq!(d.1, level, "{name} level");
             assert_eq!(d.2, arg0, "{name} arg0");
         }
@@ -3980,7 +4073,8 @@ mod tests {
             // registry lists both EXT and KHR for vkGetImageSubresourceLayout2),
             // so the exact partner is not pinned — the round trip is.
             assert_eq!(alias_of(khr), Some(core), "alias_of({khr})");
-            let partner = alias_of(core).unwrap_or_else(|| panic!("alias_of({core}) is empty"));
+            let partner = alias_of(core)
+                .unwrap_or_else(|| panic!("{}", gndrm_obf::obf!("alias_of({core}) is empty")));
             assert_eq!(alias_of(partner), Some(core), "round trip from {core}");
         }
     }
@@ -4515,7 +4609,7 @@ fn dispatch_main() {
     }
     let err = unsafe { wlproto::wl_display_get_error(dpy) };
     G_WL.lock().unwrap().failed = true;
-    crate::logf!(
+    crate::logf!(gndrm_obf::obf!(
         "wayland dispatch thread exited: {}",
         if err != 0 {
             std::io::Error::from_raw_os_error(err).to_string()
@@ -4524,7 +4618,7 @@ fn dispatch_main() {
         } else {
             "display closed".to_string()
         }
-    );
+    ));
 }
 
 fn wl_setup(dpy: *mut wl_display) -> bool {
@@ -4537,7 +4631,9 @@ fn wl_setup(dpy: *mut wl_display) -> bool {
         let dpy = if dpy.is_null() {
             let c = wlproto::wl_display_connect(std::ptr::null());
             if c.is_null() {
-                crate::logf!("proxy wayland connect failed (WAYLAND_DISPLAY unset?)");
+                crate::logf!(gndrm_obf::obf!(
+                    "proxy wayland connect failed (WAYLAND_DISPLAY unset?)"
+                ));
                 (*wptr).failed = true;
                 return false;
             }
@@ -4557,7 +4653,9 @@ fn wl_setup(dpy: *mut wl_display) -> bool {
         }
         wlproto::wl_proxy_destroy(reg);
         if !(*wptr).failed && (*wptr).dmabuf.is_null() {
-            crate::logf!("compositor misses zwp_linux_dmabuf_v1 v3 — proxy cannot present");
+            crate::logf!(gndrm_obf::obf!(
+                "compositor misses zwp_linux_dmabuf_v1 v3 — proxy cannot present"
+            ));
             (*wptr).failed = true;
         }
         if !(*wptr).failed {
@@ -4565,7 +4663,7 @@ fn wl_setup(dpy: *mut wl_display) -> bool {
                 .name("gn-wl-dispatch".into())
                 .spawn(dispatch_main);
             if spawned.is_err() {
-                crate::logf!("failed to start wayland dispatch thread");
+                crate::logf!(gndrm_obf::obf!("failed to start wayland dispatch thread"));
                 (*wptr).failed = true;
             }
         }
@@ -4579,7 +4677,7 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
     unsafe {
         let sc = (*slot).owner;
         if LOG_RELEASE.fetch_add(1, Ordering::Relaxed) < LOG_FIRST_N {
-            crate::logf!("proxy release: slot={slot:?}");
+            crate::logf!(gndrm_obf::obf!("proxy release: slot={slot:?}"));
         }
         let _g = (*sc).shared.lock().unwrap();
         (*slot).in_flight = false;
@@ -4587,7 +4685,10 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
         drop(_g);
         N_REL.fetch_add(1, Ordering::Relaxed);
         if rate_ok(&RATE_REL, RATE_EVERY) {
-            crate::logf!("gn-vkshim release: slot={slot:?} {}", slot_flags(sc));
+            crate::logf!(gndrm_obf::obf!(
+                "gn-vkshim release: slot={slot:?} {}",
+                slot_flags(sc)
+            ));
         }
     }
 }
@@ -4710,15 +4811,18 @@ fn loud(site: &'static str, msg: String) {
             None => v.push((site, 1)),
         }
     }
-    crate::logf!("{msg}");
+    crate::logf!(gndrm_obf::obf!("{msg}"));
 }
 
 /// A handle the shim could not resolve, against the wrapper table it searched,
 /// so a wrong-handle miss names both values in one line.
 unsafe fn handle_note(found: bool, searched: usize, first_wrapper: usize, n: usize) -> String {
     format!(
-        "found={found} searched={searched:#x} wrappers={n} first={first_wrapper:#x} pid={}",
-        std::process::id()
+        "{}",
+        gndrm_obf::obf!(
+            "found={found} searched={searched:#x} wrappers={n} first={first_wrapper:#x} pid={}",
+            std::process::id()
+        )
     )
 }
 
@@ -4764,7 +4868,9 @@ unsafe fn real_cmd(cmd: VkCommandBuffer) -> VkCommandBuffer {
     // wrapped is the driver's own. But say so when it *was* a wrapper —
     // that case hands the driver a shim pointer and faults inside it.
     if was_wrapper(cmd as usize) {
-        crate::logf!("proxy: BUG submit carries an untracked wrapper CB {cmd:?}");
+        crate::logf!(gndrm_obf::obf!(
+            "proxy: BUG submit carries an untracked wrapper CB {cmd:?}"
+        ));
     }
     cmd
 }
@@ -4937,7 +5043,9 @@ fn note_nested(name: &str, n: usize) {
             // the shim translated nested wrapper handles" is the fact that
             // settles whether the submit path is live, and the guest process
             // does not set GNDRM_LOG_VKSHIM. Bounded to one line per name.
-            crate::logf!("proxy nested translate: {name} ({n} handle(s))");
+            crate::logf!(gndrm_obf::obf!(
+                "proxy nested translate: {name} ({n} handle(s))"
+            ));
         }
     }
 }
@@ -5040,7 +5148,7 @@ unsafe fn gn_real_device_proc(gd: *mut GnDevice, name: &CStr) -> PFN_vkVoidFunct
                 || n.contains("CreateImage")
                 || n.contains("SubresourceLayout"))
         {
-            crate::logf!("proxy: real proc {n} via {via}");
+            crate::logf!(gndrm_obf::obf!("proxy: real proc {n} via {via}"));
             seen.push(n);
         }
     }
@@ -5173,7 +5281,10 @@ fn dev_exts_satisfied(
             name == want
         });
         if !found {
-            crate::logf!("proxy prereq: device lacks {}", want.to_str().unwrap());
+            crate::logf!(gndrm_obf::obf!(
+                "proxy prereq: device lacks {}",
+                want.to_str().unwrap()
+            ));
             return false;
         }
     }
@@ -5184,7 +5295,9 @@ pub fn device_prereqs(gipa: GipaFn) -> bool {
     let create_inst: Option<PFN_vkCreateInstance> =
         unsafe { std::mem::transmute(gipa(ptr::null_mut(), c"vkCreateInstance".as_ptr())) };
     let Some(create_inst) = create_inst else {
-        crate::logf!("proxy prereq: driver exposes no vkCreateInstance");
+        crate::logf!(gndrm_obf::obf!(
+            "proxy prereq: driver exposes no vkCreateInstance"
+        ));
         return false;
     };
     let app = VkApplicationInfo {
@@ -5209,7 +5322,9 @@ pub fn device_prereqs(gipa: GipaFn) -> bool {
     let mut inst: VkInstance = ptr::null_mut();
     let res = unsafe { create_inst(&ci, ptr::null(), &mut inst) };
     if res != VK_SUCCESS {
-        crate::logf!("proxy prereq: probe vkCreateInstance failed ({res})");
+        crate::logf!(gndrm_obf::obf!(
+            "proxy prereq: probe vkCreateInstance failed ({res})"
+        ));
         return false;
     }
     // Instance-level procs must be fetched against a live instance: mesa
@@ -5232,10 +5347,12 @@ pub fn device_prereqs(gipa: GipaFn) -> bool {
                     ok = dev_exts_satisfied(enum_de, pd);
                 }
             } else {
-                crate::logf!("proxy prereq: no physical devices");
+                crate::logf!(gndrm_obf::obf!("proxy prereq: no physical devices"));
             }
         }
-        _ => crate::logf!("proxy prereq: instance-level procs unresolved"),
+        _ => crate::logf!(gndrm_obf::obf!(
+            "proxy prereq: instance-level procs unresolved"
+        )),
     }
     if let Some(destroy_inst) = destroy_inst {
         unsafe { destroy_inst(inst, ptr::null()) };
@@ -5338,16 +5455,17 @@ unsafe extern "C" fn gn_vkCreateInstance(
             g.instances = gi;
         }
     }
-    crate::logf!("proxy instance {:?} (headless WSI backing)", unsafe {
-        *out
-    });
+    crate::logf!(gndrm_obf::obf!(
+        "proxy instance {:?} (headless WSI backing)",
+        unsafe { *out }
+    ));
     if !LOUD_INSTANCE.swap(true, Ordering::Relaxed) {
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "proxy: instance created pid={} real={:?} npds={}",
             std::process::id(),
             unsafe { *out },
             unsafe { (*gi).n_pds }
-        );
+        ));
     }
     VK_SUCCESS
 }
@@ -5518,11 +5636,15 @@ unsafe extern "C" fn gn_vkCreateWaylandSurfaceKHR(
     let ci = unsafe { &*ci };
     let gi = unsafe { find_instance(instance) };
     if gi.is_null() {
-        crate::logf!("proxy surface create FAILED: instance {instance:?} not one of ours");
+        crate::logf!(gndrm_obf::obf!(
+            "proxy surface create FAILED: instance {instance:?} not one of ours"
+        ));
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     if !wl_setup(ci.display.cast()) {
-        crate::logf!("proxy surface create FAILED: wayland setup failed");
+        crate::logf!(gndrm_obf::obf!(
+            "proxy surface create FAILED: wayland setup failed"
+        ));
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let s = Box::new(GnSurface {
@@ -5545,11 +5667,11 @@ unsafe extern "C" fn gn_vkCreateWaylandSurfaceKHR(
     }
     unsafe {
         *out = s as usize as VkSurfaceKHR;
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "proxy surface {:?} (direct attach on wl_surface {:?})",
             s,
             ci.surface
-        );
+        ));
     }
     VK_SUCCESS
 }
@@ -5610,11 +5732,13 @@ unsafe fn xlib_override_surface(
     // `resolve_override_target` swaps a degenerate ancestor for the real,
     // painted window and leaves a legitimate one untouched (see x11.rs).
     let bound_window = unsafe { crate::x11::resolve_override_target(window) };
-    crate::logf!(
+    crate::logf!(gndrm_obf::obf!(
         "override: XID {window:#x} -> gamescope override surface on {bound_window:#x} (default; guest GDI/2D not composited)"
-    );
+    ));
     if !wl_setup(ptr::null_mut()) {
-        crate::logf!("proxy xlib surface create FAILED: wayland setup failed");
+        crate::logf!(gndrm_obf::obf!(
+            "proxy xlib surface create FAILED: wayland setup failed"
+        ));
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let (comp, factory, dpy) = {
@@ -5622,14 +5746,18 @@ unsafe fn xlib_override_surface(
         (w.comp, w.swapchain_factory, w.dpy)
     };
     if factory.is_null() {
-        crate::logf!("compositor misses gamescope_swapchain_factory_v2 — cannot bind XID");
+        crate::logf!(gndrm_obf::obf!(
+            "compositor misses gamescope_swapchain_factory_v2 — cannot bind XID"
+        ));
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     unsafe {
         let _sg = SEND_LOCK.lock().unwrap();
         let surf = wlproto::compositor_create_surface(comp);
         if surf.is_null() {
-            crate::logf!("proxy xlib surface create FAILED: wl_surface create failed");
+            crate::logf!(gndrm_obf::obf!(
+                "proxy xlib surface create FAILED: wl_surface create failed"
+            ));
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         let scobj = wlproto::swapchain_factory_create_swapchain(factory, surf);
@@ -5657,12 +5785,12 @@ unsafe fn xlib_override_surface(
             g.surfaces = s;
         }
         *out = s as usize as VkSurfaceKHR;
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "override: proxy surface {:?} (own wl_surface {:?} bound to XID {:#x}; Vulkan-only, guest GDI/2D not composited)",
             s,
             surf,
             window
-        );
+        ));
     }
     VK_SUCCESS
 }
@@ -5676,7 +5804,9 @@ unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
     let ci = unsafe { &*ci };
     let gi = unsafe { find_instance(instance) };
     if gi.is_null() {
-        crate::logf!("proxy xlib surface create FAILED: instance {instance:?} not one of ours");
+        crate::logf!(gndrm_obf::obf!(
+            "proxy xlib surface create FAILED: instance {instance:?} not one of ours"
+        ));
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     // Present-route capability switch (`GN_VKSHIM_GUEST_SURFACE`, see
@@ -5687,21 +5817,21 @@ unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
         return unsafe { xlib_override_surface(gi, ci.window as u32, out) };
     }
     let x11 = if ci.window == 0 {
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "x11 route: XID {:#x} unavailable ({})",
             ci.window,
             crate::x11::RouteUnavailable::NullXid.reason()
-        );
+        ));
         ptr::null_mut()
     } else {
         match unsafe { crate::x11::X11Present::new(ci.window as u32) } {
             Ok(p) => Box::into_raw(Box::new(p)),
             Err(e) => {
-                crate::logf!(
+                crate::logf!(gndrm_obf::obf!(
                     "x11 route: XID {:#x} unavailable ({})",
                     ci.window,
                     e.reason()
-                );
+                ));
                 ptr::null_mut()
             }
         }
@@ -5726,11 +5856,11 @@ unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
     }
     unsafe {
         *out = s as usize as VkSurfaceKHR;
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "proxy surface {:?} (X11 window {:#x}, DRI3+Present route)",
             s,
             ci.window
-        );
+        ));
     }
     VK_SUCCESS
 }
@@ -5853,7 +5983,9 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
 ) -> VkResult {
     let s = unsafe { find_surface(surface) };
     if s.is_null() {
-        crate::logf!("proxy surface caps query: {surface:#x} not one of ours");
+        crate::logf!(gndrm_obf::obf!(
+            "proxy surface caps query: {surface:#x} not one of ours"
+        ));
         return VK_ERROR_SURFACE_LOST_KHR;
     }
     // The guest's own window size is what gamescope must see the presented
@@ -5966,7 +6098,9 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceFormatsKHR(
     formats: *mut VkSurfaceFormatKHR,
 ) -> VkResult {
     if unsafe { find_surface(surface) }.is_null() {
-        crate::logf!("proxy surface formats query: {surface:#x} not one of ours");
+        crate::logf!(gndrm_obf::obf!(
+            "proxy surface formats query: {surface:#x} not one of ours"
+        ));
         return VK_ERROR_SURFACE_LOST_KHR;
     }
     let served = served_surface_formats();
@@ -6003,7 +6137,7 @@ fn parse_present_mode_override(val: Option<&str>) -> Option<VkPresentModeKHR> {
         "mailbox" => VK_PRESENT_MODE_MAILBOX_KHR,
         "immediate" => VK_PRESENT_MODE_IMMEDIATE_KHR,
         _ => {
-            crate::logf!("Invalid MESA_VK_WSI_PRESENT_MODE value!");
+            crate::logf!(gndrm_obf::obf!("Invalid MESA_VK_WSI_PRESENT_MODE value!"));
             return None;
         }
     };
@@ -6037,7 +6171,9 @@ fn offered_present_modes(
         if served.contains(&m) {
             v.push(m);
         } else {
-            crate::logf!("Unsupported MESA_VK_WSI_PRESENT_MODE value!");
+            crate::logf!(gndrm_obf::obf!(
+                "Unsupported MESA_VK_WSI_PRESENT_MODE value!"
+            ));
         }
     }
     for &m in served {
@@ -6058,7 +6194,9 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfacePresentModesKHR(
     modes: *mut VkPresentModeKHR,
 ) -> VkResult {
     if unsafe { find_surface(surface) }.is_null() {
-        crate::logf!("proxy surface present-modes query: {surface:#x} not one of ours");
+        crate::logf!(gndrm_obf::obf!(
+            "proxy surface present-modes query: {surface:#x} not one of ours"
+        ));
         return VK_ERROR_SURFACE_LOST_KHR;
     }
     let modes_list = offered_present_modes(
@@ -6124,7 +6262,9 @@ unsafe extern "C" fn gn_vkSetHdrMetadataEXT(
     for i in 0..swapchain_count as usize {
         let sc = unsafe { *swapchains.add(i) };
         if unsafe { find_swapchain(sc) }.is_null() {
-            crate::logf!("proxy setHdrMetadata: swapchain {sc:#x} not one of ours");
+            crate::logf!(gndrm_obf::obf!(
+                "proxy setHdrMetadata: swapchain {sc:#x} not one of ours"
+            ));
             return VK_ERROR_INITIALIZATION_FAILED;
         }
     }
@@ -6223,7 +6363,9 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceFormats2KHR(
     }
     let surface = unsafe { (*info).surface };
     if unsafe { find_surface(surface) }.is_null() {
-        crate::logf!("proxy surface formats2 query: {surface:#x} not one of ours");
+        crate::logf!(gndrm_obf::obf!(
+            "proxy surface formats2 query: {surface:#x} not one of ours"
+        ));
         return VK_ERROR_SURFACE_LOST_KHR;
     }
     let served = served_surface_formats();
@@ -6314,10 +6456,10 @@ unsafe extern "C" fn gn_vkCreateDevice(
     if gi.is_null() || unsafe { (*gi).f.create_device.is_none() } {
         loud(
             "create_device.noinst",
-            format!(
+            format!("{}", gndrm_obf::obf!(
                 "proxy: vkCreateDevice NO INSTANCE pd={:#x} gi={} — guest device will be driver-raw (wrong-handle class)",
                 pd as usize, gi.is_null()
-            ),
+            )),
         );
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -6340,7 +6482,10 @@ unsafe extern "C" fn gn_vkCreateDevice(
         // (see `unimplemented_wsi_ext`); drop it before the driver sees it.
         let n_ = unsafe { CStr::from_ptr(name) };
         if unimplemented_wsi_ext(n_) {
-            crate::logf!("proxy device: masking {}", n_.to_string_lossy());
+            crate::logf!(gndrm_obf::obf!(
+                "proxy device: masking {}",
+                n_.to_string_lossy()
+            ));
             continue;
         }
         if n < exts.len() {
@@ -6374,7 +6519,10 @@ unsafe extern "C" fn gn_vkCreateDevice(
             let mut i = 0;
             while i < n {
                 if unsafe { CStr::from_ptr(exts[i]) } == drop {
-                    crate::logf!("proxy device: masking {}", drop.to_string_lossy());
+                    crate::logf!(gndrm_obf::obf!(
+                        "proxy device: masking {}",
+                        drop.to_string_lossy()
+                    ));
                     for j in i..n - 1 {
                         exts[j] = exts[j + 1];
                     }
@@ -6509,11 +6657,11 @@ unsafe extern "C" fn gn_vkCreateDevice(
     // word must keep pointing at the hooks' dispatch table).
     unsafe {
         *out = gd.cast::<c_void>();
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "proxy device {:?} (real {:?}, queue family {qf})",
             gd,
             (*gd).real
-        );
+        ));
     }
     VK_SUCCESS
 }
@@ -6573,8 +6721,11 @@ unsafe extern "C" fn gn_vkGetDeviceQueue(
         loud(
             "get_device_queue.miss",
             format!(
-                "proxy: gn_vkGetDeviceQueue DEVICE MISS family={family} index={index} {}",
-                unsafe { handle_note(false, device as usize, first, n) }
+                "{}",
+                gndrm_obf::obf!(
+                    "proxy: gn_vkGetDeviceQueue DEVICE MISS family={family} index={index} {}",
+                    unsafe { handle_note(false, device as usize, first, n) }
+                )
             ),
         );
         unsafe { *out = ptr::null_mut() };
@@ -6612,9 +6763,12 @@ unsafe extern "C" fn gn_vkGetDeviceQueue2(
         let (first, n) = unsafe { device_table() };
         loud(
             "get_device_queue2.miss",
-            format!("proxy: gn_vkGetDeviceQueue2 DEVICE MISS {}", unsafe {
-                handle_note(false, device as usize, first, n)
-            }),
+            format!(
+                "{}",
+                gndrm_obf::obf!("proxy: gn_vkGetDeviceQueue2 DEVICE MISS {}", unsafe {
+                    handle_note(false, device as usize, first, n)
+                })
+            ),
         );
         unsafe { *out = ptr::null_mut() };
         return;
@@ -6739,10 +6893,10 @@ fn dma_heap_open() -> i32 {
         let path = CString::new("/dev/dma_heap/system").unwrap();
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
-            crate::logf!(
+            crate::logf!(gndrm_obf::obf!(
                 "proxy: /dev/dma_heap/system: {}",
                 std::io::Error::last_os_error()
-            );
+            ));
         }
         fd
     })
@@ -6774,10 +6928,10 @@ fn dma_heap_alloc(len: usize) -> i32 {
         heap_flags: 0,
     };
     if unsafe { libc::ioctl(heap, DMA_HEAP_IOCTL_ALLOC as _, &mut data) } != 0 {
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "proxy: dma_heap alloc({len}): {}",
             std::io::Error::last_os_error()
-        );
+        ));
         return -1;
     }
     data.fd as i32
@@ -6830,8 +6984,11 @@ unsafe fn pnext_image_create_summary(mut p: *const c_void) -> String {
             VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO => {
                 let e = p.cast::<VkExternalMemoryImageCreateInfo>();
                 out.push_str(&format!(
-                    "ExternalMemoryImageCreateInfo{{handleTypes={:#x}}}",
-                    unsafe { (*e).handleTypes }
+                    "{}",
+                    gndrm_obf::obf!(
+                        "ExternalMemoryImageCreateInfo{{handleTypes={:#x}}}",
+                        unsafe { (*e).handleTypes }
+                    )
                 ));
             }
             VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT => {
@@ -6840,26 +6997,32 @@ unsafe fn pnext_image_create_summary(mut p: *const c_void) -> String {
                 let cnt = unsafe { (*e).drmFormatModifierPlaneCount };
                 let pl = unsafe { (*e).pPlaneLayouts };
                 if !pl.is_null() && cnt > 0 {
-                    out.push_str(&format!(
+                    out.push_str(&format!("{}", gndrm_obf::obf!(
                         "ImageDrmFormatModifierExplicitCreateInfoEXT{{mod={m:#x}, planes={cnt}, plane0{{offset={}, rowPitch={}, size={}}}}}",
                         unsafe { (*pl).offset },
                         unsafe { (*pl).rowPitch },
                         unsafe { (*pl).size }
-                    ));
+                    )));
                 } else {
                     out.push_str(&format!(
+                        "{}",
+                        gndrm_obf::obf!(
                         "ImageDrmFormatModifierExplicitCreateInfoEXT{{mod={m:#x}, planes={cnt}}}"
+                    )
                     ));
                 }
             }
             VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT => {
                 let e = p.cast::<VkImageDrmFormatModifierListCreateInfoEXT>();
                 out.push_str(&format!(
-                    "ImageDrmFormatModifierListCreateInfoEXT{{count={}}}",
-                    unsafe { (*e).drmFormatModifierCount }
+                    "{}",
+                    gndrm_obf::obf!(
+                        "ImageDrmFormatModifierListCreateInfoEXT{{count={}}}",
+                        unsafe { (*e).drmFormatModifierCount }
+                    )
                 ));
             }
-            _ => out.push_str(&format!("sType={st}")),
+            _ => out.push_str(&format!("{}", gndrm_obf::obf!("sType={st}"))),
         }
         p = unsafe { (*b).pNext as *const c_void };
         n += 1;
@@ -6874,7 +7037,7 @@ unsafe fn trace_image_create(ci: &VkImageCreateInfo, tag: &str, shot: &AtomicBoo
         return;
     }
     let pnext = unsafe { pnext_image_create_summary(ci.pNext) };
-    crate::logf!(
+    crate::logf!(gndrm_obf::obf!(
         "{tag}: vkCreateImage fmt={} {}x{}x{} mips={} layers={} samples={:#x} tiling={} usage={:#x} flags={:#x} pNext=[{pnext}]",
         ci.format,
         ci.extent.width,
@@ -6886,7 +7049,7 @@ unsafe fn trace_image_create(ci: &VkImageCreateInfo, tag: &str, shot: &AtomicBoo
         ci.tiling,
         ci.usage,
         ci.flags
-    );
+    ));
 }
 
 /// Pure informational `vkGetPhysicalDeviceImageFormatProperties2` with a
@@ -6908,7 +7071,9 @@ unsafe fn query_linear_modifier_support(
     let pd = unsafe { (*gd).pd };
     let raw = unsafe { gn_real_inst_proc(inst, c"vkGetPhysicalDeviceImageFormatProperties2") };
     let Some(_) = raw else {
-        crate::logf!("modq: vkGetPhysicalDeviceImageFormatProperties2 unresolved (driver/loader)");
+        crate::logf!(gndrm_obf::obf!(
+            "modq: vkGetPhysicalDeviceImageFormatProperties2 unresolved (driver/loader)"
+        ));
         return;
     };
     let query: PFN_vkGetPhysicalDeviceImageFormatProperties2 = unsafe { std::mem::transmute(raw) };
@@ -6958,7 +7123,7 @@ unsafe fn query_linear_modifier_support(
         };
         let res = unsafe { query(pd, &fmtinfo, &mut props) };
         let ip = props.imageFormatProperties;
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "modq: vkGetPhysicalDeviceImageFormatProperties2 fmt={format} type=2D tiling={tiling} usage={usage:#x} pNext=VkPhysicalDeviceImageDrmFormatModifierInfoEXT{{mod=LINEAR(0), sharing=EXCLUSIVE}} -> res={res} maxExtent={}x{}x{} maxMips={} maxLayers={} samples={:#x} maxRes={} modCount={} mod0={:#x} feat0={:#x} planes0={} [informational only: result not consulted]",
             ip.maxExtent.width,
             ip.maxExtent.height,
@@ -6971,7 +7136,7 @@ unsafe fn query_linear_modifier_support(
             mods[0].drmFormatModifier,
             mods[0].drmFormatModifierTilingFeatures,
             mods[0].drmFormatModifierPlaneCount
-        );
+        ));
     }
 }
 
@@ -7002,32 +7167,39 @@ unsafe fn log_mem_props_once(pd: VkPhysicalDevice, mp: &VkPhysicalDeviceMemoryPr
         .map(|i| {
             let t = mp.memoryTypes[i];
             format!(
-                "t{i}:heap{}:flags{:#x}{}",
-                t.heapIndex,
-                t.propertyFlags,
-                if t.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT != 0 {
-                    ":LOCAL"
-                } else {
-                    ""
-                }
+                "{}",
+                gndrm_obf::obf!(
+                    "t{i}:heap{}:flags{:#x}{}",
+                    t.heapIndex,
+                    t.propertyFlags,
+                    if t.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT != 0 {
+                        ":LOCAL"
+                    } else {
+                        ""
+                    }
+                )
             )
         })
         .collect();
     let heaps: Vec<String> = (0..(mp.memoryHeapCount as usize).min(VK_MAX_MEMORY_HEAPS))
         .map(|i| {
             format!(
-                "h{i}:{}B:flags{:#x}",
-                mp.memoryHeaps[i].size, mp.memoryHeaps[i].flags
+                "{}",
+                gndrm_obf::obf!(
+                    "h{i}:{}B:flags{:#x}",
+                    mp.memoryHeaps[i].size,
+                    mp.memoryHeaps[i].flags
+                )
             )
         })
         .collect();
-    crate::logf!(
+    crate::logf!(gndrm_obf::obf!(
         "memprops: types={} [{}] heaps={} [{}]",
         mp.memoryTypeCount,
         summary.join(" "),
         mp.memoryHeapCount,
         heaps.join(" ")
-    );
+    ));
 }
 
 /// Read-only description of a chosen `memoryTypeIndex` (heap + DEVICE_LOCAL).
@@ -7037,15 +7209,21 @@ fn mem_type_desc(gd: *mut GnDevice, idx: u32) -> String {
         let t = mp.memoryTypes[idx as usize];
         let local = t.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT != 0;
         format!(
-            "mem_type {idx} heap {} flags {:#x} DEVICE_LOCAL={}",
-            t.heapIndex,
-            t.propertyFlags,
-            if local { "yes" } else { "no" }
+            "{}",
+            gndrm_obf::obf!(
+                "mem_type {idx} heap {} flags {:#x} DEVICE_LOCAL={}",
+                t.heapIndex,
+                t.propertyFlags,
+                if local { "yes" } else { "no" }
+            )
         )
     } else {
         format!(
-            "mem_type {idx} (beyond memoryTypeCount {})",
-            mp.memoryTypeCount
+            "{}",
+            gndrm_obf::obf!(
+                "mem_type {idx} (beyond memoryTypeCount {})",
+                mp.memoryTypeCount
+            )
         )
     }
 }
@@ -7082,12 +7260,12 @@ unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
             if buf.stride != 0 {
                 (*s).stride = buf.stride;
             }
-            crate::logf!(
+            crate::logf!(gndrm_obf::obf!(
                 "proxy slot: pool buffer fd={} ino={} stride={}",
                 buf.fd,
                 buf.ino,
                 (*s).stride
-            );
+            ));
         }
         None => {
             // No daemon channel, or it refused: a local system-heap
@@ -7134,7 +7312,7 @@ unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
     unsafe { trace_image_create(&ici, "img-create linear", &TRACE_IMAGE_CI_LINEAR) };
     let res = unsafe { f.create_image.unwrap()(dev, &ici, ptr::null(), &mut (*s).image) };
     if res != VK_SUCCESS {
-        crate::logf!("proxy import image create failed: {res}");
+        crate::logf!(gndrm_obf::obf!("proxy import image create failed: {res}"));
         return res;
     }
     let mut reqs = VkMemoryRequirements {
@@ -7151,17 +7329,17 @@ unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
         }
     }
     if mem_type == u32::MAX {
-        crate::logf!("proxy import image: no memory type");
+        crate::logf!(gndrm_obf::obf!("proxy import image: no memory type"));
         return VK_ERROR_INITIALIZATION_FAILED;
     }
-    crate::logf!(
+    crate::logf!(gndrm_obf::obf!(
         "proxy slot: linear {}x{} reqs {} memTypeBits {:#x} {}",
         (*sc).extent.width,
         (*sc).extent.height,
         reqs.size,
         reqs.memoryTypeBits,
         mem_type_desc(gd, mem_type)
-    );
+    ));
     let ded = VkMemoryDedicatedAllocateInfo {
         sType: VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
         pNext: ptr::null(),
@@ -7190,7 +7368,7 @@ unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
         unsafe { libc::close(import_fd) };
     }
     if res != VK_SUCCESS {
-        crate::logf!("proxy import memory failed: {res}");
+        crate::logf!(gndrm_obf::obf!("proxy import memory failed: {res}"));
         return res;
     }
     slot_init_sync(sc, s)

@@ -662,9 +662,9 @@ unsafe fn resolve_override_target_on(conn: *mut xcb_connection_t, named: u32) ->
     let ancestor = resolved.window;
     let (aw, ah) = unsafe { window_size(conn, ancestor) };
     if !is_degenerate(aw, ah) {
-        crate::logf!(
+        crate::logf!(gndrm_obf::obf!(
             "override target: named=0x{named:x} ancestor=0x{ancestor:x} {aw}x{ah} -> 0x{ancestor:x} (legitimate; unchanged)"
-        );
+        ));
         return ancestor;
     }
 
@@ -725,10 +725,13 @@ unsafe fn resolve_override_target_on(conn: *mut xcb_connection_t, named: u32) ->
             let cn = ccls.iter().position(|&b| b == 0).unwrap_or(ccls.len());
             let cstr = String::from_utf8_lossy(&ccls[..cn]);
             report.push_str(&format!(
-                " 0x{c:x} {w}x{h} pid={cpid} class=\"{cstr}\"{}{}{}",
-                if c == focus { " <focus>" } else { "" },
-                if c == active { " <active>" } else { "" },
-                if matched { " <match>" } else { "" },
+                "{}",
+                gndrm_obf::obf!(
+                    " 0x{c:x} {w}x{h} pid={cpid} class=\"{cstr}\"{}{}{}",
+                    if c == focus { " <focus>" } else { "" },
+                    if c == active { " <active>" } else { "" },
+                    if matched { " <match>" } else { "" },
+                )
             ));
         }
         if matched {
@@ -750,10 +753,10 @@ unsafe fn resolve_override_target_on(conn: *mut xcb_connection_t, named: u32) ->
     } else {
         (ancestor, "no-candidate")
     };
-    crate::logf!(
+    crate::logf!(gndrm_obf::obf!(
         "override target: named=0x{named:x} ancestor=0x{ancestor:x} {aw}x{ah} -> 0x{chosen:x} ({why}; self_pid={self_pid} named_pid={named_pid} named_class=\"{}\"; root_children:{report})",
         String::from_utf8_lossy(&named_cls[..named_cls_len])
-    );
+    ));
     chosen
 }
 
@@ -948,7 +951,9 @@ impl X11Present {
                 )
             };
             if attr.is_null() {
-                crate::logf!("x11 window: 0x{w:x} attributes unavailable at level {level}");
+                crate::logf!(gndrm_obf::obf!(
+                    "x11 window: 0x{w:x} attributes unavailable at level {level}"
+                ));
                 return;
             }
             let (map, or, class) =
@@ -969,9 +974,9 @@ impl X11Present {
                 1 => "IsUnviewable",
                 _ => "IsViewable",
             };
-            crate::logf!(
+            crate::logf!(gndrm_obf::obf!(
                 "x11 window: level={level} id=0x{w:x} map={ms} override={or} class={class} {gw}x{gh}"
-            );
+            ));
             let tree = unsafe {
                 xcb_query_tree_reply(self.conn, xcb_query_tree(self.conn, w), ptr::null_mut())
             };
@@ -988,18 +993,18 @@ impl X11Present {
         // The outcome the presenter depends on: the root child the present
         // lands in. Named once, unconditionally.
         if self.window == origin {
-            crate::logf!(
+            crate::logf!(gndrm_obf::obf!(
                 "x11 present target: 0x{:x} (named window is already a root child)",
                 self.window
-            );
+            ));
         } else {
-            crate::logf!(
+            crate::logf!(gndrm_obf::obf!(
                 "x11 present target: 0x{:x} offset=({},{}) (root child of named window 0x{:x})",
                 self.window,
                 self.x_off,
                 self.y_off,
                 origin
-            );
+            ));
         }
     }
 
@@ -1036,10 +1041,10 @@ impl X11Present {
         // The dup is what libxcb closes; the slot keeps `fd`.
         let import_fd = unsafe { libc::dup(fd) };
         if import_fd < 0 {
-            crate::logf!(
+            crate::logf!(gndrm_obf::obf!(
                 "x11: dup of slot fd failed: {} - frame dropped",
                 std::io::Error::last_os_error()
-            );
+            ));
             return None;
         }
         let pixmap = unsafe { xcb_generate_id(self.conn) };
@@ -1071,9 +1076,9 @@ impl X11Present {
         match unsafe { check_err(self.conn, cookie) } {
             None => Some(pixmap),
             Some(code) => {
-                crate::logf!(
+                crate::logf!(gndrm_obf::obf!(
                     "x11: {width}x{height} stride={stride} modifier={modifier:#x} pixmap_from_buffers failed (X error {code}) - frame dropped"
-                );
+                ));
                 None
             }
         }
@@ -1096,7 +1101,9 @@ impl X11Present {
         match unsafe { check_err(self.conn, cookie) } {
             None => Some(fence),
             Some(code) => {
-                crate::logf!("x11: sync fence create failed (X error {code}) - frame dropped");
+                crate::logf!(gndrm_obf::obf!(
+                    "x11: sync fence create failed (X error {code}) - frame dropped"
+                ));
                 None
             }
         }
@@ -1148,7 +1155,9 @@ impl X11Present {
             )
         };
         if let Some(code) = unsafe { check_err(self.conn, cookie) } {
-            crate::logf!("x11: present of pixmap {pixmap} failed (X error {code}) - frame dropped");
+            crate::logf!(gndrm_obf::obf!(
+                "x11: present of pixmap {pixmap} failed (X error {code}) - frame dropped"
+            ));
             return None;
         }
         Some(serial)
@@ -1285,12 +1294,18 @@ mod tests {
     fn walk_reaches_the_root_child_and_carries_the_offset() {
         let conn = unsafe { xcb_connect(ptr::null(), ptr::null_mut()) };
         if conn.is_null() || unsafe { xcb_connection_has_error(conn) } != 0 {
-            eprintln!("skip: no X server (DISPLAY unreachable)");
+            eprintln!(
+                "{}",
+                gndrm_obf::obf!("skip: no X server (DISPLAY unreachable)")
+            );
             return;
         }
         let screen = unsafe { host_root(conn) };
         let Some((root, depth)) = screen else {
-            eprintln!("skip: no X server (no screen in setup)");
+            eprintln!(
+                "{}",
+                gndrm_obf::obf!("skip: no X server (no screen in setup)")
+            );
             unsafe { xcb_disconnect(conn) };
             return;
         };
@@ -1345,11 +1360,11 @@ mod tests {
             }),
             "a nested client window resolves to its root-child ancestor with its offset"
         );
-        eprintln!(
+        eprintln!("{}", gndrm_obf::obf!(
             "DEBUG root={root:#x} depth={depth} top={top:#x} client={client:#x} from_client={:?} from_top={:?}",
             unsafe { resolve_target(conn, client) },
             unsafe { resolve_target(conn, top) }
-        );
+        ));
         assert_eq!(
             unsafe { resolve_target(conn, top) },
             Some(PresentTarget {
@@ -1380,12 +1395,18 @@ mod tests {
     fn override_target_swaps_a_degenerate_ancestor_for_the_painted_window() {
         let conn = unsafe { xcb_connect(ptr::null(), ptr::null_mut()) };
         if conn.is_null() || unsafe { xcb_connection_has_error(conn) } != 0 {
-            eprintln!("skip: no X server (DISPLAY unreachable)");
+            eprintln!(
+                "{}",
+                gndrm_obf::obf!("skip: no X server (DISPLAY unreachable)")
+            );
             return;
         }
         let screen = unsafe { host_root(conn) };
         let Some((root, depth)) = screen else {
-            eprintln!("skip: no X server (no screen in setup)");
+            eprintln!(
+                "{}",
+                gndrm_obf::obf!("skip: no X server (no screen in setup)")
+            );
             unsafe { xcb_disconnect(conn) };
             return;
         };
@@ -1478,7 +1499,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
         let game_attr = unsafe { window_attr(conn, game) };
         if game_attr.map(|(m, _, _)| m) != Some(MAP_STATE_VIEWABLE) {
-            eprintln!("skip: test window not viewable (host WM interference)");
+            eprintln!(
+                "{}",
+                gndrm_obf::obf!("skip: test window not viewable (host WM interference)")
+            );
             unsafe {
                 xcb_destroy_window(conn, named);
                 xcb_destroy_window(conn, helper);
@@ -1526,12 +1550,18 @@ mod tests {
 
         let conn = unsafe { xcb_connect(ptr::null(), ptr::null_mut()) };
         if conn.is_null() || unsafe { xcb_connection_has_error(conn) } != 0 {
-            eprintln!("skip: no X server (DISPLAY unreachable)");
+            eprintln!(
+                "{}",
+                gndrm_obf::obf!("skip: no X server (DISPLAY unreachable)")
+            );
             return;
         }
         let screen = unsafe { host_root(conn) };
         let Some((root, depth)) = screen else {
-            eprintln!("skip: no X server (no screen in setup)");
+            eprintln!(
+                "{}",
+                gndrm_obf::obf!("skip: no X server (no screen in setup)")
+            );
             unsafe { xcb_disconnect(conn) };
             return;
         };
@@ -1560,7 +1590,10 @@ mod tests {
         let present = match unsafe { X11Present::new(window) } {
             Ok(p) => p,
             Err(why) => {
-                eprintln!("skip: host X server has no DRI3/Present ({})", why.reason());
+                eprintln!(
+                    "{}",
+                    gndrm_obf::obf!("skip: host X server has no DRI3/Present ({})", why.reason())
+                );
                 unsafe {
                     xcb_destroy_window(conn, window);
                     xcb_disconnect(conn);
@@ -1572,7 +1605,8 @@ mod tests {
         // Any open fd will do: libxcb hands the fd to the server and closes it
         // regardless of whether the server accepts the buffer, so the slot's
         // ownership is what is under test, not the payload.
-        let file = std::fs::File::open("/etc/hostname").expect("open /etc/hostname");
+        let file =
+            std::fs::File::open("/etc/hostname").expect(&gndrm_obf::obf!("open /etc/hostname"));
         let fd = file.as_raw_fd();
         assert!(
             unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
@@ -1596,7 +1630,7 @@ mod tests {
 
     fn open_fd_count() -> usize {
         std::fs::read_dir("/proc/self/fd")
-            .expect("/proc/self/fd")
+            .expect(&gndrm_obf::obf!("/proc/self/fd"))
             .count()
     }
 
@@ -1611,11 +1645,17 @@ mod tests {
     fn present_loop_is_fd_neutral() {
         let conn = unsafe { xcb_connect(ptr::null(), ptr::null_mut()) };
         if conn.is_null() || unsafe { xcb_connection_has_error(conn) } != 0 {
-            eprintln!("skip: no X server (DISPLAY unreachable)");
+            eprintln!(
+                "{}",
+                gndrm_obf::obf!("skip: no X server (DISPLAY unreachable)")
+            );
             return;
         }
         let Some((root, depth)) = (unsafe { host_root(conn) }) else {
-            eprintln!("skip: no X server (no screen in setup)");
+            eprintln!(
+                "{}",
+                gndrm_obf::obf!("skip: no X server (no screen in setup)")
+            );
             unsafe { xcb_disconnect(conn) };
             return;
         };
@@ -1641,7 +1681,10 @@ mod tests {
         let mut present = match unsafe { X11Present::new(window) } {
             Ok(p) => p,
             Err(why) => {
-                eprintln!("skip: host X server has no DRI3/Present ({})", why.reason());
+                eprintln!(
+                    "{}",
+                    gndrm_obf::obf!("skip: host X server has no DRI3/Present ({})", why.reason())
+                );
                 unsafe {
                     xcb_destroy_window(conn, window);
                     xcb_disconnect(conn);
@@ -1694,9 +1737,9 @@ mod tests {
             }
         }
         let after = open_fd_count();
-        eprintln!(
+        eprintln!("{}", gndrm_obf::obf!(
             "DEBUG present-loop: fds before={before} after={after} N={N} xpix={xpix} xfence={xfence}"
-        );
+        ));
         assert!(
             after <= before + 1,
             "the present path acquired descriptors per frame: {before} -> {after} over {N} frames"

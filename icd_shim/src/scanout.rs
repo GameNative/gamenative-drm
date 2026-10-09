@@ -277,7 +277,7 @@ mod tests {
     /// with a `/dev/null` descriptor, which is all the transport needs.
     #[test]
     fn connect_and_exchange_receive_a_pool_buffer() {
-        let name = format!("gndrm-icdsc-{}", std::process::id());
+        let name = format!("{}", gndrm_obf::obf!("gndrm-icdsc-{}", std::process::id()));
         let listener = listen(&name);
         let server = std::thread::spawn(move || {
             // SAFETY: accept on the listener created above, then recv/send on
@@ -293,7 +293,7 @@ mod tests {
                 let mut buf = [0u8; ScanoutAllocReq::LEN];
                 let n = libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0);
                 assert_eq!(n as usize, ScanoutAllocReq::LEN);
-                let req = ScanoutAllocReq::decode(&buf).expect("request frame");
+                let req = ScanoutAllocReq::decode(&buf).expect(&gndrm_obf::obf!("request frame"));
                 assert_eq!((req.width, req.height), (1280, 960));
                 assert_eq!(req.format, SCANOUT_FORMAT_BGRA_8888);
                 assert_eq!(req.len, 1280 * 960 * 4);
@@ -317,7 +317,9 @@ mod tests {
 
         let fd = connect(&name);
         assert!(fd >= 0, "connect: {}", std::io::Error::last_os_error());
-        let got = exchange(fd, 1280, 960).ok().expect("exchange");
+        let got = exchange(fd, 1280, 960)
+            .ok()
+            .expect(&gndrm_obf::obf!("exchange"));
         assert_eq!(got.stride, 5120);
         // The received descriptor is the one the daemon sent, and the reply's
         // identity is that descriptor's inode — the registration key.
@@ -329,6 +331,6 @@ mod tests {
             libc::close(got.fd);
             libc::close(fd);
         }
-        server.join().expect("server thread");
+        server.join().expect(&gndrm_obf::obf!("server thread"));
     }
 }

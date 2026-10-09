@@ -212,6 +212,12 @@ static uint32_t g_in_fence_prop; /* discovered at init, 0 = unsupported */
  * resolved or is not yet available.
  */
 
+/* GNDRM_OBF() is resolved by tools/obf-shim.py at build time (it decodes an
+ * XOR-encoded copy of the literal); this fallback keeps the source compilable
+ * standalone. */
+#ifndef GNDRM_OBF
+#define GNDRM_OBF(s) (s)
+#endif
 #define LOG(...)                       \
     do {                               \
         if (getenv("GNDRM_LOG_SHIM"))  \
@@ -1410,19 +1416,19 @@ static int scanout_hand_out(struct gndrm_dmaheap_alloc *a,
          * unreachable. The elapsed time and attempt number are logged so this
          * line can be aligned with the daemon's "received (seq=)" receipt (or
          * its absence). */
-        const char *why = "allocation failure";
+        const char *why = GNDRM_OBF("allocation failure");
         if (rc == -EAGAIN || rc == -ETIMEDOUT)
-            why = "request timed out waiting for a reply";
+            why = GNDRM_OBF("request timed out waiting for a reply");
         else if (rc == -ENOSPC)
-            why = "daemon pool exhausted";
+            why = GNDRM_OBF("daemon pool exhausted");
         else if (rc == -ENOSYS)
-            why = "daemon presenter disabled";
+            why = GNDRM_OBF("daemon presenter disabled");
         else if (rc == -EINVAL)
-            why = "unsupported geometry/format";
+            why = GNDRM_OBF("unsupported geometry/format");
         else if (rc == -ECONNREFUSED)
-            why = "allocator channel unreachable";
+            why = GNDRM_OBF("allocator channel unreachable");
         else if (rc == -EPROTO)
-            why = "malformed daemon reply";
+            why = GNDRM_OBF("malformed daemon reply");
         if (rate_ok(2)) {
             if (w && h)
                 LOG("scanout: daemon allocated no %ux%u buffer: %s "

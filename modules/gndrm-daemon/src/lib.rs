@@ -246,7 +246,9 @@ impl Device {
     pub fn new(panel: PanelDesc, presenter: Box<dyn Presenter>) -> Self {
         let mut stores = Stores::default();
         // Infallible: a fresh store has the whole blob space free.
-        let in_formats_blob = stores.alloc_blob().expect("in_formats blob id");
+        let in_formats_blob = stores
+            .alloc_blob()
+            .expect(&gndrm_obf::obf!("in_formats blob id"));
         stores.blobs.insert(
             in_formats_blob,
             Blob {
@@ -256,12 +258,12 @@ impl Device {
         );
         let (commit_tx, commit_rx) = mpsc::channel();
         let flip_queue = Arc::new(Mutex::new(VecDeque::new()));
-        let flip_event_fd = new_eventfd(0).expect("flip eventfd");
+        let flip_event_fd = new_eventfd(0).expect(&gndrm_obf::obf!("flip eventfd"));
         let in_flight = Arc::new(Mutex::new(HashSet::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger: Arc<Mutex<Option<LogFn>>> = Arc::new(Mutex::new(None));
         // The worker owns the presenter and signals a dup of the flip eventfd.
-        let worker_fd = dup_fd(flip_event_fd, 0).expect("dup flip eventfd");
+        let worker_fd = dup_fd(flip_event_fd, 0).expect(&gndrm_obf::obf!("dup flip eventfd"));
         // The event clock is shared with the commit worker, which re-stamps a
         // page-flip event when it emits it (see `commit_worker_loop`).
         let clock: SharedClock = Arc::new(Mutex::new(Box::new(monotonic_now)));
@@ -362,9 +364,9 @@ impl Device {
     fn note_exhausted(&mut self, space: &'static str) -> i32 {
         if !self.logged_exhaustion.contains(&space) {
             self.logged_exhaustion.push(space);
-            self.diag(&format!(
+            self.diag(&format!("{}", gndrm_obf::obf!(
                 "resource: {space} exhausted; returning ENOSPC (display path degraded, app continues)"
-            ));
+            )));
         }
         errno::ENOSPC
     }
@@ -506,8 +508,8 @@ impl Device {
         if !self.seen_ioctls.contains(&ioctl_nr) {
             self.seen_ioctls.push(ioctl_nr);
             self.diag(&format!(
-                "ioctl: first {} (0x{ioctl_nr:08x})",
-                ioctl_name(ioctl_nr)
+                "{}",
+                gndrm_obf::obf!("ioctl: first {} (0x{ioctl_nr:08x})", ioctl_name(ioctl_nr))
             ));
         }
         let mut result = if self.node_kind == NODE_KIND_RENDER && !render_node_allows(ioctl_nr) {
@@ -515,8 +517,11 @@ impl Device {
             // modesetting/master here is what a real kernel node does, and it
             // is the observable signal that this connection is a render node.
             self.diag(&format!(
-                "render node: refused {} (0x{ioctl_nr:08x})",
-                ioctl_name(ioctl_nr)
+                "{}",
+                gndrm_obf::obf!(
+                    "render node: refused {} (0x{ioctl_nr:08x})",
+                    ioctl_name(ioctl_nr)
+                )
             ));
             DispatchResult::err(errno::EACCES)
         } else {
@@ -1379,8 +1384,11 @@ impl Device {
         if cmd.flags & DRM_MODE_FB_MODIFIERS != 0 && !self.addfb_mods.contains(&modifier) {
             self.addfb_mods.push(modifier);
             self.diag(&format!(
+                "{}",
+                gndrm_obf::obf!(
                 "addfb2: fb {}x{} fmt={:#x} gem={} modifier={:#x} registered into the length index",
                 cmd.width, cmd.height, cmd.pixel_format, gem_size, modifier
+            )
             ));
         }
         let mut body = Vec::new();
@@ -1922,7 +1930,7 @@ mod tests {
         };
         let r = dev.dispatch(DRM_IOCTL_GET_CAP, &body_of(&c), None);
         assert_eq!(r.ret, 0, "GET_CAP 0x{cap:x} failed");
-        c = pod_read::<DrmGetCap>(&r.body).expect("GET_CAP body");
+        c = pod_read::<DrmGetCap>(&r.body).expect(&gndrm_obf::obf!("GET_CAP body"));
         c.value
     }
 
@@ -1946,7 +1954,7 @@ mod tests {
         };
         let r = d.dispatch(DRM_IOCTL_VERSION, &body_of(&v), None);
         assert_eq!(r.ret, 0);
-        v = pod_read::<DrmVersion>(&r.body).expect("VERSION body");
+        v = pod_read::<DrmVersion>(&r.body).expect(&gndrm_obf::obf!("VERSION body"));
         assert_eq!(v.version_major, DRIVER_VERSION.0);
         assert!(v.name_len > 0);
 
@@ -2005,7 +2013,7 @@ mod tests {
         };
         let r = d.dispatch(DRM_IOCTL_GEM_CREATE, &body_of(&req), None);
         assert_eq!(r.ret, 0, "GEM_CREATE failed");
-        let created = pod_read::<DrmGemCreate>(&r.body).expect("GEM_CREATE body");
+        let created = pod_read::<DrmGemCreate>(&r.body).expect(&gndrm_obf::obf!("GEM_CREATE body"));
         assert!(created.handle > 0, "GEM_CREATE must return a handle");
         assert_eq!(created.size, 4096);
 
@@ -2018,7 +2026,7 @@ mod tests {
         };
         let r = d.dispatch(DRM_IOCTL_GEM_MMAP, &body_of(&m), None);
         assert_eq!(r.ret, 0, "GEM_MMAP failed");
-        m = pod_read::<DrmGemMmap>(&r.body).expect("GEM_MMAP body");
+        m = pod_read::<DrmGemMmap>(&r.body).expect(&gndrm_obf::obf!("GEM_MMAP body"));
         assert_eq!(m.size, 4096);
         assert_eq!(m.offset & GEM_MMAP_OFFSET_BASE, GEM_MMAP_OFFSET_BASE);
         assert_eq!(m.offset & GEM_MMAP_HANDLE_MASK, u64::from(created.handle));
@@ -2031,7 +2039,9 @@ mod tests {
         };
         let r = d.dispatch(DRM_IOCTL_PRIME_HANDLE_TO_FD, &body_of(&h), None);
         assert_eq!(r.ret, 0, "PRIME_HANDLE_TO_FD failed");
-        let exported = r.fd_out.expect("export must attach an fd");
+        let exported = r
+            .fd_out
+            .expect(&gndrm_obf::obf!("export must attach an fd"));
         assert!(exported >= 0);
         // It is a real, sized file: fstat succeeds and reports the size.
         assert_eq!(fstat_fd(exported).map(|(_, sz)| sz), Some(4096));

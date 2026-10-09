@@ -172,11 +172,11 @@ pub fn start(runtime_dir: String, display: String) -> i32 {
                 stop,
                 thread: Some(t),
             });
-            log_info!("injector started (target {path})");
+            log_info!("{}", gndrm_obf::obf!("injector started (target {path})"));
             0
         }
         Err(e) => {
-            log_error!("injector spawn: {e}");
+            log_error!("{}", gndrm_obf::obf!("injector spawn: {e}"));
             -5
         }
     }
@@ -196,7 +196,7 @@ pub fn stop() {
     if let Some(t) = handle.thread.take() {
         let _ = t.join();
     }
-    log_info!("injector stopped");
+    log_info!("{}", gndrm_obf::obf!("injector stopped"));
 }
 
 fn post(ev: InputEvent) {
@@ -337,8 +337,12 @@ pub fn display_and_features() -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "features=0x{features:X};connector={};display_flags=0x{:X};rates={rates}",
-        info.connector, info.flags
+        "{}",
+        gndrm_obf::obf!(
+            "features=0x{features:X};connector={};display_flags=0x{:X};rates={rates}",
+            info.connector,
+            info.flags
+        )
     )
 }
 
@@ -492,10 +496,10 @@ fn run(path: &str, rx: &mpsc::Receiver<InputEvent>, stop: &AtomicBool) {
             Ok(()) => return, // stop requested
             Err(e) => {
                 if !logged_wait {
-                    log_info!("injector waiting for {path}: {e}");
+                    log_info!("{}", gndrm_obf::obf!("injector waiting for {path}: {e}"));
                     logged_wait = true;
                 } else {
-                    log_warn!("injector reconnecting: {e}");
+                    log_warn!("{}", gndrm_obf::obf!("injector reconnecting: {e}"));
                 }
                 // Drain stale input while disconnected, then wait.
                 while rx.try_recv().is_ok() {}
@@ -512,7 +516,8 @@ fn connect_and_run(
     stop: &AtomicBool,
 ) -> Result<(), String> {
     let stream = UnixStream::connect(path).map_err(|e| e.to_string())?;
-    let conn = Connection::from_socket(stream).map_err(|e| format!("from_socket: {e}"))?;
+    let conn = Connection::from_socket(stream)
+        .map_err(|e| format!("{}", gndrm_obf::obf!("from_socket: {e}")))?;
     let mut event_queue = conn.new_event_queue::<State>();
     let qh = event_queue.handle();
 
@@ -529,27 +534,40 @@ fn connect_and_run(
     };
     event_queue
         .roundtrip(&mut state)
-        .map_err(|e| format!("registry roundtrip: {e}"))?;
+        .map_err(|e| format!("{}", gndrm_obf::obf!("registry roundtrip: {e}")))?;
 
     let (Some(seat), Some(ptr_mgr), Some(kbd_mgr)) = (&state.seat, &state.ptr_mgr, &state.kbd_mgr)
     else {
         return Err(format!(
-            "missing globals (seat={} ptr={} kbd={})",
-            state.seat.is_some(),
-            state.ptr_mgr.is_some(),
-            state.kbd_mgr.is_some()
+            "{}",
+            gndrm_obf::obf!(
+                "missing globals (seat={} ptr={} kbd={})",
+                state.seat.is_some(),
+                state.ptr_mgr.is_some(),
+                state.kbd_mgr.is_some()
+            )
         ));
     };
 
     state.pointer = Some(ptr_mgr.create_virtual_pointer(Some(seat), &qh, ()));
     state.keyboard = Some(kbd_mgr.create_virtual_keyboard(seat, &qh, ()));
-    let keyboard = state.keyboard.as_ref().expect("keyboard just created");
+    let keyboard = state
+        .keyboard
+        .as_ref()
+        .expect(&gndrm_obf::obf!("keyboard just created"));
     upload_keymap(keyboard);
     if state.gs_control.is_none() {
-        log_warn!("gamescope_control not offered; fps cap unavailable");
+        log_warn!(
+            "{}",
+            gndrm_obf::obf!("gamescope_control not offered; fps cap unavailable")
+        );
     }
-    conn.flush().map_err(|e| format!("flush: {e}"))?;
-    log_info!("injector connected: virtual pointer + keyboard created");
+    conn.flush()
+        .map_err(|e| format!("{}", gndrm_obf::obf!("flush: {e}")))?;
+    log_info!(
+        "{}",
+        gndrm_obf::obf!("injector connected: virtual pointer + keyboard created")
+    );
 
     // Main loop: apply queued input, apply a pending fps cap, flush, drain
     // server events.
@@ -599,12 +617,13 @@ fn connect_and_run(
                 applied_fps = Some((want, internal));
             }
         }
-        conn.flush().map_err(|e| format!("flush: {e}"))?;
+        conn.flush()
+            .map_err(|e| format!("{}", gndrm_obf::obf!("flush: {e}")))?;
         // Keep the read side drained and detect server death promptly.
         if last_roundtrip.elapsed() >= Duration::from_millis(500) {
             event_queue
                 .roundtrip(&mut state)
-                .map_err(|e| format!("roundtrip: {e}"))?;
+                .map_err(|e| format!("{}", gndrm_obf::obf!("roundtrip: {e}")))?;
             last_roundtrip = std::time::Instant::now();
         }
     }
@@ -673,15 +692,18 @@ fn upload_keymap(keyboard: &ZwpVirtualKeyboardV1) {
     let fd = unsafe { libc::memfd_create(c"gndrm-keymap".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         log_error!(
-            "keymap memfd_create failed: {}",
-            std::io::Error::last_os_error()
+            "{}",
+            gndrm_obf::obf!(
+                "keymap memfd_create failed: {}",
+                std::io::Error::last_os_error()
+            )
         );
         return;
     }
     // SAFETY: fd is valid; bytes outlive the call.
     let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
     if written != bytes.len() as isize {
-        log_error!("keymap write short: {written}");
+        log_error!("{}", gndrm_obf::obf!("keymap write short: {written}"));
         // SAFETY: owned fd.
         unsafe { libc::close(fd) };
         return;

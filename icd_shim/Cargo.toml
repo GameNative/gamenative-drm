@@ -33,4 +33,5 @@ libc = "0.2"
 # verbatim so the ICD's scan-out client speaks the same protocol as the
 # LD_PRELOAD shim's — a second, hand-mirrored set of structs is how the two
 # sides drift apart.
+gndrm-obf = { path = "../modules/gndrm-obf" }
 gndrm-uapi = { path = "../modules/gndrm-uapi" }

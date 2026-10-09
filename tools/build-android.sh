@@ -17,6 +17,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Reproducibility: pin any timestamp-consuming tool to SOURCE_DATE_EPOCH (a
+# caller-supplied value wins, else the tree's last commit) so identical inputs
+# rebuild to identical bytes.
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || echo 0)}"
+
 NDK="${ANDROID_NDK_HOME:-}"
 if [ -z "$NDK" ]; then
     NDK="$(ls -d "$HOME"/Android/Sdk/ndk/* 2>/dev/null | sort -V | tail -1)"

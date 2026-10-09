@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+gndrm-obf = { path = "../gndrm-obf" }
 gndrm-uapi = { path = "../gndrm-uapi" }
 libc = "0.2"
 

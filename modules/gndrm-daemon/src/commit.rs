@@ -63,8 +63,12 @@ impl Device {
             | DRM_MODE_PAGE_FLIP_ASYNC;
         if a.flags & !KNOWN != 0 || a.reserved != 0 {
             self.diag(&format!(
-                "atomic: reject EINVAL unknown flags=0x{:x} reserved=0x{:x}",
-                a.flags, a.reserved
+                "{}",
+                gndrm_obf::obf!(
+                    "atomic: reject EINVAL unknown flags=0x{:x} reserved=0x{:x}",
+                    a.flags,
+                    a.reserved
+                )
             ));
             return DispatchResult::err(errno::EINVAL);
         }
@@ -99,9 +103,12 @@ impl Device {
                 crate::close_fd(fd);
             }
             self.diag(&format!(
-                "atomic: reject EINVAL fence mismatch wants={} got={}",
-                parsed.wants_fence,
-                fd_in.is_some()
+                "{}",
+                gndrm_obf::obf!(
+                    "atomic: reject EINVAL fence mismatch wants={} got={}",
+                    parsed.wants_fence,
+                    fd_in.is_some()
+                )
             ));
             return DispatchResult::err(errno::EINVAL);
         }
@@ -139,10 +146,13 @@ impl Device {
         if !self.logged_first_commit {
             self.logged_first_commit = true;
             self.diag(&format!(
-                "atomic: first commit queued (primary fb={}, {} props, flags=0x{:x})",
-                self.primary_state().fb_id,
-                parsed.sets.len(),
-                parsed.flags
+                "{}",
+                gndrm_obf::obf!(
+                    "atomic: first commit queued (primary fb={}, {} props, flags=0x{:x})",
+                    self.primary_state().fb_id,
+                    parsed.sets.len(),
+                    parsed.flags
+                )
             ));
         }
         // Periodic commit geometry: what the client actually puts on the
@@ -158,7 +168,7 @@ impl Device {
                 .get(&p.fb_id)
                 .map(|f| (f.width, f.height, f.pixel_format, f.pitches[0]))
                 .unwrap_or((0, 0, 0, 0));
-            self.diag(&format!(
+            self.diag(&format!("{}", gndrm_obf::obf!(
                 "atomic #{}: fb={} {}x{} fmt={:#010x} pitch={} src=({},{}) {}x{} crtc=({},{}) {}x{}",
                 self.commit_count,
                 p.fb_id,
@@ -174,7 +184,7 @@ impl Device {
                 p.crtc_y,
                 p.crtc_w,
                 p.crtc_h,
-            ));
+            )));
         }
         // Plane census: the full plane set, on the same rate policy as the
         // `atomic #N:` line, plus every change at once — a plane that only
@@ -186,7 +196,10 @@ impl Device {
             self.plane_census = census.clone();
         }
         if changed || self.commit_count <= 30 || self.commit_count.is_multiple_of(120) {
-            self.diag(&format!("planes #{}: {}", self.commit_count, census));
+            self.diag(&format!(
+                "{}",
+                gndrm_obf::obf!("planes #{}: {}", self.commit_count, census)
+            ));
         }
         DispatchResult::ok(Vec::new())
     }
@@ -206,9 +219,9 @@ impl Device {
             .iter()
             .map(|(id, ty, p)| {
                 if p.fb_id == 0 {
-                    format!("[{ty} id={id} fb=0 crtc={} zpos=- alpha=- **]", p.crtc_id)
+                    format!("{}", gndrm_obf::obf!("[{ty} id={id} fb=0 crtc={} zpos=- alpha=- **]", p.crtc_id))
                 } else {
-                    format!(
+                    format!("{}", gndrm_obf::obf!(
                         "[{ty} id={id} fb={} crtc={} zpos=- alpha=- src={}x{}+({},{}) crtc={}x{}+({},{})]",
                         p.fb_id,
                         p.crtc_id,
@@ -220,11 +233,14 @@ impl Device {
                         p.crtc_h,
                         p.crtc_x,
                         p.crtc_y,
-                    )
+                    ))
                 }
             })
             .collect();
-        format!("count={} {}", planes.len(), parts.join(" "))
+        format!(
+            "{}",
+            gndrm_obf::obf!("count={} {}", planes.len(), parts.join(" "))
+        )
     }
 
     /// Decode the linearized extension into `(obj, prop, value)` triples.
@@ -282,7 +298,10 @@ impl Device {
                 flat += 1;
                 let Some(prop_index) = props::resolve(obj_id, prop_id) else {
                     self.diag(&format!(
-                        "atomic: reject ENOENT unresolved prop obj={obj_id} prop=0x{prop_id:x}"
+                        "{}",
+                        gndrm_obf::obf!(
+                            "atomic: reject ENOENT unresolved prop obj={obj_id} prop=0x{prop_id:x}"
+                        )
                     ));
                     return Err(DispatchResult::err(errno::ENOENT));
                 };
@@ -311,9 +330,12 @@ impl Device {
             let (_, _, immutable) = props::PROPS[s.prop_index];
             if immutable {
                 self.diag(&format!(
-                    "atomic: reject EPERM immutable prop {} (idx {})",
-                    props::PROPS[s.prop_index].0,
-                    s.prop_index
+                    "{}",
+                    gndrm_obf::obf!(
+                        "atomic: reject EPERM immutable prop {} (idx {})",
+                        props::PROPS[s.prop_index].0,
+                        s.prop_index
+                    )
                 ));
                 return Err(errno::EPERM);
             }
@@ -334,22 +356,28 @@ impl Device {
             match s.prop_index {
                 props::P_PLANE_FB_ID => {
                     if s.value != 0 && !self.stores().fbs.contains_key(&(s.value as u32)) {
-                        self.diag(&format!("atomic: reject ENOENT unknown fb={}", s.value));
+                        self.diag(&format!(
+                            "{}",
+                            gndrm_obf::obf!("atomic: reject ENOENT unknown fb={}", s.value)
+                        ));
                         return Err(errno::ENOENT);
                     }
                 }
                 props::P_CRTC_MODE_ID => {
                     if s.value != 0 && !self.stores().blobs.contains_key(&(s.value as u32)) {
                         self.diag(&format!(
-                            "atomic: reject ENOENT unknown mode blob={}",
-                            s.value
+                            "{}",
+                            gndrm_obf::obf!("atomic: reject ENOENT unknown mode blob={}", s.value)
                         ));
                         return Err(errno::ENOENT);
                     }
                 }
                 props::P_PLANE_CRTC_ID | props::P_CONN_CRTC_ID => {
                     if s.value != 0 && s.value != u64::from(CRTC_ID) {
-                        self.diag(&format!("atomic: reject ENOENT unknown crtc={}", s.value));
+                        self.diag(&format!(
+                            "{}",
+                            gndrm_obf::obf!("atomic: reject ENOENT unknown crtc={}", s.value)
+                        ));
                         return Err(errno::ENOENT);
                     }
                 }
@@ -372,8 +400,12 @@ impl Device {
         for plane in [&primary, &cursor] {
             if plane.fb_id != 0 && plane.crtc_id != CRTC_ID {
                 self.diag(&format!(
-                    "atomic: reject EINVAL fb={} without crtc (crtc_id={})",
-                    plane.fb_id, plane.crtc_id
+                    "{}",
+                    gndrm_obf::obf!(
+                        "atomic: reject EINVAL fb={} without crtc (crtc_id={})",
+                        plane.fb_id,
+                        plane.crtc_id
+                    )
                 ));
                 return Err(errno::EINVAL);
             }
