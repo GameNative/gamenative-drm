@@ -1674,6 +1674,16 @@ unsafe extern "C" fn gn_vkCreateGraphicsPipelines(
     res
 }
 
+// Bring-up: log the first occurrence of each image format the guest creates.
+// Texture formats are the one Vulkan-level input we cannot see otherwise —
+// DXVK logs a format only when its own table lacks it, so emulation gaps in
+// the driver (e.g. BCn on Adreno) stay silent and show up as black elements.
+// Bounded to LOG_IMAGE_FIRST_N distinct (format, usage, tiling) triples, so a
+// session pays one lock per created image and one line per new format only.
+static SEEN_IMAGE: Mutex<Vec<(VkFormat, VkImageUsageFlags, VkImageTiling)>> =
+    Mutex::new(Vec::new());
+const LOG_IMAGE_FIRST_N: usize = 48;
+
 unsafe extern "C" fn gn_vkCreateImage(
     device: VkDevice,
     ci: *const VkImageCreateInfo,
@@ -1684,7 +1694,31 @@ unsafe extern "C" fn gn_vkCreateImage(
     if gd.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
-    unsafe { (*gd).f.create_image.unwrap()((*gd).real, ci, alloc, out) }
+    let ci_ref = unsafe { &*ci };
+    let res = unsafe { (*gd).f.create_image.unwrap()((*gd).real, ci, alloc, out) };
+    if res == VK_SUCCESS {
+        let key = (ci_ref.format, ci_ref.usage, ci_ref.tiling);
+        let mut seen = SEEN_IMAGE.lock().unwrap();
+        if seen.len() < LOG_IMAGE_FIRST_N && !seen.contains(&key) {
+            seen.push(key);
+            let pnext = unsafe { pnext_image_create_summary(ci_ref.pNext) };
+            crate::logf!(
+                "guest image: fmt={} {}x{}x{} type={} mips={} layers={} samples={:#x} tiling={} usage={:#x} flags={:#x} pNext=[{pnext}]",
+                ci_ref.format,
+                ci_ref.extent.width,
+                ci_ref.extent.height,
+                ci_ref.extent.depth,
+                ci_ref.imageType,
+                ci_ref.mipLevels,
+                ci_ref.arrayLayers,
+                ci_ref.samples,
+                ci_ref.tiling,
+                ci_ref.usage,
+                ci_ref.flags
+            );
+        }
+    }
+    res
 }
 
 // ---- guest-command trace (bounded one-shot, always on) -------------------
