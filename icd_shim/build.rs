@@ -40,6 +40,20 @@ fn main() {
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=build.rs");
 
+    // Export allowlist: the ICD's dynamic table is exactly the three Khronos
+    // loader entry points (tools/exports/libadrenotools_gamescope.map). The
+    // version script pins it; `--exclude-libs,ALL` keeps statically-linked
+    // archive symbols (compiler-rt, the Rust std objects) out of the table too.
+    // Applied to the cdylib only, so the host integration tests and icd_probe
+    // are unaffected; the rlib half keeps its symbols.
+    let map = format!(
+        "{}/../tools/exports/libadrenotools_gamescope.map",
+        env::var("CARGO_MANIFEST_DIR").unwrap()
+    );
+    println!("cargo:rustc-cdylib-link-arg=-Wl,--version-script={map}");
+    println!("cargo:rustc-cdylib-link-arg=-Wl,--exclude-libs,ALL");
+    println!("cargo:rerun-if-changed={map}");
+
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("android") {
         return;
     }

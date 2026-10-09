@@ -28,6 +28,13 @@ license = "MIT"
 # the codegen/size cost is accepted for a display path that must never take the
 # host app down.
 [profile.release]
-lto = "thin"
+# `fat` LTO crosses crate boundaries so more of the daemon folds into one unit:
+# cheaper for a reverse engineer to read a single link, at no runtime cost.
+lto = "fat"
 codegen-units = 1
 panic = "unwind"
+# Ship no static symbol table — `.symtab` names every internal function and
+# crate; `.dynsym` is separately pinned to the export allowlist (the linker
+# version scripts in tools/exports/). No debuginfo either.
+strip = "symbols"
+debug = false

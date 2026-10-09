@@ -1,0 +1,24 @@
+/* Export allowlist for libgamenative_drm.so (the in-app JNI cdylib).
+ *
+ * The dynamic table is EXACTLY the JNI entry points the Java side resolves
+ * through System.loadLibrary("gamenative_drm"); every other symbol is local.
+ * Dropping one of these is a NoSuchMethodError at session start, so the set is
+ * pinned here and audited by tools/check-exports.sh. */
+{
+  global:
+    Java_app_gamenative_display_GameNativeDrm_nativeKey;
+    Java_app_gamenative_display_GameNativeDrm_nativePointerAxis;
+    Java_app_gamenative_display_GameNativeDrm_nativePointerAbsolute;
+    Java_app_gamenative_display_GameNativeDrm_nativePointerButton;
+    Java_app_gamenative_display_GameNativeDrm_nativePointerMotion;
+    Java_app_gamenative_display_GameNativeDrm_nativeInjectorStart;
+    Java_app_gamenative_display_GameNativeDrm_nativeInjectorStop;
+    Java_app_gamenative_display_GameNativeDrm_nativeInjectorSetSuspended;
+    Java_app_gamenative_display_GameNativeDrm_nativeDisplayInfo;
+    Java_app_gamenative_display_GameNativeDrm_nativeRetargetSurface;
+    Java_app_gamenative_display_GameNativeDrm_nativeGamescopeCommand;
+    Java_app_gamenative_display_GameNativeDrm_nativeSetFpsLimit;
+    Java_app_gamenative_display_GameNativeDrm_nativeStart;
+    Java_app_gamenative_display_GameNativeDrm_nativeStop;
+  local: *;
+};

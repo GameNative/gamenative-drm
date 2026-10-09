@@ -32,7 +32,9 @@ if [ "${1:-}" = "debug" ]; then PROFILE=""; DIR=debug; fi
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG"
 # 16 KB page-size support (Google Play requirement): matches the gamescope
 # toolchain flag in android/cross/aarch64-linux-android.txt.
-export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-args=-Wl,-z,max-page-size=16384"
+# --remap-path-prefix keeps the build host's paths (workspace root, cargo
+# registry) out of the shipped binary, so it carries no build-machine layout.
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-args=-Wl,-z,max-page-size=16384 --remap-path-prefix=$ROOT=/build/gamenative-drm --remap-path-prefix=$HOME/.cargo/registry=/build/cargo-registry"
 # rust-std component for the tier-2 target must be installed (rustup).
 cargo build $PROFILE --target aarch64-linux-android -p gndrm-android
 
@@ -41,6 +43,11 @@ cargo build $PROFILE --target aarch64-linux-android -p gndrm-android
 # prefix (build.rs reads GAMESCOPE_TERMUX_PREFIX); the test binaries also
 # link libvulkan from there.
 cargo build $PROFILE --target aarch64-linux-android -p adrenotools_gamescope -p gn-utils
+
+# Export drift guard: the dynamic export set of each shipped library must match
+# its allowlist (tools/exports/*.map), so a dropped JNI/ICD symbol or a newly
+# leaked internal one fails the build instead of the device.
+bash "$ROOT/tools/check-exports.sh"
 
 SO="$ROOT/target/aarch64-linux-android/$DIR/libgamenative_drm.so"
 REL="$ROOT/target/aarch64-linux-android/$DIR"

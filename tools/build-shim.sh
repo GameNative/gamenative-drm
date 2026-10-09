@@ -16,12 +16,16 @@ SRC="$ROOT/modules/gndrm-shim/gndrm_shim.c"
 OUT="$ROOT/target/shim"
 CFLAGS="-Wall -Wextra -Werror -O2 -fPIC"
 # NOTE: no -fvisibility=hidden — the interposed symbols (open/ioctl/close)
-# must stay exported for LD_PRELOAD interposition to work at all.
+# must stay exported for LD_PRELOAD interposition to work at all. What pins the
+# exported set is the linker version script below: it makes everything except
+# the interposer entry points local, without touching the visible ones.
+MAP="$ROOT/tools/exports/libgndrm_shim.map"
+LDFLAGS="-Wl,--version-script=$MAP -Wl,--exclude-libs,ALL"
 
 mkdir -p "$OUT"
 
 # --- host ----------------------------------------------------------------
-cc $CFLAGS -shared -o "$OUT/libgndrm_shim.so" "$SRC" -ldl -lpthread
+cc $CFLAGS -shared $LDFLAGS -o "$OUT/libgndrm_shim.so" "$SRC" -ldl -lpthread
 echo "host:   $OUT/libgndrm_shim.so"
 
 # --- test client (host, real libdrm) --------------------------------------
@@ -57,7 +61,14 @@ if [ "${1:-}" = "android" ]; then
     AOUT="$OUT/android/aarch64"
     mkdir -p "$AOUT"
     # bionic has dl* in libc; pthread is built in. Only libc needed.
-    "$TC/bin/aarch64-linux-android$API-clang" $CFLAGS -shared \
+    # The version script pins the export allowlist; --exclude-libs,ALL drops
+    # archive symbols. llvm-strip then removes the static symbol table from the
+    # shipped .so (the leak this hardening closes).
+    "$TC/bin/aarch64-linux-android$API-clang" $CFLAGS -shared $LDFLAGS \
         -o "$AOUT/libgndrm_shim.so" "$SRC" -ldl -landroid
+    "$TC/bin/llvm-strip" --strip-unneeded "$AOUT/libgndrm_shim.so"
     echo "android: $AOUT/libgndrm_shim.so (NDK $(basename "$NDK"), API $API)"
+
+    bash "$ROOT/tools/check-exports.sh" \
+        "$AOUT/libgndrm_shim.so" "$MAP"
 fi

@@ -1,0 +1,23 @@
+/* Export allowlist for libgndrm_shim.so (the LD_PRELOAD DRM interposer).
+ *
+ * These are the interposed libc entry points plus the shim's own connect
+ * helper; they must stay dynamically exported for LD_PRELOAD interposition to
+ * work (so the C build keeps default visibility — this script, not
+ * -fvisibility=hidden, is what pins the exported set). Everything else is
+ * local. Audited by tools/check-exports.sh. */
+{
+  global:
+    gamenative_drm_connect;
+    open;
+    openat;
+    open64;
+    close;
+    dup;
+    dup2;
+    dup3;
+    fcntl;
+    ioctl;
+    mmap;
+    mmap64;
+  local: *;
+};
