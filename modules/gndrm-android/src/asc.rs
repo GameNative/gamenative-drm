@@ -1998,6 +1998,17 @@ fn build_show(
         (api.st_set_zorder)(tx, sc, 0);
         (api.st_set_visibility)(tx, sc, 1);
         (api.st_set_color)(tx, sc, 0.0, 0.0, 0.0, 1.0, ffi::ADATASPACE_UNKNOWN);
+        // The scan-out buffer's alpha is not meaningful: the layer is the whole
+        // frame, composited opaque, and gamescope's composite shaders are
+        // written for a DRM plane whose X-prefixed fourcc ignores alpha (a pass
+        // may store alpha 0 — cs_composite_rcas.comp does — without blanking
+        // the frame). The pool's AHardwareBuffer is BGRA_8888, whose alpha SF
+        // would otherwise honour, so assert opacity here. See ffi.rs.
+        (api.st_set_buffer_transparency)(
+            tx,
+            sc,
+            ffi::ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE,
+        );
         (api.st_set_geometry)(tx, sc, &src, &dst, 0);
         // setBuffer consumes the acquire fence: SurfaceFlinger closes it,
         // so it must not be closed here as well.

@@ -35,10 +35,10 @@ winlator X11 path (which remains the default for normal launches).
 3. [03-gamescope-build.md](03-gamescope-build.md) — meson configuration, dependency strategy for the bionic/termux prefix, wlroots config, patch list, packaging.
 4. [04-gamenative-app.md](04-gamenative-app.md) — GameNative app changes: Display Server dropdown, launch path, wine driver steering, Surface host, JNI bridge, input.
 5. [05-xwayland-reintroduction.md](05-xwayland-reintroduction.md) — client windowing via `winex11.drv` + XWayland (`gamenative-xwayland`), XID-bound proxy surfaces, cursor/input via the upstream X11 compositor path.
-6. [06-presenter-latency.md](06-presenter-latency.md) — the SurfaceControl presenter: AHardwareBuffer scan-out pool and `ASurfaceTransaction` publish.
+6. [06-presenter-latency.md](06-presenter-latency.md) — the SurfaceControl presenter: AHardwareBuffer scan-out pool, the scan-out alpha invariant, and `ASurfaceTransaction` publish.
 7. [07-kernel-drm-parity.md](07-kernel-drm-parity.md) — the async commit + vblank event-queue model.
 8. [08-xwayland-render-node.md](08-xwayland-render-node.md) — the render-node path: Xwayland's second DRM listener, and why the card and render nodes are served separately.
-9. [09-runtime-features.md](09-runtime-features.md) — the gamescope runtime controls behind the QuickMenu Gamescope tab, and which of them the control connection can actually carry.
+9. [09-runtime-features.md](09-runtime-features.md) — the gamescope runtime controls behind the QuickMenu Gamescope tab, which of them the control connection can actually carry, and Scaling Mode's guest-X-client transport.
 10. [10-fps-limit.md](10-fps-limit.md) — how the app's fps limit reaches gamescope, what the deadline grid and the commit deferral each do, and what the divisor can express.
 11. [11-refresh-model.md](11-refresh-model.md) — `g_nOutputRefresh` against `g_nNestedRefresh` (`-r`): what each drives, and what that means when gndrm advertises its own session rate rather than the panel's.
 12. [12-present-latency-budget.md](12-present-latency-budget.md) — the present-latency budget: what each frame on the paced path pays, and why the flip event is emitted with the publish.

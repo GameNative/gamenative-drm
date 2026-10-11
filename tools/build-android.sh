@@ -83,9 +83,17 @@ bash "$ROOT/tools/check-elf-deps.sh" "$REL/icd_probe" "${BIONIC[@]}"
 # its own script keeps the NDK/clang wiring and the ELF dep audit.
 bash "$ROOT/tools/build-xtree-probe.sh"
 
+# Live scaling-mode client (guest control client, ships in the gamescope payload
+# as bin/gn-scaling-mode): sets GAMESCOPE_NEW_SCALING_SCALER on the session's X
+# root so a Scaling Mode change applies without a relaunch. Same build/audit
+# style as the other guest clients; its own script keeps the NDK/clang wiring
+# and the ELF dep audit.
+bash "$ROOT/tools/build-scaling-mode.sh"
+
 file "$SO"
 echo "built:  $SO (NDK ${NDK##*/}, API 28)"
 echo "built:  $REL/libadrenotools_gamescope.so"
 echo "built:  $REL/gn-dmabuf-test"
 echo "built:  $REL/gn-wsi-test"
 echo "built:  $REL/gn-xtree-probe"
+echo "built:  $REL/gn-scaling-mode"

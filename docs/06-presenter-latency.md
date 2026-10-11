@@ -23,6 +23,38 @@ The pool is BGRA (`BGRA_8888`), which is byte-for-byte identical to DRM
 conversion and no shader. The daemon advertises exactly the formats the pool is
 laid out in, so gamescope cannot elect a layout the pool does not have.
 
+## Alpha semantics (scan-out alpha is not meaningful)
+
+The pool's `AHardwareBuffer` is `BGRA_8888`, whose alpha channel SurfaceFlinger
+**honours** by default. The frame gamescope renders is written for a DRM primary
+plane, whose X-prefixed fourcc (`XRGB8888`/`XR24`) carries no alpha: a shader
+pass may store alpha **0** without blanking the plane. gamescope's RCAS composite
+shaders do exactly that — `imageStore(dst, …, vec4(outputValue, 0))` in
+`cs_composite_rcas.comp` / `cs_composite_rcas_1px.comp:94`. Storing 0 is
+**correct** for scan-out, because DRM ignores alpha; it is only wrong once the
+same bytes are published through SurfaceFlinger, which does not ignore it.
+
+Invariant: **a scan-out format that carries no meaningful alpha must not be
+published as transparent.** The publisher, not the producer, owns this. The
+presenter asserts `ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE` on every show
+transaction (`modules/gndrm-android/src/asc.rs` `build_show`; constant and
+rationale in `ffi.rs`), so the layer composites opaque no matter what alpha the
+scan-out pass left behind. The scan-out format table is not the fix and needs no
+change: the daemon's `PRIMARY_FORMATS` already lists `XRGB8888` first (an
+X-prefixed fourcc, alpha ignored).
+
+Without the assertion the primary layer is composited with the buffer's alpha,
+and a full-frame `alpha = 0` renders the whole frame transparent — black. The
+tell is which upscaler measured black: the FSR and SGSR paths go through the RCAS
+composite that writes alpha 0, while NIS, nearest and pixel do not. The
+falsifying measurements are a frame's *content*, not the publish path: a rendered
+frame's screenshot is ≈2.6–2.8 MB with mean luma ~54–58 and >300k distinct
+colours; a black frame is ≈37–41 KB with mean luma ~1.2 and ~1.4k colours. The
+render side is therefore ruled out — FSR/SGSR arithmetic, the RCAS pass
+configuration, the shader body, the descriptor layout, pipeline creation — and so
+is the ICD shim, which logs command *names*, not arguments, and so cannot see
+formats or `VkResult`s.
+
 ## Publish tail
 
 Presentation uses `ASurfaceControl` / `ASurfaceTransaction`, resolved at runtime

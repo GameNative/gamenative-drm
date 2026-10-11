@@ -196,6 +196,15 @@ pub struct ARect {
 /// colour-managed.
 pub const ADATASPACE_UNKNOWN: c_int = 0;
 
+/// `ASurfaceTransactionTransparency` (`<android/surface_control.h>`, API 29).
+/// `OPAQUE` tells SurfaceFlinger the buffer's alpha channel is not meaningful,
+/// so the scan-out layer is composited opaque — the DRM convention an
+/// X-prefixed fourcc (`XR24`) carries, and the one gamescope's composite
+/// shaders are written to (a pass may store alpha 0 without blanking the
+/// frame). The pool's `AHardwareBuffer` is `BGRA_8888`, whose alpha is
+/// honoured by default, so this must be asserted explicitly.
+pub const ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE: i8 = 2;
+
 pub type FnScCreateFromWindow = unsafe extern "C" fn(
     window: *mut ANativeWindow,
     debug_name: *const c_char,
@@ -229,6 +238,11 @@ pub type FnStSetColor = unsafe extern "C" fn(
     b: f32,
     alpha: f32,
     dataspace: c_int,
+);
+pub type FnStSetBufferTransparency = unsafe extern "C" fn(
+    tx: *mut ASurfaceTransaction,
+    sc: *mut ASurfaceControl,
+    transparency: i8,
 );
 pub type FnStOnComplete =
     unsafe extern "C" fn(context: *mut c_void, stats: *mut ASurfaceTransactionStats);
@@ -290,6 +304,7 @@ pub struct ScApi {
     pub st_set_visibility: FnStSetVisibility,
     pub st_set_geometry: FnStSetGeometry,
     pub st_set_color: FnStSetColor,
+    pub st_set_buffer_transparency: FnStSetBufferTransparency,
     pub st_set_on_complete: FnStSetOnComplete,
     pub st_stats_previous_release_fence_fd: FnStStatsGetPreviousReleaseFenceFd,
     pub st_stats_get_controls: FnStStatsGetASurfaceControls,
@@ -343,6 +358,10 @@ impl ScApi {
                 st_set_visibility: sym(handle, c"ASurfaceTransaction_setVisibility")?,
                 st_set_geometry: sym(handle, c"ASurfaceTransaction_setGeometry")?,
                 st_set_color: sym(handle, c"ASurfaceTransaction_setColor")?,
+                st_set_buffer_transparency: sym(
+                    handle,
+                    c"ASurfaceTransaction_setBufferTransparency",
+                )?,
                 st_set_on_complete: sym(handle, c"ASurfaceTransaction_setOnComplete")?,
                 st_stats_previous_release_fence_fd: sym(
                     handle,

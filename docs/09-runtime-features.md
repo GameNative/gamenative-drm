@@ -5,6 +5,8 @@ Everything below is already reachable from the app process: the input injector
 (`modules/gndrm-android/src/injector.rs`) holds a wayland connection to
 `$XDG_RUNTIME_DIR/gamescope-0` and binds `gamescope_control`, which is the same
 route `nativeFps()` uses. No patch and no new transport is needed per feature.
+(Scaling Mode is the one control the connection cannot carry — see its section
+below.)
 
 ## gamescope_control (protocol v7; each request's `since` shown)
 
@@ -53,6 +55,34 @@ Events (server → client):
   controller action bindings.
 - `gamescope_xwayland` — Xwayland server control.
 
+## Scaling Mode — live, via a guest X client
+
+Scaling Mode is a live QuickMenu control, not a launch setting, and it is not in
+`gamescope_control`. It is carried by a guest-side X client shipped in the
+payload as `bin/gn-scaling-mode` (built from `tools/scaling-mode.c` +
+`tools/build-scaling-mode.sh`), which sets the **`GAMESCOPE_NEW_SCALING_SCALER`**
+root property on gamescope's X display: a single 32-bit `XA_CARDINAL` holding the
+`GamescopeUpscaleScaler` enum — `AUTO=0, INTEGER=1, FIT=2, FILL=3, STRETCH=4`.
+gamescope reads it live in the `PropertyNotify` handler
+(`steamcompmgr.cpp:7482`) and repaints; `--scaler` only seeds the launch value.
+
+It is deliberately **not** `GAMESCOPE_SCALING_FILTER`: that legacy property is a
+*combined* scaler+filter mapping (case 0 = AUTO+LINEAR, 1 = AUTO+NEAREST,
+2 = INTEGER+NEAREST, 3 = AUTO+FSR, 4 = AUTO+NIS), so writing a scaler value there
+silently changes the *filter* too.
+
+Why a guest command rather than a JNI entry point: the daemon is the layer
+*below* gamescope (userspace DRM / scan-out), whereas X11 is gamescope's *client*
+side — a daemon-side X client would sit on both sides of that boundary. A
+separate short-lived process also cannot take the app process down, and it leaves
+the daemon's export contract untouched: the 14 `GameNativeDrm` JNI symbols and
+their allowlist are unchanged, with no allowlist/drift-guard churn.
+
+The binary's payload wiring lives in these two places: gamenative-drm's
+`tools/build-android.sh` runs `tools/build-scaling-mode.sh`, and gamescope's
+`android/package-gamescope.sh` ships the result as `bin/gn-scaling-mode` beside
+the other guest clients (`gn-dmabuf-test`, `gn-wsi-test`, `gn-xtree-probe`).
+
 ## Launch-time only (not settable at runtime)
 
 `--framerate-limit N`, `--backend`, `--expose-wayland`, `-W/-H/-w/-h`,
@@ -73,3 +103,4 @@ runtime-settable has to go through a protocol request above.
 | gamescope "look" | `set_look` / `unset_look`, gated by `feature_support`/`look` | medium |
 | ReShade | `gamescope_reshade`, gated by `reshade_shaders` | medium |
 | HDR / VRR | read `active_display_info` flags first; the flags say whether the display path supports them at all | low — display flags only; the actual enable paths are not in this protocol |
+| Scaling Mode | guest `bin/gn-scaling-mode` sets the `GAMESCOPE_NEW_SCALING_SCALER` root property | high (see its section above) |
