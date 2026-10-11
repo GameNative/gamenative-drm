@@ -23,7 +23,7 @@ pub mod server;
 
 use std::collections::{HashSet, VecDeque};
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
@@ -107,18 +107,47 @@ fn primary_formats_for(hdr: bool) -> &'static [u32] {
 /// Whether the session asked for HDR output, so the plane may offer the 10-bit
 /// scan-out formats.
 ///
-/// Read from `GNDRM_HDR` on every call: the launcher sets it in this process
-/// (the daemon, the pool and the presenter share one address space) when it
-/// builds the gamescope command, which happens after the daemon starts, so the
-/// value has to be read lazily rather than cached at init. Any value other than
-/// a set/`1`/`true` is treated as off.
+/// The environment (`GNDRM_HDR`) is the source of the flag: the launcher sets it
+/// in this process (the daemon, the pool and the presenter share one address
+/// space) when it builds the gamescope command. That happens after the daemon
+/// process starts but before the guest forks, and the first call that reads this
+/// (the plane's format list, built with the guest's first plane query) lands
+/// after the set, so the value is resolved lazily on first use rather than
+/// cached at init. It is served from a cached slot thereafter, because the
+/// environment lookup takes a lock and one caller is on the per-published-buffer
+/// path. [`reset_hdr_output_cache`] drops the slot at session start so a later
+/// session re-reads the environment. Any value other than a set/`1`/`true` is
+/// treated as off.
 #[must_use]
 pub fn hdr_output_enabled() -> bool {
-    matches!(
-        std::env::var_os("GNDRM_HDR"),
-        Some(v) if !v.is_empty() && v != "0"
-    )
+    match HDR_GATE.load(Ordering::Relaxed) {
+        HDR_ON => true,
+        HDR_OFF => false,
+        _ => {
+            let on = matches!(
+                std::env::var_os("GNDRM_HDR"),
+                Some(v) if !v.is_empty() && v != "0"
+            );
+            HDR_GATE.store(if on { HDR_ON } else { HDR_OFF }, Ordering::Relaxed);
+            on
+        }
+    }
 }
+
+/// Drop the cached [`hdr_output_enabled`] verdict so the next call re-reads
+/// `GNDRM_HDR`. Called at session start: the launcher sets the variable before
+/// each session's guest forks and it can change between sessions, so a value
+/// carried over would advertise the HDR format table to an SDR session.
+pub fn reset_hdr_output_cache() {
+    HDR_GATE.store(HDR_UNRESOLVED, Ordering::Relaxed);
+}
+
+/// Cached `GNDRM_HDR` verdict: [`HDR_UNRESOLVED`] until the first read, then
+/// [`HDR_OFF`] or [`HDR_ON`].
+static HDR_GATE: AtomicU8 = AtomicU8::new(HDR_UNRESOLVED);
+const HDR_UNRESOLVED: u8 = 0;
+const HDR_OFF: u8 = 1;
+const HDR_ON: u8 = 2;
 /// Cursor plane formats (doc §3.2: ARGB8888, 64×64).
 const CURSOR_FORMATS: &[u32] = &[DRM_FORMAT_ARGB8888];
 
@@ -419,22 +448,40 @@ impl Device {
     fn note_exhausted(&mut self, space: &'static str) -> i32 {
         if !self.logged_exhaustion.contains(&space) {
             self.logged_exhaustion.push(space);
-            self.diag(&format!("{}", gndrm_obf::obf!(
+            self.diag(|| format!("{}", gndrm_obf::obf!(
                 "resource: {space} exhausted; returning ENOSPC (display path degraded, app continues)"
             )));
         }
         errno::ENOSPC
     }
 
-    pub(crate) fn diag(&self, msg: &str) {
+    /// Emit a diagnostic through the installed logger, if any.
+    ///
+    /// `msg` is a thunk: the message (and any `obf!` literal in it, which is a
+    /// stack decode) is built only when a logger is installed. The app installs
+    /// the logger only when `GNDRM_LOG_DAEMON` is on, so a disabled daemon never
+    /// decodes a line it would drop.
+    pub(crate) fn diag(&self, msg: impl FnOnce() -> String) {
         if let Some(log) = self
             .logger
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
         {
-            log(msg);
+            log(&msg());
         }
+    }
+
+    /// Whether a diagnostics logger is installed. A call site that builds a
+    /// message outside [`Self::diag`] (the plane census, which also tracks
+    /// changes) tests this first so the work is skipped when diagnostics are
+    /// off.
+    #[must_use]
+    pub(crate) fn diag_on(&self) -> bool {
+        self.logger
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
     }
 
     /// Override the event clock (tests).
@@ -562,22 +609,26 @@ impl Device {
         // (gamescope) gets through the uapi surface before stalling.
         if !self.seen_ioctls.contains(&ioctl_nr) {
             self.seen_ioctls.push(ioctl_nr);
-            self.diag(&format!(
-                "{}",
-                gndrm_obf::obf!("ioctl: first {} (0x{ioctl_nr:08x})", ioctl_name(ioctl_nr))
-            ));
+            self.diag(|| {
+                format!(
+                    "{}",
+                    gndrm_obf::obf!("ioctl: first {} (0x{ioctl_nr:08x})", ioctl_name(ioctl_nr))
+                )
+            });
         }
         let mut result = if self.node_kind == NODE_KIND_RENDER && !render_node_allows(ioctl_nr) {
             // A render node exposes only the render-capable ioctls. Refusing
             // modesetting/master here is what a real kernel node does, and it
             // is the observable signal that this connection is a render node.
-            self.diag(&format!(
-                "{}",
-                gndrm_obf::obf!(
-                    "render node: refused {} (0x{ioctl_nr:08x})",
-                    ioctl_name(ioctl_nr)
+            self.diag(|| {
+                format!(
+                    "{}",
+                    gndrm_obf::obf!(
+                        "render node: refused {} (0x{ioctl_nr:08x})",
+                        ioctl_name(ioctl_nr)
+                    )
                 )
-            ));
+            });
             DispatchResult::err(errno::EACCES)
         } else {
             match ioctl_nr {
@@ -1438,13 +1489,15 @@ impl Device {
         let modifier = cmd.modifier[0];
         if cmd.flags & DRM_MODE_FB_MODIFIERS != 0 && !self.addfb_mods.contains(&modifier) {
             self.addfb_mods.push(modifier);
-            self.diag(&format!(
-                "{}",
-                gndrm_obf::obf!(
+            self.diag(|| {
+                format!(
+                    "{}",
+                    gndrm_obf::obf!(
                 "addfb2: fb {}x{} fmt={:#x} gem={} modifier={:#x} registered into the length index",
                 cmd.width, cmd.height, cmd.pixel_format, gem_size, modifier
             )
-            ));
+                )
+            });
         }
         let mut body = Vec::new();
         pod_write(&mut body, &cmd);

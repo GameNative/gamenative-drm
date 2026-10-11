@@ -62,11 +62,18 @@ pub(crate) fn daemon_info(text: &str) {
 /// One log line at `prio`; `fmt`/`args` go through `format_args!`. The
 /// call site's module path is classified at compile time (`const`), so it is
 /// never stored in the binary.
+///
+/// The gate is tested *before* `format_args!`: an `obf!` literal at the call
+/// site is a stack decode, so a disabled line must not build the arguments at
+/// all. `write` re-checks (it is also the entry for the daemon's forwarded
+/// lines); this only short-circuits the decode.
 #[macro_export]
 macro_rules! alog {
     ($prio:expr, $($arg:tt)*) => {{
         const GATE: $crate::log_policy::Gate = $crate::log_policy::gate_of(module_path!());
-        $crate::log::write($prio, GATE, format_args!($($arg)*))
+        if $crate::log_policy::enabled(GATE) {
+            $crate::log::write($prio, GATE, format_args!($($arg)*))
+        }
     }};
 }
 

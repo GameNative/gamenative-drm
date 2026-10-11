@@ -1259,8 +1259,7 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
         // present still runs against the device table head, but say so, because
         // an unrecognised queue is the same wrong-handle class as submit.
         let (first, n) = unsafe { device_table() };
-        loud(
-            "present.queue_miss",
+        loud("present.queue_miss", || {
             format!(
                 "{}",
                 gndrm_obf::obf!(
@@ -1268,21 +1267,20 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
                     queue as usize,
                     unsafe { handle_note(false, queue as usize, first, n) }
                 )
-            ),
-        );
+            )
+        });
         gd = G.lock().unwrap().devices;
     }
     if gd.is_null() {
-        loud(
-            "present.device_miss",
+        loud("present.device_miss", || {
             format!(
                 "{}",
                 gndrm_obf::obf!(
                     "proxy: gn_vkQueuePresentKHR DEVICE MISS q={:#x} — no device wrapper at all",
                     queue as usize
                 )
-            ),
-        );
+            )
+        });
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let real_q = if gq.is_null() {
@@ -1390,8 +1388,7 @@ unsafe fn submit_impl(
         // No queue wrapper: the guest's VkQueue is not one `gn_vkGetDeviceQueue`
         // produced, so the batch has no device to reach the driver through.
         let (first, n) = unsafe { device_table() };
-        loud(
-            "submit.miss",
+        loud("submit.miss", || {
             format!(
                 "{}",
                 gndrm_obf::obf!(
@@ -1399,8 +1396,8 @@ unsafe fn submit_impl(
                     queue as usize,
                     unsafe { handle_note(false, queue as usize, first, n) }
                 )
-            ),
-        );
+            )
+        });
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let gd = unsafe { (*gq).gd };
@@ -1513,8 +1510,7 @@ unsafe fn submit2_impl(
     let gq = unsafe { find_queue(queue) };
     if gq.is_null() {
         let (first, n) = unsafe { device_table() };
-        loud(
-            "submit2.miss",
+        loud("submit2.miss", || {
             format!(
                 "{}",
                 gndrm_obf::obf!(
@@ -1522,8 +1518,8 @@ unsafe fn submit2_impl(
                     queue as usize,
                     unsafe { handle_note(false, queue as usize, first, n) }
                 )
-            ),
-        );
+            )
+        });
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let gd = unsafe { (*gq).gd };
@@ -1639,16 +1635,15 @@ unsafe extern "C" fn gn_vkAllocateCommandBuffers(
     let gd = unsafe { find_device(device) };
     if gd.is_null() {
         let (first, n) = unsafe { device_table() };
-        loud(
-            "alloc_cmd.miss",
+        loud("alloc_cmd.miss", || {
             format!(
                 "{}",
                 gndrm_obf::obf!(
                     "proxy: vkAllocateCommandBuffers DEVICE MISS {} — guest CBs will be driver-raw",
                     unsafe { handle_note(false, device as usize, first, n) }
                 )
-            ),
-        );
+            )
+        });
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let mut rc = vec![ptr::null_mut::<c_void>(); ci.commandBufferCount as usize];
@@ -2772,13 +2767,12 @@ unsafe extern "C" fn gn_vkCmdExecuteCommands(
         // device to route the driver export through and no way to translate the
         // secondary handles. Forwarding raw is what fed the driver wrapper
         // pointers before; dropping it is silent. Say it happened.
-        loud(
-            "exec_cmds.miss",
+        loud("exec_cmds.miss", || {
             format!("{}", gndrm_obf::obf!(
                 "proxy: vkCmdExecuteCommands CB MISS cmd={:#x} count={count} — secondaries not translated",
                 cmd as usize
-            )),
-        );
+            ))
+        });
         return;
     }
     let mut stage = NestedStage::new();
@@ -4801,8 +4795,14 @@ fn was_wrapper(p: usize) -> bool {
 /// shim dropped is named when the gate is on rather than being indistinguishable
 /// from one the guest never made. Bounded per site so a storm of misses cannot
 /// flood logcat.
+///
+/// `msg` is a thunk: the gate and the per-site budget are both checked before
+/// it runs, so a gated-off or bounded-out site never decodes its message.
 const LOUD_MAX: u32 = 6;
-fn loud(site: &'static str, msg: String) {
+fn loud(site: &'static str, msg: impl FnOnce() -> String) {
+    if !crate::vkshim_enabled() {
+        return;
+    }
     static SEEN: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new());
     if let Ok(mut v) = SEEN.lock() {
         match v.iter_mut().find(|(s, _)| *s == site) {
@@ -4811,7 +4811,8 @@ fn loud(site: &'static str, msg: String) {
             None => v.push((site, 1)),
         }
     }
-    crate::logf!(gndrm_obf::obf!("{msg}"));
+    let line = msg();
+    crate::logf!(gndrm_obf::obf!("{}", line));
 }
 
 /// A handle the shim could not resolve, against the wrapper table it searched,
@@ -6454,13 +6455,12 @@ unsafe extern "C" fn gn_vkCreateDevice(
     let ci = unsafe { &*ci };
     let gi = unsafe { find_instance_by_pd(pd) };
     if gi.is_null() || unsafe { (*gi).f.create_device.is_none() } {
-        loud(
-            "create_device.noinst",
+        loud("create_device.noinst", || {
             format!("{}", gndrm_obf::obf!(
                 "proxy: vkCreateDevice NO INSTANCE pd={:#x} gi={} — guest device will be driver-raw (wrong-handle class)",
                 pd as usize, gi.is_null()
-            )),
-        );
+            ))
+        });
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     const ADD_EXTS: [&CStr; 4] = [
@@ -6718,16 +6718,15 @@ unsafe extern "C" fn gn_vkGetDeviceQueue(
         // queue and every later submit would be dropped against it. Name the
         // handle that did not match and the table that was searched.
         let (first, n) = unsafe { device_table() };
-        loud(
-            "get_device_queue.miss",
+        loud("get_device_queue.miss", || {
             format!(
                 "{}",
                 gndrm_obf::obf!(
                     "proxy: gn_vkGetDeviceQueue DEVICE MISS family={family} index={index} {}",
                     unsafe { handle_note(false, device as usize, first, n) }
                 )
-            ),
-        );
+            )
+        });
         unsafe { *out = ptr::null_mut() };
         return;
     }
@@ -6761,15 +6760,14 @@ unsafe extern "C" fn gn_vkGetDeviceQueue2(
     let gd = unsafe { find_device(device) };
     if gd.is_null() {
         let (first, n) = unsafe { device_table() };
-        loud(
-            "get_device_queue2.miss",
+        loud("get_device_queue2.miss", || {
             format!(
                 "{}",
                 gndrm_obf::obf!("proxy: gn_vkGetDeviceQueue2 DEVICE MISS {}", unsafe {
                     handle_note(false, device as usize, first, n)
                 })
-            ),
-        );
+            )
+        });
         unsafe { *out = ptr::null_mut() };
         return;
     }

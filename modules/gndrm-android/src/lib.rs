@@ -51,7 +51,7 @@ use jni::{JNIEnv, JavaVM};
 
 use gndrm_daemon::diag;
 use gndrm_daemon::server;
-use gndrm_daemon::{Device, NullPresenter, PanelDesc};
+use gndrm_daemon::{reset_hdr_output_cache, Device, NullPresenter, PanelDesc};
 
 /// Return codes are negative errno-style values (`0` = success).
 const E_BUSY: jint = -16;
@@ -469,7 +469,13 @@ fn server_thread_inner(
 
     // 4. Serve until the peer closes or nativeStop shuts the fds down.
     let mut dev = Device::new(panel, presenter);
-    dev.set_logger(Box::new(crate::log::daemon_info));
+    // The daemon's diagnostics are gated by `GNDRM_LOG_DAEMON` (its module
+    // paths classify to `Gate::Daemon`). Installing the sink only when the gate
+    // is on lets `Device::diag` skip building — and skip decoding — a line that
+    // would be dropped.
+    if crate::log_policy::enabled(crate::log_policy::Gate::Daemon) {
+        dev.set_logger(Box::new(crate::log::daemon_info));
+    }
     // Teach the pool the geometry of every framebuffer the client registers,
     // so a length-only scan-out request for a window-sized buffer resolves
     // even before that buffer is first published. This takes the pool's own
@@ -553,6 +559,11 @@ fn start(
     height: jint,
 ) -> jint {
     PRESENTED_FRAMES.store(0, Ordering::Relaxed);
+    // Session start: drop the cached `GNDRM_HDR` verdict so this session
+    // re-reads the environment. The launcher sets the variable (via
+    // `Os.setenv`) after this returns and before the guest forks, so the first
+    // plane query — which is what resolves the flag — sees this session's value.
+    reset_hdr_output_cache();
     // First JNI entry point to run: capture the VM so the presenter thread can
     // push the booting-splash event on the first frame.
     cache_java_vm(env);
