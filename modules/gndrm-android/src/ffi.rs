@@ -196,6 +196,30 @@ pub struct ARect {
 /// colour-managed.
 pub const ADATASPACE_UNKNOWN: c_int = 0;
 
+/// `ADATASPACE_BT2020_PQ` (`<android/data_space.h>`): full-range, BT.2020
+/// primaries, SMPTE ST 2084 (PQ) transfer. This is the dataspace the scan-out
+/// layer is published with when the DRM framebuffer gamescope committed is a
+/// 2:10:10:10 (`XR30`/`XB30`) HDR10 buffer — transparent (no alpha) 10-bit
+/// pixels carry no colour meaning until SF is told the transfer function, and
+/// PQ onto BT.2020 is what the HDR10 panel and gamescope's HDR output expect.
+/// An 8-bit framebuffer keeps `ADATASPACE_UNKNOWN` (today's behaviour).
+pub const ADATASPACE_BT2020_PQ: c_int = 163971072;
+
+/// `AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM` (`<android/hardware_buffer.h>`,
+/// HAL `0x2b`): the 10-bit 2:10:10:10 B,G,R,A layout that matches gamescope's
+/// `XRGB2101010`/`XBGR2101010` scan-out fourcc. This is the format a published
+/// HDR scan-out buffer must be declared with; publishing 10-bit pixels under
+/// the 8-bit `BGRA_8888` label misdescribes them to SurfaceFlinger.
+pub const AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM: u32 = 0x2b;
+
+/// Whether a scan-out framebuffer's DRM fourcc is a 10-bit 2:10:10:10 layout
+/// (the HDR output path). `DRM_FORMAT_XRGB2101010` / `DRM_FORMAT_XBGR2101010`.
+#[must_use]
+pub const fn is_ten_bit_drm_format(fourcc: u32) -> bool {
+    // fourcc_code('X','R','3','0') = 0x30335258, ('X','B','3','0') = 0x30334258.
+    fourcc == 0x3033_5258 || fourcc == 0x3033_4258
+}
+
 /// `ASurfaceTransactionTransparency` (`<android/surface_control.h>`, API 29).
 /// `OPAQUE` tells SurfaceFlinger the buffer's alpha channel is not meaningful,
 /// so the scan-out layer is composited opaque — the DRM convention an
@@ -239,11 +263,14 @@ pub type FnStSetColor = unsafe extern "C" fn(
     alpha: f32,
     dataspace: c_int,
 );
-pub type FnStSetBufferTransparency = unsafe extern "C" fn(
-    tx: *mut ASurfaceTransaction,
-    sc: *mut ASurfaceControl,
-    transparency: i8,
-);
+/// `ASurfaceTransaction_setBufferDataSpace` (`<android/surface_control.h>`, API
+/// 29): the dataspace the published buffer is interpreted in. Without it a
+/// 10-bit buffer is read as sRGB and reaches the panel colour-managed rather
+/// than as HDR.
+pub type FnStSetBufferDataSpace =
+    unsafe extern "C" fn(tx: *mut ASurfaceTransaction, sc: *mut ASurfaceControl, dataspace: c_int);
+pub type FnStSetBufferTransparency =
+    unsafe extern "C" fn(tx: *mut ASurfaceTransaction, sc: *mut ASurfaceControl, transparency: i8);
 pub type FnStOnComplete =
     unsafe extern "C" fn(context: *mut c_void, stats: *mut ASurfaceTransactionStats);
 pub type FnStSetOnComplete = unsafe extern "C" fn(
@@ -304,6 +331,7 @@ pub struct ScApi {
     pub st_set_visibility: FnStSetVisibility,
     pub st_set_geometry: FnStSetGeometry,
     pub st_set_color: FnStSetColor,
+    pub st_set_buffer_dataspace: FnStSetBufferDataSpace,
     pub st_set_buffer_transparency: FnStSetBufferTransparency,
     pub st_set_on_complete: FnStSetOnComplete,
     pub st_stats_previous_release_fence_fd: FnStStatsGetPreviousReleaseFenceFd,
@@ -358,6 +386,7 @@ impl ScApi {
                 st_set_visibility: sym(handle, c"ASurfaceTransaction_setVisibility")?,
                 st_set_geometry: sym(handle, c"ASurfaceTransaction_setGeometry")?,
                 st_set_color: sym(handle, c"ASurfaceTransaction_setColor")?,
+                st_set_buffer_dataspace: sym(handle, c"ASurfaceTransaction_setBufferDataSpace")?,
                 st_set_buffer_transparency: sym(
                     handle,
                     c"ASurfaceTransaction_setBufferTransparency",

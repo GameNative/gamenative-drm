@@ -303,6 +303,14 @@ pub const DRM_FORMAT_XRGB8888: u32 = fourcc(b'X', b'R', b'2', b'4');
 pub const DRM_FORMAT_XBGR8888: u32 = fourcc(b'X', b'B', b'2', b'4');
 pub const DRM_FORMAT_ARGB8888: u32 = fourcc(b'A', b'R', b'2', b'4');
 pub const DRM_FORMAT_ABGR8888: u32 = fourcc(b'A', b'B', b'2', b'4');
+/// 10-bit 2:10:10:10 formats, the HDR output scan-out layout. gamescope asks
+/// for `XRGB2101010` first for a 10-bit primary plane (then `XBGR2101010`),
+/// exactly as it asks for the 8-bit pair — see `DRMBackend`'s plane-format pick.
+/// The daemon deliberately offers only `XBGR2101010`: its R-low/B-high channels
+/// match the `R10G10B10A2_UNORM` scan-out buffer, `XRGB2101010` is the opposite
+/// order (see `PRIMARY_FORMATS_HDR` in `gndrm-daemon`).
+pub const DRM_FORMAT_XRGB2101010: u32 = fourcc(b'X', b'R', b'3', b'0');
+pub const DRM_FORMAT_XBGR2101010: u32 = fourcc(b'X', b'B', b'3', b'0');
 
 /// `DRM_FORMAT_MOD_LINEAR`.
 pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;

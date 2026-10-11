@@ -639,6 +639,9 @@ struct LastPublish {
     ino: u64,
     src: ffi::ARect,
     dst: ffi::ARect,
+    /// Dataspace the buffer was published with, so a republish (a rebuilt
+    /// layer) restores the same HDR/SDR treatment rather than guessing.
+    dataspace: c_int,
 }
 
 /// The presenter's state, shared between the server thread that presents and
@@ -945,7 +948,30 @@ impl AscState {
                         )
                         );
                     }
-                    match build_show(&api, self.sc, ahb, ctx, src, dst, fence) {
+                    // A 2:10:10:10 scan-out framebuffer is HDR10: publish the
+                    // layer with the BT.2020/PQ dataspace so SurfaceFlinger
+                    // passes it to the panel as HDR rather than colour-managing
+                    // it as sRGB. The 8-bit path keeps ADATASPACE_UNKNOWN.
+                    //
+                    // Two views of the same fact, OR'd: the client's
+                    // framebuffer fourcc, and the layout the pool served (the
+                    // buffer actually on the layer). They agree because both
+                    // follow `hdr_output_enabled`, but the pool is what is
+                    // published, so it must be able to stand alone.
+                    let hdr_buffer = ffi::is_ten_bit_drm_format(fb.pixel_format)
+                        || served_ahb_format(SCANOUT_FORMAT_BGRA_8888)
+                            == ffi::AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM;
+                    let dataspace = if hdr_buffer {
+                        ffi::ADATASPACE_BT2020_PQ
+                    } else {
+                        ffi::ADATASPACE_UNKNOWN
+                    };
+                    let rect = ShowRect {
+                        src,
+                        dst,
+                        dataspace,
+                    };
+                    match build_show(&api, self.sc, ahb, ctx, rect, fence) {
                         Some(tx) => {
                             apply_transaction(&api, tx);
                             // What is on the layer is what a later commit falls
@@ -954,6 +980,7 @@ impl AscState {
                                 ino: published_ino,
                                 src,
                                 dst,
+                                dataspace,
                             });
                             // The frame is on the layer; dump what we
                             // published (rate-limited, off the reply path).
@@ -1082,7 +1109,12 @@ impl AscState {
         let Some(PoolBuf { ahb, ctx, .. }) = handles else {
             return;
         };
-        if let Some(tx) = build_show(&api, self.sc, ahb, ctx, lp.src, lp.dst, None) {
+        let rect = ShowRect {
+            src: lp.src,
+            dst: lp.dst,
+            dataspace: lp.dataspace,
+        };
+        if let Some(tx) = build_show(&api, self.sc, ahb, ctx, rect, None) {
             apply_transaction(&api, tx);
         }
         log_info!(
@@ -1879,6 +1911,22 @@ pub fn warm_worker(pool: Arc<TrackedMutex<ScanoutPool>>, doorbell: Arc<WarmDoorb
     }
 }
 
+/// The `AHardwareBuffer` format the pool allocates for an incoming wire format.
+///
+/// The shim requests one fixed format (`SCANOUT_FORMAT_BGRA_8888`, the 8-bit
+/// `XR24` layout gamescope renders in the SDR path). When HDR output is on,
+/// gamescope scans out in a 2:10:10:10 format instead, so that request is
+/// served as `R10G10B10A2_UNORM`: the pixels gamescope writes are then described
+/// to SurfaceFlinger by the format they actually are. Both are 32 bpp, so the
+/// stride and the pool's length/geometry keys are unchanged.
+fn served_ahb_format(wire_format: u32) -> u32 {
+    if wire_format == SCANOUT_FORMAT_BGRA_8888 && gndrm_daemon::hdr_output_enabled() {
+        ffi::AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM
+    } else {
+        wire_format
+    }
+}
+
 /// Allocate one scan-out `AHardwareBuffer` and resolve its client descriptor,
 /// with no pool lock held.
 ///
@@ -1896,7 +1944,7 @@ fn allocate_buffer(
         width,
         height,
         layers: 1,
-        format,
+        format: served_ahb_format(format),
         usage: ffi::SCANOUT_POOL_USAGE,
         ..Default::default()
     };
@@ -1972,6 +2020,16 @@ fn refusal_reason(errno: i32) -> String {
     }
 }
 
+/// One show transaction's layer description: the FB source and CRTC
+/// destination rects, plus the dataspace the published buffer carries (BT.2020
+/// /ST.2084 for a 10-bit HDR scan-out buffer, unspecified for 8-bit).
+#[derive(Clone, Copy)]
+struct ShowRect {
+    src: ffi::ARect,
+    dst: ffi::ARect,
+    dataspace: c_int,
+}
+
 /// Create a transaction that puts `ahb` on `sc` with the given geometry, but do
 /// not apply it: the caller drops the pool lock before applying, because
 /// `ASurfaceTransaction_apply` is the blocking SurfaceFlinger round-trip.
@@ -1983,10 +2041,14 @@ fn build_show(
     sc: *mut ffi::ASurfaceControl,
     ahb: *mut ffi::AHardwareBuffer,
     ctx: *mut ReleaseCtx,
-    src: ffi::ARect,
-    dst: ffi::ARect,
+    rect: ShowRect,
     fence: Option<RawFd>,
 ) -> Option<*mut ffi::ASurfaceTransaction> {
+    let ShowRect {
+        src,
+        dst,
+        dataspace,
+    } = rect;
     // SAFETY: one transaction per commit, deleted by the caller's
     // `apply_transaction`; all handles come from the API table and are non-null
     // by construction.
@@ -2004,15 +2066,16 @@ fn build_show(
         // may store alpha 0 — cs_composite_rcas.comp does — without blanking
         // the frame). The pool's AHardwareBuffer is BGRA_8888, whose alpha SF
         // would otherwise honour, so assert opacity here. See ffi.rs.
-        (api.st_set_buffer_transparency)(
-            tx,
-            sc,
-            ffi::ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE,
-        );
+        (api.st_set_buffer_transparency)(tx, sc, ffi::ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE);
         (api.st_set_geometry)(tx, sc, &src, &dst, 0);
         // setBuffer consumes the acquire fence: SurfaceFlinger closes it,
         // so it must not be closed here as well.
         (api.st_set_buffer)(tx, sc, ahb, fence.unwrap_or(-1));
+        // The dataspace describes the buffer just set: BT.2020/ST.2084 (PQ) for
+        // the 10-bit HDR scan-out buffer, ADATASPACE_UNKNOWN (SF's sRGB default)
+        // for the 8-bit one. setColor's dataspace above only applies to the
+        // background colour layer, not the buffer.
+        (api.st_set_buffer_dataspace)(tx, sc, dataspace);
         // The completion reports the previous release fence, which is what
         // gates re-publishing this buffer.
         (api.st_set_on_complete)(tx, ctx.cast(), on_complete);

@@ -56,14 +56,69 @@ const MIN_HEIGHT: u32 = 1;
 const MAX_WIDTH: u32 = 8192;
 const MAX_HEIGHT: u32 = 8192;
 
-/// Formats on the primary plane (gamescope renders XRGB8888/ARGB8888).
-const PRIMARY_FORMATS: &[u32] = &[
+/// Formats on the primary plane (the SDR set). `XRGB8888` stays first.
+const PRIMARY_FORMATS_SDR: &[u32] = &[
     DRM_FORMAT_XRGB8888,
     DRM_FORMAT_ARGB8888,
     DRM_FORMAT_XBGR8888,
     DRM_FORMAT_ABGR8888,
     DRM_FORMAT_RGB565,
 ];
+/// The SDR set plus the 2:10:10:10 HDR scan-out format, advertised only when the
+/// container asked for HDR output.
+///
+/// gamescope's plane-format pick prefers `XRGB2101010` over `XBGR2101010` and
+/// does NOT gate that on `--hdr-enabled`: once the plane offers a 10-bit format
+/// gamescope scans out in it unconditionally. Two consequences shape this list:
+///
+/// * the 10-bit entry cannot be appended to a flat list — that moves the SDR
+///   path onto a 10-bit buffer too, which the presenter/pool describe as
+///   `BGRA_8888`. So the set is gated on [`hdr_output_enabled`].
+/// * only `XBGR2101010` is offered, never `XRGB2101010`. The pool's AHB is
+///   `R10G10B10A2_UNORM` (`RGBA_1010102`), whose channels are R-low/B-high;
+///   gamescope's `XBGR2101010` (`xB:G:R`, R-low) matches it, while
+///   `XRGB2101010` (`x:R:G:B`, B-low) is the opposite order and reaches the
+///   panel with red and blue exchanged. Offering both would let gamescope pick
+///   the mismatched one.
+const PRIMARY_FORMATS_HDR: &[u32] = &[
+    DRM_FORMAT_XRGB8888,
+    DRM_FORMAT_ARGB8888,
+    DRM_FORMAT_XBGR8888,
+    DRM_FORMAT_ABGR8888,
+    DRM_FORMAT_RGB565,
+    DRM_FORMAT_XBGR2101010,
+];
+
+/// The primary plane's format list for the current session.
+fn primary_formats() -> &'static [u32] {
+    primary_formats_for(hdr_output_enabled())
+}
+
+/// Pure core of [`primary_formats`], so the HDR branch is testable without
+/// mutating the process environment.
+fn primary_formats_for(hdr: bool) -> &'static [u32] {
+    if hdr {
+        PRIMARY_FORMATS_HDR
+    } else {
+        PRIMARY_FORMATS_SDR
+    }
+}
+
+/// Whether the session asked for HDR output, so the plane may offer the 10-bit
+/// scan-out formats.
+///
+/// Read from `GNDRM_HDR` on every call: the launcher sets it in this process
+/// (the daemon, the pool and the presenter share one address space) when it
+/// builds the gamescope command, which happens after the daemon starts, so the
+/// value has to be read lazily rather than cached at init. Any value other than
+/// a set/`1`/`true` is treated as off.
+#[must_use]
+pub fn hdr_output_enabled() -> bool {
+    matches!(
+        std::env::var_os("GNDRM_HDR"),
+        Some(v) if !v.is_empty() && v != "0"
+    )
+}
 /// Cursor plane formats (doc §3.2: ARGB8888, 64×64).
 const CURSOR_FORMATS: &[u32] = &[DRM_FORMAT_ARGB8888];
 
@@ -815,7 +870,7 @@ impl Device {
             return DispatchResult::err(errno::EINVAL);
         };
         let (state, formats) = match p.plane_id {
-            PLANE_PRIMARY_ID => (&self.primary, PRIMARY_FORMATS),
+            PLANE_PRIMARY_ID => (&self.primary, primary_formats()),
             PLANE_CURSOR_ID => (&self.cursor, CURSOR_FORMATS),
             _ => return DispatchResult::err(errno::ENOENT),
         };
@@ -1723,10 +1778,12 @@ fn commit_worker_loop(
 }
 
 /// `drm_format_modifier_blob` for the primary plane's `IN_FORMATS`: every
-/// `PRIMARY_FORMATS` entry scanned out with `DRM_FORMAT_MOD_LINEAR`.
+/// advertised primary format (SDR, or the HDR set when HDR output is on)
+/// scanned out with `DRM_FORMAT_MOD_LINEAR`.
 fn in_formats_blob_data() -> Vec<u8> {
+    let formats = primary_formats();
     const HEADER: u32 = 24; // drm_format_modifier_blob header size
-    let count_formats = PRIMARY_FORMATS.len() as u32;
+    let count_formats = formats.len() as u32;
     let formats_offset = HEADER;
     let modifiers_offset = formats_offset + count_formats * 4;
     let mut data = Vec::with_capacity(modifiers_offset as usize + 24);
@@ -1736,7 +1793,7 @@ fn in_formats_blob_data() -> Vec<u8> {
     data.extend_from_slice(&formats_offset.to_le_bytes());
     data.extend_from_slice(&1u32.to_le_bytes()); // count_modifiers
     data.extend_from_slice(&modifiers_offset.to_le_bytes());
-    for &f in PRIMARY_FORMATS {
+    for &f in formats {
         data.extend_from_slice(&f.to_le_bytes());
     }
     // drm_format_modifier { formats, offset, pad, modifier }
@@ -1754,6 +1811,9 @@ fn format_bpp(fourcc: u32) -> Option<u32> {
         DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 | DRM_FORMAT_XBGR8888 | DRM_FORMAT_ABGR8888 => {
             Some(32)
         }
+        // 2:10:10:10 is still a 32-bit word, so buffer sizing and stride are
+        // unchanged from the 8-bit formats above.
+        DRM_FORMAT_XRGB2101010 | DRM_FORMAT_XBGR2101010 => Some(32),
         DRM_FORMAT_RGB565 => Some(16),
         _ => None,
     }
@@ -1914,6 +1974,26 @@ mod tests {
 
     fn dev() -> Device {
         Device::new(PanelDesc::default(), Box::<NullPresenter>::default())
+    }
+
+    /// The HDR flag gates exactly the two 10-bit fourccs, keeping XRGB8888 first
+    /// and the SDR set untouched.
+    #[test]
+    fn primary_formats_are_hdr_gated() {
+        let sdr = primary_formats_for(false);
+        assert_eq!(sdr.len(), 5);
+        assert_eq!(sdr[0], DRM_FORMAT_XRGB8888);
+        assert!(!sdr.contains(&DRM_FORMAT_XRGB2101010));
+
+        let hdr = primary_formats_for(true);
+        assert_eq!(hdr.len(), 6);
+        assert_eq!(hdr[0], DRM_FORMAT_XRGB8888);
+        assert!(hdr.contains(&DRM_FORMAT_XBGR2101010));
+        // XRGB2101010 is deliberately absent: its channel order does not match
+        // the R10G10B10A2 pool layout, and gamescope would prefer it.
+        assert!(!hdr.contains(&DRM_FORMAT_XRGB2101010));
+        // The SDR set is a prefix: enabling HDR only appends.
+        assert_eq!(&hdr[..sdr.len()], sdr);
     }
 
     /// Encode a payload the way the shim's `rpc()` does for a fixed struct.
