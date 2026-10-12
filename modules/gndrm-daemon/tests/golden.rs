@@ -447,7 +447,7 @@ fn connector_encoder_plane_queries() {
     assert_eq!(c.connector_type, DRM_MODE_CONNECTOR_DSI);
     assert_eq!(c.count_modes, 1);
     assert_eq!(c.count_encoders, 1);
-    assert_eq!(c.count_props, 2);
+    assert_eq!(c.count_props, 5); // CRTC_ID, panel orientation, EDID, Colorspace, HDR_OUTPUT_METADATA
     assert_eq!(c.encoder_id, ENCODER_ID);
 
     // With arrays.

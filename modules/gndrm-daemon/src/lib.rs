@@ -14,6 +14,7 @@
 
 mod commit;
 pub mod diag;
+mod edid;
 mod objects;
 #[doc(hidden)] // exposed for integration tests; not public API
 pub mod pod;
@@ -140,7 +141,64 @@ pub fn hdr_output_enabled() -> bool {
 /// carried over would advertise the HDR format table to an SDR session.
 pub fn reset_hdr_output_cache() {
     HDR_GATE.store(HDR_UNRESOLVED, Ordering::Relaxed);
+    *HDR_LUMINANCE.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
+
+/// The display's HDR capability for this session: the panel's real luminances
+/// in cd/m². `None` when the session is not HDR — either the launcher never
+/// asked for it, or the panel reported no HDR types (the launcher only sets
+/// `GNDRM_HDR` when `Display.getHdrCapabilities()` is non-empty).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HdrCapability {
+    /// Peak luminance (CTA "desired content max luminance").
+    pub max_nits: f32,
+    /// Peak frame-average luminance.
+    pub fall_nits: f32,
+    /// Floor luminance.
+    pub min_nits: f32,
+}
+
+/// Whether the session asked for HDR *and* the panel can take it, with the
+/// panel's luminances. The gate is [`hdr_output_enabled`]; the luminances come
+/// from `GNDRM_HDR_MAX_NITS` / `GNDRM_HDR_FALL_NITS` / `GNDRM_HDR_MIN_NITS`
+/// (the launcher passes `Display.getHdrCapabilities()` values). Missing
+/// luminances fall back to a generic HDR10 profile rather than losing HDR: the
+/// gate already proves the panel is HDR-capable.
+///
+/// Resolved from the environment once per session and cached (the environment
+/// lookup takes a lock), mirroring [`hdr_output_enabled`]; invalidation is the
+/// same [`reset_hdr_output_cache`].
+#[must_use]
+pub fn hdr_output_capability() -> Option<HdrCapability> {
+    if !hdr_output_enabled() {
+        return None;
+    }
+    let mut slot = HDR_LUMINANCE.lock().unwrap_or_else(PoisonError::into_inner);
+    let (max_nits, fall_nits, min_nits) = *slot.get_or_insert_with(|| {
+        (
+            env_f32("GNDRM_HDR_MAX_NITS", 1000.0),
+            env_f32("GNDRM_HDR_FALL_NITS", 1000.0),
+            env_f32("GNDRM_HDR_MIN_NITS", 0.05),
+        )
+    });
+    Some(HdrCapability {
+        max_nits,
+        fall_nits,
+        min_nits,
+    })
+}
+
+/// Read a positive `f32` from the environment, or `default`.
+fn env_f32(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| *v > 0.0 && v.is_finite())
+        .unwrap_or(default)
+}
+
+/// Cached panel luminances, resolved with [`hdr_output_capability`].
+static HDR_LUMINANCE: Mutex<Option<(f32, f32, f32)>> = Mutex::new(None);
 
 /// Cached `GNDRM_HDR` verdict: [`HDR_UNRESOLVED`] until the first read, then
 /// [`HDR_OFF`] or [`HDR_ON`].
@@ -269,12 +327,20 @@ pub struct Device {
 
     // live software state
     conn_crtc_id: u32,
+    /// Connector `Colorspace` current value. gamescope writes `BT2020_RGB` for
+    /// HDR10 and `DEFAULT` for SDR.
+    conn_colorspace: u64,
+    /// Connector `HDR_OUTPUT_METADATA` current value: a property-blob id, or 0.
+    conn_hdr_metadata: u64,
     crtc: CrtcState,
     primary: PlaneState,
     cursor: PlaneState,
     /// Primary-plane `IN_FORMATS` blob id (created at init: every
     /// `PRIMARY_FORMATS` fourcc × `DRM_FORMAT_MOD_LINEAR`).
     in_formats_blob: u32,
+    /// Connector `EDID` blob id, built at session start from the display
+    /// capability (no HDR static metadata block on an SDR panel).
+    edid_blob: u32,
 
     clock: SharedClock,
     flip_sequence: u32,
@@ -329,6 +395,7 @@ impl Device {
     /// worker thread.
     pub fn new(panel: PanelDesc, presenter: Box<dyn Presenter>) -> Self {
         let mut stores = Stores::default();
+        let mode = panel.modeinfo();
         // Infallible: a fresh store has the whole blob space free.
         let in_formats_blob = stores
             .alloc_blob()
@@ -338,6 +405,17 @@ impl Device {
             Blob {
                 id: in_formats_blob,
                 data: in_formats_blob_data(),
+            },
+        );
+        // The EDID tells gamescope whether this display is HDR10. Built once
+        // per session from the capability the launcher passes in, so an SDR
+        // panel gets no HDR static metadata block and gamescope stays in SDR.
+        let edid_blob = stores.alloc_blob().expect(&gndrm_obf::obf!("edid blob id"));
+        stores.blobs.insert(
+            edid_blob,
+            Blob {
+                id: edid_blob,
+                data: edid::build(hdr_output_capability(), &mode, &panel),
             },
         );
         let (commit_tx, commit_rx) = mpsc::channel();
@@ -369,17 +447,20 @@ impl Device {
             .ok();
         Self {
             panel,
-            mode: panel.modeinfo(),
+            mode,
             stores,
             cap_atomic: false,
             cap_universal_planes: false,
             cap_writeback: false,
             node_kind: NODE_KIND_CARD,
             conn_crtc_id: 0,
+            conn_colorspace: DRM_MODE_COLORIMETRY_DEFAULT,
+            conn_hdr_metadata: 0,
             crtc: CrtcState::default(),
             primary: PlaneState::default(),
             cursor: PlaneState::default(),
             in_formats_blob,
+            edid_blob,
             clock,
             flip_sequence: 0,
             commit_tx: Some(commit_tx),
@@ -511,6 +592,14 @@ impl Device {
 
     pub(crate) fn set_conn_crtc(&mut self, crtc: u32) {
         self.conn_crtc_id = crtc;
+    }
+
+    pub(crate) fn set_conn_colorspace(&mut self, value: u64) {
+        self.conn_colorspace = value;
+    }
+
+    pub(crate) fn set_conn_hdr_metadata(&mut self, value: u64) {
+        self.conn_hdr_metadata = value;
     }
 
     pub(crate) fn set_crtc_active(&mut self, active: bool) {
@@ -645,7 +734,7 @@ impl Device {
                 DRM_IOCTL_MODE_GETPLANE => self.ioctl_get_plane(payload),
                 DRM_IOCTL_MODE_OBJ_GETPROPERTIES => self.ioctl_obj_get_properties(payload),
                 DRM_IOCTL_MODE_GETPROPERTY => self.ioctl_get_property(payload),
-                DRM_IOCTL_MODE_OBJ_SETPROPERTY => DispatchResult::err(errno::EINVAL),
+                DRM_IOCTL_MODE_OBJ_SETPROPERTY => self.ioctl_obj_set_property(payload),
                 DRM_IOCTL_MODE_CREATEPROPBLOB => self.ioctl_create_blob(payload),
                 DRM_IOCTL_MODE_GETPROPBLOB => self.ioctl_get_blob(payload),
                 DRM_IOCTL_MODE_DESTROYPROPBLOB => self.ioctl_destroy_blob(payload),
@@ -879,10 +968,10 @@ impl Device {
             .iter()
             .map(|&i| props::prop_id(i))
             .collect::<Vec<_>>();
-        let vals = vec![
-            u64::from(self.conn_crtc_id),
-            0, // panel orientation: Normal (phase 3: from display rotation)
-        ];
+        let vals = props::CONNECTOR_PROPS
+            .iter()
+            .map(|&i| self.current_value(CONNECTOR_ID, i))
+            .collect::<Vec<_>>();
         (ids, vals)
     }
 
@@ -947,6 +1036,9 @@ impl Device {
         match (obj_id, index) {
             (CONNECTOR_ID, P_CONN_CRTC_ID) => u64::from(self.conn_crtc_id),
             (CONNECTOR_ID, P_CONN_PANEL_ORIENTATION) => 0,
+            (CONNECTOR_ID, P_CONN_EDID) => u64::from(self.edid_blob),
+            (CONNECTOR_ID, P_CONN_COLORSPACE) => self.conn_colorspace,
+            (CONNECTOR_ID, P_CONN_HDR_METADATA) => self.conn_hdr_metadata,
             (CRTC_ID, P_CRTC_ACTIVE) => u64::from(self.crtc.active),
             (CRTC_ID, P_CRTC_MODE_ID) => u64::from(self.crtc.mode_id),
             (PLANE_PRIMARY_ID, P_PLANE_TYPE) => u64::from(DRM_PLANE_TYPE_PRIMARY),
@@ -979,6 +1071,38 @@ impl Device {
             (PLANE_CURSOR_ID, P_PLANE_IN_FORMATS) => u64::from(self.in_formats_blob),
             _ => 0,
         }
+    }
+
+    /// `OBJ_SETPROPERTY`: the legacy (non-atomic) property write. gamescope is
+    /// atomic-only, but the shim forwards the ioctl and a client that uses it
+    /// (the b9 harness, libdrm's older helpers) must not get a blanket
+    /// `EINVAL`. Validates and stores exactly like the atomic path — see
+    /// [`Device::validate_property`].
+    fn ioctl_obj_set_property(&mut self, payload: &[u8]) -> DispatchResult {
+        let Some(s) = pod_read::<DrmModeObjSetProperty>(payload) else {
+            return DispatchResult::err(errno::EINVAL);
+        };
+        // The object type must agree with the id, like the kernel.
+        let Some((_, ty, _)) = props::obj_list()
+            .into_iter()
+            .find(|(id, _, _)| *id == s.obj_id)
+        else {
+            return DispatchResult::err(errno::ENOENT);
+        };
+        if ty != s.obj_type {
+            return DispatchResult::err(errno::ENOENT);
+        }
+        let Some(index) = props::resolve(s.obj_id, s.prop_id) else {
+            return DispatchResult::err(errno::ENOENT);
+        };
+        if props::PROPS[index].2 {
+            return DispatchResult::err(errno::EPERM);
+        }
+        if let Err(e) = self.validate_property(index, s.value) {
+            return DispatchResult::err(e);
+        }
+        self.apply_property(s.obj_id, index, s.value);
+        DispatchResult::ok(Vec::new())
     }
 
     fn ioctl_obj_get_properties(&mut self, payload: &[u8]) -> DispatchResult {
@@ -1866,7 +1990,10 @@ fn format_bpp(fourcc: u32) -> Option<u32> {
         }
         // 2:10:10:10 is still a 32-bit word, so buffer sizing and stride are
         // unchanged from the 8-bit formats above.
-        DRM_FORMAT_XRGB2101010 | DRM_FORMAT_XBGR2101010 => Some(32),
+        DRM_FORMAT_XRGB2101010
+        | DRM_FORMAT_XBGR2101010
+        | DRM_FORMAT_ARGB2101010
+        | DRM_FORMAT_ABGR2101010 => Some(32),
         DRM_FORMAT_RGB565 => Some(16),
         _ => None,
     }

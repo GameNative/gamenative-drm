@@ -286,6 +286,27 @@ pub const DRM_PLANE_TYPE_CURSOR: u32 = 2;
 pub const DRM_MODE_SUBPIXEL_UNKNOWN: u32 = 1;
 pub const DRM_MODE_SUBPIXEL_NONE: u32 = 6;
 
+/// Connector `Colorspace` enum (`enum drm_colorspace`). gamescope writes
+/// `BT2020_RGB` for HDR10 output and `DEFAULT` for SDR, and treats the
+/// property's current value of `BT2020_RGB` as "HDR is active", so the
+/// numeric values are load-bearing.
+pub const DRM_MODE_COLORIMETRY_DEFAULT: u64 = 0;
+pub const DRM_MODE_COLORIMETRY_SMPTE_170M_YCC: u64 = 1;
+pub const DRM_MODE_COLORIMETRY_BT709_YCC: u64 = 2;
+pub const DRM_MODE_COLORIMETRY_XVYCC_601: u64 = 3;
+pub const DRM_MODE_COLORIMETRY_XVYCC_709: u64 = 4;
+pub const DRM_MODE_COLORIMETRY_SYCC_601: u64 = 5;
+pub const DRM_MODE_COLORIMETRY_OPYCC_601: u64 = 6;
+pub const DRM_MODE_COLORIMETRY_OPRGB: u64 = 7;
+pub const DRM_MODE_COLORIMETRY_BT2020_CYCC: u64 = 8;
+pub const DRM_MODE_COLORIMETRY_BT2020_RGB: u64 = 9;
+pub const DRM_MODE_COLORIMETRY_BT2020_YCC: u64 = 10;
+pub const DRM_MODE_COLORIMETRY_DCI_P3_RGB_D65: u64 = 11;
+pub const DRM_MODE_COLORIMETRY_DCI_P3_RGB_THEATER: u64 = 12;
+pub const DRM_MODE_COLORIMETRY_RGB_WIDE_FIXED: u64 = 13;
+pub const DRM_MODE_COLORIMETRY_RGB_WIDE_FLOAT: u64 = 14;
+pub const DRM_MODE_COLORIMETRY_BT601_YCC: u64 = 15;
+
 // ---------------------------------------------------------------------------
 // FB flags / fourcc
 // ---------------------------------------------------------------------------
@@ -311,6 +332,12 @@ pub const DRM_FORMAT_ABGR8888: u32 = fourcc(b'A', b'B', b'2', b'4');
 /// order (see `PRIMARY_FORMATS_HDR` in `gndrm-daemon`).
 pub const DRM_FORMAT_XRGB2101010: u32 = fourcc(b'X', b'R', b'3', b'0');
 pub const DRM_FORMAT_XBGR2101010: u32 = fourcc(b'X', b'B', b'3', b'0');
+/// The alpha-bearing 2:10:10:10 siblings (`AR30`/`AB30`) — same 32-bit word as
+/// the `X` variants. Not advertised in `PRIMARY_FORMATS_HDR` (gamescope asks
+/// for the `X` pair), so they are not reachable today; `format_bpp` names them
+/// only so the table stays complete if a plane ever offers one.
+pub const DRM_FORMAT_ARGB2101010: u32 = fourcc(b'A', b'R', b'3', b'0');
+pub const DRM_FORMAT_ABGR2101010: u32 = fourcc(b'A', b'B', b'3', b'0');
 
 /// `DRM_FORMAT_MOD_LINEAR`.
 pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;

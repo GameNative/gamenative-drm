@@ -370,47 +370,23 @@ impl Device {
             self.diag(|| "atomic: reject EINVAL modeset props without ALLOW_MODESET".to_string());
             return Err(errno::EINVAL);
         }
-        // Referenced objects must exist.
+        // Referenced objects must exist, and enum/numeric values must be in
+        // range — the same checks the legacy `OBJ_SETPROPERTY` path makes.
         for s in &commit.sets {
-            match s.prop_index {
-                props::P_PLANE_FB_ID => {
-                    if s.value != 0 && !self.stores().fbs.contains_key(&(s.value as u32)) {
-                        self.diag(|| {
-                            format!(
-                                "{}",
-                                gndrm_obf::obf!("atomic: reject ENOENT unknown fb={}", s.value)
-                            )
-                        });
-                        return Err(errno::ENOENT);
-                    }
-                }
-                props::P_CRTC_MODE_ID => {
-                    if s.value != 0 && !self.stores().blobs.contains_key(&(s.value as u32)) {
-                        self.diag(|| {
-                            format!(
-                                "{}",
-                                gndrm_obf::obf!(
-                                    "atomic: reject ENOENT unknown mode blob={}",
-                                    s.value
-                                )
-                            )
-                        });
-                        return Err(errno::ENOENT);
-                    }
-                }
-                props::P_PLANE_CRTC_ID | props::P_CONN_CRTC_ID => {
-                    if s.value != 0 && s.value != u64::from(CRTC_ID) {
-                        self.diag(|| {
-                            format!(
-                                "{}",
-                                gndrm_obf::obf!("atomic: reject ENOENT unknown crtc={}", s.value)
-                            )
-                        });
-                        return Err(errno::ENOENT);
-                    }
-                }
-                props::P_CRTC_ACTIVE if s.value > 1 => return Err(errno::EINVAL),
-                _ => {}
+            if let Err(e) = self.validate_property(s.prop_index, s.value) {
+                self.diag(|| {
+                    format!(
+                        "{}",
+                        gndrm_obf::obf!(
+                            "atomic: reject errno={} invalid prop {} (idx {}) value={}",
+                            e,
+                            props::PROPS[s.prop_index].0,
+                            s.prop_index,
+                            s.value
+                        )
+                    )
+                });
+                return Err(e);
             }
         }
         // A plane with an FB needs a CRTC; check post-commit state by
@@ -447,23 +423,7 @@ impl Device {
         let old_primary_fb = self.primary_state().fb_id;
 
         for s in &commit.sets {
-            match s.obj_id {
-                CONNECTOR_ID => {
-                    if s.prop_index == props::P_CONN_CRTC_ID {
-                        self.set_conn_crtc(s.value as u32);
-                    }
-                }
-                CRTC_ID => match s.prop_index {
-                    props::P_CRTC_ACTIVE => self.set_crtc_active(s.value != 0),
-                    props::P_CRTC_MODE_ID => self.set_crtc_mode(s.value as u32),
-                    _ => {}
-                },
-                PLANE_PRIMARY_ID | PLANE_CURSOR_ID => {
-                    let idx = usize::from(s.obj_id == PLANE_CURSOR_ID);
-                    self.apply_plane(idx, s.prop_index, s.value);
-                }
-                _ => {}
-            }
+            self.apply_property(s.obj_id, s.prop_index, s.value);
         }
         let crtc_on = self.crtc_state().active;
         let new_fb = self.primary_state().fb_id;
@@ -540,6 +500,88 @@ impl Device {
             fence: fence_fd,
             event,
         });
+    }
+
+    /// Validate a writable property's value the way the kernel would — a
+    /// referenced id must exist, an enum value must be in the list. Shared by
+    /// the atomic path ([`Self::validate_commit`]) and the legacy
+    /// `OBJ_SETPROPERTY` path so both reject the same input.
+    ///
+    /// # Errors
+    /// The errno the client sees: `EINVAL` for an out-of-range enum/range
+    /// value, `ENOENT` for a reference to a non-existent object.
+    pub(crate) fn validate_property(&self, index: usize, value: u64) -> Result<(), i32> {
+        use props::*;
+        match index {
+            P_CONN_COLORSPACE => {
+                if enum_contains(index, value) {
+                    Ok(())
+                } else {
+                    Err(errno::EINVAL)
+                }
+            }
+            P_CONN_HDR_METADATA => {
+                // 0 clears it; otherwise it must name a live property blob
+                // (gamescope's `hdr_output_metadata`).
+                if value == 0 || self.stores().blobs.contains_key(&(value as u32)) {
+                    Ok(())
+                } else {
+                    Err(errno::ENOENT)
+                }
+            }
+            P_CONN_CRTC_ID | P_PLANE_CRTC_ID => {
+                if value == 0 || value == u64::from(CRTC_ID) {
+                    Ok(())
+                } else {
+                    Err(errno::ENOENT)
+                }
+            }
+            P_CRTC_MODE_ID => {
+                if value == 0 || self.stores().blobs.contains_key(&(value as u32)) {
+                    Ok(())
+                } else {
+                    Err(errno::ENOENT)
+                }
+            }
+            P_PLANE_FB_ID => {
+                if value == 0 || self.stores().fbs.contains_key(&(value as u32)) {
+                    Ok(())
+                } else {
+                    Err(errno::ENOENT)
+                }
+            }
+            P_CRTC_ACTIVE => {
+                if value > 1 {
+                    Err(errno::EINVAL)
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Apply one already-validated property to software state.
+    pub(crate) fn apply_property(&mut self, obj_id: u32, index: usize, value: u64) {
+        use props::*;
+        match obj_id {
+            CONNECTOR_ID => match index {
+                P_CONN_CRTC_ID => self.set_conn_crtc(value as u32),
+                P_CONN_COLORSPACE => self.set_conn_colorspace(value),
+                P_CONN_HDR_METADATA => self.set_conn_hdr_metadata(value),
+                _ => {}
+            },
+            CRTC_ID => match index {
+                P_CRTC_ACTIVE => self.set_crtc_active(value != 0),
+                P_CRTC_MODE_ID => self.set_crtc_mode(value as u32),
+                _ => {}
+            },
+            PLANE_PRIMARY_ID | PLANE_CURSOR_ID => {
+                let idx = usize::from(obj_id == PLANE_CURSOR_ID);
+                self.apply_plane(idx, index, value);
+            }
+            _ => {}
+        }
     }
 }
 
