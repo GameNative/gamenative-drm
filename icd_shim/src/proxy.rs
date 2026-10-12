@@ -139,6 +139,70 @@ static X11_DROP_LOGGED: AtomicBool = AtomicBool::new(false);
 /// env var) but bounded to the first `X11_TRACE_N` presents of each swapchain,
 /// so it names why a session shows nothing without spamming a healthy one.
 static ACQ_SEQ: AtomicUsize = AtomicUsize::new(0);
+// Acquire-dwell census, in microseconds, reported on the commit line. The
+// counters are incremented before any log call, so the values are not inflated
+// by logging; reading them does need GNDRM_LOG_VKSHIM=1, because the commit
+// line is itself logf!-gated. Microseconds because the signal being chased (a
+// missed 8.33 ms vblank) is sub-ms at the acquire itself: a 0.5 ms wait is
+// invisible at millisecond resolution.
+static ACQ_US_N: AtomicUsize = AtomicUsize::new(0);
+static ACQ_US_SUM: AtomicUsize = AtomicUsize::new(0);
+static ACQ_US_MAX: AtomicUsize = AtomicUsize::new(0);
+static ACQ_US_NONZERO: AtomicUsize = AtomicUsize::new(0);
+static ACQ_GE_8MS: AtomicUsize = AtomicUsize::new(0); // >= 8333 us: one missed 120 Hz vblank
+static ACQ_GE_16MS: AtomicUsize = AtomicUsize::new(0); // >= 16667 us: two
+                                                       // Present-to-present interval census, in microseconds — the same shape and the
+                                                       // same reasoning as the acquire dwell above, reported on the same commit line.
+                                                       // This is the guest's own frame period as the shim sees it: the client <->
+                                                       // gamescope lap that doc 12 leaves unmeasured end to end, so a hard throttle
+                                                       // and plain jitter are told apart by the tail shares, not just the mean (a
+                                                       // throttle parks the mass at one packet time; jitter spreads it). Counters are
+                                                       // bumped before any log call, so they are honest without the gate; reading them
+                                                       // needs GNDRM_LOG_VKSHIM=1 only because the commit line is itself logf!-gated.
+                                                       // The delta needs the previous present's stamp, so one mutex touch per present
+                                                       // — no formatting, no allocation, on the hot path. us, not ms: the signal is
+                                                       // sub-ms and disappears at millisecond resolution.
+static PRES_IV_N: AtomicUsize = AtomicUsize::new(0);
+static PRES_IV_SUM_US: AtomicUsize = AtomicUsize::new(0);
+static PRES_IV_MIN_US: AtomicUsize = AtomicUsize::new(usize::MAX);
+static PRES_IV_MAX_US: AtomicUsize = AtomicUsize::new(0);
+static PRES_IV_GE_16667: AtomicUsize = AtomicUsize::new(0); // >= 16.67 ms: a missed 60 Hz frame
+static PRES_IV_GE_33333: AtomicUsize = AtomicUsize::new(0); // >= 33.3 ms: two
+static PRES_IV_LAST: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Record the interval since the previous present. Called once per present at
+/// entry; the first present only seeds the stamp, so the delta count is
+/// presents - 1 per process.
+fn pres_iv_note(now: Instant) {
+    let Ok(mut g) = PRES_IV_LAST.lock() else {
+        return;
+    };
+    if let Some(prev) = *g {
+        let us = now.duration_since(prev).as_micros() as usize;
+        PRES_IV_N.fetch_add(1, Ordering::Relaxed);
+        PRES_IV_SUM_US.fetch_add(us, Ordering::Relaxed);
+        PRES_IV_MIN_US.fetch_min(us, Ordering::Relaxed);
+        PRES_IV_MAX_US.fetch_max(us, Ordering::Relaxed);
+        if us >= 16_667 {
+            PRES_IV_GE_16667.fetch_add(1, Ordering::Relaxed);
+        }
+        if us >= 33_333 {
+            PRES_IV_GE_33333.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    *g = Some(now);
+}
+
+/// The minimum interval, or 0 while no delta exists — the initialised sentinel
+/// would otherwise print as a huge number.
+fn pres_iv_min_us() -> usize {
+    let m = PRES_IV_MIN_US.load(Ordering::Relaxed);
+    if m == usize::MAX {
+        0
+    } else {
+        m
+    }
+}
 const X11_TRACE_N: usize = 24;
 /// The two-view experiment (driver copy vs shim mmap) is heavier per present,
 /// so it is bounded to the first few presents only.
@@ -188,13 +252,25 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
     format!(
         "{}",
         gndrm_obf::obf!(
-            "acq={} pres={} rel={} commit={} starved={} in_flight={in_flight} slots=[{}]",
+            "acq={} pres={} rel={} commit={} starved={} in_flight={in_flight} slots=[{}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
             N_COMMIT_OK.load(Ordering::Relaxed),
             N_STARVE.load(Ordering::Relaxed),
-            flags.trim_end()
+            flags.trim_end(),
+                ACQ_US_N.load(Ordering::Relaxed),
+                ACQ_US_SUM.load(Ordering::Relaxed),
+                ACQ_US_MAX.load(Ordering::Relaxed),
+                ACQ_US_NONZERO.load(Ordering::Relaxed),
+                ACQ_GE_8MS.load(Ordering::Relaxed),
+                ACQ_GE_16MS.load(Ordering::Relaxed),
+                PRES_IV_N.load(Ordering::Relaxed),
+                PRES_IV_SUM_US.load(Ordering::Relaxed),
+                pres_iv_min_us(),
+                PRES_IV_MAX_US.load(Ordering::Relaxed),
+                PRES_IV_GE_16667.load(Ordering::Relaxed),
+                PRES_IV_GE_33333.load(Ordering::Relaxed),
         )
     )
 }
@@ -204,12 +280,24 @@ fn counters() -> String {
     format!(
         "{}",
         gndrm_obf::obf!(
-            "acq={} pres={} rel={} commit={} starved={}",
+            "acq={} pres={} rel={} commit={} starved={} acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
             N_COMMIT_OK.load(Ordering::Relaxed),
-            N_STARVE.load(Ordering::Relaxed)
+            N_STARVE.load(Ordering::Relaxed),
+                ACQ_US_N.load(Ordering::Relaxed),
+                ACQ_US_SUM.load(Ordering::Relaxed),
+                ACQ_US_MAX.load(Ordering::Relaxed),
+                ACQ_US_NONZERO.load(Ordering::Relaxed),
+                ACQ_GE_8MS.load(Ordering::Relaxed),
+                ACQ_GE_16MS.load(Ordering::Relaxed),
+                PRES_IV_N.load(Ordering::Relaxed),
+                PRES_IV_SUM_US.load(Ordering::Relaxed),
+                pres_iv_min_us(),
+                PRES_IV_MAX_US.load(Ordering::Relaxed),
+                PRES_IV_GE_16667.load(Ordering::Relaxed),
+                PRES_IV_GE_33333.load(Ordering::Relaxed),
         )
     )
 }
@@ -1062,6 +1150,19 @@ unsafe fn gn_acquire_common(
     }
     *index = idx as u32;
     let acq_ms = acq_t0.elapsed().as_millis();
+    let acq_us = acq_t0.elapsed().as_micros() as usize;
+    ACQ_US_N.fetch_add(1, Ordering::Relaxed);
+    ACQ_US_SUM.fetch_add(acq_us, Ordering::Relaxed);
+    ACQ_US_MAX.fetch_max(acq_us, Ordering::Relaxed);
+    if acq_us > 0 {
+        ACQ_US_NONZERO.fetch_add(1, Ordering::Relaxed);
+    }
+    if acq_us >= 8_333 {
+        ACQ_GE_8MS.fetch_add(1, Ordering::Relaxed);
+    }
+    if acq_us >= 16_667 {
+        ACQ_GE_16MS.fetch_add(1, Ordering::Relaxed);
+    }
     // Bounded one-shot: a guest thread blocked in acquire for a second or more
     // is the stall class this ring exists to name, so print the last calls the
     // guest made before it parked (once per process).
@@ -1247,6 +1348,9 @@ unsafe fn present_dispatch(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
 // Present: the app's render completion
 unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentInfoKHR) -> VkResult {
     N_PRES.fetch_add(1, Ordering::Relaxed);
+    // The guest's frame period as the shim sees it: stamped at present entry,
+    // before any work, so the census is the client's own cadence, not ours.
+    pres_iv_note(Instant::now());
     let pi = unsafe { &*pi };
     let gq = unsafe { find_queue(queue) };
     let mut gd = if gq.is_null() {
@@ -1742,7 +1846,11 @@ unsafe extern "C" fn gn_vkCreateImage(
     }
     let ci_ref = unsafe { &*ci };
     let res = unsafe { (*gd).f.create_image.unwrap()((*gd).real, ci, alloc, out) };
-    if res == VK_SUCCESS {
+    // Gate first: when GNDRM_LOG_VKSHIM is off (the default) this is one flag
+    // load and a branch — no lock, no map insert, no formatting. The detector
+    // below is a diagnostic, so it must not pay a per-created-image cost when
+    // it cannot emit a line anyway.
+    if res == VK_SUCCESS && crate::vkshim_enabled() {
         let key = (ci_ref.format, ci_ref.usage, ci_ref.tiling);
         let mut seen = SEEN_IMAGE.lock().unwrap();
         if seen.len() < LOG_IMAGE_FIRST_N && !seen.contains(&key) {
@@ -1850,6 +1958,12 @@ macro_rules! call_cmd {
 
 static TRACE_SEEN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 fn trace_seen(name: &'static str) {
+    // Gate first: this bounded dedupe set exists only to suppress repeat lines
+    // of a logf!-gated trace, so with the log off it is dead state and must not
+    // take the lock on every intercepted command.
+    if !crate::vkshim_enabled() {
+        return;
+    }
     if let Ok(mut v) = TRACE_SEEN.lock() {
         if v.len() < 32 && !v.contains(&name) {
             crate::logf!(gndrm_obf::obf!(
@@ -1954,7 +2068,10 @@ unsafe extern "C" fn gn_vkCreateImageView(
         unsafe { (*gd).real }
     };
     let res = unsafe { f(real_dev, ci, alloc, out) };
-    if res == VK_SUCCESS && !ci.is_null() {
+    // Gate first: VIEW_IMAGE feeds only the GNDRM_LOG_VKSHIM-gated render-pass
+    // trace (view_image / fb_slots), so with the log off this map serves
+    // nothing and the per-created-view lock+insert is pure overhead.
+    if res == VK_SUCCESS && !ci.is_null() && crate::vkshim_enabled() {
         let img = unsafe { (*ci).image };
         if let Ok(mut m) = VIEW_IMAGE.lock() {
             let m = m.get_or_insert_with(HashMap::new);
@@ -1989,7 +2106,10 @@ unsafe extern "C" fn gn_vkCreateFramebuffer(
         unsafe { (*gd).real }
     };
     let res = unsafe { f(real_dev, ci, alloc, out) };
-    if res == VK_SUCCESS && !ci.is_null() {
+    // Gate first (same shape as VIEW_IMAGE above): FB_VIEWS is read only by the
+    // gated render-pass trace, so the to_vec() allocation and the lock are
+    // skipped when the log is off.
+    if res == VK_SUCCESS && !ci.is_null() && crate::vkshim_enabled() {
         let n = unsafe { (*ci).attachmentCount as usize };
         let views = unsafe { slice_or_empty((*ci).pAttachments, n) }.to_vec();
         if let Ok(mut m) = FB_VIEWS.lock() {
@@ -2017,6 +2137,11 @@ static SC_LOGGED: AtomicUsize = AtomicUsize::new(0);
 static SC_LAST: Mutex<Option<[i32; 4]>> = Mutex::new(None);
 
 fn trace_viewports(name: &str, count: u32, vps: *const VkViewport) {
+    // Gate first: the viewport trace is logf!-gated, so with the log off the
+    // counter and the VP_LAST lock must not run on every vkCmdSetViewport.
+    if !crate::vkshim_enabled() {
+        return;
+    }
     let n = VP_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
     if count == 0 || vps.is_null() {
         return;
@@ -2050,6 +2175,11 @@ fn trace_viewports(name: &str, count: u32, vps: *const VkViewport) {
 }
 
 fn trace_scissors(name: &str, count: u32, rects: *const VkRect2D) {
+    // Gate first, same as trace_viewports: no counter, no SC_LAST lock when
+    // the log is off.
+    if !crate::vkshim_enabled() {
+        return;
+    }
     let n = SC_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
     if count == 0 || rects.is_null() {
         return;
@@ -2213,7 +2343,10 @@ unsafe extern "C" fn gn_vkCreateRenderPass(
         unsafe { (*gd).real }
     };
     let res = unsafe { f(real_dev, ci, alloc, out) };
-    if res == VK_SUCCESS && !ci.is_null() {
+    // Gate first (same shape as VIEW_IMAGE above): RP_OPS is read only by the
+    // gated render-pass trace via rp_ops_note, so render_pass_ops()'s Vec
+    // allocation and the lock are skipped when the log is off.
+    if res == VK_SUCCESS && !ci.is_null() && crate::vkshim_enabled() {
         let ops = unsafe { render_pass_ops(&*ci) };
         if let Ok(mut m) = RP_OPS.lock() {
             let m = m.get_or_insert_with(HashMap::new);
