@@ -127,7 +127,9 @@ Configuration (wlroots subproject options; `session`/`backends` are set by
 ## 4. Gamescope patch list (branch `gamenative`, one commit per patch)
 
 Patches are numbered files in `android/patches/{gamescope,wlroots}/`, applied in
-filename order by `android/build-gamescope.sh`.
+filename order by `android/build-gamescope.sh`. File numbers run `0001`–`0011`,
+then `0018`, `0019`, `0021`–`0032` (no `0012`–`0017`, `0020`); wlroots runs
+`0001`–`0003`.
 
 | # | Patch | Files | Size | Purpose |
 |---|---|---|---|---|
@@ -152,6 +154,13 @@ filename order by `android/build-gamescope.sh`.
 | A23 | present-path diagnostics | `src/steamcompmgr.cpp`, `src/Backends/DRMBackend.cpp` | XS | rate-limited logs of the paint loop (scene contents) and the DRM flip/present path, so a stalled pipeline still leaves a trail. Diagnostics only — no behavior change. |
 | A24 | bound the Xwayland ready-wait | `src/wlserver.cpp`, `src/wlserver.hpp`, `src/main.cpp` | S | overall deadline on the Xwayland ready-wait; on expiry dumps each Xwayland thread's `wchan` and open fds mapped back to `/proc/net/unix` endpoints so a wedged startup handshake is named instead of pinning the process; adds `wlserver_get_pid`, and `main.cpp` `_exit(1)`s on an unrecoverable `wlserver_init` failure rather than unwinding through joinable backend threads. |
 | A25 | startup/present diagnostics | `src/wlserver.cpp`, `src/steamcompmgr.cpp` | S | wlserver commit routing, texture-acquire drops, override bind/unbind/link, plus `import_commit` failure detail in steamcompmgr. Diagnostics only — no behavior change. |
+| A26 | uniform app id | `src/steamcompmgr.cpp` | XS | Without `--steam`, `w->appID` is the Xwayland window id — a per-launch value the app process cannot know, since `request_app_performance_stats()` is called from the app with no X11 connection. Every window gets one fixed `kGameNativeUniformAppId`, so `wlserver_app_presented()`'s match against `wlserver.app_perf_requests` needs no cross-process channel; the app side uses the same constant (`GameNativeDrm.GAMESCOPE_APP_ID`). |
+| A27 | reaper: SIGKILL the descendant tree, don't wait | `src/Apps/gamescopereaper.cpp` | XS | Wine's wineserver (plus explorer/services.exe) outlives the game and ignores SIGTERM. On the primary child's exit, kill the reparented descendant tree with SIGKILL and return without `WaitForAllChildren()` — blocking there kept the reaper, and gamescope, alive past the game. |
+| A28 | end the session with the game process | `src/Apps/gamescopereaper.cpp`, `src/Utils/Process.{h,cpp}` | S | The primary child is wine's wrapper chain (explorer → winhandler), which outlives the game, so waiting on it alone keeps the session alive after the game quits. When `GAMENATIVE_GAME_PROCESS` names the game image, end the session once that process is gone — but only after it has been seen once, and only after two consecutive misses; without the name, fall back to the primary child. |
+| A29 | keep override-surface windows | `src/steamcompmgr.cpp` | XS | The 1x1-window filter dropped a 1x1 override-redirect wine helper even when it held the app's real frame on a content override (Dishonored). Return "not useless" when `w->override_surface()` is set; a genuine 1x1 helper with no override is still dropped. |
+| A30 | the override surface is the app's frame | `src/steamcompmgr.cpp`, `src/steamcompmgr_shared.hpp` | S | A window with a content override draws its real frame on the override surface (the guest's Vulkan swapchain the WSI shim bound to it); wine's own X11 surface commits — frame, decorations, the 1x1 helper — are furniture, and texturing them is a full-frame dropout. Once the override has committed, `window_last_done_commit_index()` tracks only override-surface commits (`bHasOverrideContent`), so the base plane holds the last real frame instead of painting wine's window furniture. |
+| A31 | composite while a colour look is set | `src/steamcompmgr.cpp`, `src/Backends/DRMBackend.cpp` | XS | Colour-management look LUTs are baked into the composite LUT that only `vulkan_composite()` samples, so a single fullscreen SDR layer with no scaling filter direct-scanouts and the look never reaches the screen (this backend advertises no colour-mgmt plane properties). New `ColorLookInUse()` is OR'd into `bNeedsFullComposite` in the DRM backend, so the composite runs only while a look is loaded. |
+| A32 | fps cap by a lower-bound delay, not a vblank grid | `src/steamcompmgr.cpp` | XS | The fixed-rate path dropped callbacks on a `vblank_idx % (refresh / target)` grid, dragging a title already at its own ceiling below it. Pace by a lower-bound delay on the target frame time (`1/target`), as the VRR branch already does, and use `1/target` as the limiter cycle instead of `AppRefreshCycle * floor(refresh / target)` — which also mis-capped targets that do not divide the refresh (60 on 90Hz → no cap). No-op for a real VRR panel. |
 
 Build output: the patch train lands as `android/patches/{gamescope,wlroots}/*.patch`
 (applied by `android/build-gamescope.sh`). `ninja` completes from clean;
@@ -213,7 +222,7 @@ cross-file `[built-in options]` — wipe the build dir when the cross file chang
 ```
 android/
 ├── patches/
-│   ├── gamescope/*.patch              # M3, M4, A4-A10, A17, A18, A20, A21, A23-A25, D1, I1 — applied in filename order
+│   ├── gamescope/*.patch              # M3, M4, A4-A10, A17, A18, A20, A21, A23-A32, D1, I1 — applied in filename order
 │   └── wlroots/*.patch                # W1-W3 — applied inside the wlroots submodule
 ├── cross/aarch64-linux-android.txt
 ├── build-gamescope.sh                 # patch train + meson setup + ninja
