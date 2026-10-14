@@ -689,15 +689,18 @@ fn worker_main(sc: *mut GnSwapchain) {
             let t1 = Instant::now();
             let flush_rc = {
                 let _sg = SEND_LOCK.lock().unwrap();
-                // This surface presents FIFO (a slot becomes reusable only on the
-                // compositor's wl_buffer.release) and gamescope reads the declared
-                // mode once per commit, then paces only the commits it reads as
-                // FIFO — so the declaration rides every commit. Without it a
-                // window's fps limit is applied in the compositor and never
-                // reaches this present path.
+                // Declare this swapchain's *effective* present mode — the mode
+                // `present_dispatch` honours — so gamescope's view matches what
+                // the shim actually does. A slot becomes reusable only on the
+                // compositor's wl_buffer.release, and gamescope reads the
+                // declared mode once per commit and paces only the commits it
+                // reads as FIFO — so the declaration rides every commit.
+                // Declaring the effective mode (not a hardcoded FIFO) is what
+                // lets a window's fps limit, or the absence of one, be seen by
+                // the compositor as the shim applies it.
                 wlproto::swapchain_set_present_mode(
                     (*(*sc).surf).swapchain_obj,
-                    crate::vk::VK_PRESENT_MODE_FIFO_KHR as u32,
+                    gamescope_present_mode((*sc).present_mode),
                 );
                 wlproto::surface_attach(parent, (*s).buf, 0, 0);
                 wlproto::surface_damage_buffer(
@@ -898,7 +901,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     unsafe {
         *out = sc as usize as VkSwapchainKHR;
         crate::logf!(gndrm_obf::obf!(
-            "proxy swapchain {:?}: {}x{} fmt {} -> fourcc {:#x}, {} images; requested usage={:#x} minImages={} presentMode={} compositeAlpha={:#x} colorspace={} clipped={} tiling=LINEAR effective_mode={}",
+            "proxy swapchain {:?}: {}x{} fmt {} -> fourcc {:#x}, {} images; requested usage={:#x} minImages={} presentMode={} compositeAlpha={:#x} colorspace={} clipped={} tiling=LINEAR effective_mode={} gamescope_mode={}",
             sc,
             (*sc).extent.width,
             (*sc).extent.height,
@@ -911,7 +914,8 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             ci.compositeAlpha,
             ci.imageColorSpace,
             ci.clipped,
-            mode
+            mode,
+            gamescope_present_mode(mode)
         ));
     }
     VK_SUCCESS
@@ -1314,11 +1318,11 @@ unsafe fn present_sync_commit(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32)
         if !unsafe { (*slot).buf.is_null() } {
             let _sg = SEND_LOCK.lock().unwrap();
             unsafe {
-                // Declare FIFO as on the worker path above (gamescope reads the
-                // mode once per commit).
+                // Declare this swapchain's *effective* present mode, as on the
+                // worker path above (gamescope reads the mode once per commit).
                 wlproto::swapchain_set_present_mode(
                     (*(*sc).surf).swapchain_obj,
-                    crate::vk::VK_PRESENT_MODE_FIFO_KHR as u32,
+                    gamescope_present_mode((*sc).present_mode),
                 );
                 wlproto::surface_attach(parent, (*slot).buf, 0, 0);
                 wlproto::surface_damage_buffer(
@@ -6293,6 +6297,35 @@ fn effective_present_mode(ci: &VkSwapchainCreateInfoKHR) -> VkPresentModeKHR {
         | VK_PRESENT_MODE_FIFO_KHR
         | VK_PRESENT_MODE_FIFO_RELAXED_KHR => ci.presentMode,
         _ => VK_PRESENT_MODE_FIFO_KHR,
+    }
+}
+
+/// The wire value for `gamescope_swapchain.set_present_mode` that declares
+/// `mode` — the mode `present_dispatch` honours — to the compositor.
+///
+/// gamescope's protocol arg is declared as its own type in
+/// `protocol/gamescope-swapchain.xml` (arg name `vk_present_mode`,
+/// `summary="VkPresentModeKHR"`), and its handler stores it verbatim as a
+/// `VkPresentModeKHR` (`src/wlserver.cpp:1121`:
+/// `wl_info->oCurrentPresentMode = VkPresentModeKHR( present_mode );`), then
+/// compares it against the Vulkan enumerators in `wlserver_surface_is_fifo()`
+/// (`src/wlserver.cpp:3418`, `== VK_PRESENT_MODE_FIFO_KHR`) and
+/// `wlserver_surface_is_async()` (`:3401`, `== VK_PRESENT_MODE_IMMEDIATE_KHR
+/// || == VK_PRESENT_MODE_MAILBOX_KHR`). So the wire enum IS
+/// `VkPresentModeKHR` — immediate=0, mailbox=1, fifo=2, fifo_relaxed=3, the
+/// same values `crate::vk` uses — and the map is value-for-value. It is
+/// written out explicitly (not `as u32`) so that a future divergence between
+/// the two enums is a compile-time edit here rather than a silent mis-pacing
+/// on every frame.
+fn gamescope_present_mode(mode: VkPresentModeKHR) -> u32 {
+    match mode {
+        VK_PRESENT_MODE_IMMEDIATE_KHR => 0,
+        VK_PRESENT_MODE_MAILBOX_KHR => 1,
+        VK_PRESENT_MODE_FIFO_KHR => 2,
+        VK_PRESENT_MODE_FIFO_RELAXED_KHR => 3,
+        // Unreachable: `(*sc).present_mode` is `effective_present_mode`'s
+        // output, which is one of the four served modes above.
+        _ => 2,
     }
 }
 
