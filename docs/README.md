@@ -43,6 +43,7 @@ winlator X11 path (which remains the default for normal launches).
 11. [11-refresh-model.md](11-refresh-model.md) — `g_nOutputRefresh` against `g_nNestedRefresh` (`-r`): what each drives, and what that means when gndrm advertises its own session rate rather than the panel's.
 12. [12-present-latency-budget.md](12-present-latency-budget.md) — the present-latency budget: what each frame on the paced path pays, and why the flip event is emitted with the publish.
 13. [13-single-layer-windowing.md](13-single-layer-windowing.md) — the window/layer model on the single-layer path: what plays layer 0/1/N here, why the content-override mechanism exists, the per-patch layer audit, and the target architecture.
+14. [14-guest-surface-commit-stall.md](14-guest-surface-commit-stall.md) — the guest-surface route's queued defect: the commit stream stalls when the guest's Vulkan swapchain comes up, the two candidate causes, and the instrumentation that would decide between them.
 
 ## One-paragraph summary
 

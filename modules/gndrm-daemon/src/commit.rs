@@ -149,6 +149,7 @@ impl Device {
 
         // Apply software state synchronously (queries see it immediately), then
         // queue the present + flip event for the worker.
+        let prev_primary_fb = self.primary_state().fb_id;
         self.apply_commit(&parsed, fd_in);
         if !self.logged_first_commit {
             self.logged_first_commit = true;
@@ -177,6 +178,27 @@ impl Device {
                 .get(&p.fb_id)
                 .map(|f| (f.width, f.height, f.pixel_format, f.pitches[0]))
                 .unwrap_or((0, 0, 0, 0));
+            // UNGATED sibling of the line below, on the same rate policy: the
+            // commit's primary-fb id and a running commit count in one line, so
+            // "commits arrive but the plane is blank (fb=0)" is separable from
+            // "no commit arrives at all" (no probe line). The gated line cannot
+            // serve this — the daemon runs in the app process, where no
+            // `GNDRM_LOG_*` from the container can be set. `prev_fb` is the
+            // publish verdict's other half: the daemon publishes only when the
+            // primary fb both is non-zero and changed.
+            self.always_log(|| {
+                format!(
+                    "{}",
+                    gndrm_obf::obf!(
+                        "gndrm-daemon: commit #{} fb={} prev_fb={} crtc_on={} fbs={}",
+                        self.commit_count,
+                        p.fb_id,
+                        prev_primary_fb,
+                        self.crtc_state().active,
+                        self.stores.fbs.len()
+                    )
+                )
+            });
             self.diag(|| format!("{}", gndrm_obf::obf!(
                 "atomic #{}: fb={} {}x{} fmt={:#010x} pitch={} src=({},{}) {}x{} crtc=({},{}) {}x{}",
                 self.commit_count,

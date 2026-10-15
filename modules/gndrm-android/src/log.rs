@@ -23,6 +23,17 @@ pub(crate) fn write(prio: i32, gate: Gate, args: fmt::Arguments<'_>) {
     emit(prio, gate, &fmt::format(args));
 }
 
+/// Emit `text` at `prio` with **no gate at all**: the line prints whenever the
+/// process runs, whatever `GNDRM_LOG_*` says. This exists for one-shot
+/// instrumentation on the app side, where a missing env var would otherwise
+/// silence the whole diagnostic — the container's environment reaches the guest
+/// (gamescope's process), not this app process, so a gated line here is
+/// invisible on device. Never call it on a per-frame path: every call site
+/// latches itself so it cannot format on a repeated path.
+pub(crate) fn write_ungated(prio: i32, args: fmt::Arguments<'_>) {
+    emit(prio, Gate::Daemon, &fmt::format(args));
+}
+
 /// Format `text` into a C string and hand it to logcat under the gate's tag.
 fn emit(prio: i32, gate: Gate, text: &str) {
     // CString::new fails only on interior NUL, which format! output of our
@@ -59,6 +70,16 @@ pub(crate) fn daemon_info(text: &str) {
     );
 }
 
+/// Log a line the daemon produced with **no gate at all** — the sink the
+/// daemon's commit probe prints through (see `Device::set_always_logger`).
+/// The probe is unsilenceable on purpose: its caller applies its own rate
+/// limit, and the daemon runs in this app process, where the container's
+/// `GNDRM_LOG_*` cannot reach — a gated probe could not be switched on for a
+/// device pass at all.
+pub(crate) fn daemon_always(text: &str) {
+    write_ungated(crate::ffi::ANDROID_LOG_INFO, format_args!("{text}"));
+}
+
 /// One log line at `prio`; `fmt`/`args` go through `format_args!`. The
 /// call site's module path is classified at compile time (`const`), so it is
 /// never stored in the binary.
@@ -80,6 +101,16 @@ macro_rules! alog {
 #[macro_export]
 macro_rules! log_info {
     ($($arg:tt)*) => { $crate::alog!($crate::ffi::ANDROID_LOG_INFO, $($arg)*) };
+}
+
+/// Log one line with **NO gate** (no `GNDRM_LOG_*` can silence it). One-shot
+/// instrumentation only: every call site must latch itself so it cannot format
+/// on a repeated path. See [`crate::log::write_ungated`].
+#[macro_export]
+macro_rules! log_always {
+    ($($arg:tt)*) => {
+        $crate::log::write_ungated($crate::ffi::ANDROID_LOG_INFO, format_args!($($arg)*))
+    };
 }
 
 #[macro_export]

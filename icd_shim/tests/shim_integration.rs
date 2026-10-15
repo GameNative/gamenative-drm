@@ -213,8 +213,9 @@ fn driver_refusing_instances_falls_back() {
 
 /// `vkCreateXlibSurfaceKHR` is the entry point winex11.drv actually reaches
 /// (winevulkan translates the app's VK_KHR_win32_surface to a host Xlib
-/// surface). The DRI3 route into wine's own X window is now selected by
-/// `GN_VKSHIM_GUEST_SURFACE=1`, so this scenario sets it. The shim must
+/// surface). The DRI3 route into wine's own X window is now the OPT-IN
+/// (`GN_VKSHIM_GUEST_SURFACE=1`; unset takes the override/Wayland route), so
+/// this scenario selects it explicitly. The shim must
 /// intercept the call and always report the route decision, gated or not: a
 /// session that shows nothing is otherwise indistinguishable from a route that
 /// never engaged. With a null XID the call must still succeed and leave the
@@ -251,10 +252,11 @@ fn xlib_surface_without_x_names_the_unreachable_check() {
 }
 
 /// The DEFAULT (`GN_VKSHIM_GUEST_SURFACE` unset) must take the override/Wayland
-/// route, not DRI3: the route decision must be reported, and the DRI3 route
-/// line must be absent. On the host there is no Wayland display, so the
-/// override route fails cleanly with VK_ERROR_INITIALIZATION_FAILED and the
-/// probe exits non-zero — that is the expected host outcome, not a test error.
+/// route, not the guest-surface DRI3 one: the route decision must be reported,
+/// and the DRI3 route line must be absent. On the host there is no Wayland
+/// display, so the override route fails cleanly with
+/// VK_ERROR_INITIALIZATION_FAILED and the probe exits non-zero — that is the
+/// expected host outcome, not a test error.
 #[test]
 fn xlib_surface_defaults_to_override_route() {
     let dir = target_dir();
@@ -263,10 +265,32 @@ fn xlib_surface_defaults_to_override_route() {
     assert!(out.contains("PROBE xlib_surface"), "stdout:\n{out}");
     assert!(
         err.contains("override: XID 0x0"),
-        "the default must take the override route; stderr:\n{err}"
+        "the default must take the override/Wayland route; stderr:\n{err}"
     );
     assert!(
         !err.contains("x11 route:"),
-        "the DRI3 route must not be the default; stderr:\n{err}"
+        "the guest-surface DRI3 route must not be the default; stderr:\n{err}"
+    );
+}
+
+/// The opt-in (`GN_VKSHIM_GUEST_SURFACE=1`) must take the guest-surface DRI3
+/// route, not the override: the route decision must be reported, and the
+/// override line must be absent. With a null XID the DRI3 arm reports the
+/// null-XID check and carries on, which tells the two routes apart without
+/// needing a reachable X server.
+#[test]
+fn xlib_surface_opt_in_takes_the_guest_surface_route() {
+    let dir = target_dir();
+    let mut env = adrenotools_env(&dir);
+    env.push(("GN_VKSHIM_GUEST_SURFACE", "1".into())); // opt in to the DRI3 route
+    let (_code, out, err) = run_probe_args(&Scenario { comm: None, env }, &["--xlib-window", "0"]);
+    assert!(out.contains("PROBE xlib_surface"), "stdout:\n{out}");
+    assert!(
+        err.contains("x11 route: XID 0x0 unavailable (null XID)"),
+        "the opt-in must take the guest-surface DRI3 route; stderr:\n{err}"
+    );
+    assert!(
+        !err.contains("override: XID 0x0"),
+        "the override route must not run when the opt-in is set; stderr:\n{err}"
     );
 }

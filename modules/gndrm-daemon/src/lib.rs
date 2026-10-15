@@ -367,6 +367,12 @@ pub struct Device {
     /// behind an `Arc<Mutex<_>>` with the commit worker, which is spawned
     /// before `set_logger` runs and must observe it.
     logger: Arc<Mutex<Option<LogFn>>>,
+    /// Optional sink for the commit probe, which is **ungated** — it prints
+    /// whenever it is installed, whatever `GNDRM_LOG_*` says (see
+    /// [`Device::set_always_logger`]). The container's environment reaches the
+    /// guest, never the app process the daemon runs in, so a gated line cannot
+    /// be turned on for a device pass at all. Serve thread only.
+    always_logger: Option<LogFn>,
     /// Optional sink for framebuffer geometries (`ADDFB2`); see
     /// [`Device::set_addfb_geometry`]. Called on the serve thread only.
     addfb_geometry: Option<AddFbGeometryFn>,
@@ -470,6 +476,7 @@ impl Device {
             shutdown,
             worker,
             logger,
+            always_logger: None,
             addfb_geometry: None,
             emulated_fences: HashSet::new(),
             seen_ioctls: Vec::new(),
@@ -484,6 +491,26 @@ impl Device {
     /// Install a diagnostics logger (rejections only; see commit.rs).
     pub fn set_logger(&mut self, logger: LogFn) {
         *self.logger.lock().unwrap_or_else(PoisonError::into_inner) = Some(logger);
+    }
+
+    /// Install the **ungated** sink the commit probe prints through
+    /// ([`Device::always_log`]). Unlike [`Device::set_logger`] this is installed
+    /// unconditionally: the probe exists precisely for the sessions where no
+    /// gate can be set — the daemon runs inside the app process, and the
+    /// container's `GNDRM_LOG_*` reaches only the guest.
+    pub fn set_always_logger(&mut self, logger: LogFn) {
+        self.always_logger = Some(logger);
+    }
+
+    /// Emit the commit probe through the ungated sink, if one is installed.
+    ///
+    /// `msg` is a thunk so the message (and any `obf!` literal in it, which is a
+    /// stack decode) is built only at the probe's own rate limit, never per
+    /// frame. See [`Device::set_always_logger`].
+    pub(crate) fn always_log(&self, msg: impl FnOnce() -> String) {
+        if let Some(log) = &self.always_logger {
+            log(&msg());
+        }
     }
 
     /// Install a sink for framebuffer geometries the client registers

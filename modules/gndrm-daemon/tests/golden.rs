@@ -2292,3 +2292,68 @@ fn plane_census_names_every_plane_in_z_order() {
         libc::close(fd2);
     }
 }
+
+/// The commit probe is the daemon-side line a device pass can rely on: it is
+/// emitted through the **always** sink, which is installed with no gate at all,
+/// and it carries the commit's primary fb id together with a running commit
+/// count. Both halves matter on the single-layer path, where the presenter's
+/// splash-clear latch and its frame counter sit behind `fb.id != 0`: "commits
+/// arrive, and the plane is blank (fb=0)" and "no commit arrives at all" are
+/// otherwise indistinguishable, because the absence of any other daemon line
+/// means the same thing in both cases.
+#[test]
+fn commit_probe_reports_fb_id_and_running_count_ungated() {
+    let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&logs);
+    let mut d = Device::new(PanelDesc::default(), Box::<NullPresenter>::default());
+    d.set_clock(Box::new(|| (1000, 500)));
+    // The always sink only; `set_logger` is deliberately not called, so the
+    // gated diagnostics stay off and anything the probe prints is ungated.
+    d.set_always_logger(Box::new(move |m: &str| {
+        sink.lock().unwrap().push(m.to_string());
+    }));
+
+    let blob = create_mode_blob(&mut d).0;
+    let (handle, fb, fd) = import_fb(&mut d);
+    let sets = modeset_sets(&d, blob, fb);
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(
+            &sets,
+            DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_PAGE_FLIP_EVENT,
+            1,
+        ),
+    ));
+    // A re-commit of the same primary fb: the daemon publishes only a *changed*
+    // non-zero fb, so this one is carried by the probe and not by the presenter.
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(&sets, DRM_MODE_ATOMIC_ALLOW_MODESET, 2),
+    ));
+
+    let lines = logs.lock().unwrap().clone();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with(&format!("gndrm-daemon: commit #1 fb={fb} prev_fb=0 "))),
+        "probe must report the modeset's fb id and a running count: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with(&format!("gndrm-daemon: commit #2 fb={fb} prev_fb={fb} "))),
+        "probe must report a re-commit of the same fb, which the presenter never sees: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("atomic #")),
+        "only the ungated probe may print when no gated sink is installed: {lines:?}"
+    );
+
+    // SAFETY: caller's fds.
+    unsafe {
+        libc::close(fd);
+    }
+    let _ = handle;
+}

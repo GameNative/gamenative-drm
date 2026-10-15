@@ -66,7 +66,9 @@ use std::time::{Duration, Instant};
 use gndrm_daemon::diag::{self, Diag, Reply, Role, Stage, State, TrackedMutex, LOCK_SCANOUT_POOL};
 use gndrm_daemon::scanout::{Geometry, Removed, Reservation as CacheReservation, ReusePool};
 use gndrm_daemon::{Framebuffer, PlaneState, Presenter};
-use gndrm_uapi::wire::{ScanoutAllocReq, ScanoutAllocResp, SCANOUT_FORMAT_BGRA_8888};
+use gndrm_uapi::wire::{
+    GameWindowNote, ScanoutAllocReq, ScanoutAllocResp, SCANOUT_FORMAT_BGRA_8888,
+};
 
 use crate::ffi;
 use crate::{log_info, log_warn};
@@ -664,6 +666,9 @@ pub struct AscState {
     pool: Arc<TrackedMutex<ScanoutPool>>,
     last_publish: Option<LastPublish>,
     frames: u64,
+    /// The booting-splash clear has fired this session (one latch, single
+    /// condition).
+    splash_cleared: bool,
     warned_fence_timeout: bool,
     /// Inodes already reported as having no registered buffer (log once each).
     logged_unregistered: Vec<u64>,
@@ -735,6 +740,7 @@ impl AscState {
             )),
             last_publish: None,
             frames: 0,
+            splash_cleared: false,
             warned_fence_timeout: false,
             logged_unregistered: Vec::new(),
             logged_stale: Vec::new(),
@@ -789,6 +795,25 @@ impl AscState {
         live_inos: &HashSet<u64>,
         fence: Option<RawFd>,
     ) {
+        // UNGATED one-shot at the presenter's entry. The daemon's own commit
+        // probe says whether a commit arrived with a publishable framebuffer;
+        // this says whether the presenter was handed it, and names the inputs
+        // its early exits test — so a run that shows commits arriving and still
+        // no published frame points at one exit instead of at the whole path.
+        // Latched: one relaxed swap per publish and nothing formats after the
+        // first call.
+        {
+            static PUBLISH_SEEN: AtomicBool = AtomicBool::new(false);
+            if !PUBLISH_SEEN.swap(true, Ordering::Relaxed) {
+                crate::log_always!(
+                    "gndrm-daemon: publish entry fb={} ino_set={} api_set={} sc_set={}",
+                    fb.id,
+                    ino.is_some(),
+                    self.api.is_some(),
+                    !self.sc.is_null()
+                );
+            }
+        }
         let Some(api) = self.api else {
             close_fence(fence);
             return;
@@ -1008,8 +1033,28 @@ impl AscState {
 
         self.frames += 1;
         if fb.id != 0 {
-            // First real frame on the panel: clear the splash.
-            if crate::PRESENTED_FRAMES.fetch_add(1, Ordering::Relaxed) == 0 {
+            // Latched booting-splash clear. The trigger is the game's own
+            // window appearing, reported by the ICD shim over the scan-out
+            // channel. The desktop's first frame is deliberately not a trigger:
+            // it is exactly the blue desktop the splash exists to cover. One
+            // latch, so the clear fires once per session.
+            if !self.splash_cleared && crate::GAME_WINDOW_PRESENT.load(Ordering::Relaxed) {
+                self.splash_cleared = true;
+                // UNGATED one-shot at the latch-fired moment. Latched on the
+                // *clear*, not on the first published frame: the first frame is
+                // the desktop, ~10 s before the note, so a line there can only
+                // report the pre-latch state and never observes this event. One
+                // relaxed atomic per latch; nothing formats on a later frame.
+                {
+                    static CLEAR_FIRED: AtomicBool = AtomicBool::new(false);
+                    if !CLEAR_FIRED.swap(true, Ordering::Relaxed) {
+                        crate::log_always!(
+                            "gndrm-daemon: splash-clear latch fired splash_cleared={} game_window_present={} clear_attempted=true",
+                            self.splash_cleared,
+                            crate::GAME_WINDOW_PRESENT.load(Ordering::Relaxed)
+                        );
+                    }
+                }
                 crate::clear_booting_splash();
             }
             // Announce the daemon's new-frame decision to the app's frame-time
@@ -1256,6 +1301,29 @@ pub enum ScanoutChannel {
     Stop,
 }
 
+/// UNGATED one-shot: the first frame on the scan-out channel that is **not**
+/// an allocator request. Reports the magic it carried, whether it decoded as a
+/// game-window note, and the session latch the note drives — so the note's
+/// arrival and its effect are visible in logcat with no env gate (the daemon
+/// runs in the app process, which the container's env vars do not reach, so a
+/// gated line here is invisible on device). One-shot: a static latch, flipped
+/// on the first call, returns on every later one, so nothing formats again and
+/// the allocator path never calls this at all.
+fn log_first_non_request_frame(frame: &[u8], note: Option<GameWindowNote>) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let magic = frame
+        .get(0..4)
+        .map_or(0, |m| u32::from_le_bytes([m[0], m[1], m[2], m[3]]));
+    crate::log_always!(
+        "gndrm-daemon: scan-out channel non-request frame magic={magic:#010x} note_decoded={} game_window_present={}",
+        note.is_some(),
+        crate::GAME_WINDOW_PRESENT.load(Ordering::Relaxed)
+    );
+}
+
 /// Serve the scan-out allocator channel until the peer goes away.
 ///
 /// One request per `SOCK_SEQPACKET` message, one response back with the
@@ -1371,12 +1439,35 @@ pub fn serve_scanout(
             );
             return ScanoutChannel::Closed;
         }
+        // The game-window notification shares this channel. It is recognised
+        // by its own magic *before* the allocator decode, so a daemon that knows
+        // it never mistakes it for, or rejects it as, a scan-out request. It is
+        // fire-and-forget: no reply is sent, and the shim reads none.
+        if let Some(note) = GameWindowNote::decode(&buf[..n]) {
+            // Latch first, report second: the line reads GAME_WINDOW_PRESENT, so
+            // logged ahead of the store it could only ever print `false`,
+            // whatever the note actually carried.
+            if note.present == GameWindowNote::PRESENT {
+                crate::note_game_window_present();
+            }
+            log_first_non_request_frame(&buf[..n], Some(note));
+            continue;
+        }
         let Some(req) = ScanoutAllocReq::decode(&buf[..n]) else {
+            // A frame that is neither the game-window notification (handled
+            // above) nor an allocator request is logged and skipped, not fatal.
+            // The shim rides in the `.tzst` payload and this daemon in
+            // `jniLibs`, so the two can be updated apart: a shim sending a
+            // message this daemon does not know must cost at most that message,
+            // never the scan-out allocator, which would strand the session's
+            // buffers. A genuinely malformed allocator request is a bug the log
+            // names either way.
+            log_first_non_request_frame(&buf[..n], None);
             log_warn!(
                 "{}",
-                gndrm_obf::obf!("asc: malformed scan-out request ({n} bytes); channel dropped")
+                gndrm_obf::obf!("asc: unrecognised scan-out channel frame ({n} bytes); ignored")
             );
-            return ScanoutChannel::Closed;
+            continue;
         };
         // Open the request epoch. From here the watchdog samples this request,
         // and the reply has to be on the wire before the shim's budget expires.

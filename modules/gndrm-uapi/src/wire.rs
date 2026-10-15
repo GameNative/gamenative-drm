@@ -348,6 +348,60 @@ impl ScanoutAllocResp {
     }
 }
 
+// ------------------------------------------------------- game-window presence
+//
+// A third message shape on the scan-out channel, told apart by its own magic.
+// The ICD shim sends it (fire-and-forget, no reply) once, when the game's own
+// window first appears under the wine desktop; the daemon latches it and clears
+// the booting splash on that event. It rides the channel the shim already holds
+// rather than opening a new socket. Because the shim ships inside the `.tzst`
+// payload and the daemon in `jniLibs`, the daemon must tolerate a magic it does
+// not know (log and skip, never close) so an out-of-step pair costs at most
+// this notification, not the scan-out allocator sharing the channel.
+
+/// Game-window presence message magic: ASCII `"GNW1"`.
+pub const GAME_WINDOW_MAGIC: u32 = 0x474E_5731;
+
+/// Game-window presence notification, shim -> daemon.
+///
+/// Encoded little-endian, 24 bytes:
+/// `magic:u32, present:u32, reserved:u64, reserved:u64`.
+/// One flag and no reply: `present` is [`Self::PRESENT`] when the game's own
+/// window has appeared. The reserved words keep the frame the same width as the
+/// allocator exchange and leave room for a field without a shape change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameWindowNote {
+    /// [`Self::PRESENT`] when the game's own window is on screen.
+    pub present: u32,
+}
+
+impl GameWindowNote {
+    pub const LEN: usize = 24;
+    /// The one flag value this message carries today.
+    pub const PRESENT: u32 = 1;
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[0..4].copy_from_slice(&GAME_WINDOW_MAGIC.to_le_bytes());
+        b[4..8].copy_from_slice(&self.present.to_le_bytes());
+        b
+    }
+
+    /// `None` when `b` is not exactly one encoded notification (short frame,
+    /// bad magic, or trailing bytes).
+    #[must_use]
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN || u32::from_le_bytes(b[0..4].try_into().ok()?) != GAME_WINDOW_MAGIC
+        {
+            return None;
+        }
+        Some(Self {
+            present: u32::from_le_bytes(b[4..8].try_into().ok()?),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,6 +515,24 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(ScanoutAllocResp::decode(&err.encode()), Some(err));
+    }
+
+    #[test]
+    fn game_window_note_round_trip() {
+        let note = GameWindowNote {
+            present: GameWindowNote::PRESENT,
+        };
+        let enc = note.encode();
+        assert_eq!(enc.len(), GameWindowNote::LEN);
+        assert_eq!(enc[0..4], GAME_WINDOW_MAGIC.to_le_bytes());
+        assert_eq!(GameWindowNote::decode(&enc), Some(note));
+        // Its magic and the allocator magic are distinct, so neither decode
+        // ever mistakes the other's frame.
+        assert_ne!(GAME_WINDOW_MAGIC, SCANOUT_MAGIC);
+        assert_eq!(GameWindowNote::decode(&[0u8; GameWindowNote::LEN]), None);
+        let mut extra = note.encode().to_vec();
+        extra.push(0);
+        assert_eq!(GameWindowNote::decode(&extra), None);
     }
 
     #[test]

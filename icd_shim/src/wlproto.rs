@@ -173,7 +173,8 @@ pub unsafe fn surface_commit(surface: *mut wl_proxy) {
     wl_proxy_marshal_array(surface, 6, std::ptr::null_mut());
 }
 
-// gamescope override/Wayland present route (the shim's DEFAULT) — see
+// gamescope override/Wayland present route (the shim's default,
+// `GN_VKSHIM_GUEST_SURFACE` unset or not exactly "1") — see
 // `gn_vkCreateXlibSurfaceKHR` in `crate::proxy` and `GN_VKSHIM_GUEST_SURFACE`.
 // Recovered from the pre-DRI3 route that this shim carried at commit
 // `cb89a9f^` ("icd_shim: X11 DRI3+Present present route …", which *deleted*
@@ -182,7 +183,8 @@ pub unsafe fn surface_commit(surface: *mut wl_proxy) {
 // override_window_content; the compositor then routes that surface's commits
 // as the window's content. It presents the guest's Vulkan frames straight to
 // the override/Wayland surface instead of into wine's own X window, so wine's
-// own GDI/2D is not composited. Its only caller is the default route.
+// own GDI/2D is not composited. Its only caller is the default branch of the
+// route selector, so the guest-surface (opt-in) route never creates one.
 
 /// wl_compositor_create_surface (opcode 0): new_id wl_surface.
 pub unsafe fn compositor_create_surface(comp: *mut wl_proxy) -> *mut wl_proxy {

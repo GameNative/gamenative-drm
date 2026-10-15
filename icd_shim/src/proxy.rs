@@ -34,7 +34,7 @@ use crate::vk::*;
 use crate::wlproto::{self, wl_display, wl_proxy};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 // First-N diagnostics for the present pipeline handoffs (acquire ->
 // present -> worker commit -> compositor release). Bounded counters, so
@@ -117,6 +117,17 @@ fn ring_dump(reason: &str) {
     }
 }
 static LOG_COMMIT: AtomicUsize = AtomicUsize::new(0);
+
+/// Presents between game-window tree walks (see `maybe_report_game_window`).
+/// The splash-clear transition is one-shot, so a walk every `N` presents — a
+/// handful of milliseconds of latency — is ample, and it keeps a per-frame X
+/// round trip out of the present path.
+const GAME_WINDOW_CHECK_EVERY: u32 = 30;
+/// Presents counted since the last game-window tree walk.
+static GAME_WINDOW_CHECK: AtomicU32 = AtomicU32::new(0);
+/// Set once the game-window notification has been sent; stops all further
+/// walks, so a signalled or idle session costs nothing.
+static GAME_WINDOW_REPORTED: AtomicBool = AtomicBool::new(false);
 static LOG_RELEASE: AtomicUsize = AtomicUsize::new(0);
 const LOG_FIRST_N: usize = 8;
 
@@ -327,35 +338,6 @@ const DMA_BUF_SYNC_START: u64 = 0 << 2;
 const DMA_BUF_SYNC_END: u64 = 1 << 2;
 const DMA_BUF_IOCTL_SYNC: u64 = 0x4008_6200;
 
-/// Forces every real device queue idle — a true GPU-completion barrier —
-/// before the shim hands a slot to Xwayland or reads it on the CPU. The
-/// per-slot fence cannot serve this: the guest never waits on a shim fence, so
-/// it says nothing about whether the guest's render into the slot completed.
-unsafe fn gpu_idle(gd: *mut GnDevice) -> bool {
-    if gd.is_null() {
-        return false;
-    }
-    unsafe {
-        let mut any = false;
-        let mut q = (*gd).queues;
-        while !q.is_null() {
-            if let Some(wait) = (*gd).f.queue_wait_idle {
-                wait((*q).real);
-                any = true;
-            }
-            q = (*q).next;
-        }
-        if any {
-            return true;
-        }
-        if let Some(wait) = (*gd).f.wait_idle {
-            wait((*gd).real);
-            return true;
-        }
-        false
-    }
-}
-
 /// Bounded one-shot: a cheap content signature of a LINEAR slot, read on the CPU
 /// (alpha=0 pixel count, non-zero byte count, first pixel RGBA). Used by the
 /// always-on acquire/present trace so an all-zero present can be attributed to
@@ -466,15 +448,12 @@ unsafe fn x11_present_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) -> bo
     if present.is_null() {
         return false;
     }
-    // Order the guest's GPU work ahead of the present. The present hands the
-    // slot to Xwayland and the bounded dump reads it on the CPU, so the render
-    // must be complete (and its writes visible) first; see `gpu_idle`.
-    if !unsafe { gpu_idle((*sc).dev) } {
-        crate::logf!(gndrm_obf::obf!(
-            "x11: slot {idx} present skipped - no GPU-completion wait available"
-        ));
-        return false;
-    }
+    // The caller has already waited the slot's own fence, and that fence is
+    // signalled by the shim's present submit, which waits the guest's present
+    // semaphores (see `gn_vkQueuePresentKHR`). So the guest's render into this
+    // slot has completed before the slot is handed to Xwayland or read on the
+    // CPU here: no whole-device drain is needed, and taking one would destroy
+    // all CPU/GPU overlap on the present path.
     // Bounded one-shot (always on): record the presented index, the acquire
     // sequence that filled the slot, and the slot's content signature after the
     // GPU is idle. An all-zero signature here means the guest presented a frame
@@ -557,6 +536,46 @@ unsafe fn x11_present_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) -> bo
         }
     }
     true
+}
+
+/// Walk the bound window at a fraction of the present cadence and tell the
+/// daemon (once) when the game's own window appears, so it can clear the
+/// booting splash on that event instead of on the first published frame.
+/// A no-op once reported, so an idle or already-signalled session costs
+/// nothing; the walk itself is bounded and never hangs.
+///
+/// Reached from BOTH present routes, at the same N-present cadence, so the
+/// override/Wayland route (the default) runs the check too (it previously sat
+/// behind the DRI3-only X11 present and never fired on the shipping
+/// configuration):
+///  - guest-surface route (the opt-in; `surf.x11` set): the present's own live
+///    connection, with `surf.window` — the guest's own window — as the bound
+///    window (see [`crate::x11::window_present`]).
+///  - override route (the default; `surf.x11` null): `surf.window` is the window
+///    the override resolved gamescope will paint; the walk opens its own
+///    connection (see [`crate::x11::game_window_present`]). Rides the cadence,
+///    never the per-frame present path.
+unsafe fn maybe_report_game_window(surf: *mut GnSurface) {
+    if GAME_WINDOW_REPORTED.load(Ordering::Relaxed) {
+        return;
+    }
+    if !GAME_WINDOW_CHECK
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(GAME_WINDOW_CHECK_EVERY)
+    {
+        return;
+    }
+    let present = unsafe { (*surf).x11 };
+    let bound = unsafe { (*surf).window };
+    let game_window_up = if present.is_null() {
+        unsafe { crate::x11::game_window_present(bound) }
+    } else {
+        unsafe { (*present).window_present(bound) }
+    };
+    if game_window_up {
+        GAME_WINDOW_REPORTED.store(true, Ordering::Relaxed);
+        crate::scanout::report_game_window_present();
+    }
 }
 
 /// Frees every X11 slot whose idle fence has triggered - the server is done
@@ -658,6 +677,7 @@ fn worker_main(sc: *mut GnSwapchain) {
                 // and a guest waiting on a release that never comes stalls on
                 // its next acquire.
                 if x11_present_slot(sc, s, idx) {
+                    maybe_report_game_window((*sc).surf);
                     x11_reap(sc);
                 } else {
                     if !X11_DROP_LOGGED.swap(true, Ordering::Relaxed) {
@@ -713,6 +733,11 @@ fn worker_main(sc: *mut GnSwapchain) {
                 wlproto::surface_commit(parent);
                 wlproto::wl_display_flush((*(*sc).surf).dpy)
             };
+            // Override/Wayland route (the default; `GN_VKSHIM_GUEST_SURFACE`
+            // unset or not exactly "1"): same tree-walk cadence as the
+            // guest-surface arm above, so the game's own window clears the
+            // splash on this route too.
+            maybe_report_game_window((*sc).surf);
             let commit_ms = t1.elapsed().as_millis();
             let n = LOG_COMMIT.fetch_add(1, Ordering::Relaxed);
             let done = N_COMMIT_OK.fetch_add(1, Ordering::Relaxed);
@@ -1306,6 +1331,7 @@ unsafe fn present_sync_commit(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32)
         // The X11 present holds the slot until its idle fence triggers; the
         // immediate in_flight clear above is restored on success.
         if unsafe { x11_present_slot(sc, slot, idx) } {
+            maybe_report_game_window((*sc).surf);
             let g = unsafe { (*sc).shared.lock().unwrap() };
             unsafe { (*slot).in_flight = true };
             drop(g);
@@ -1336,6 +1362,9 @@ unsafe fn present_sync_commit(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32)
                 wlproto::wl_display_flush((*(*sc).surf).dpy);
             }
         }
+        // Override/Wayland route (the default; `GN_VKSHIM_GUEST_SURFACE` unset
+        // or not exactly "1"): same tree-walk cadence as the guest-surface arm above.
+        maybe_report_game_window((*sc).surf);
     }
 }
 
@@ -4643,8 +4672,8 @@ extern "C" fn registry_global(
         } else if iface == b"gamescope_swapchain_factory_v2" && !use_guest_surface() {
             // Capability switch (`GN_VKSHIM_GUEST_SURFACE`): the
             // gamescope_swapchain_factory_v2 global is bound only while the
-            // override (default) route is active. The `=1` DRI3 route binds
-            // exactly the globals it always did and nothing more.
+            // override route (the default) is active. The guest-surface
+            // (opt-in) route binds exactly the globals it always did and nothing more.
             (*w).swapchain_factory = wlproto::registry_bind(
                 reg,
                 id,
@@ -5830,29 +5859,47 @@ unsafe extern "C" fn gn_vkCreateWaylandSurfaceKHR(
 
 /// `GN_VKSHIM_GUEST_SURFACE` — the present-route capability switch.
 ///
-/// This shim's DEFAULT (`0` or unset) presents the guest's Vulkan frames to
-/// gamescope's override/Wayland surface (`xlib_override_surface`), ignoring
-/// the guest's window content: Vulkan-only, lowest CPU, no dependence on
-/// Xwayland's DRI3. Setting `GN_VKSHIM_GUEST_SURFACE=1` involves the guest's
-/// surface instead — the DRI3 1.2 + Present route into wine's own X window,
-/// which additionally carries wine's GDI/2D content drawn outside the guest's
-/// Vulkan surface.
+/// This shim's DEFAULT (`0`, and every value other than exactly `1`) is the
+/// override/Wayland route (`xlib_override_surface`): the guest's Vulkan frames
+/// are presented to gamescope's override/Wayland surface, ignoring the guest's
+/// window content — Vulkan-only, the cheapest, and independent of Xwayland's
+/// DRI3. It is the default because it is the route that keeps presenting here:
+/// the splash-clear detection rides the tree walk that runs on BOTH routes (see
+/// `maybe_report_game_window`), so the frame path is chosen on its own merits —
+/// and the guest-surface route's commit stream stalls when the guest's Vulkan
+/// swapchain comes up (see `docs/14-guest-surface-commit-stall.md`).
+///
+/// Setting `GN_VKSHIM_GUEST_SURFACE=1` opts in to the guest-surface route: the
+/// DRI3 1.2 + Present route into wine's own X window, which carries wine's
+/// GDI/2D content drawn outside the guest's Vulkan surface as well as the
+/// guest's frames. GDI/2D content is the reason to take it.
 ///
 /// This is a deliberate, documented capability switch — not scaffolding. It
 /// intentionally deviates from the project's usual "no knobs" rule by the
-/// user's decision: `=1` restores GDI/2D support at a CPU cost.
+/// user's decision: `=1` trades the cheaper, Xwayland-independent frame path
+/// away for GDI/2D support and the real window.
 fn use_guest_surface() -> bool {
-    std::env::var_os("GN_VKSHIM_GUEST_SURFACE").is_some_and(|v| v == "1")
+    // The DEFAULT is 0 — the override/Wayland route (gamescope's own override
+    // surface). Stated as an explicit constant (not implied by the comparison)
+    // so the default is a decision in the code: unset, empty, or any value
+    // other than exactly "1" is 0, and only the exact value "1" departs from it.
+    const DEFAULT_GUEST_SURFACE: u8 = 0;
+    let selected = match std::env::var("GN_VKSHIM_GUEST_SURFACE").as_deref() {
+        Ok("1") => 1,
+        _ => DEFAULT_GUEST_SURFACE,
+    };
+    selected == 1
 }
 
-/// The override/Wayland present route — the shim's DEFAULT (see
-/// `use_guest_surface`). Creates the shim's OWN wl_surface, wraps it in a
+/// The override/Wayland present route — the DEFAULT (`GN_VKSHIM_GUEST_SURFACE`
+/// unset, or any value other than exactly `1`; see `use_guest_surface`).
+/// Creates the shim's OWN wl_surface, wraps it in a
 /// gamescope_swapchain, and binds it to the guest's X window via
 /// override_window_content; the compositor then routes this surface's commits
 /// as that window's content. Presenting therefore shows the guest's frames
 /// directly — wine's own GDI/2D window content is NOT composited (the known
 /// and accepted "chooses, never combines" consequence of this route). That
-/// GDI/2D gap is exactly the cost the `=1` DRI3 route buys back.
+/// GDI/2D gap is exactly what the guest-surface route (the opt-in) buys.
 ///
 /// Recovered from `cb89a9f^` (the commit whose DRI3 route deleted it); adapted
 /// to the current shim (the `x11` field on `GnSurface`, the worker's existing
@@ -5871,7 +5918,7 @@ unsafe fn xlib_override_surface(
     // painted window and leaves a legitimate one untouched (see x11.rs).
     let bound_window = unsafe { crate::x11::resolve_override_target(window) };
     crate::logf!(gndrm_obf::obf!(
-        "override: XID {window:#x} -> gamescope override surface on {bound_window:#x} (default; guest GDI/2D not composited)"
+        "override: XID {window:#x} -> gamescope override surface on {bound_window:#x} (default route; guest GDI/2D not composited)"
     ));
     if !wl_setup(ptr::null_mut()) {
         crate::logf!(gndrm_obf::obf!(
@@ -5948,9 +5995,10 @@ unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     // Present-route capability switch (`GN_VKSHIM_GUEST_SURFACE`, see
-    // `use_guest_surface`). The DEFAULT (0/unset) presents the guest's Vulkan
-    // frames to the gamescope override/Wayland surface; `=1` selects the
-    // DRI3-into-wine's-X-window route below, which restores wine's GDI/2D.
+    // `use_guest_surface`). The DEFAULT (unset, or anything but exactly "1") is
+    // the gamescope override/Wayland surface, taken here; `=1` opts in to the
+    // DRI3-into-wine's-X-window route below, which carries wine's GDI/2D and
+    // hands the shim the real window.
     if !use_guest_surface() {
         return unsafe { xlib_override_surface(gi, ci.window as u32, out) };
     }
@@ -6037,9 +6085,9 @@ unsafe extern "C" fn gn_vkDestroySurfaceKHR(
         if !(*s).x11.is_null() {
             drop(Box::from_raw((*s).x11));
         }
-        // The override route (default) owns a wl_surface + gamescope_swapchain.
-        // Both are null on the `GN_VKSHIM_GUEST_SURFACE=1` DRI3 route, so this
-        // teardown is inert there.
+        // The override route (the default) owns a wl_surface +
+        // gamescope_swapchain. Both are null on the guest-surface DRI3
+        // route (the opt-in), so this teardown is inert there.
         if !(*s).swapchain_obj.is_null() || !(*s).own_surface.is_null() {
             let _sg = SEND_LOCK.lock().unwrap();
             if !(*s).swapchain_obj.is_null() {

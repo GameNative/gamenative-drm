@@ -39,7 +39,7 @@ mod log_policy;
 
 use std::io;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
@@ -61,10 +61,11 @@ const E_IO: jint = -5;
 /// `nativeRetargetSurface` with no running session; the caller starts one.
 const E_NOENT: jint = -2;
 
-/// Real frames put on the panel (fb != 0 commits — gamescope's blank fb=0
-/// commits excluded). Reset by `nativeStart`/`nativeStop`; its 0->1 edge drives
-/// the booting-splash dismissal upcall ([`clear_booting_splash`]).
-pub(crate) static PRESENTED_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// Whether the game's own window has appeared this session, as reported by the
+/// ICD shim over the scan-out channel (a [`gndrm_uapi::wire::GameWindowNote`]).
+/// The presenter's latched booting-splash clear reads it; reset alongside the
+/// rest of the session state by `nativeStart`/`nativeStop`.
+pub(crate) static GAME_WINDOW_PRESENT: AtomicBool = AtomicBool::new(false);
 
 /// The app's `JavaVM`, cached from the first JNI entry point (`nativeStart`).
 /// Needed by the presenter thread, which is a Rust-spawned thread with no
@@ -119,7 +120,24 @@ fn cache_java_vm(env: &mut JNIEnv) {
 /// a failure to attach, a missing cached VM, or a failing call is logged and
 /// swallowed; nothing on this path may panic.
 pub(crate) fn clear_booting_splash() {
-    call_app_static("clearBootingSplash");
+    let outcome = call_app_static("clearBootingSplash");
+    // UNGATED one-shot: the last hop of the splash-clear chain. This method's
+    // own line is gated (`GNDRM_LOG_*`), and the container's environment does
+    // not reach this app process, so the upcall's outcome is otherwise
+    // invisible on device. Latched, and the caller's own latch already makes
+    // the call once per session.
+    {
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            crate::log_always!(
+                "gndrm-daemon: splash-clear upcall clearBootingSplash outcome={}",
+                match outcome {
+                    AppCall::Ok => "ok",
+                    AppCall::Failed => "failed",
+                }
+            );
+        }
+    }
 }
 
 /// Notify the app that the daemon published a new frame, so its frame-time ring
@@ -127,7 +145,31 @@ pub(crate) fn clear_booting_splash() {
 /// on the commit worker per new frame; best-effort, and a no-op on the app side
 /// when the metrics collector is not running.
 pub(crate) fn notify_frame_published() {
-    call_app_static("onFramePublished");
+    let _ = call_app_static("onFramePublished");
+}
+
+/// Latch [`GAME_WINDOW_PRESENT`]. Called by the scan-out channel reader when the
+/// ICD shim reports the game's own window as present. Idempotent, so a repeat
+/// notification is free.
+pub(crate) fn note_game_window_present() {
+    if !GAME_WINDOW_PRESENT.swap(true, Ordering::Relaxed) {
+        log_info!(
+            "{}",
+            gndrm_obf::obf!("daemon: game window present reported by the shim")
+        );
+    }
+}
+
+/// Outcome of a [`call_app_static`] upcall, so a caller can report the link it
+/// owns instead of a failure being indistinguishable from a success.
+#[derive(Clone, Copy)]
+enum AppCall {
+    /// The method ran to completion with no pending Java exception.
+    Ok,
+    /// The call could not be made (no cached VM or class, attach failed), or the
+    /// method threw. The reason is logged; a thrown exception is cleared here so
+    /// it cannot poison the calling thread.
+    Failed,
 }
 
 /// Attach the calling thread (kept attached — a per-frame caller keeps one
@@ -135,20 +177,20 @@ pub(crate) fn notify_frame_published() {
 /// session), call a no-arg static method on `GameNativeDrm`. The class must be
 /// resolved on a Java thread, so it comes from [`CALLBACK_CLASS`]; every failure
 /// is logged and swallowed.
-fn call_app_static(method: &str) {
+fn call_app_static(method: &str) -> AppCall {
     let Some(vm) = JAVA_VM.get() else {
         log_warn!(
             "{}",
             gndrm_obf::obf!("{method}: no cached JavaVM; call skipped")
         );
-        return;
+        return AppCall::Failed;
     };
     let Some(class) = CALLBACK_CLASS.get() else {
         log_warn!(
             "{}",
             gndrm_obf::obf!("{method}: GameNativeDrm class not cached; call skipped")
         );
-        return;
+        return AppCall::Failed;
     };
     let mut env = match vm.attach_current_thread_permanently() {
         Ok(env) => env,
@@ -157,15 +199,30 @@ fn call_app_static(method: &str) {
                 "{}",
                 gndrm_obf::obf!("{method}: attach_current_thread failed: {e}")
             );
-            return;
+            return AppCall::Failed;
         }
     };
     match env.call_static_method(class, method, "()V", &[]) {
-        Ok(_) => log_info!("{}", gndrm_obf::obf!("{method}: called")),
+        Ok(_) => {
+            // A `()V` call comes back `Ok` even when the Java body threw: the
+            // jni crate never inspects the pending exception on its void path,
+            // so the throw would be reported as a success and left pending on
+            // this thread, where every later JNI call is undefined. Check it
+            // here, name it, and clear it.
+            if let Ok(true) = env.exception_check() {
+                let _ = env.exception_describe();
+                let _ = env.exception_clear();
+                log_warn!("{}", gndrm_obf::obf!("{method}: threw; exception cleared"));
+                return AppCall::Failed;
+            }
+            log_info!("{}", gndrm_obf::obf!("{method}: called"));
+            AppCall::Ok
+        }
         Err(e) => {
             log_warn!("{}", gndrm_obf::obf!("{method}: call failed: {e}"));
             // Never leave a pending exception on this thread.
             let _ = env.exception_clear();
+            AppCall::Failed
         }
     }
 }
@@ -476,6 +533,11 @@ fn server_thread_inner(
     if crate::log_policy::enabled(crate::log_policy::Gate::Daemon) {
         dev.set_logger(Box::new(crate::log::daemon_info));
     }
+    // The commit probe's sink is installed unconditionally: it is the one
+    // daemon-side line a device pass can rely on, because no `GNDRM_LOG_*` from
+    // the container reaches this process (see `Device::set_always_logger`). The
+    // probe applies its own rate limit, so this costs nothing per frame.
+    dev.set_always_logger(Box::new(crate::log::daemon_always));
     // Teach the pool the geometry of every framebuffer the client registers,
     // so a length-only scan-out request for a window-sized buffer resolves
     // even before that buffer is first published. This takes the pool's own
@@ -558,14 +620,14 @@ fn start(
     width: jint,
     height: jint,
 ) -> jint {
-    PRESENTED_FRAMES.store(0, Ordering::Relaxed);
+    GAME_WINDOW_PRESENT.store(false, Ordering::Relaxed);
     // Session start: drop the cached `GNDRM_HDR` verdict so this session
     // re-reads the environment. The launcher sets the variable (via
     // `Os.setenv`) after this returns and before the guest forks, so the first
     // plane query — which is what resolves the flag — sees this session's value.
     reset_hdr_output_cache();
     // First JNI entry point to run: capture the VM so the presenter thread can
-    // push the booting-splash event on the first frame.
+    // push the booting-splash event when the game's own window is reported.
     cache_java_vm(env);
     let name: String = match env.get_string(socket_name) {
         Ok(s) => s.to_string_lossy().into_owned(),
@@ -826,7 +888,7 @@ fn stop() {
     // again.
     // SAFETY: presenter no longer references the window.
     unsafe { ffi::ANativeWindow_release(rt.window.0) };
-    PRESENTED_FRAMES.store(0, Ordering::Relaxed);
+    GAME_WINDOW_PRESENT.store(false, Ordering::Relaxed);
     log_info!("{}", gndrm_obf::obf!("stopped"));
 }
 

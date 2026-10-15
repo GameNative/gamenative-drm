@@ -59,9 +59,12 @@ translated; and the ICD embeds a build timestamp, so a packaged payload is not
 bit-reproducible. See `docs/10-fps-limit.md`, `docs/11-refresh-model.md` and
 `docs/12-present-latency-budget.md`.
 
-Diagnostic switches (all default off): `GNDRM_LOG_*` selects a module to log (see
+Diagnostic switches (all default off, with one documented exception):
+`GNDRM_LOG_*` selects a module to log (see
 `modules/gndrm-daemon/src/log_policy.rs`), `GN_VKSHIM_*` affect the ICD's own
-paths, `GN_VKSHIM_GUEST_SURFACE=1` selects the guest-surface present route, and
+paths — `GN_VKSHIM_GUEST_SURFACE` is that exception: it selects the present
+route and defaults to the override/Wayland route, so `GN_VKSHIM_GUEST_SURFACE=1`
+is the opt-in to the guest-surface DRI3 one — and
 `GNDRM_DUMP_DIR` / `GAMENATIVE_DUMP_DIR` enable dumps (game process and app
 process respectively). Winding compensation is unconditional (no switch): the
 driver leaves effective winding alone under a flipped viewport, so the shim

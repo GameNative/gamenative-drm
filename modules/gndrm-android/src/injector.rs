@@ -182,6 +182,12 @@ pub fn start(runtime_dir: String, display: String) -> i32 {
     }
 }
 
+/// How long `nativeInjectorStop` may wait for the injector thread to leave its
+/// loop. The thread tests `stop` at the top of that loop and inside a 100 ms
+/// receive timeout, so a compositor that is answering lets it go almost
+/// immediately; this bound is for the compositor that is present but silent.
+const JOIN_TIMEOUT: Duration = Duration::from_millis(1000);
+
 /// `GameNativeDrm.nativeInjectorStop()`.
 pub fn stop() {
     let handle = INJECTOR
@@ -194,7 +200,29 @@ pub fn stop() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     handle.stop.store(true, Ordering::SeqCst);
     if let Some(t) = handle.thread.take() {
-        let _ = t.join();
+        // Bounded join, because this runs on the app's MAIN thread: an
+        // unbounded `join()` is an ANR whenever the thread cannot observe
+        // `stop`, and it cannot while it waits on the Wayland socket — that wait
+        // is `rustix::event::poll(fd, None)`, an infinite timeout, so a
+        // compositor holding its socket open without answering parks the thread
+        // where the stop check is never reached. The bound is the whole fix: the
+        // app never waits longer than this. A thread that misses the deadline is
+        // detached rather than joined, and returns on its own as soon as the
+        // socket errors — which is what gamescope exiting does, closing it.
+        let deadline = std::time::Instant::now() + JOIN_TIMEOUT;
+        let mut finished = t.is_finished();
+        while !finished && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+            finished = t.is_finished();
+        }
+        if finished {
+            let _ = t.join();
+        } else {
+            log_warn!(
+                "{}",
+                gndrm_obf::obf!("injector thread parked past {JOIN_TIMEOUT:?}; detached")
+            );
+        }
     }
     log_info!("{}", gndrm_obf::obf!("injector stopped"));
 }

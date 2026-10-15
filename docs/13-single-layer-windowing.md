@@ -128,39 +128,47 @@ The second channel is a genuine ordinary-client path, and it is implemented.
 > + Present: **the compositor's own Xwayland IS the client, so the flip reaches
 > the compositor without any `gamescope_swapchain` override.**
 
-`GN_VKSHIM_GUEST_SURFACE=1` selects it (`use_guest_surface()`,
-`icd_shim/src/proxy.rs`). On that route the frame becomes the window's own
+It is the opt-in present route (`use_guest_surface()` returning true,
+`icd_shim/src/proxy.rs`; `GN_VKSHIM_GUEST_SURFACE=1`); the override/Wayland route is the default. On that route the frame becomes the window's own
 content through an ordinary X11 present — `xcb_dri3_pixmap_from_buffers` +
 `xcb_present_pixmap`, release riding an X sync idle fence — and the window's
 content is then its normal Xwayland `wl_surface`, which gamescope composites
 through the stock `main_surface` path. **No override, no `gamescope_swapchain`,
 no shim-owned `wl_surface`.**
 
-### 3.3 Why the override is nonetheless the default
+### 3.3 Which route is the default, and why it is the override one
 
 `use_guest_surface()`'s own doc:
 
-> This shim's DEFAULT (`0` or unset) presents the guest's Vulkan frames to
-> gamescope's override/Wayland surface (`xlib_override_surface`), ignoring the
-> guest's window content: **Vulkan-only, lowest CPU, no dependence on
-> Xwayland's DRI3.** Setting `GN_VKSHIM_GUEST_SURFACE=1` involves the guest's
-> surface instead — the DRI3 1.2 + Present route into wine's own X window, which
-> additionally carries wine's GDI/2D content drawn outside the guest's Vulkan
-> surface.
+> This shim's DEFAULT (`0`, and every value other than exactly `1`) is the
+> override/Wayland route (`xlib_override_surface`): the guest's Vulkan frames
+> are presented to gamescope's override/Wayland surface, ignoring the guest's
+> window content — Vulkan-only, the cheapest, and independent of Xwayland's
+> DRI3. **It is the default because it is the route that keeps presenting
+> here**: the splash-clear detection rides the tree walk that runs on BOTH
+> routes (see `maybe_report_game_window`), so the frame path is chosen on its
+> own merits — and the guest-surface route's commit stream stalls when the
+> guest's Vulkan swapchain comes up (`14-guest-surface-commit-stall.md`).
 
 and, on the override arm itself:
 
 > Presenting therefore shows the guest's frames directly — **wine's own GDI/2D
 > window content is NOT composited (the known and accepted "chooses, never
-> combines" consequence of this route).** That GDI/2D gap is exactly the cost
-> the `=1` DRI3 route buys back.
+> combines" consequence of this route).** That GDI/2D gap is exactly what the
+> guest-surface route (the opt-in) buys.
 
 So the trade is explicit and recorded: the override is a **lower-cost, lower-
 capability** route (no Xwayland leg on the frame path, but a window can only
 ever show the guest's Vulkan frame). The DRI3 route is a **higher-cost,
 strictly-more-capable** route (one window carries the guest's frame *and* wine's
-GDI/2D). The motivation for the default is the frame-path cost, not an inability
-to do the ordinary thing.
+GDI/2D). `eba9ed9` shipped with the frame-path cost as the deciding argument and
+the override as the default; a later choice demoted it, because the shim needs
+the real window for the splash-clear detection — and that reason has since been
+withdrawn, because the detection now rides the tree walk that runs on both routes
+and the guest-surface route's own commit stream stalls when the guest's Vulkan
+swapchain comes up (`14-guest-surface-commit-stall.md`). So the override is the
+default again and the guest-surface route is the opt-in
+(`GN_VKSHIM_GUEST_SURFACE=1`).
 
 ### 3.4 What the override *does* require: the XID and the root-child walk
 
@@ -193,8 +201,9 @@ keep and correctly size a window whose X geometry says nothing.
 - **Not by the multi-window case.** `content_overrides` is an
   `unordered_map<uint32_t /*xid*/, wlserver_content_override *>`; one override
   per window, several windows = several overrides. Both routes handle it.
-- **The concrete reason is §3.3**: it is the default the user chose, for
-  frame-path cost, over a route that exists and is host-proven.
+- **The concrete reason is §3.3**: it was the default the user chose, for
+  frame-path cost, over a route that exists and is host-proven — and it is the
+  default again, for that cost plus the opt-in route's own commit stall.
 
 ### 3.6 Provenance: recorded, not reconstructed
 
@@ -263,12 +272,17 @@ surface is composited.**
 
 ## 5. Target architecture
 
-### 5.1 Decision: keep the override as the shipped default; narrow it; do not delete it yet
+### 5.1 Decision: keep the override; narrow it; do not delete it yet
 
 Rationale:
 
-1. It is the **documented, user-chosen default** (`eba9ed9`), and the frame-path
-   cost it buys is the reason.
+1. It was the **documented, user-chosen default** (`eba9ed9`), and the frame-path
+   cost it buys is the reason. It was briefly demoted to the opt-in so the shim
+   would hold the real window for the splash-clear detection; that reason is
+   withdrawn — the detection rides the tree walk on both routes — and the
+   guest-surface route stalls (`14-guest-surface-commit-stall.md`), so the
+   override is the default again (`GN_VKSHIM_GUEST_SURFACE` unset) and the
+   guest-surface route is the opt-in (`GN_VKSHIM_GUEST_SURFACE=1`).
 2. The alternative is **not free**: `docs/08 §6` names "render-target acceptance
    (primary)" as the unproven step of the DRI3 route — the guest rendering *into*
    the shim's buffer must be accepted by the driver as a colour attachment, and
@@ -336,7 +350,7 @@ would need — and that is needed only if the default is ever switched.
 
 | patch | disposition |
 |---|---|
-| A29 (0029), A30 (0030), diagnostics A25 (0025), diagnostics A30 (0030) | **Parked in `disabled/`.** The override mechanism itself is **stock** — `current_surface()` returns `override_surface` when one is set and the commit-accept path filters to it — so these are refinements, not the mechanism: A29 removes a 1×1 degenerate-ancestor discard, A30 selects which queued override commit is kept and sizes the layer from the committed buffer instead of X geometry. **Measured with all four disabled**: Dave, Hades II and Dishonored all render through the still-present override with `GN_VKSHIM_GUEST_SURFACE` unset — so deleting them would not remove the override, and restoring them is about A30's hold, not about rendering at all. A30's hold is untested for the case it exists for (a pause or loading gap where the guest briefly stops presenting). |
+| A29 (0029), A30 (0030), diagnostics A25 (0025), diagnostics A30 (0030) | **Parked in `disabled/`.** The override mechanism itself is **stock** — `current_surface()` returns `override_surface` when one is set and the commit-accept path filters to it — so these are refinements, not the mechanism: A29 removes a 1×1 degenerate-ancestor discard, A30 selects which queued override commit is kept and sizes the layer from the committed buffer instead of X geometry. **Measured with all four disabled**: Dave, Hades II and Dishonored all render through the still-present override with `GN_VKSHIM_GUEST_SURFACE` unset (which selected the override then; unset selects the override route again) — so deleting them would not remove the override, and restoring them is about A30's hold, not about rendering at all. A30's hold is untested for the case it exists for (a pause or loading gap where the guest briefly stops presenting). |
 | A31 — re-assert seat pointer focus (gamescope + diagnostics) | **Removed** (see §6 — abandoned as the wrong direction). It was chasing a `win_surface()` vs `override_surface()` divergence that A30 created; a single-layer model that names the composited surface explicitly would not have that divergence. |
 | A31-composite-on-active-look (`disabled/`) | Parked; orthogonal to the layer model (§4.1). |
 | All of §4.2, §4.3 | **Keep unchanged.** |
@@ -404,5 +418,5 @@ is not misled; updating them is a separate decision.
 | doc | says | code says |
 |---|---|---|
 | `04-gamenative-app.md §3.5` | "Desktop naming: `/desktop=gamescope`, never `shell`" | `XServerScreen.kt` now uses `shell` for both arms (this change); `PreInstallSteps.kt` already used `shell`; the pre-existing code used `shell` for the X11 arm. The doc's stated reason (explorer's shell/taskbar only for the magic name) is the open question in §7.1. |
-| `05-xwayland-reintroduction.md §3–4`, `08-xwayland-render-node.md` | the XID-bound override is the path (§05), and "The gamescope override is gone… the previous override / `gamescope_swapchain` path is deleted" (§08, status "implemented") | `eba9ed9` (2026-10-04) put the **override back as the default** two days before `47b72c9` (2026-10-06) committed the docs. The override is the shipped default; the DRI3 route is the opt-in (`GN_VKSHIM_GUEST_SURFACE=1`). §08 describes the target state, not the current one. |
+| `05-xwayland-reintroduction.md §3–4`, `08-xwayland-render-node.md` | the XID-bound override is the path (§05), and "The gamescope override is gone… the previous override / `gamescope_swapchain` path is deleted" (§08, status "implemented") | `eba9ed9` (2026-10-04) put the override back as the default two days before `47b72c9` (2026-10-06) committed the docs; the default was briefly reversed and has since been restored, so the **override/Wayland route is the default and `GN_VKSHIM_GUEST_SURFACE=1` opts in to the guest-surface DRI3 route**. §08 describes the target state, not the code. |
 | `03-gamescope-build.md` | A31 = "composite while a colour look is set" | the colour-look patch is parked in `disabled/`; the A31 that was in the train (seat pointer-focus re-assert) is reverted by this change. |
