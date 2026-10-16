@@ -402,6 +402,140 @@ impl GameWindowNote {
     }
 }
 
+// ------------------------------------------------------- frame cap
+//
+// The user's fps cap is decided in the daemon and enforced in the ICD shim.
+// The daemon holds the target (the app pushes it through `nativeSetFpsLimit`),
+// and the scan-out channel is the only link the shim has to it. The shim holds
+// the target it was last told and the only gate that can block the guest (the
+// guest blocks in `vkAcquireNextImageKHR` until a slot frees), so it derives
+// the release floor from the target itself, at each release it sees: one
+// period (`1 / target`) since its own previous release. A per-buffer deadline
+// cannot be handed out for that, because a hand-out happens once per pool
+// buffer per session while a release happens every frame.
+//
+// A note therefore carries exactly one value, the current target, and no
+// schedule. It rides the scan-out channel the shim already holds; no new
+// socket and no second channel is introduced.
+//
+// Compatibility. The channel is a strict one-request/one-response exchange, so
+// an unsolicited frame would desynchronise a shim that does not expect one.
+// The daemon therefore sends a [`FrameCapNote`] only on a connection that has
+// opted in with a [`FrameCapSubscribe`]: a shim that never subscribes sees
+// exactly the frames it saw before, and a new shim against an older daemon
+// simply never receives a note (its subscribe is logged and skipped, as every
+// unknown magic already is). A mismatched pair therefore stays uncapped
+// instead of faulting the scan-out allocator they still share.
+//
+// The shim's obligation, in two sentences. A note updates the target it
+// enforces, and a release of a slot must not free it before one target period
+// has passed since this shim's own previous release. That floor is at or below
+// the guest's own interval whenever the target is at or above the guest's
+// rate, so honouring it can never make a title slower than it would be
+// uncapped: a release already at or after the floor is not delayed at all, and
+// one before it is only moved up to the floor. The rate a title delivers is
+// therefore its own rate when it is below the target, and the target when it is
+// above.
+
+/// Frame-cap note magic: ASCII "GNFC". Daemon -> shim.
+pub const FRAME_CAP_MAGIC: u32 = 0x474E_4643;
+
+/// Frame-cap subscribe magic: ASCII "GNCS". Shim -> daemon.
+pub const FRAME_CAP_SUBSCRIBE_MAGIC: u32 = 0x474E_4353;
+
+/// The `fps` of a [`FrameCapNote`] when no cap is in force: the guest presents
+/// at its own rate.
+pub const FPS_UNCAPPED: u32 = 0;
+
+/// The `caps` bit a [`FrameCapSubscribe`] sets once the shim can honour
+/// [`FrameCapNote`]: it enforces the release floor the target implies.
+pub const CAP_FRAME_CAP: u32 = 1 << 0;
+
+/// The fps target, daemon -> shim, on the scan-out channel.
+///
+/// Encoded little-endian, 24 bytes:
+/// `magic:u32, fps:u32, reserved:u64, reserved:u64`. The tail is reserved:
+/// written as zero and ignored on decode. Its width is the shape this
+/// capability was defined with, and a shim matches on the frame length and the
+/// magic, so the two must not change under one.
+///
+/// `fps` is the current target, [`FPS_UNCAPPED`] when the limiter is off. The
+/// shim adopts it on every note and derives the release floor from it; the
+/// floor itself is not on the wire, because it is measured from the shim's own
+/// previous release, which only the shim observes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameCapNote {
+    /// The current target, [`FPS_UNCAPPED`] when uncapped.
+    pub fps: u32,
+}
+
+impl FrameCapNote {
+    pub const LEN: usize = 24;
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[0..4].copy_from_slice(&FRAME_CAP_MAGIC.to_le_bytes());
+        b[4..8].copy_from_slice(&self.fps.to_le_bytes());
+        b
+    }
+
+    /// `None` when `b` is not exactly one encoded note (short frame, bad magic,
+    /// or trailing bytes). The reserved tail carries no value and is not
+    /// validated, so a note from a daemon that still wrote it decodes.
+    #[must_use]
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN || u32::from_le_bytes(b[0..4].try_into().ok()?) != FRAME_CAP_MAGIC {
+            return None;
+        }
+        Some(Self {
+            fps: u32::from_le_bytes(b[4..8].try_into().ok()?),
+        })
+    }
+}
+
+/// The shim's opt-in to frame-cap notes, shim -> daemon, on the scan-out
+/// channel.
+///
+/// Encoded little-endian, 24 bytes:
+/// `magic:u32, caps:u32, reserved:u64, reserved:u64`.
+/// The daemon latches the capability for the connection and answers with the
+/// current target as a [`FrameCapNote`]; it pushes the same note again whenever
+/// the target changes. `caps` is a bitmask of what the shim can honour, today
+/// only [`CAP_FRAME_CAP`]. A shim that never sends this is sent no
+/// [`FrameCapNote`] -- one frame per request, as before -- which is what keeps an
+/// older shim on the channel it expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameCapSubscribe {
+    /// Capability bits; today only [`CAP_FRAME_CAP`].
+    pub caps: u32,
+}
+
+impl FrameCapSubscribe {
+    pub const LEN: usize = 24;
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[0..4].copy_from_slice(&FRAME_CAP_SUBSCRIBE_MAGIC.to_le_bytes());
+        b[4..8].copy_from_slice(&self.caps.to_le_bytes());
+        b
+    }
+
+    /// `None` when `b` is not exactly one encoded subscribe.
+    #[must_use]
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN
+            || u32::from_le_bytes(b[0..4].try_into().ok()?) != FRAME_CAP_SUBSCRIBE_MAGIC
+        {
+            return None;
+        }
+        Some(Self {
+            caps: u32::from_le_bytes(b[4..8].try_into().ok()?),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,5 +747,76 @@ mod tests {
         // would exchange red and blue on the panel.
         assert_eq!(scanout_ahb_format(ScanoutLayout::EightBit), 5);
         assert_eq!(SCANOUT_FORMAT_BGRA_8888, 5);
+    }
+
+    #[test]
+    fn frame_cap_note_round_trip() {
+        let note = FrameCapNote { fps: 120 };
+        let enc = note.encode();
+        assert_eq!(enc.len(), FrameCapNote::LEN);
+        assert_eq!(enc[0..4], FRAME_CAP_MAGIC.to_le_bytes());
+        assert_eq!(FrameCapNote::decode(&enc), Some(note));
+
+        // The reserved tail carries nothing: the note is the target alone, and
+        // the uncapped target is FPS_UNCAPPED.
+        assert_eq!(FrameCapNote::decode(&note.encode()), Some(note));
+        let uncapped = FrameCapNote { fps: FPS_UNCAPPED };
+        assert_eq!(FrameCapNote::decode(&uncapped.encode()), Some(uncapped));
+
+        // Its magic is its own: no other shape on the channel decodes as a note
+        // and a note never decodes as another shape.
+        assert_ne!(FRAME_CAP_MAGIC, SCANOUT_MAGIC);
+        assert_ne!(FRAME_CAP_MAGIC, GAME_WINDOW_MAGIC);
+        assert_ne!(FRAME_CAP_MAGIC, FRAME_CAP_SUBSCRIBE_MAGIC);
+        assert_eq!(FrameCapNote::decode(&[0u8; FrameCapNote::LEN]), None);
+        assert_eq!(FrameCapNote::decode(&[]), None);
+        let mut extra = note.encode().to_vec();
+        extra.push(0);
+        assert_eq!(FrameCapNote::decode(&extra), None);
+        let mut short = note.encode().to_vec();
+        short.truncate(FrameCapNote::LEN - 1);
+        assert_eq!(FrameCapNote::decode(&short), None);
+    }
+
+    #[test]
+    fn frame_cap_note_wire_layout_is_pinned() {
+        // The exact bytes the shim matches on: magic "GNFC", then fps, then the
+        // reserved tail, all LE. A note whose tail a daemon still writes
+        // decodes to the same target, which is what keeps the shipped frame
+        // shape usable in either direction.
+        let note = FrameCapNote { fps: 60 };
+        let mut pinned = [0u8; FrameCapNote::LEN];
+        pinned[0..4].copy_from_slice(&[0x43, 0x46, 0x4E, 0x47]); // "GNFC"
+        pinned[4..8].copy_from_slice(&[0x3C, 0x00, 0x00, 0x00]); // 60
+        assert_eq!(note.encode(), pinned);
+        for tail in [
+            [0u8; 16],
+            [
+                0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13,
+                0x12, 0x11,
+            ],
+        ] {
+            let mut bytes = pinned;
+            bytes[8..24].copy_from_slice(&tail);
+            assert_eq!(FrameCapNote::decode(&bytes), Some(note));
+        }
+    }
+
+    #[test]
+    fn frame_cap_subscribe_round_trip() {
+        let sub = FrameCapSubscribe {
+            caps: CAP_FRAME_CAP,
+        };
+        let enc = sub.encode();
+        assert_eq!(enc.len(), FrameCapSubscribe::LEN);
+        assert_eq!(enc[0..4], FRAME_CAP_SUBSCRIBE_MAGIC.to_le_bytes());
+        assert_eq!(FrameCapSubscribe::decode(&enc), Some(sub));
+        assert_eq!(
+            FrameCapSubscribe::decode(&[0u8; FrameCapSubscribe::LEN]),
+            None
+        );
+        // A subscribe never decodes as a note and vice versa.
+        assert_eq!(FrameCapNote::decode(&enc), None);
+        assert_eq!(FrameCapSubscribe::decode(&sub.encode()), Some(sub));
     }
 }

@@ -19,8 +19,12 @@
 //! the retained last frame, keeping the listen sockets, the object stores and
 //! the gamescope connection alive; `nativeStop()` stays the session-exit path.
 //!
-//! The session's refresh rate is not a caller concern: the daemon owns it as
-//! its own constant (`gndrm_daemon::SESSION_REFRESH_MHZ`).
+//! The session's vblank grid is not a caller concern: the daemon owns it as
+//! its own constant (`gndrm_daemon::SESSION_REFRESH_MHZ`). The panel's real
+//! refresh rate *is* one: the app supplies it through
+//! `nativeSetPanelRefreshHz` before `nativeStart`, and it becomes the emulated
+//! mode's rate — the refresh advertised to clients — while the grid stays the
+//! daemon's constant.
 //!
 //! On non-Android targets this crate is an empty stub so host-side
 //! workspace gates (fmt/clippy/test) stay green; the real gates for this
@@ -39,7 +43,7 @@ mod log_policy;
 
 use std::io;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
@@ -51,7 +55,7 @@ use jni::{JNIEnv, JavaVM};
 
 use gndrm_daemon::diag;
 use gndrm_daemon::server;
-use gndrm_daemon::{reset_hdr_output_cache, Device, NullPresenter, PanelDesc};
+use gndrm_daemon::{reset_hdr_output_cache, Device, FrameCap, NullPresenter, PanelDesc};
 
 /// Return codes are negative errno-style values (`0` = success).
 const E_BUSY: jint = -16;
@@ -66,6 +70,30 @@ const E_NOENT: jint = -2;
 /// The presenter's latched booting-splash clear reads it; reset alongside the
 /// rest of the session state by `nativeStart`/`nativeStop`.
 pub(crate) static GAME_WINDOW_PRESENT: AtomicBool = AtomicBool::new(false);
+
+/// The session's fps cap: the target the app set, which the scan-out channel
+/// hands to a subscribed shim on its subscribe and pushes again whenever it
+/// changes (see [`gndrm_daemon::FrameCap`]). Written by the JNI setter, read by
+/// the scan-out channel. Process-lifetime, like the panel rate: a target set
+/// once survives a session restart.
+pub(crate) static FRAME_CAP: Mutex<FrameCap> = Mutex::new(FrameCap::new());
+
+/// The scan-out thread's cap-change eventfd, so
+/// [`Java_app_gamenative_display_GameNativeDrm_nativeSetFpsLimit`] can wake a
+/// [`asc::serve_scanout`] parked in `poll` and have it push a new target to the
+/// shim. `-1` while no scan-out thread holds one.
+static CAP_CHANGED_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// The panel's real refresh rate in millihertz, supplied by the app through
+/// [`Java_app_gamenative_display_GameNativeDrm_nativeSetPanelRefreshHz`] before
+/// the session starts; 0 until then.
+///
+/// It is a session-level input, not per-frame: the emulated mode is built once
+/// when `nativeStart` assembles the [`PanelDesc`], and gamescope learns it then.
+/// A value set after `nativeStart` does not reach the running session. It is
+/// process-lifetime (not reset per session) so an app that supplies it once
+/// still gets it for every later session.
+static PANEL_REFRESH_MHZ: AtomicU32 = AtomicU32::new(0);
 
 /// The app's `JavaVM`, cached from the first JNI entry point (`nativeStart`).
 /// Needed by the presenter thread, which is a Rust-spawned thread with no
@@ -146,6 +174,27 @@ pub(crate) fn clear_booting_splash() {
 /// when the metrics collector is not running.
 pub(crate) fn notify_frame_published() {
     let _ = call_app_static("onFramePublished");
+}
+
+/// Store a new cap target and, when it changed, wake the scan-out channel so it
+/// pushes the new value to a subscribed shim.
+fn set_frame_cap_target(fps: u32) {
+    let changed = FRAME_CAP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_target_fps(fps);
+    if !changed {
+        return;
+    }
+    let fd = CAP_CHANGED_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let one: u64 = 1;
+        // SAFETY: `fd` is the cap-change eventfd, created by the scan-out
+        // thread and closed only after that thread is joined, so it is live
+        // here; the write is non-blocking (EFD_NONBLOCK) and a single
+        // increment cannot fill the counter.
+        unsafe { libc::write(fd, (&raw const one).cast(), 8) };
+    }
 }
 
 /// Latch [`GAME_WINDOW_PRESENT`]. Called by the scan-out channel reader when the
@@ -378,6 +427,26 @@ fn server_thread_inner(
             None
         }
     };
+    // The frame-cap push's own eventfd: `nativeSetFpsLimit` writes it when the
+    // target changes, so a `serve_scanout` parked in `poll` wakes and pushes the
+    // new value to a subscribed shim, which reads it on its next release. No fd
+    // (creation failed) only costs the push: a target change then reaches the
+    // shim when it reconnects and subscribes.
+    let cap_fd = match unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) } {
+        fd if fd >= 0 => {
+            CAP_CHANGED_FD.store(fd, Ordering::Relaxed);
+            fd
+        }
+        _ => {
+            log_warn!(
+                "{}",
+                gndrm_obf::obf!(
+                    "eventfd for the frame-cap push failed; a target change reaches the shim only when it reconnects"
+                )
+            );
+            -1
+        }
+    };
     // The allocator's own handle on the pool, cloned once here: the scan-out
     // thread must never take the publish state's lock, which the presenter
     // holds across its blocking SurfaceFlinger round-trip.
@@ -468,7 +537,8 @@ fn server_thread_inner(
                             "{}",
                             gndrm_obf::obf!("scan-out channel connected (fd={fd})")
                         );
-                        let outcome = asc::serve_scanout(fd, listener, signal, &pool, &doorbell);
+                        let outcome =
+                            asc::serve_scanout(fd, listener, signal, cap_fd, &pool, &doorbell);
                         // The channel is done with this fd: it is either gone or
                         // superseded by a newer connection. Clear the published fd
                         // BEFORE closing it, and close it exactly once here (this
@@ -598,6 +668,13 @@ fn server_thread_inner(
         // SAFETY: the acceptor is joined; nothing else uses this descriptor.
         unsafe { libc::close(signal) };
     }
+    if cap_fd >= 0 {
+        // Published before the close, so a late `nativeSetFpsLimit` never writes
+        // a descriptor that has been reaped by the kernel.
+        CAP_CHANGED_FD.store(-1, Ordering::Relaxed);
+        // SAFETY: the acceptor is joined; nothing else uses this descriptor.
+        unsafe { libc::close(cap_fd) };
+    }
     drop(dev);
     if let Ok(state) = asc_state.lock() {
         log_info!(
@@ -719,6 +796,7 @@ fn start(
         height: panel_h,
         mm_width: 0,
         mm_height: 0,
+        refresh_mhz: PANEL_REFRESH_MHZ.load(Ordering::Relaxed),
     };
     let fds = Arc::new(Mutex::new(AcceptedFds {
         rpc: -1,
@@ -1062,6 +1140,41 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeInjectorS
     .unwrap_or(E_FAULT)
 }
 
+/// `GameNativeDrm.nativeSetPanelRefreshHz(refreshHz)` — tell the daemon the
+/// panel's real refresh rate in whole hertz, before `nativeStart`. It becomes
+/// the emulated mode's `clock`/`vrefresh`, i.e. the rate gamescope recomputes
+/// into `g_nOutputRefresh` and advertises to clients; the session's vblank grid
+/// stays the daemon's own constant. A value outside `1..=1000` Hz is rejected
+/// with a log and leaves the previous setting in place. Safe to call with no
+/// session running; a value set after `nativeStart` does not reach that session.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetPanelRefreshHz(
+    _env: JNIEnv,
+    _class: JClass,
+    refresh_hz: jint,
+) {
+    if let Err(e) = std::panic::catch_unwind(|| set_panel_refresh_hz(refresh_hz)) {
+        report_panic("gndrm-refresh", e.as_ref());
+    }
+}
+
+/// Validate and store the panel refresh rate from
+/// [`Java_app_gamenative_display_GameNativeDrm_nativeSetPanelRefreshHz`].
+///
+/// The bounds are a plausible panel rate: anything outside `1..=1000` Hz is
+/// nonsense, and a zero or negative value would leave the mode's clock at 0,
+/// which gamescope reads as no mode at all — so it is dropped, not propagated.
+fn set_panel_refresh_hz(refresh_hz: jint) {
+    if !(1..=1000).contains(&refresh_hz) {
+        log_warn!(
+            "{}",
+            gndrm_obf::obf!("panel refresh {refresh_hz} Hz out of range 1..=1000; ignored")
+        );
+        return;
+    }
+    PANEL_REFRESH_MHZ.store(refresh_hz as u32 * 1000, Ordering::Relaxed);
+}
+
 /// `GameNativeDrm.nativeInjectorStop()`.
 /// `GameNativeDrm.nativeSetFpsLimit(fps)` — cap gamescope's frame rate for this
 /// app (0 = uncapped). Never blocks.
@@ -1071,7 +1184,15 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetFpsLim
     _class: JClass,
     fps: jint,
 ) {
-    if let Err(e) = std::panic::catch_unwind(|| injector::set_fps_limit(fps.max(0) as u32)) {
+    if let Err(e) = std::panic::catch_unwind(|| {
+        let fps = fps.max(0) as u32;
+        // gamescope's own limiter, for the paths that still honour it.
+        injector::set_fps_limit(fps);
+        // The daemon's own cap, which the ICD shim enforces through its slot
+        // gate: the target is stored here too, and the scan-out channel is
+        // woken so it pushes a change to a subscribed shim.
+        set_frame_cap_target(fps);
+    }) {
         report_panic("gndrm-fpslimit", e.as_ref());
     }
 }

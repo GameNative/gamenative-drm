@@ -17,14 +17,19 @@
 //! pre-existing behaviour rather than a broken one.
 
 use gndrm_uapi::wire::{
-    GameWindowNote, ScanoutAllocReq, ScanoutAllocResp, SCANOUT_FORMAT_BGRA_8888,
+    FrameCapNote, FrameCapSubscribe, GameWindowNote, ScanoutAllocReq, ScanoutAllocResp,
+    CAP_FRAME_CAP, FPS_UNCAPPED, SCANOUT_FORMAT_BGRA_8888,
 };
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Default budget for one exchange, matching the LD_PRELOAD shim's: a daemon
 /// that has stopped answering must not stall the guest's swapchain creation.
 const TIMEOUT_US: i64 = 250_000;
+
+/// One nanosecond per second, the release floor's numerator.
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 /// A buffer the daemon allocated, already registered under `ino` in the
 /// presenter's map. The caller owns `fd` and closes it with the slot.
@@ -42,6 +47,100 @@ pub struct ScanoutBuf {
 /// channel displaced from the daemon's side is only discovered on the next
 /// exchange.
 static CHAN: Mutex<RawFd> = Mutex::new(-1);
+
+// ---------------------------------------------------------------- frame cap
+//
+// The daemon decides the fps cap's target and tells this shim on this channel
+// (see `gndrm_uapi::wire::FrameCapNote`). The floor the target implies is
+// derived here, because a release is what it is measured against and this shim
+// is the only side that sees one — and it sees every one. A per-buffer deadline
+// sent with a hand-out cannot pace a title: a hand-out happens once per pool
+// buffer per session, while a release happens every frame.
+
+/// The frame cap the daemon has declared on this connection, and this shim's
+/// own release schedule.
+struct FrameCapState {
+    /// The target in fps, [`FPS_UNCAPPED`] when the limiter is off.
+    target_fps: u32,
+    /// The instant the previous release freed its slot, in `CLOCK_MONOTONIC`
+    /// ns, or 0 before a release has been seen.
+    last_release_ns: u64,
+}
+
+static CAP: Mutex<FrameCapState> = Mutex::new(FrameCapState {
+    target_fps: FPS_UNCAPPED,
+    last_release_ns: 0,
+});
+
+/// Notes adopted on this connection. Read by the census: `notes=0` means no
+/// target ever arrived, which is a different fault from a target whose floor
+/// never bound.
+static NOTES_N: AtomicUsize = AtomicUsize::new(0);
+
+/// One target period in nanoseconds, truncated to whole nanoseconds so a period
+/// is never longer than `1 / target`, and zero when no cap is in force.
+#[must_use]
+pub(crate) fn period_ns(target_fps: u32) -> u64 {
+    if target_fps == FPS_UNCAPPED {
+        return 0;
+    }
+    NANOS_PER_SECOND / u64::from(target_fps)
+}
+
+/// The instant a release seen at `now_ns` may free its slot.
+///
+/// The floor is one target period after the previous release's own free
+/// instant, so it applies the same rule to every release rather than to the
+/// first release of each buffer. `now_ns` comes back unchanged whenever it is at
+/// or after that floor — and always when no cap is in force or no release has
+/// been seen — so a release the guest was already slow enough to produce is
+/// never delayed. The delivered interval is therefore `max(guest interval,
+/// period)`: exact at the target when the guest is faster, the guest's own rate
+/// when it is slower, and never below it.
+#[must_use]
+fn release_floor(target_fps: u32, last_release_ns: u64, now_ns: u64) -> u64 {
+    let period = period_ns(target_fps);
+    if period == 0 || last_release_ns == 0 {
+        return now_ns;
+    }
+    last_release_ns.saturating_add(period).max(now_ns)
+}
+
+/// Record a release seen at `now_ns` (`CLOCK_MONOTONIC` ns) and return the
+/// instant from which its slot may be freed.
+///
+/// The recorded instant is that free instant, not the release's arrival: a held
+/// slot frees when its floor passes, so the schedule and what the guest
+/// observes are the same sequence. That is what makes consecutive frees at
+/// least one period apart, which is the cap.
+#[must_use]
+pub(crate) fn note_release(now_ns: u64) -> u64 {
+    let mut c = CAP.lock().unwrap_or_else(|e| e.into_inner());
+    let free_at = release_floor(c.target_fps, c.last_release_ns, now_ns);
+    c.last_release_ns = free_at;
+    free_at
+}
+
+/// Adopt one frame-cap note: the target it carries.
+fn apply_note(note: FrameCapNote) {
+    crate::logf!(gndrm_obf::obf!("scanout frame cap: fps={}", note.fps));
+    NOTES_N.fetch_add(1, Ordering::Relaxed);
+    let mut c = CAP.lock().unwrap_or_else(|e| e.into_inner());
+    c.target_fps = note.fps;
+}
+
+/// The target the daemon last declared, [`FPS_UNCAPPED`] when none has: read by
+/// the shim's census, so a round can tell "no note arrived" from "a note
+/// arrived whose floor never bound".
+pub(crate) fn target_fps() -> u32 {
+    CAP.lock().unwrap_or_else(|e| e.into_inner()).target_fps
+}
+
+/// How many frame-cap notes have been adopted on this connection, for the same
+/// census.
+pub(crate) fn notes_seen() -> usize {
+    NOTES_N.load(Ordering::Relaxed)
+}
 
 /// Tell the daemon the game's own window has appeared, so it can dismiss the
 /// booting splash on that event instead of on the desktop's first frame.
@@ -91,7 +190,13 @@ pub fn report_game_window_present() {
 /// reply is read: the daemon does not answer this message, so nothing is
 /// expected back on the connection.
 fn send_note(fd: RawFd, note: GameWindowNote) -> bool {
-    let wire = note.encode();
+    send_frame(fd, &note.encode())
+}
+
+/// Send one frame that expects no reply; `false` when the channel did not
+/// accept it. Shared by the two fire-and-forget frames on this channel: the
+/// game-window notification and the frame-cap subscribe.
+fn send_frame(fd: RawFd, wire: &[u8]) -> bool {
     // SAFETY: `fd` is the connection this module owns, `wire` outlives the
     // call. MSG_NOSIGNAL: a displaced or closed channel must fail rather than
     // raise SIGPIPE inside the guest.
@@ -193,9 +298,32 @@ fn connect(path: &str) -> RawFd {
         let tvlen = core::mem::size_of::<libc::timeval>() as u32;
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO, tvp, tvlen);
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDTIMEO, tvp, tvlen);
+        // Opt in to the frame cap on this connection. The daemon latches the
+        // subscription per connection and only then sends a `FrameCapNote`
+        // (with the hand-out of a buffer, or when the target changes), so
+        // sending it here — at the one place a connection is made — is what
+        // re-subscribes after a reconnect, with no second site to keep in step.
+        // Fire-and-forget: the daemon answers it with the current target, which
+        // the reply reader accepts in whatever order it arrives.
+        if !send_frame(
+            fd,
+            &FrameCapSubscribe {
+                caps: CAP_FRAME_CAP,
+            }
+            .encode(),
+        ) {
+            libc::close(fd);
+            return -1;
+        }
         fd
     }
 }
+
+/// The most frames one reply burst may hold on this channel: the allocator
+/// reply, plus a frame-cap note the daemon may put ahead of it (the answer to
+/// the subscribe, or a target the user changed while a request was in flight).
+/// Beyond this the peer is not speaking this protocol.
+const MAX_BURST_FRAMES: usize = 4;
 
 /// One request/response exchange: send a geometry request, receive the reply
 /// and its descriptor.
@@ -223,60 +351,109 @@ fn exchange(fd: RawFd, width: u32, height: u32) -> Result<ScanoutBuf, Failure> {
             return Err(Failure::Dead);
         }
 
-        let mut buf = [0u8; ScanoutAllocResp::LEN];
-        let mut riov = libc::iovec {
-            iov_base: buf.as_mut_ptr().cast(),
-            iov_len: buf.len(),
-        };
-        let mut cbuf = [0u8; 64];
-        let mut rmsg: libc::msghdr = core::mem::zeroed();
-        rmsg.msg_iov = &mut riov;
-        rmsg.msg_iovlen = 1;
-        rmsg.msg_control = cbuf.as_mut_ptr().cast();
-        rmsg.msg_controllen = cbuf.len();
-        let n = libc::recvmsg(fd, &mut rmsg, 0);
+        // Frames are identified by their own magic, never by position: an
+        // unsolicited note (the answer to the subscribe, or a target the user
+        // changed) can stand where a reply is expected. A note is applied here
+        // and the read continues, so either order leaves the channel in step.
+        let mut frames = 0usize;
+        loop {
+            frames += 1;
+            let mut buf = [0u8; ScanoutAllocResp::LEN];
+            let mut riov = libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.len(),
+            };
+            let mut cbuf = [0u8; 64];
+            let mut rmsg: libc::msghdr = core::mem::zeroed();
+            rmsg.msg_iov = &mut riov;
+            rmsg.msg_iovlen = 1;
+            rmsg.msg_control = cbuf.as_mut_ptr().cast();
+            rmsg.msg_controllen = cbuf.len();
+            let n = libc::recvmsg(fd, &mut rmsg, 0);
 
-        // Take any descriptor before validating anything: whatever arrived has
-        // to be closed here if the frame turns out not to be a usable reply.
-        let mut recv_fd: RawFd = -1;
-        let mut cmsg = libc::CMSG_FIRSTHDR(&rmsg);
-        while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                core::ptr::copy_nonoverlapping(
-                    libc::CMSG_DATA(cmsg).cast::<RawFd>(),
-                    &mut recv_fd,
-                    1,
-                );
+            // Take any descriptor before validating anything: whatever arrived
+            // has to be closed here unless the frame turns out to be the reply
+            // it belongs to.
+            let mut recv_fd: RawFd = -1;
+            let mut cmsg = libc::CMSG_FIRSTHDR(&rmsg);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                    core::ptr::copy_nonoverlapping(
+                        libc::CMSG_DATA(cmsg).cast::<RawFd>(),
+                        &mut recv_fd,
+                        1,
+                    );
+                }
+                cmsg = libc::CMSG_NXTHDR(&rmsg, cmsg);
             }
-            cmsg = libc::CMSG_NXTHDR(&rmsg, cmsg);
-        }
 
-        let resp = if n as usize == ScanoutAllocResp::LEN {
-            ScanoutAllocResp::decode(&buf)
-        } else {
-            None
-        };
-        match resp {
-            Some(r) if r.ret == 0 && recv_fd >= 0 => Ok(ScanoutBuf {
-                fd: recv_fd,
-                ino: r.ino,
-                stride: r.stride,
-            }),
-            Some(_) => {
-                // A refusal carries no buffer; the channel stays usable.
-                if recv_fd >= 0 {
-                    libc::close(recv_fd);
+            if n as usize == ScanoutAllocResp::LEN {
+                if let Some(note) = FrameCapNote::decode(&buf) {
+                    // A note carries no buffer.
+                    if recv_fd >= 0 {
+                        libc::close(recv_fd);
+                    }
+                    apply_note(note);
+                    if frames < MAX_BURST_FRAMES {
+                        continue;
+                    }
+                } else if let Some(r) = ScanoutAllocResp::decode(&buf) {
+                    if r.ret != 0 || recv_fd < 0 {
+                        // A refusal carries no buffer; the channel stays
+                        // usable.
+                        if recv_fd >= 0 {
+                            libc::close(recv_fd);
+                        }
+                        return Err(Failure::Refused);
+                    }
+                    return Ok(ScanoutBuf {
+                        fd: recv_fd,
+                        ino: r.ino,
+                        stride: r.stride,
+                    });
                 }
-                Err(Failure::Refused)
             }
-            None => {
-                // Closed peer, timeout, or an unframeable reply.
-                if recv_fd >= 0 {
-                    libc::close(recv_fd);
-                }
-                Err(Failure::Dead)
+            // Closed peer, timeout, or a frame that is neither shape.
+            if recv_fd >= 0 {
+                libc::close(recv_fd);
             }
+            return Err(Failure::Dead);
         }
+    }
+}
+
+/// Adopt any frame-cap note the daemon has pushed on this channel, if one is
+/// already there.
+///
+/// The daemon pushes the target when it changes, and a push is tied to no
+/// request, so this is its reader: the shim is told otherwise only when it
+/// connects (the answer to its subscribe), and a limiter changed mid-session
+/// would never reach an already-connected shim.
+///
+/// Non-blocking and it gives way to an exchange in progress (`try_lock`). That
+/// is what makes it safe to call while a reply may be pending: a reply only
+/// exists while `exchange` holds this same lock across its send and receive, so
+/// a lock that is free means no reply is in flight and any frame on the socket
+/// is a push. A push skipped then is read on the next release.
+pub(crate) fn poll_cap_change() {
+    let ch = match CHAN.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    if *ch < 0 {
+        return;
+    }
+    let mut buf = [0u8; FrameCapNote::LEN];
+    // SAFETY: `*ch` is the connection this module owns and `buf` is one full
+    // frame; MSG_DONTWAIT leaves a frame that has not arrived for the next
+    // call, and a read of any other length is a peer that closed.
+    let n = unsafe { libc::recv(*ch, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
+    if n as usize != FrameCapNote::LEN {
+        return;
+    }
+    if let Some(note) = FrameCapNote::decode(&buf) {
+        apply_note(note);
     }
 }
 
@@ -338,6 +515,30 @@ mod tests {
         }
     }
 
+    /// The frame-cap subscribe a client sends on connect, so a stand-in daemon
+    /// reads it before the client's first request.
+    fn recv_subscribe(conn: RawFd) {
+        // SAFETY: `conn` is the accepted connection and `buf` is one full frame.
+        unsafe {
+            let mut buf = [0u8; FrameCapSubscribe::LEN];
+            let n = libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0);
+            assert_eq!(n as usize, FrameCapSubscribe::LEN);
+            let sub = FrameCapSubscribe::decode(&buf).expect(&gndrm_obf::obf!("subscribe frame"));
+            assert_eq!(sub.caps, CAP_FRAME_CAP);
+        }
+    }
+
+    /// `send` one frame with no descriptor attached.
+    fn send_bare(conn: RawFd, bytes: &[u8]) {
+        // SAFETY: a live fd and a byte slice that outlives the call.
+        unsafe {
+            assert_eq!(
+                libc::send(conn, bytes.as_ptr().cast(), bytes.len(), 0),
+                bytes.len() as isize
+            );
+        }
+    }
+
     /// The client speaks the shim's protocol: a geometry request goes out, the
     /// reply's descriptor and identity come back. A daemon stand-in answers
     /// with a `/dev/null` descriptor, which is all the transport needs.
@@ -356,6 +557,7 @@ mod tests {
                     libc::SOCK_CLOEXEC,
                 );
                 assert!(conn >= 0, "accept: {}", std::io::Error::last_os_error());
+                recv_subscribe(conn);
                 let mut buf = [0u8; ScanoutAllocReq::LEN];
                 let n = libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0);
                 assert_eq!(n as usize, ScanoutAllocReq::LEN);
@@ -398,5 +600,128 @@ mod tests {
             libc::close(fd);
         }
         server.join().expect(&gndrm_obf::obf!("server thread"));
+    }
+
+    /// The frame-cap note stands ahead of the hand-out reply, where the shim
+    /// would otherwise expect the reply. The reader finds each frame by its own
+    /// magic, so the target is adopted and the reply is still the reply.
+    #[test]
+    fn exchange_sorts_the_frame_cap_note_from_the_reply() {
+        let name = format!("{}", gndrm_obf::obf!("gndrm-icdcap-{}", std::process::id()));
+        let listener = listen(&name);
+        let server = std::thread::spawn(move || {
+            // SAFETY: accept on the listener created above; every frame is a
+            // full 24 bytes and every descriptor is closed once. Returns the
+            // buffer's ino.
+            unsafe {
+                let conn = libc::accept4(
+                    listener,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    libc::SOCK_CLOEXEC,
+                );
+                assert!(conn >= 0, "accept: {}", std::io::Error::last_os_error());
+                recv_subscribe(conn);
+                // The daemon answers a subscribe with the current target, ahead
+                // of any reply: a note where a reply would be expected.
+                send_bare(conn, &FrameCapNote { fps: 120 }.encode());
+                let mut buf = [0u8; ScanoutAllocReq::LEN];
+                let n = libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0);
+                assert_eq!(n as usize, ScanoutAllocReq::LEN);
+
+                let payload = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+                assert!(payload >= 0);
+                let mut st: libc::stat = core::mem::zeroed();
+                assert_eq!(libc::fstat(payload, &mut st), 0);
+                let ino = st.st_ino as u64;
+                let resp = ScanoutAllocResp {
+                    ret: 0,
+                    ino,
+                    stride: 5120,
+                }
+                .encode();
+                send_with_fd(conn, &resp, payload);
+                libc::close(payload);
+                libc::close(conn);
+                libc::close(listener);
+                ino
+            }
+        });
+
+        let fd = connect(&name);
+        assert!(fd >= 0, "connect: {}", std::io::Error::last_os_error());
+        let got = exchange(fd, 1280, 960)
+            .ok()
+            .expect(&gndrm_obf::obf!("exchange"));
+        let ino = server.join().expect(&gndrm_obf::obf!("server thread"));
+        assert_eq!(got.ino, ino);
+        // The note ahead of the reply set the target.
+        assert_eq!(target_fps(), 120);
+        // SAFETY: the received descriptor and the connection are live.
+        unsafe {
+            libc::close(got.fd);
+            libc::close(fd);
+        }
+    }
+
+    /// The floor is one period after the previous release's own free instant,
+    /// so it is a lower bound that holds only a release that would have come
+    /// sooner than `1 / target`.
+    #[test]
+    fn the_release_floor_is_one_period_after_the_previous_release() {
+        let period = period_ns(40);
+        assert_eq!(period, 25_000_000);
+        // The first release has nothing to measure from.
+        assert_eq!(release_floor(40, 0, 1_000), 1_000);
+        // A second release inside the period is held to it.
+        assert_eq!(
+            release_floor(40, 1_000_000_000, 1_004_000_000),
+            1_025_000_000
+        );
+        // One at or after the floor is not delayed at all: a guest already at
+        // or below the target keeps its own rate.
+        assert_eq!(
+            release_floor(40, 1_000_000_000, 1_025_000_000),
+            1_025_000_000
+        );
+        assert_eq!(
+            release_floor(40, 1_000_000_000, 1_100_000_000),
+            1_100_000_000
+        );
+        // No cap: no floor, whenever the release arrives.
+        assert_eq!(release_floor(FPS_UNCAPPED, 1_000_000_000, 1_000), 1_000);
+        assert_eq!(period_ns(FPS_UNCAPPED), 0);
+        // A period is truncated, never rounded up past `1 / target`.
+        assert_eq!(period_ns(3), 333_333_333);
+    }
+
+    /// The recorded instant is the free instant, so a run of releases inside
+    /// the period frees one per period rather than in a burst, and never later
+    /// than the guest's own next release would have been.
+    #[test]
+    fn consecutive_releases_frees_are_spaced_by_the_period() {
+        let period = period_ns(40);
+        let mut last = 0u64;
+        let mut frees = Vec::new();
+        for i in 0..5u64 {
+            // The guest presents every 4 ms, far faster than the target.
+            let now = 1_000_000_000 + i * 4_000_000;
+            let free_at = release_floor(40, last, now);
+            last = free_at;
+            frees.push(free_at);
+        }
+        assert_eq!(
+            frees,
+            vec![
+                1_000_000_000,
+                1_025_000_000,
+                1_050_000_000,
+                1_075_000_000,
+                1_100_000_000,
+            ]
+        );
+        for pair in frees.windows(2) {
+            assert_eq!(pair[1] - pair[0], period);
+        }
     }
 }

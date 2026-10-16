@@ -180,6 +180,23 @@ static PRES_IV_MAX_US: AtomicUsize = AtomicUsize::new(0);
 static PRES_IV_GE_16667: AtomicUsize = AtomicUsize::new(0); // >= 16.67 ms: a missed 60 Hz frame
 static PRES_IV_GE_33333: AtomicUsize = AtomicUsize::new(0); // >= 33.3 ms: two
 static PRES_IV_LAST: Mutex<Option<Instant>> = Mutex::new(None);
+// Release-floor census, in microseconds, the same shape as the acquire dwell
+// and the present interval above and reported on the same lines. A release is
+// held when it arrives sooner than one target period after this shim's own
+// previous release, so `REL_HOLD_N` counts the releases the floor actually
+// delayed, `REL_HOLD_SUM_US` is the total time they were held — the pacing the
+// cap added — and the threshold bucket separates a floor that bit hard from the
+// sub-millisecond residue of one that had almost elapsed. Read against
+// `REL_CAPPED_N` (releases seen while a target was set) and `cap=[fps=…
+// notes=…]`, which is what tells "the target never arrived" (notes=0) from "a
+// target arrived and the floor never bound" (notes>0, capped_rel>0, held=0).
+static REL_HOLD_N: AtomicUsize = AtomicUsize::new(0);
+static REL_HOLD_SUM_US: AtomicUsize = AtomicUsize::new(0);
+static REL_HOLD_MAX_US: AtomicUsize = AtomicUsize::new(0);
+static REL_HOLD_GE_8333: AtomicUsize = AtomicUsize::new(0); // >= 8.33 ms: one 120 Hz frame
+/// Releases seen while a target was set, held or not: the denominator the
+/// `held=` count is read against.
+static REL_CAPPED_N: AtomicUsize = AtomicUsize::new(0);
 
 /// Record the interval since the previous present. Called once per present at
 /// entry; the first present only seeds the stamp, so the delta count is
@@ -242,6 +259,15 @@ fn rate_ok(slot: &'static Mutex<Option<Instant>>, every: Duration) -> bool {
     true
 }
 
+/// The mean hold per delayed release, or 0 while none has been delayed — the
+/// aggregate `held_us=` divided by `held=`.
+fn held_avg_us() -> usize {
+    REL_HOLD_SUM_US
+        .load(Ordering::Relaxed)
+        .checked_div(REL_HOLD_N.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 /// "0:-F 1:A- …": A = held by the app, F = committed and awaiting release.
 fn slot_flags(sc: *mut GnSwapchain) -> String {
     let mut flags = String::new();
@@ -263,7 +289,7 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
     format!(
         "{}",
         gndrm_obf::obf!(
-            "acq={} pres={} rel={} commit={} starved={} in_flight={in_flight} slots=[{}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}]",
+            "acq={} pres={} rel={} commit={} starved={} in_flight={in_flight} slots=[{}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} capped_rel={} held={} held_us={} held_avg_us={} held_max_us={} held_ge8333={}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
@@ -282,6 +308,14 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
                 PRES_IV_MAX_US.load(Ordering::Relaxed),
                 PRES_IV_GE_16667.load(Ordering::Relaxed),
                 PRES_IV_GE_33333.load(Ordering::Relaxed),
+                crate::scanout::target_fps(),
+                crate::scanout::notes_seen(),
+                REL_CAPPED_N.load(Ordering::Relaxed),
+                REL_HOLD_N.load(Ordering::Relaxed),
+                REL_HOLD_SUM_US.load(Ordering::Relaxed),
+                held_avg_us(),
+                REL_HOLD_MAX_US.load(Ordering::Relaxed),
+                REL_HOLD_GE_8333.load(Ordering::Relaxed),
         )
     )
 }
@@ -291,7 +325,7 @@ fn counters() -> String {
     format!(
         "{}",
         gndrm_obf::obf!(
-            "acq={} pres={} rel={} commit={} starved={} acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}]",
+            "acq={} pres={} rel={} commit={} starved={} acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} capped_rel={} held={} held_us={} held_avg_us={} held_max_us={} held_ge8333={}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
@@ -309,6 +343,14 @@ fn counters() -> String {
                 PRES_IV_MAX_US.load(Ordering::Relaxed),
                 PRES_IV_GE_16667.load(Ordering::Relaxed),
                 PRES_IV_GE_33333.load(Ordering::Relaxed),
+                crate::scanout::target_fps(),
+                crate::scanout::notes_seen(),
+                REL_CAPPED_N.load(Ordering::Relaxed),
+                REL_HOLD_N.load(Ordering::Relaxed),
+                REL_HOLD_SUM_US.load(Ordering::Relaxed),
+                held_avg_us(),
+                REL_HOLD_MAX_US.load(Ordering::Relaxed),
+                REL_HOLD_GE_8333.load(Ordering::Relaxed),
         )
     )
 }
@@ -859,6 +901,9 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             acquired: false,
             in_flight: false,
             acq_seq: 0,
+            ino: 0,
+            floor_ns: 0,
+            release_held: false,
         });
     }
     for inited in 0..n_slots as usize {
@@ -1032,6 +1077,27 @@ unsafe extern "C" fn gn_vkDestroySwapchainKHR(
 // imported dma-buf image directly.
 const REAP_SLICE: Duration = Duration::from_millis(4);
 
+/// Bound `slice` by the soonest floor among the slots the compositor has
+/// already returned, so such a slot is handed back the moment its floor passes
+/// rather than on the next poll of the slice: the guest is blocked in the
+/// acquire that called this, and a late free there is a late frame. Called with
+/// `shared` held; takes no other lock.
+unsafe fn slice_to_floor(sc: *mut GnSwapchain, slice: Duration) -> Duration {
+    let now_ns = monotonic_ns();
+    let mut soonest = 0u64;
+    for k in 0..unsafe { (*sc).slots.len() } {
+        let s = unsafe { (*sc).slots.as_mut_ptr().add(k) };
+        let (held, floor) = unsafe { ((*s).release_held, (*s).floor_ns) };
+        if held && (soonest == 0 || floor < soonest) {
+            soonest = floor;
+        }
+    }
+    if soonest == 0 || now_ns >= soonest {
+        return slice;
+    }
+    slice.min(Duration::from_nanos(soonest - now_ns))
+}
+
 /// Claim the first swapchain slot that is neither held by the app nor awaiting a
 /// compositor release. On success `idx` is set to the slot (marked acquired);
 /// when none is free `idx` is left unchanged.
@@ -1045,8 +1111,22 @@ const REAP_SLICE: Duration = Duration::from_millis(4);
 /// free-running scheme needs a rotating slot choice (so each commit carries a
 /// newer buffer) and its own back-pressure, not just this condition relaxed.
 unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
+    let now_ns = monotonic_ns();
     for k in 0..unsafe { (*sc).slots.len() } {
         let s = unsafe { (*sc).slots.as_mut_ptr().add(k) };
+        // A slot the compositor returned while the daemon's floor for it was
+        // still ahead becomes free the instant that floor passes, and this scan
+        // is what performs that free: the guest is blocked in the acquire that
+        // called us, so nothing has to be woken and no timer is needed. The
+        // floor is at most one target period past the daemon's last release and
+        // the comparison is on a monotonic clock, so a held slot always becomes
+        // free.
+        if unsafe { (*s).release_held && now_ns >= (*s).floor_ns } {
+            unsafe {
+                (*s).release_held = false;
+                (*s).in_flight = false;
+            }
+        }
         if unsafe { !(*s).acquired && !(*s).in_flight } {
             *idx = k as i32;
             unsafe {
@@ -1125,6 +1205,7 @@ unsafe fn gn_acquire_common(
                 }
                 None => REAP_SLICE,
             };
+            let slice = unsafe { slice_to_floor(sc, slice) };
             let (guard, _res) = (*sc).cv_free.wait_timeout(g, slice).unwrap();
             g = guard;
         }
@@ -4590,6 +4671,18 @@ pub struct GnSlot {
     // Guest-side trace: the acquire sequence that filled this slot, so a
     // present can be tied back to the acquire that handed the guest the image.
     pub acq_seq: u64,
+    // The daemon's scan-out inode for this slot's buffer, or 0 when the buffer
+    // was allocated locally. Identity and logging only: the release floor is
+    // this shim's own, one period after the last release, and is not filed
+    // against a buffer (see `crate::scanout::note_release`).
+    pub ino: u64,
+    // The instant the floor for the release landing on this slot expires, in
+    // `CLOCK_MONOTONIC` ns, stamped when the release arrived.
+    pub floor_ns: u64,
+    // Set when the compositor returned the buffer before that instant: the slot
+    // stays in flight until the floor passes, and `acquire_take_free` is what
+    // hands it back then.
+    pub release_held: bool,
 }
 
 pub struct ScShared {
@@ -4832,6 +4925,18 @@ fn wl_setup(dpy: *mut wl_display) -> bool {
     }
 }
 
+/// `clock_gettime(CLOCK_MONOTONIC)` in nanoseconds — the domain the daemon's
+/// release floor is expressed in, so a floor is compared with no conversion.
+fn monotonic_ns() -> u64 {
+    // SAFETY: clock_gettime with a valid clock id and a valid out-pointer.
+    let ts = unsafe {
+        let mut ts: libc::timespec = core::mem::zeroed();
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        ts
+    };
+    (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
+}
+
 extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
     let slot = data as *mut GnSlot;
     unsafe {
@@ -4839,9 +4944,41 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
         if LOG_RELEASE.fetch_add(1, Ordering::Relaxed) < LOG_FIRST_N {
             crate::logf!(gndrm_obf::obf!("proxy release: slot={slot:?}"));
         }
+        // The target may have changed since this shim connected, and a push
+        // from the daemon is read here because a release is the one event this
+        // shim sees on every frame. Ahead of the floor, so the release it paces
+        // is measured against the target it arrived under.
+        crate::scanout::poll_cap_change();
+        // The floor this release is held to, measured from this shim's own
+        // previous release (see `scanout::note_release`): the instant the slot
+        // may go back to the guest.
+        let now_ns = monotonic_ns();
+        let floor_ns = crate::scanout::note_release(now_ns);
+        let capped = crate::scanout::target_fps() != 0;
+        let held = now_ns < floor_ns;
         let _g = (*sc).shared.lock().unwrap();
-        (*slot).in_flight = false;
-        (*sc).cv_free.notify_all();
+        if capped {
+            REL_CAPPED_N.fetch_add(1, Ordering::Relaxed);
+        }
+        if held {
+            // This runs on the Wayland dispatch thread, so the hold is state,
+            // not a wait: the slot keeps `in_flight`, and the instant it may be
+            // freed is recorded for `acquire_take_free`, which is already
+            // running on the guest's blocked acquire. Nothing here can stall
+            // the connection's other events on a floor.
+            (*slot).floor_ns = floor_ns;
+            (*slot).release_held = true;
+            let hold_us = ((floor_ns - now_ns) / 1_000) as usize;
+            REL_HOLD_N.fetch_add(1, Ordering::Relaxed);
+            REL_HOLD_SUM_US.fetch_add(hold_us, Ordering::Relaxed);
+            REL_HOLD_MAX_US.fetch_max(hold_us, Ordering::Relaxed);
+            if hold_us >= 8_333 {
+                REL_HOLD_GE_8333.fetch_add(1, Ordering::Relaxed);
+            }
+        } else {
+            (*slot).in_flight = false;
+            (*sc).cv_free.notify_all();
+        }
         drop(_g);
         N_REL.fetch_add(1, Ordering::Relaxed);
         if rate_ok(&RATE_REL, RATE_EVERY) {
@@ -7469,6 +7606,9 @@ unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
     match crate::scanout::allocate((*sc).extent.width, (*sc).extent.height) {
         Some(buf) => {
             (*s).fd = buf.fd;
+            // The ino the daemon registered this buffer under is the key its
+            // frame-cap note files the release floor by.
+            (*s).ino = buf.ino;
             if buf.stride != 0 {
                 (*s).stride = buf.stride;
             }

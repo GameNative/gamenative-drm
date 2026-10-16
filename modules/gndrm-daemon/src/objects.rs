@@ -50,21 +50,25 @@ const FIRST_SYNCOBJ_HANDLE: u32 = 0x4000;
 /// Exclusive end of the syncobj handle space.
 const END_SYNCOBJ_HANDLE: u32 = 0x5000;
 
-/// The session's advertised refresh rate, in millihertz (1200 Hz = 1_200_000).
+/// The session's vblank grid, in millihertz (1200 Hz = 1_200_000).
 ///
-/// gamescope builds its entire vblank grid from the exposed mode's `vrefresh`
-/// and honours only integer divisors of it for an fps cap, so this one value
-/// sets both the guest's uncapped ceiling and every cap's granularity. It is
-/// deliberately high: the grid is a timer, so a finite value is required, and
-/// 1200 Hz is ~4.6x the present pipeline's measured throughput (~259
-/// presents/s), so it cannot bind. The only real cap on the guest is the user's
-/// own fps limit in the QuickMenu; the physical panel is downstream and
-/// coalesces whatever the session sends.
+/// gamescope builds its vblank grid — the compositor's paint and frame-done
+/// tick — from the refresh it is launched with (`-r`), and the daemon builds its
+/// flip-event timeline from this constant, so the grid and the timeline agree by
+/// construction. It is deliberately high: the grid is a timer, so a finite value
+/// is required, and 1200 Hz is ~4.6x the present pipeline's measured throughput
+/// (~259 presents/s), so it cannot bind and a guest can over-refresh the panel.
+/// The only real cap on the guest is the user's own fps limit in the QuickMenu;
+/// the physical panel is downstream and coalesces whatever the session sends.
+///
+/// This is NOT the emulated mode's refresh. The mode's rate is the panel's real
+/// rate when the caller supplies one ([`PanelDesc::refresh_mhz`]) and falls back
+/// to this constant otherwise; keeping the two separate is what lets the refresh
+/// advertised to clients be truthful without clamping the grid onto the panel.
 pub const SESSION_REFRESH_MHZ: u32 = 1_200_000;
 
-/// Physical panel description: the surface size the session presents into. The
-/// session refresh rate is the daemon's own constant (`SESSION_REFRESH_MHZ`),
-/// not a caller-supplied value.
+/// Physical panel description: the surface size the session presents into and,
+/// when known, the panel's real refresh rate.
 #[derive(Debug, Clone, Copy)]
 pub struct PanelDesc {
     pub width: u16,
@@ -72,6 +76,11 @@ pub struct PanelDesc {
     /// Physical size in millimetres (0 = unknown).
     pub mm_width: u32,
     pub mm_height: u32,
+    /// The panel's real refresh rate in millihertz as supplied by the caller, or
+    /// 0 when it is not known. It sets the emulated mode's `clock` and
+    /// `vrefresh` only; the session's vblank grid stays [`SESSION_REFRESH_MHZ`].
+    /// See [`PanelDesc::mode_refresh_mhz`].
+    pub refresh_mhz: u32,
 }
 
 impl Default for PanelDesc {
@@ -81,11 +90,32 @@ impl Default for PanelDesc {
             height: 720,
             mm_width: 0,
             mm_height: 0,
+            refresh_mhz: 0,
         }
     }
 }
 
 impl PanelDesc {
+    /// The emulated mode's refresh rate in millihertz: the panel's real rate when
+    /// the caller supplied one, else [`SESSION_REFRESH_MHZ`].
+    ///
+    /// The mode's rate and the session's vblank grid are separate values on
+    /// purpose. The mode's rate is what gamescope recomputes into
+    /// `g_nOutputRefresh` and advertises to every client — the Xwayland mode, the
+    /// refresh-rate feedback property, `active_display_info` — so it must be the
+    /// panel's truth. The grid is the compositor's paint/frame-done tick and the
+    /// daemon's flip-event interval, and it must stay above the present
+    /// pipeline's ceiling so a guest can over-refresh the panel. One constant
+    /// served both jobs, which forced a fabricated rate onto the clients.
+    #[must_use]
+    pub fn mode_refresh_mhz(&self) -> u32 {
+        if self.refresh_mhz == 0 {
+            SESSION_REFRESH_MHZ
+        } else {
+            self.refresh_mhz
+        }
+    }
+
     /// Build the single preferred mode exposed on the connector.
     #[must_use]
     pub fn modeinfo(&self) -> DrmModeModeinfo {
@@ -99,9 +129,14 @@ impl PanelDesc {
         let vsync_start = vdisplay + 3;
         let vsync_end = vdisplay + 6;
         let vtotal = vdisplay + 20;
+        // The mode's rate is the panel's, not the session grid: clock, htotal and
+        // vtotal must agree with `vrefresh`, because gamescope recomputes the rate
+        // from them (`GetModeRefresh`) and the recomputed value is what reaches
+        // clients.
+        let refresh_mhz = self.mode_refresh_mhz();
         // clock[kHz] = total_px * refresh / 1000, rounded.
-        let clock = (u64::from(htotal) * u64::from(vtotal) * u64::from(SESSION_REFRESH_MHZ)
-            / 1_000_000) as u32;
+        let clock =
+            (u64::from(htotal) * u64::from(vtotal) * u64::from(refresh_mhz) / 1_000_000) as u32;
         let mut name = [0u8; DRM_DISPLAY_MODE_LEN];
         let label = format!("{}", gndrm_obf::obf!("{}x{}", self.width, self.height));
         name[..label.len()].copy_from_slice(label.as_bytes());
@@ -117,7 +152,7 @@ impl PanelDesc {
             vsync_end,
             vtotal,
             vscan: 0,
-            vrefresh: SESSION_REFRESH_MHZ.div_ceil(1000),
+            vrefresh: refresh_mhz.div_ceil(1000),
             flags: 0,
             ty: DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DRIVER,
             name,
@@ -336,5 +371,36 @@ fn alloc_within(free: &mut Vec<u32>, next: &mut u32, end: u32) -> Result<u32, i3
 fn free_within(free: &mut Vec<u32>, id: u32, range: core::ops::Range<u32>) {
     if range.contains(&id) {
         free.push(id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `GetModeRefresh`: gamescope recomputes the rate from the mode's timings,
+    /// so clock/htotal/vtotal and `vrefresh` must all describe the same rate.
+    fn recomputed_mhz(mode: &DrmModeModeinfo) -> u64 {
+        (u64::from(mode.clock) * 1_000_000 / u64::from(mode.htotal) + u64::from(mode.vtotal) / 2)
+            / u64::from(mode.vtotal)
+    }
+
+    #[test]
+    fn mode_rate_is_the_panel_rate_when_supplied() {
+        let mode = PanelDesc {
+            refresh_mhz: 90_000,
+            ..PanelDesc::default()
+        }
+        .modeinfo();
+        assert_eq!(mode.vrefresh, 90);
+        assert_eq!(recomputed_mhz(&mode), 90_000);
+        assert_ne!(mode.vrefresh, SESSION_REFRESH_MHZ.div_ceil(1000));
+    }
+
+    #[test]
+    fn mode_rate_falls_back_to_the_session_grid_when_absent() {
+        let mode = PanelDesc::default().modeinfo();
+        assert_eq!(mode.vrefresh, SESSION_REFRESH_MHZ.div_ceil(1000));
+        assert_eq!(recomputed_mhz(&mode), u64::from(SESSION_REFRESH_MHZ));
     }
 }

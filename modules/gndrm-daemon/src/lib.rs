@@ -15,6 +15,7 @@
 mod commit;
 pub mod diag;
 mod edid;
+pub mod frame_cap;
 mod objects;
 #[doc(hidden)] // exposed for integration tests; not public API
 pub mod pod;
@@ -33,6 +34,7 @@ use gndrm_uapi::drm::*;
 use gndrm_uapi::mode::*;
 use gndrm_uapi::wire::errno;
 
+pub use frame_cap::FrameCap;
 pub use objects::{CrtcState, Framebuffer, GemObject, PanelDesc, PlaneState, Stores};
 pub use objects::{CONNECTOR_ID, CRTC_ID, ENCODER_ID, PLANE_CURSOR_ID, PLANE_PRIMARY_ID};
 pub use props::find_prop_id;

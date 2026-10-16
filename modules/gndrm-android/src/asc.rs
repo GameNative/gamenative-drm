@@ -65,9 +65,10 @@ use std::time::{Duration, Instant};
 
 use gndrm_daemon::diag::{self, Diag, Reply, Role, Stage, State, TrackedMutex, LOCK_SCANOUT_POOL};
 use gndrm_daemon::scanout::{Geometry, Removed, Reservation as CacheReservation, ReusePool};
-use gndrm_daemon::{Framebuffer, PlaneState, Presenter};
+use gndrm_daemon::{FrameCap, Framebuffer, PlaneState, Presenter};
 use gndrm_uapi::wire::{
-    GameWindowNote, ScanoutAllocReq, ScanoutAllocResp, SCANOUT_FORMAT_BGRA_8888,
+    FrameCapSubscribe, GameWindowNote, ScanoutAllocReq, ScanoutAllocResp, CAP_FRAME_CAP,
+    SCANOUT_FORMAT_BGRA_8888,
 };
 
 use crate::ffi;
@@ -1481,11 +1482,17 @@ pub fn serve_scanout(
     fd: RawFd,
     listener: RawFd,
     stop: RawFd,
+    cap_fd: RawFd,
     pool: &Arc<TrackedMutex<ScanoutPool>>,
     doorbell: &Arc<WarmDoorbell>,
 ) -> ScanoutChannel {
     let d = diag::diag();
     let mut buf = [0u8; ScanoutAllocReq::LEN];
+    // Whether this connection opted in to frame-cap notes with a
+    // [`FrameCapSubscribe`]. A connection that did not is sent exactly the
+    // frames it was sent before, so an older shim sharing this allocator is
+    // never handed a frame it would refuse to frame.
+    let mut cap_aware = false;
     loop {
         // The channel is idle until a request arrives. Its state is what tells
         // a shim-side timeout apart from a request the daemon never read: if
@@ -1493,8 +1500,11 @@ pub fn serve_scanout(
         // counters did not move, the request never reached this thread.
         d.set_role(Role::Scanout, State::ScanoutWaitingRequest);
         // Wait for a request on the current fd, a newer connection on the
-        // listener, or teardown. Watching the listener here (rather than only
-        // after this loop returns) is what makes the current fd the newest one.
+        // listener, a changed frame-cap target, or teardown. Watching the
+        // listener here (rather than only after this loop returns) is what
+        // makes the current fd the newest one; watching `cap_fd` is what lets a
+        // target the user changed mid-session reach a shim that is not handing
+        // a buffer over at that instant.
         let mut pfds = [
             libc::pollfd {
                 fd,
@@ -1511,9 +1521,15 @@ pub fn serve_scanout(
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: cap_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        // SAFETY: three valid pollfds waited on indefinitely.
-        let ready = unsafe { libc::poll(pfds.as_mut_ptr(), 3, -1) };
+        // SAFETY: four pollfds waited on indefinitely; a negative `cap_fd` (no
+        // eventfd) is ignored by `poll`.
+        let ready = unsafe { libc::poll(pfds.as_mut_ptr(), 4, -1) };
         if ready < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
@@ -1524,6 +1540,21 @@ pub fn serve_scanout(
         }
         if pfds[2].revents != 0 {
             return ScanoutChannel::Stop;
+        }
+        if pfds[3].revents != 0 {
+            // The target changed. Drain the eventfd first, so a count left
+            // behind cannot wake this loop again. The note is pushed even when
+            // a request is pending: nothing else carries the target, and a
+            // skipped push would be lost — the shim reads frames by their magic
+            // whatever order they arrive in, so a note ahead of the reply it
+            // waits for is in step.
+            drain_eventfd(cap_fd);
+            if cap_aware {
+                let note = cap_now().note();
+                if send_resp(fd, &note.encode(), None).is_err() {
+                    return ScanoutChannel::Closed;
+                }
+            }
         }
         if pfds[1].revents != 0 {
             // A newer connection is already queued: this fd has been superseded
@@ -1582,6 +1613,29 @@ pub fn serve_scanout(
                 crate::note_game_window_present();
             }
             log_first_non_request_frame(&buf[..n], Some(note));
+            continue;
+        }
+        // The frame-cap opt-in shares this channel and is recognised the same
+        // way, by its own magic before the allocator decode. A shim sends it
+        // once per connection to declare it honours frame-cap notes; the daemon
+        // latches that for this connection and answers with the current target
+        // at once, so a shim that connects mid-session starts in step. A
+        // connection that never subscribes is sent no note at all.
+        if let Some(sub) = FrameCapSubscribe::decode(&buf[..n]) {
+            if sub.caps & CAP_FRAME_CAP != 0 {
+                cap_aware = true;
+                let note = cap_now().note();
+                if send_resp(fd, &note.encode(), None).is_err() {
+                    return ScanoutChannel::Closed;
+                }
+            }
+            log_info!(
+                "{}",
+                gndrm_obf::obf!(
+                    "asc: scan-out channel frame-cap subscribe (caps={:#x})",
+                    sub.caps
+                )
+            );
             continue;
         }
         let Some(req) = ScanoutAllocReq::decode(&buf[..n]) else {
@@ -2461,6 +2515,25 @@ fn close_fence(fence: Option<RawFd>) {
     if let Some(fd) = fence.filter(|fd| *fd >= 0) {
         // SAFETY: ownership of the fence moved to the presenter.
         unsafe { libc::close(fd) };
+    }
+}
+
+/// A snapshot of the session's frame cap — the target the scan-out channel
+/// hands and pushes to the shim.
+fn cap_now() -> FrameCap {
+    *crate::FRAME_CAP
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Drain the cap-change eventfd, so a count left behind cannot wake the scan-out
+/// channel again on the next poll.
+fn drain_eventfd(fd: RawFd) {
+    let mut buf = [0u8; 8];
+    // SAFETY: `fd` is the cap-change eventfd, created non-blocking; `buf` is an
+    // 8-byte counter buffer. A negative `fd` (no eventfd) is a no-op.
+    unsafe {
+        libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
     }
 }
 
