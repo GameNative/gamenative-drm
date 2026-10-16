@@ -632,6 +632,23 @@ fn ctx_release_fd(buf: &PoolBuf) -> RawFd {
     unsafe { (*buf.ctx).release_fd.swap(-1, Ordering::AcqRel) }
 }
 
+/// The layer-rect probe's change key: the published source and destination
+/// rects plus the panel the destination is bounded by. A plain tuple, so the
+/// probe has a `Copy + PartialEq` value to compare against the last one and
+/// prints on a change instead of every frame.
+type RectLogKey = (
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+);
+
 /// The last buffer actually put on the layer, with the geometry it went out
 /// with. A commit for an inode that is not registered re-publishes this rather
 /// than leaving the layer empty: SurfaceFlinger compositing nothing drops the
@@ -674,6 +691,12 @@ pub struct AscState {
     logged_unregistered: Vec<u64>,
     /// Inodes already reported as re-publishing a stale buffer (log once each).
     logged_stale: Vec<u64>,
+    /// Last `(src, dst, panel)` tuple the layer-rect probe printed, so the probe
+    /// prints on a geometry change rather than every frame.
+    last_rect_log: Option<RectLogKey>,
+    /// Whether the layer is currently hidden for a non-drawable plane, so the
+    /// hide/show probe prints on the transition instead of every frame.
+    hidden: bool,
     /// Frames the panel dump has considered, and the geometry it last dumped
     /// (see [`AscState::dump_published`]).
     dump_n: u64,
@@ -744,6 +767,8 @@ impl AscState {
             warned_fence_timeout: false,
             logged_unregistered: Vec::new(),
             logged_stale: Vec::new(),
+            last_rect_log: None,
+            hidden: false,
             dump_n: 0,
             dump_geom: None,
         };
@@ -852,6 +877,46 @@ impl AscState {
             && dst.bottom > dst.top;
         let keep = self.last_publish.map(|lp| lp.ino);
 
+        // UNGATED, change-latched: the rect this commit publishes the layer
+        // with, against the panel it is bounded by. The layer is a child of the
+        // app's window and is sized to the CRTC rect only, so whatever lies
+        // inside the panel but outside that rect is the app's own window
+        // showing through — the bands this probe exists to measure. Prints on a
+        // rect or panel change and once at session start, never per frame.
+        let key: RectLogKey = (
+            src.left,
+            src.top,
+            src.right,
+            src.bottom,
+            dst.left,
+            dst.top,
+            dst.right,
+            dst.bottom,
+            self.panel_w,
+            self.panel_h,
+        );
+        if self.last_rect_log != Some(key) {
+            self.last_rect_log = Some(key);
+            crate::log_always!(
+                "gndrm-daemon: asc layer rect src=({},{})-({},{}) dst=({},{})-({},{}) panel={}x{} band left={} top={} right={} bottom={} drawable={}",
+                key.0,
+                key.1,
+                key.2,
+                key.3,
+                key.4,
+                key.5,
+                key.6,
+                key.7,
+                key.8,
+                key.9,
+                dst.left,
+                dst.top,
+                self.panel_w - dst.right,
+                self.panel_h - dst.bottom,
+                drawable,
+            );
+        }
+
         // The pool lock is held only for map work: retiring the buffers the
         // client stopped importing (into the reuse cache) and resolving the
         // payload this commit publishes. Every gralloc call, the looper/fence
@@ -884,20 +949,20 @@ impl AscState {
                 // allocation through to the kernel, or the table was rebuilt
                 // under a still-running client. There is no last buffer to fall
                 // back to, so the frame is dropped and the fence released.
+                // UNGATED: the dropped frame is the other half of the stale
+                // path — a commit arrived that the presenter could not put
+                // anything on the panel for. Once per inode.
                 if !self.logged_unregistered.contains(&ino) {
                     self.logged_unregistered.push(ino);
-                    log_warn!("{}", gndrm_obf::obf!(
-                        "asc: no AHardwareBuffer for dma-buf ino {ino}; frame dropped (misses={misses})"
-                    ));
-                    log_warn!(
-                        "{}",
-                        gndrm_obf::obf!(
-                            "asc: unregistered framebuffer: {}x{} fmt={:#x} pitch={} (ino {ino})",
-                            fb.width,
-                            fb.height,
-                            fb.pixel_format,
-                            fb.pitches[0]
-                        )
+                    crate::log_always!(
+                        "gndrm-daemon: asc DROPPED frame: no AHardwareBuffer for dma-buf ino {ino} (misses={misses})"
+                    );
+                    crate::log_always!(
+                        "gndrm-daemon: asc dropped framebuffer: {}x{} fmt={:#x} pitch={} (ino {ino})",
+                        fb.width,
+                        fb.height,
+                        fb.pixel_format,
+                        fb.pitches[0]
                     );
                 }
                 close_fence(fence);
@@ -956,21 +1021,23 @@ impl AscState {
                     // No buffer for this inode: re-publish the last buffer rather
                     // than leave the layer empty (SurfaceFlinger compositing
                     // nothing shows the app's background through as a blank
-                    // panel).
+                    // panel). UNGATED, because this is the "the old frame is
+                    // still there" path: a committed framebuffer that could not
+                    // be resolved re-publishes the previous one, so what the
+                    // panel shows is a frame the game already replaced. Once per
+                    // inode (the same latch the gated line uses), so a burst
+                    // prints one line rather than one per frame.
                     if stale && !self.logged_stale.contains(&ino) {
                         self.logged_stale.push(ino);
-                        log_warn!("{}", gndrm_obf::obf!(
-                            "asc: no AHardwareBuffer for dma-buf ino {ino}; re-publishing ino {published_ino} (misses={misses})"
-                        ));
-                        log_warn!(
-                            "{}",
-                            gndrm_obf::obf!(
-                            "asc: unregistered framebuffer: {}x{} fmt={:#x} pitch={} (ino {ino})",
+                        crate::log_always!(
+                            "gndrm-daemon: asc STALE re-publish: no AHardwareBuffer for dma-buf ino {ino}; re-publishing ino {published_ino} (misses={misses})"
+                        );
+                        crate::log_always!(
+                            "gndrm-daemon: asc stale framebuffer: {}x{} fmt={:#x} pitch={} (ino {ino})",
                             fb.width,
                             fb.height,
                             fb.pixel_format,
                             fb.pitches[0]
-                        )
                         );
                     }
                     // A 2:10:10:10 scan-out framebuffer is HDR10: publish the
@@ -996,6 +1063,25 @@ impl AscState {
                         dst,
                         dataspace,
                     };
+                    // UNGATED, change-latched: the layer has come back from a
+                    // hide. A hidden layer composites nothing (the app's window
+                    // shows through), so this is the moment the panel stops
+                    // being the app's own background and starts being the
+                    // session's frame again — or, at session end, the other way
+                    // round.
+                    if self.hidden {
+                        self.hidden = false;
+                        crate::log_always!(
+                            "gndrm-daemon: asc layer shown again fb={} dst=({},{})-({},{}) panel={}x{}",
+                            fb.id,
+                            dst.left,
+                            dst.top,
+                            dst.right,
+                            dst.bottom,
+                            self.panel_w,
+                            self.panel_h
+                        );
+                    }
                     match build_show(&api, self.sc, ahb, ctx, rect, fence) {
                         Some(tx) => {
                             apply_transaction(&api, tx);
@@ -1023,6 +1109,28 @@ impl AscState {
                     // published buffer is retained: the plane can come back on
                     // the next commit, and hiding is a deliberate state rather
                     // than a lost buffer.
+                    //
+                    // UNGATED, change-latched: this is the one path where the
+                    // daemon itself blanks the panel, so whether the session
+                    // ever went dark (and when, and for how long) is visible in
+                    // logcat. A steady state prints once at the transition.
+                    if !self.hidden {
+                        self.hidden = true;
+                        crate::log_always!(
+                            "gndrm-daemon: asc layer HIDDEN (plane not drawable) fb={} src=({},{})-({},{}) dst=({},{})-({},{}) panel={}x{}",
+                            fb.id,
+                            src.left,
+                            src.top,
+                            src.right,
+                            src.bottom,
+                            dst.left,
+                            dst.top,
+                            dst.right,
+                            dst.bottom,
+                            self.panel_w,
+                            self.panel_h
+                        );
+                    }
                     if let Some(tx) = build_hide(&api, self.sc) {
                         apply_transaction(&api, tx);
                     }
@@ -1162,9 +1270,15 @@ impl AscState {
         if let Some(tx) = build_show(&api, self.sc, ahb, ctx, rect, None) {
             apply_transaction(&api, tx);
         }
-        log_info!(
-            "{}",
-            gndrm_obf::obf!("asc: re-published ino {} onto the layer", lp.ino)
+        // UNGATED: a rebuilt layer has just been given the retained frame back.
+        // This runs once per layer rebuild (session bring-up, a display power
+        // cycle), never per frame.
+        crate::log_always!(
+            "gndrm-daemon: asc re-published retained ino {} onto a {}x{} layer (frames={})",
+            lp.ino,
+            self.panel_w,
+            self.panel_h,
+            self.frames
         );
     }
 
@@ -1236,6 +1350,23 @@ impl AscState {
 
 impl Drop for AscState {
     fn drop(&mut self) {
+        // UNGATED session-end summary: what the layer was left holding and how
+        // much of the session the presenter actually published. A session that
+        // ends with the daemon having published nothing, or with the layer
+        // hidden, is a different failure from one that published to the end —
+        // and this is the last line the presenter can print.
+        crate::log_always!(
+            "gndrm-daemon: asc teardown frames_published={} hidden={} last_publish_ino={} last_dst=({},{})-({},{}) panel={}x{}",
+            self.frames,
+            self.hidden,
+            self.last_publish.map_or(0, |lp| lp.ino),
+            self.last_publish.map_or(0, |lp| lp.dst.left),
+            self.last_publish.map_or(0, |lp| lp.dst.top),
+            self.last_publish.map_or(0, |lp| lp.dst.right),
+            self.last_publish.map_or(0, |lp| lp.dst.bottom),
+            self.panel_w,
+            self.panel_h
+        );
         // Return every buffer before the layer goes: the presenter owns the
         // daemon's reference on each, and SurfaceFlinger may still be reading
         // one. The map work runs under the lock; the gralloc releases run
