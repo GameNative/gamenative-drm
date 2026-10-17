@@ -141,8 +141,13 @@ pub fn hdr_output_enabled() -> bool {
 /// `GNDRM_HDR`. Called at session start: the launcher sets the variable before
 /// each session's guest forks and it can change between sessions, so a value
 /// carried over would advertise the HDR format table to an SDR session.
+///
+/// Also clears the connector HDR-output mirror ([`hdr_output_active`]): a new
+/// session's connector starts un-driven, so a value left over from the previous
+/// session would tag this session's first frames with the previous one's state.
 pub fn reset_hdr_output_cache() {
     HDR_GATE.store(HDR_UNRESOLVED, Ordering::Relaxed);
+    CONNECTOR_HDR_ACTIVE.store(false, Ordering::Relaxed);
     *HDR_LUMINANCE.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
@@ -208,6 +213,50 @@ static HDR_GATE: AtomicU8 = AtomicU8::new(HDR_UNRESOLVED);
 const HDR_UNRESOLVED: u8 = 0;
 const HDR_OFF: u8 = 1;
 const HDR_ON: u8 = 2;
+
+/// Whether the connector has been driven for HDR10 output this session: the HDR
+/// **content** signal, mirrored process-wide from the connector state the daemon
+/// serves.
+///
+/// gamescope's HDR10 commit writes the connector's `Colorspace` as
+/// `DRM_MODE_COLORIMETRY_BT2020_RGB` and sets the `HDR_OUTPUT_METADATA` blob (the
+/// DRM backend writes both, gated on `bWantsHDR10 && SupportsHDR10()`); its SDR
+/// path writes `Colorspace = DEFAULT` and clears the blob. The daemon records
+/// both writes (`Device::set_conn_colorspace`, `Device::set_conn_hdr_metadata`)
+/// and this is the process-global mirror of them, read by the presenter at
+/// publish time (the presenter runs on the commit worker, which holds no
+/// `Device`).
+///
+/// This is deliberately **not** [`hdr_output_enabled`], which only reports that
+/// the launcher asked for HDR: asking makes the plane advertise a 10-bit format,
+/// so gamescope scans out `XBGR2101010` for the whole session, but it does not
+/// mean the connector was ever driven for HDR10. Conflating the two is what
+/// tags a composite output image as BT.2020/PQ — the composited framebuffer is
+/// 10-bit whatever its content.
+static CONNECTOR_HDR_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the connector's HDR10 output is genuinely active (see
+/// [`CONNECTOR_HDR_ACTIVE`]). The presenter reports it beside the published
+/// this, never on the committed framebuffer's fourcc.
+///
+/// AWAITS DEVICE CONFIRMATION: the mechanism is read from gamescope's DRM
+/// backend, not measured. The read that confirms or refutes it is the daemon's
+/// committed-fourcc line in an HDR-on FSR/SGSR session: a 10-bit fourcc with
+/// this signal false is the failure this discriminates; this true there would
+/// refute it.
+#[must_use]
+pub fn hdr_output_active() -> bool {
+    CONNECTOR_HDR_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Pure core of the mirror the connector setters write: the connector is
+/// HDR-active when its `Colorspace` is `BT2020_RGB` or its `HDR_OUTPUT_METADATA`
+/// blob is set. gamescope writes the two together, so either alone means the
+/// connector was driven for HDR10; neither is set on the SDR path.
+fn hdr_output_active_for(colorspace: u64, metadata: u64) -> bool {
+    colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB || metadata != 0
+}
+
 /// Cursor plane formats (doc §3.2: ARGB8888, 64×64).
 const CURSOR_FORMATS: &[u32] = &[DRM_FORMAT_ARGB8888];
 
@@ -625,10 +674,21 @@ impl Device {
 
     pub(crate) fn set_conn_colorspace(&mut self, value: u64) {
         self.conn_colorspace = value;
+        self.mirror_connector_hdr();
     }
 
     pub(crate) fn set_conn_hdr_metadata(&mut self, value: u64) {
         self.conn_hdr_metadata = value;
+        self.mirror_connector_hdr();
+    }
+
+    /// Publish the connector's HDR-output state into the process-global signal
+    /// the presenter reads (see `hdr_output_active`).
+    fn mirror_connector_hdr(&self) {
+        CONNECTOR_HDR_ACTIVE.store(
+            hdr_output_active_for(self.conn_colorspace, self.conn_hdr_metadata),
+            Ordering::Relaxed,
+        );
     }
 
     pub(crate) fn set_crtc_active(&mut self, active: bool) {
@@ -2203,6 +2263,18 @@ mod tests {
         assert!(!hdr.contains(&DRM_FORMAT_XRGB2101010));
         // The SDR set is a prefix: enabling HDR only appends.
         assert_eq!(&hdr[..sdr.len()], sdr);
+    }
+
+    /// The connector's HDR-output signal is the connector state, not the
+    /// launcher's request: `BT2020_RGB` colorspace or a set metadata blob.
+    /// gamescope writes the two together, and neither is set on the SDR path.
+    #[test]
+    fn connector_hdr_state_follows_colorspace_and_metadata() {
+        assert!(!hdr_output_active_for(DRM_MODE_COLORIMETRY_DEFAULT, 0));
+        assert!(hdr_output_active_for(DRM_MODE_COLORIMETRY_BT2020_RGB, 0));
+        assert!(hdr_output_active_for(DRM_MODE_COLORIMETRY_DEFAULT, 7));
+        // A non-BT2020_RGB colorspace with a cleared blob is not HDR output.
+        assert!(!hdr_output_active_for(DRM_MODE_COLORIMETRY_BT709_YCC, 0));
     }
 
     /// Encode a payload the way the shim's `rpc()` does for a fixed struct.

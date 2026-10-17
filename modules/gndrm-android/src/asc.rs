@@ -102,6 +102,14 @@ const MAX_SCANOUT_POOL: usize = 64;
 const DUMP_FIRST: u64 = 10;
 const DUMP_EVERY: u64 = 120;
 
+/// Publish-probe period, in published frames. The probe also prints on a change
+/// of the decision or either input, so this exists to keep it in a capture that
+/// starts after the transition — the probe's earliest line arrives at session
+/// start, long before any post-launch capture begins. 121 is coprime with the
+/// two-buffer scan-out pool: a multiple of 120 always lands on the same buffer,
+/// which hides whether the published inode is cycling.
+const PUBLISH_LOG_EVERY: u64 = 121;
+
 /// `GNDRM_DUMP_DIR`, read once: the directory the panel dump is written to.
 /// `None` (unset or empty) disables the dump entirely, so it costs nothing on
 /// the publish path when dumps are off.
@@ -695,6 +703,11 @@ pub struct AscState {
     /// Last `(src, dst, panel)` tuple the layer-rect probe printed, so the probe
     /// prints on a geometry change rather than every frame.
     last_rect_log: Option<RectLogKey>,
+    /// Last `(fourcc, buffer_is_ten_bit, connector_hdr)` triple the HDR probe
+    /// printed, so it prints when the decision or either of its inputs changes
+    /// rather than every frame — and every [`PUBLISH_LOG_EVERY`]-th frame
+    /// regardless, so a capture that starts after the transition still sees it.
+    last_hdr_log: Option<(u32, bool, bool)>,
     /// Whether the layer is currently hidden for a non-drawable plane, so the
     /// hide/show probe prints on the transition instead of every frame.
     hidden: bool,
@@ -769,6 +782,7 @@ impl AscState {
             logged_unregistered: Vec::new(),
             logged_stale: Vec::new(),
             last_rect_log: None,
+            last_hdr_log: None,
             hidden: false,
             dump_n: 0,
             dump_geom: None,
@@ -1041,24 +1055,76 @@ impl AscState {
                             fb.pitches[0]
                         );
                     }
-                    // A 2:10:10:10 scan-out framebuffer is HDR10: publish the
-                    // layer with the BT.2020/PQ dataspace so SurfaceFlinger
-                    // passes it to the panel as HDR rather than colour-managing
-                    // it as sRGB. The 8-bit path keeps ADATASPACE_UNKNOWN.
+                    // Format and content are two questions; the published
+                    // dataspace answers the first under the existing rule.
                     //
-                    // Two views of the same fact, OR'd: the client's
-                    // framebuffer fourcc, and the layout the pool served (the
-                    // buffer actually on the layer). They agree because both
-                    // follow `hdr_output_enabled`, but the pool is what is
-                    // published, so it must be able to stand alone.
+                    // Format — is the buffer on the layer 10-bit? The pool serves
+                    // `R10G10B10A2_UNORM` whenever the session asked for HDR
+                    // (`served_ahb_format` follows `hdr_output_enabled`), and
+                    // gamescope scans out a 10-bit fourcc to match. This is a fact
+                    // about the pixels' layout, not their transfer function, and it
+                    // is what the dataspace is keyed on — unchanged.
+                    //
+                    // Content — are those pixels PQ-encoded in fact? The committed
+                    // fourcc cannot answer that: on the forced-composition path
+                    // (FSR/SGSR) the committed framebuffer is the composite output
+                    // image (`XBGR2101010`, `g_nDRMFormat`) whatever the frame's
+                    // content. So on that path the two questions can disagree, and
+                    // the register that would tell them apart is the connector's
+                    // HDR-output state that the daemon already serves.
+                    //
+                    // AWAITS DEVICE CONFIRMATION: whether the connector state
+                    // discriminates the FSR/SGSR flat-field failure is read, not
+                    // measured. The deciding observation is this line's own
+                    // `conn_hdr=` in an HDR-on FSR/SGSR arm beside a working one —
+                    // until then the dataspace keeps its existing rule and only the
+                    // log is added, so a working HDR case cannot be altered.
                     let hdr_buffer = ffi::is_ten_bit_drm_format(fb.pixel_format)
                         || served_ahb_format(SCANOUT_FORMAT_BGRA_8888)
                             == ffi::AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM;
+                    let hdr_content = gndrm_daemon::hdr_output_active();
                     let dataspace = if hdr_buffer {
                         ffi::ADATASPACE_BT2020_PQ
                     } else {
                         ffi::ADATASPACE_UNKNOWN
                     };
+                    // UNGATED: the per-frame HDR decision and both inputs to it,
+                    // printed on a change of any of the three and every
+                    // [`PUBLISH_LOG_EVERY`]-th frame regardless. `n` and `ino`
+                    // pair with the commit probe's `commit #N fb=`: publishes per
+                    // second against commits per second, and whether the buffer
+                    // actually published is still moving. A publish index that
+                    // advances while `ino` repeats is the retained-buffer
+                    // re-publish (the composite output stopped arriving).
+                    let hdr_key = (fb.pixel_format, hdr_buffer, hdr_content);
+                    let publish_n = self.frames + 1;
+                    if self.last_hdr_log != Some(hdr_key)
+                        || publish_n.is_multiple_of(PUBLISH_LOG_EVERY)
+                    {
+                        self.last_hdr_log = Some(hdr_key);
+                        // The alpha field and two reference words, sampled only
+                        // where this line prints. A publish index and an inode
+                        // sequence advance whether or not the pixels differ, and
+                        // whether a compositor can show the frame at all is a
+                        // separate question the alpha field answers.
+                        let sample = match Self::content_sample(ahb, stride, fb.height) {
+                            Some((w0, w1)) => {
+                                format!("a={} c={w0:#010x} p={w1:#010x}", w0 >> 30)
+                            }
+                            None => "a=none".to_string(),
+                        };
+                        crate::log_always!(
+                            "gndrm-daemon: asc hdr decision n={} fb={} ino={} {} fmt={:#x} buffer10={} conn_hdr={} dataspace={:#x}",
+                            publish_n,
+                            fb.id,
+                            published_ino,
+                            sample,
+                            fb.pixel_format,
+                            hdr_buffer,
+                            hdr_content,
+                            dataspace
+                        );
+                    }
                     let rect = ShowRect {
                         src,
                         dst,
@@ -1173,6 +1239,46 @@ impl AscState {
             // gamescope's frames never tick the X11 present hook.
             crate::notify_frame_published();
         }
+    }
+
+    /// Two reference words from a published buffer — the centre pixel and one at
+    /// (400,300) — read under the same lock pattern as
+    /// [`AscState::dump_published`]. The word's alpha field plus the word itself
+    /// answer the two questions a counter cannot: does the buffer carry content,
+    /// and can a compositor show it at all. That pair is what identified the
+    /// scaler composite's alpha 0.
+    ///
+    /// `None` when the buffer cannot be locked, reported as `a=none`.
+    fn content_sample(
+        ahb: *mut ffi::AHardwareBuffer,
+        stride: u32,
+        height: u32,
+    ) -> Option<(u32, u32)> {
+        let mut base: *mut c_void = ptr::null_mut();
+        // SAFETY: `ahb` is a live buffer the presenter owns; the lock maps its
+        // pixels read-only at `base` until the matching unlock below.
+        let rc = unsafe {
+            ffi::AHardwareBuffer_lock(
+                ahb,
+                ffi::AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
+                -1,
+                ptr::null(),
+                &mut base,
+            )
+        };
+        if rc != 0 || base.is_null() {
+            return None;
+        }
+        let stride_words = stride as usize / core::mem::size_of::<u32>();
+        let pixels = base.cast::<u32>();
+        let centre = (height as usize / 2) * stride_words + (stride_words / 2);
+        // SAFETY: both offsets are inside the `stride * height` bytes the lock
+        // maps, and nothing reads `base` after the unlock.
+        let w0 = unsafe { pixels.add(centre).read_unaligned() };
+        let w1 = unsafe { pixels.add(300 * stride_words + 400).read_unaligned() };
+        // SAFETY: `ahb` is locked by this call and nothing reads `base` after.
+        unsafe { ffi::AHardwareBuffer_unlock(ahb, ptr::null_mut()) };
+        Some((w0, w1))
     }
 
     /// Keep a rolling PPM of the frame the presenter just published as
