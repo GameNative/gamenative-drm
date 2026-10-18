@@ -243,11 +243,6 @@ static LAST_SIG: Mutex<Option<(String, u64)>> = Mutex::new(None);
 static RATE_REL: Mutex<Option<Instant>> = Mutex::new(None);
 static RATE_IDLE: Mutex<Option<Instant>> = Mutex::new(None);
 /// The surface-format list the guest is served (once a second at most).
-static RATE_SURFFMT: Mutex<Option<Instant>> = Mutex::new(None);
-// What the surface reports for `currentExtent`, once a second. vkd3d's swapchain
-// recreate returns without a word when that value is `u32::MAX`, so a window
-// whose size stops being readable stops every present with no other trace.
-static RATE_CAPS: Mutex<Option<Instant>> = Mutex::new(None);
 /// WSI entry-point call counters, printed once a second by [`wsi_hb`]. A client
 /// stuck in its own present loop still shows up here as the calls it keeps
 /// making, which is the one thing a driver-side trace cannot show.
@@ -6519,17 +6514,6 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     // gamescope scans out 1:1. `u32::MAX` ("app picks") is kept only for
     // surfaces with no guest window (the wayland route).
     let window_extent = unsafe { surface_extent(s) };
-    if rate_ok(&RATE_CAPS, Duration::from_secs(1)) {
-        let w = unsafe { (*s).window };
-        match window_extent {
-            Some((cw, ch)) => crate::logf!(gndrm_obf::obf!(
-                "proxy caps: current={cw}x{ch} win={w:#x} src=window"
-            )),
-            None => crate::logf!(gndrm_obf::obf!(
-                "proxy caps: current=u32::MAX win={w:#x} src=none"
-            )),
-        }
-    }
     let out = VkSurfaceCapabilitiesKHR {
         minImageCount: 2,
         maxImageCount: max_swapchain_images(),
@@ -6681,17 +6665,6 @@ fn served_surface_formats() -> &'static [VkSurfaceFormatKHR] {
         },
     ];
     if hdr_session() {
-        if rate_ok(&RATE_SURFFMT, Duration::from_secs(1)) {
-            let mut list = String::new();
-            for f in K_HDR.iter() {
-                list.push_str(&format!(" {:#x}/{:#x}", f.format as u32, f.colorSpace));
-            }
-            crate::logf!(gndrm_obf::obf!(
-                "proxy surface formats served (hdr): n={} {}",
-                K_HDR.len(),
-                list
-            ));
-        }
         return if advertises_rgba() {
             &K_HDR_RGBA
         } else {
