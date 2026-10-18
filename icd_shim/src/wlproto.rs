@@ -326,6 +326,41 @@ pub unsafe fn swapchain_set_present_mode(sc: *mut wl_proxy, present_mode: u32) {
     wl_proxy_marshal_array(sc, 3, args.as_mut_ptr());
 }
 
+/// gamescope_swapchain.swapchain_feedback (opcode 2): image count, VkFormat,
+/// VkColorSpaceKHR, composite alpha, pre-transform, clipped, engine name.
+///
+/// This is how gamescope learns what the guest's swapchain actually is. The
+/// colourspace matters most: `VkColorSpaceToGamescopeAppTextureColorSpace`
+/// maps `VK_COLOR_SPACE_HDR10_ST2084_EXT` to `HDR10_PQ`, and that tag is what
+/// decides whether the composite passes PQ through or applies its SDR→PQ LUT.
+/// Without the feedback gamescope reads every client as sRGB.
+#[allow(clippy::too_many_arguments)] // the protocol request's own arity
+pub unsafe fn swapchain_feedback(
+    sc: *mut wl_proxy,
+    image_count: u32,
+    vk_format: u32,
+    vk_colorspace: u32,
+    vk_composite_alpha: u32,
+    vk_pre_transform: u32,
+    vk_clipped: u32,
+    engine_name: *const std::os::raw::c_char,
+) {
+    let mut args = [
+        wl_argument { u: image_count },
+        wl_argument { u: vk_format },
+        wl_argument { u: vk_colorspace },
+        wl_argument {
+            u: vk_composite_alpha,
+        },
+        wl_argument {
+            u: vk_pre_transform,
+        },
+        wl_argument { u: vk_clipped },
+        wl_argument { s: engine_name },
+    ];
+    wl_proxy_marshal_array(sc, 2, args.as_mut_ptr());
+}
+
 // ------------------------------------------- zwp_linux_dmabuf_v1 statics
 // Transliterated from the wayland-scanner output (linux-dmabuf-v1); only
 // the members a version-3 bind can speak are referenced at runtime.

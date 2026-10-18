@@ -250,11 +250,14 @@ pub fn hdr_output_active() -> bool {
 }
 
 /// Pure core of the mirror the connector setters write: the connector is
-/// HDR-active when its `Colorspace` is `BT2020_RGB` or its `HDR_OUTPUT_METADATA`
-/// blob is set. gamescope writes the two together, so either alone means the
-/// connector was driven for HDR10; neither is set on the SDR path.
-fn hdr_output_active_for(colorspace: u64, metadata: u64) -> bool {
-    colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB || metadata != 0
+/// HDR-active when its `Colorspace` is `BT2020_RGB`.
+///
+/// The metadata blob deliberately does NOT count. gamescope writes
+/// `HDR_OUTPUT_METADATA` on both paths — the SDR static metadata blob when HDR
+/// is off (`DRMBackend.cpp:3281`) — so a set blob says nothing about the output
+/// encoding, and reading it as a signal made this true in every session.
+fn hdr_output_active_for(colorspace: u64) -> bool {
+    colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB
 }
 
 /// Cursor plane formats (doc §3.2: ARGB8888, 64×64).
@@ -686,7 +689,7 @@ impl Device {
     /// the presenter reads (see `hdr_output_active`).
     fn mirror_connector_hdr(&self) {
         CONNECTOR_HDR_ACTIVE.store(
-            hdr_output_active_for(self.conn_colorspace, self.conn_hdr_metadata),
+            hdr_output_active_for(self.conn_colorspace),
             Ordering::Relaxed,
         );
     }
@@ -2265,16 +2268,14 @@ mod tests {
         assert_eq!(&hdr[..sdr.len()], sdr);
     }
 
-    /// The connector's HDR-output signal is the connector state, not the
-    /// launcher's request: `BT2020_RGB` colorspace or a set metadata blob.
-    /// gamescope writes the two together, and neither is set on the SDR path.
+    /// The connector's HDR-output signal is its colorspace alone. A metadata
+    /// blob is always written — the SDR static metadata one when HDR is off —
+    /// so it cannot be part of the test.
     #[test]
-    fn connector_hdr_state_follows_colorspace_and_metadata() {
-        assert!(!hdr_output_active_for(DRM_MODE_COLORIMETRY_DEFAULT, 0));
-        assert!(hdr_output_active_for(DRM_MODE_COLORIMETRY_BT2020_RGB, 0));
-        assert!(hdr_output_active_for(DRM_MODE_COLORIMETRY_DEFAULT, 7));
-        // A non-BT2020_RGB colorspace with a cleared blob is not HDR output.
-        assert!(!hdr_output_active_for(DRM_MODE_COLORIMETRY_BT709_YCC, 0));
+    fn connector_hdr_state_follows_colorspace() {
+        assert!(!hdr_output_active_for(DRM_MODE_COLORIMETRY_DEFAULT));
+        assert!(hdr_output_active_for(DRM_MODE_COLORIMETRY_BT2020_RGB));
+        assert!(!hdr_output_active_for(DRM_MODE_COLORIMETRY_BT709_YCC));
     }
 
     /// Encode a payload the way the shim's `rpc()` does for a fixed struct.

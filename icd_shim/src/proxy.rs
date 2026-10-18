@@ -242,6 +242,47 @@ static RATE_WAIT: Mutex<Option<Instant>> = Mutex::new(None);
 static LAST_SIG: Mutex<Option<(String, u64)>> = Mutex::new(None);
 static RATE_REL: Mutex<Option<Instant>> = Mutex::new(None);
 static RATE_IDLE: Mutex<Option<Instant>> = Mutex::new(None);
+/// The surface-format list the guest is served (once a second at most).
+static RATE_SURFFMT: Mutex<Option<Instant>> = Mutex::new(None);
+// What the surface reports for `currentExtent`, once a second. vkd3d's swapchain
+// recreate returns without a word when that value is `u32::MAX`, so a window
+// whose size stops being readable stops every present with no other trace.
+static RATE_CAPS: Mutex<Option<Instant>> = Mutex::new(None);
+/// WSI entry-point call counters, printed once a second by [`wsi_hb`]. A client
+/// stuck in its own present loop still shows up here as the calls it keeps
+/// making, which is the one thing a driver-side trace cannot show.
+static HB_FMT: AtomicUsize = AtomicUsize::new(0);
+static HB_FMT2: AtomicUsize = AtomicUsize::new(0);
+static HB_CAPS: AtomicUsize = AtomicUsize::new(0);
+static HB_CAPS2: AtomicUsize = AtomicUsize::new(0);
+static HB_PMODES: AtomicUsize = AtomicUsize::new(0);
+static HB_CREATE: AtomicUsize = AtomicUsize::new(0);
+static HB_DESTROY: AtomicUsize = AtomicUsize::new(0);
+static HB_ACQ: AtomicUsize = AtomicUsize::new(0);
+static HB_PRESENT: AtomicUsize = AtomicUsize::new(0);
+static HB_IMAGES: AtomicUsize = AtomicUsize::new(0);
+static RATE_HB: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Print the WSI call counters at most once a second. Cumulative, so two
+/// consecutive lines differ by the calls made in between.
+fn wsi_hb() {
+    if !rate_ok(&RATE_HB, Duration::from_secs(1)) {
+        return;
+    }
+    crate::logf!(gndrm_obf::obf!(
+        "proxy hb: fmt={} fmt2={} caps={} caps2={} pmodes={} create={} destroy={} images={} acq={} present={}",
+        HB_FMT.load(Ordering::Relaxed),
+        HB_FMT2.load(Ordering::Relaxed),
+        HB_CAPS.load(Ordering::Relaxed),
+        HB_CAPS2.load(Ordering::Relaxed),
+        HB_PMODES.load(Ordering::Relaxed),
+        HB_CREATE.load(Ordering::Relaxed),
+        HB_DESTROY.load(Ordering::Relaxed),
+        HB_IMAGES.load(Ordering::Relaxed),
+        HB_ACQ.load(Ordering::Relaxed),
+        HB_PRESENT.load(Ordering::Relaxed),
+    ));
+}
 const RATE_EVERY: Duration = Duration::from_secs(1);
 const IDLE_EVERY: Duration = Duration::from_secs(2);
 
@@ -803,15 +844,21 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     _alloc: *const VkAllocationCallbacks,
     out: *mut VkSwapchainKHR,
 ) -> VkResult {
+    HB_CREATE.fetch_add(1, Ordering::Relaxed);
+    wsi_hb();
     let ci = unsafe { &*ci };
     let gd = unsafe { find_device(device) };
     let surf = unsafe { find_surface(ci.surface) };
     crate::logf!(gndrm_obf::obf!(
-        "proxy swapchain create: device={device:?} surface={:#x} {}x{} fmt={} -> gd={:?} surf={:?}",
+        "proxy swapchain create: device={device:?} surface={:#x} {}x{} fmt={} cs={} min={} mode={} old={:#x} -> gd={:?} surf={:?}",
         ci.surface,
         ci.imageExtent.width,
         ci.imageExtent.height,
         ci.imageFormat,
+        ci.imageColorSpace,
+        ci.minImageCount,
+        ci.presentMode,
+        ci.oldSwapchain as usize,
         gd,
         surf
     ));
@@ -832,10 +879,50 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     // R/B-exchanged pixels. Refuse it loudly rather than render wrong colours.
     if !swapchain_format_allowed(ci.imageFormat, advertises_rgba()) {
         crate::logf!(gndrm_obf::obf!(
-            "proxy: refusing swapchain format {} (scan-out pool is B8G8R8A8; set GN_VKSHIM_ALLOW_RGBA to opt in)",
-            ci.imageFormat
+            "proxy: refusing swapchain format {} cs={} (scan-out pool is B8G8R8A8; set GN_VKSHIM_ALLOW_RGBA to opt in)",
+            ci.imageFormat,
+            ci.imageColorSpace
         ));
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    // Declare what this swapchain is to gamescope. The colourspace is the load
+    // bearing field: gamescope maps HDR10_ST2084 to its HDR10_PQ app-texture
+    // colourspace, and that tag is what decides whether its composite passes PQ
+    // through or applies the SDR→PQ LUT. It is taken from the create info, not
+    // inferred from the format: the same 10-bit format is legitimately requested
+    // with the plain sRGB colours by clients that want the precision without HDR
+    // (DXVK does), and declaring that PQ makes gamescope decode sRGB as PQ.
+    {
+        let colorspace = ci.imageColorSpace;
+        let scobj = unsafe { (*surf).swapchain_obj };
+        if scobj.is_null() {
+            crate::logf!(gndrm_obf::obf!(
+                "proxy: no gamescope_swapchain to declare format {} colourspace {} on",
+                ci.imageFormat,
+                colorspace
+            ));
+        } else {
+            let engine = c"gn-shim";
+            let _sg = SEND_LOCK.lock().unwrap();
+            unsafe {
+                wlproto::swapchain_feedback(
+                    scobj,
+                    ci.minImageCount,
+                    ci.imageFormat as u32,
+                    colorspace as u32,
+                    ci.compositeAlpha,
+                    ci.preTransform,
+                    ci.clipped,
+                    engine.as_ptr(),
+                );
+                wlproto::wl_display_flush((*surf).dpy);
+            }
+            crate::logf!(gndrm_obf::obf!(
+                "proxy: declared swapchain format {} colourspace {} to gamescope",
+                ci.imageFormat,
+                colorspace
+            ));
+        }
     }
     let mode = effective_present_mode(ci);
     // Mesa's wayland WSI derives minImageCount from the present mode
@@ -997,6 +1084,8 @@ unsafe extern "C" fn gn_vkGetSwapchainImagesKHR(
     count: *mut u32,
     images: *mut VkImage,
 ) -> VkResult {
+    HB_IMAGES.fetch_add(1, Ordering::Relaxed);
+    wsi_hb();
     let sc = unsafe { find_swapchain(swapchain) };
     if sc.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -1031,6 +1120,8 @@ unsafe extern "C" fn gn_vkDestroySwapchainKHR(
     swapchain: VkSwapchainKHR,
     _alloc: *const VkAllocationCallbacks,
 ) {
+    HB_DESTROY.fetch_add(1, Ordering::Relaxed);
+    wsi_hb();
     let sc = unsafe { find_swapchain(swapchain) };
     if sc.is_null() {
         return;
@@ -1043,6 +1134,18 @@ unsafe extern "C" fn gn_vkDestroySwapchainKHR(
             (*sc).cv_free.notify_all();
         }
         drop(g);
+    }
+    {
+        // One line per destroyed swapchain: a swapchain that goes away while the
+        // guest keeps rendering is otherwise invisible, and nothing downstream
+        // can tell it from a guest that simply stopped presenting.
+        crate::logf!(gndrm_obf::obf!(
+            "proxy swapchain destroyed: sc={sc:?} {}x{} presents={} commits={}",
+            unsafe { (*sc).extent.width },
+            unsafe { (*sc).extent.height },
+            N_PRES.load(Ordering::Relaxed),
+            N_COMMIT_OK.load(Ordering::Relaxed)
+        ));
     }
     if let Some(worker) = unsafe { (*sc).worker.take() } {
         let _ = worker.join();
@@ -1296,6 +1399,8 @@ unsafe extern "C" fn gn_vkAcquireNextImageKHR(
     fence: VkFence,
     index: *mut u32,
 ) -> VkResult {
+    HB_ACQ.fetch_add(1, Ordering::Relaxed);
+    wsi_hb();
     let sc = unsafe { find_swapchain(swapchain) };
     if sc.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -1461,6 +1566,8 @@ unsafe fn present_dispatch(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
 
 // Present: the app's render completion
 unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentInfoKHR) -> VkResult {
+    HB_PRESENT.fetch_add(1, Ordering::Relaxed);
+    wsi_hb();
     N_PRES.fetch_add(1, Ordering::Relaxed);
     // The guest's frame period as the shim sees it: stamped at present entry,
     // before any work, so the census is the client's own cadence, not ours.
@@ -1824,14 +1931,19 @@ unsafe fn submit2_impl(
                 }
             }
         }
-        crate::logf!(gndrm_obf::obf!(
-            "proxy submit2 #{seq}: n={count} q={queue:?} real_q={:?} entries={:?} cbs={cbs:?} sems={sems:?} fence={fence:?}",
-            unsafe { (*gq).real },
-            unsafe { slice_or_empty(submits, count as usize) }
-                .iter()
-                .map(|s| s.commandBufferInfoCount)
-                .collect::<Vec<_>>()
-        ));
+        // Rate-limited: submits run at the guest's frame rate, so one line per
+        // submit floods the 256 KiB log ring in seconds and evicts the startup
+        // sequence this log exists to explain.
+        if seq < LOG_FIRST_N || seq.is_multiple_of(240) {
+            crate::logf!(gndrm_obf::obf!(
+                "proxy submit2 #{seq}: n={count} q={queue:?} real_q={:?} entries={:?} cbs={cbs:?} sems={sems:?} fence={fence:?}",
+                unsafe { (*gq).real },
+                unsafe { slice_or_empty(submits, count as usize) }
+                    .iter()
+                    .map(|s| s.commandBufferInfoCount)
+                    .collect::<Vec<_>>()
+            ));
+        }
     }
     unsafe { real_fn((*gq).real, count, translated, fence) }
 }
@@ -3896,6 +4008,16 @@ pub fn serve_unlisted(
     raw: PFN_vkVoidFunction,
     ctx: DispatchCtx,
 ) -> PFN_vkVoidFunction {
+    // The WSI commands the proxy cannot honour are never handed out, whichever
+    // entry point is asked: `vkGetDeviceProcAddr` filters before it gets here,
+    // and the loader resolves device functions through the *instance* path, so
+    // without this a client still receives `vkWaitForPresentKHR` from the
+    // driver with a shim swapchain handle the driver has never seen. vkd3d-proton
+    // takes that pointer, budgets its frame latency on it, and its present task
+    // then iterates without ever presenting.
+    if unimplemented_wsi_ext(name) {
+        return None;
+    }
     let raw = raw?;
     if !crate::proxy_active() {
         // No wrappers exist, so every handle is the driver's own.
@@ -4499,6 +4621,8 @@ pub const GN_DRM_FORMAT_XBGR8888: u32 = gn_fourcc(b'X', b'B', b'2', b'4');
 // so describing it as an X-format would force the compositor to discard it.
 pub const GN_DRM_FORMAT_ARGB8888: u32 = gn_fourcc(b'A', b'R', b'2', b'4');
 pub const GN_DRM_FORMAT_ABGR8888: u32 = gn_fourcc(b'A', b'B', b'2', b'4');
+pub const GN_DRM_FORMAT_ABGR2101010: u32 = gn_fourcc(b'A', b'B', b'3', b'0');
+pub const GN_DRM_FORMAT_ARGB2101010: u32 = gn_fourcc(b'A', b'R', b'3', b'0');
 pub const GN_DRM_MOD_LINEAR: u64 = 0;
 fn max_swapchain_images() -> u32 {
     match std::env::var("WRAPPER_MAX_IMAGE_COUNT")
@@ -4510,10 +4634,24 @@ fn max_swapchain_images() -> u32 {
     }
 }
 
+/// The WSI surface the proxy does not implement, by extension name and by the
+/// command names those extensions add.
+///
+/// Both forms are needed because the same predicate guards two different
+/// questions: which extensions to enumerate (`vkEnumerate*ExtensionProperties`,
+/// extension names) and which entry points `vkGetDeviceProcAddr` may resolve
+/// (command names). Testing extension names alone left the commands resolvable,
+/// so the guest got `vkWaitForPresentKHR` from the driver together with a shim
+/// swapchain handle the driver has never seen — vkd3d-proton asks for it
+/// whenever it resolves, which is why DX12 titles stalled in their present task
+/// while DXVK titles, which never call it, presented normally.
 fn unimplemented_wsi_ext(name: &CStr) -> bool {
     name == c"VK_KHR_present_wait"
         || name == c"VK_KHR_present_id"
         || name == c"VK_EXT_swapchain_maintenance1"
+        || name == c"vkWaitForPresentKHR"
+        || name == c"vkWaitForPresent2KHR"
+        || name == c"vkReleaseSwapchainImagesEXT"
 }
 
 // ---------------------------------------------------------------- objects
@@ -5821,6 +5959,16 @@ unsafe extern "C" fn gn_vkEnumerateInstanceExtensionProperties(
     let Some(real_enum) = real_enum else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
+    // Extensions the proxy answers itself. The two surface extensions are always
+    // hidden from the real driver; `VK_EXT_swapchain_colorspace` is added in an
+    // HDR session because it defines the PQ colourspace the surface formats
+    // advertise, and a client that does not see the extension must ignore it.
+    let names: [&[u8]; 3] = [
+        b"VK_KHR_wayland_surface\0",
+        b"VK_KHR_xlib_surface\0",
+        b"VK_EXT_swapchain_colorspace\0",
+    ];
+    let extra: u32 = 2;
     unsafe {
         if pProps.is_null() {
             let mut n: u32 = 0;
@@ -5828,7 +5976,7 @@ unsafe extern "C" fn gn_vkEnumerateInstanceExtensionProperties(
             if res != VK_SUCCESS {
                 return res;
             }
-            *pCount = n + 2;
+            *pCount = n + extra;
             return VK_SUCCESS;
         }
         let cap = *pCount;
@@ -5836,27 +5984,24 @@ unsafe extern "C" fn gn_vkEnumerateInstanceExtensionProperties(
             *pCount = 0;
             return VK_INCOMPLETE;
         }
-        let mut n = cap.saturating_sub(2);
+        let mut n = cap.saturating_sub(extra);
         let res = real_enum(layer, &mut n, pProps);
         if res != VK_SUCCESS && res != VK_INCOMPLETE {
             return res;
         }
-        let total = n + 2;
+        let total = n + extra;
         if cap >= total {
             // Both surface extensions are proxied: winewayland clients use
             // the wayland one, winex11 clients (the gamescope path) the xlib
-            // one — the real driver never sees either.
-            for (i, name) in [
-                &b"VK_KHR_wayland_surface\0"[..],
-                &b"VK_KHR_xlib_surface\0"[..],
-            ]
-            .iter()
-            .enumerate()
-            {
+            // one — the real driver never sees either. `VK_EXT_swapchain_colorspace`
+            // is NOT advertised: exposing it made vkd3d-proton titles present once
+            // per swapchain and then stop, while the PQ surface format alone is
+            // enough for DXVK to report an HDR10 output.
+            for (i, name) in names[..extra as usize].iter().enumerate() {
                 let slot = &mut *pProps.add(n as usize + i);
                 slot.specVersion = 6;
                 slot.extensionName[..name.len()]
-                    .copy_from_slice(std::mem::transmute::<&[u8], &[c_char]>(name));
+                    .copy_from_slice(std::mem::transmute::<&[u8], &[c_char]>(*name));
             }
             *pCount = total;
             return VK_SUCCESS;
@@ -5895,12 +6040,14 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
         if res != VK_SUCCESS {
             return res;
         }
+        // One spare slot: the proxy appends `VK_EXT_hdr_metadata` when the
+        // driver does not list it (see below).
         let mut buf = vec![
             VkExtensionProperties {
                 extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
                 specVersion: 0,
             };
-            n as usize
+            n as usize + 1
         ];
         let mut got = n;
         let res = real(pd, layer, &mut got, buf.as_mut_ptr());
@@ -5908,11 +6055,37 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
             return res;
         }
         let mut kept = 0usize;
+        let mut has_hdr_metadata = false;
         for i in 0..got as usize {
-            if !unimplemented_wsi_ext(CStr::from_ptr(buf[i].extensionName.as_ptr())) {
-                buf[kept] = buf[i];
-                kept += 1;
+            let name = CStr::from_ptr(buf[i].extensionName.as_ptr());
+            if unimplemented_wsi_ext(name) {
+                continue;
             }
+            if name == c"VK_EXT_hdr_metadata" {
+                has_hdr_metadata = true;
+            }
+            buf[kept] = buf[i];
+            kept += 1;
+        }
+        if !has_hdr_metadata {
+            // The proxy answers `vkSetHdrMetadataEXT` itself, so the extension
+            // honours its only command whether or not the driver implements it. A
+            // guest that is offered a PQ surface format needs to see this: vkd3d
+            // re-enters its swapchain-recreate path and never issues a create when
+            // a PQ colours is on offer without it.
+            let mut prop = VkExtensionProperties {
+                extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
+                specVersion: 2,
+            };
+            let name = b"VK_EXT_hdr_metadata\0";
+            for (j, b) in name.iter().enumerate() {
+                prop.extensionName[j] = *b as std::os::raw::c_char;
+            }
+            buf[kept] = prop;
+            kept += 1;
+            crate::logf!(gndrm_obf::obf!(
+                "proxy: advertised VK_EXT_hdr_metadata (driver does not list it)"
+            ));
         }
         if props.is_null() {
             *count = kept as u32;
@@ -6274,6 +6447,8 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilities2KHR(
     info: *const VkPhysicalDeviceSurfaceInfo2KHR,
     caps: *mut VkSurfaceCapabilities2KHR,
 ) -> VkResult {
+    HB_CAPS2.fetch_add(1, Ordering::Relaxed);
+    wsi_hb();
     if info.is_null() || caps.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -6304,6 +6479,8 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     surface: VkSurfaceKHR,
     caps: *mut VkSurfaceCapabilitiesKHR,
 ) -> VkResult {
+    HB_CAPS.fetch_add(1, Ordering::Relaxed);
+    wsi_hb();
     let s = unsafe { find_surface(surface) };
     if s.is_null() {
         crate::logf!(gndrm_obf::obf!(
@@ -6319,6 +6496,17 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     // gamescope scans out 1:1. `u32::MAX` ("app picks") is kept only for
     // surfaces with no guest window (the wayland route).
     let window_extent = unsafe { surface_extent(s) };
+    if rate_ok(&RATE_CAPS, Duration::from_secs(1)) {
+        let w = unsafe { (*s).window };
+        match window_extent {
+            Some((cw, ch)) => crate::logf!(gndrm_obf::obf!(
+                "proxy caps: current={cw}x{ch} win={w:#x} src=window"
+            )),
+            None => crate::logf!(gndrm_obf::obf!(
+                "proxy caps: current=u32::MAX win={w:#x} src=none"
+            )),
+        }
+    }
     let out = VkSurfaceCapabilitiesKHR {
         minImageCount: 2,
         maxImageCount: max_swapchain_images(),
@@ -6393,6 +6581,78 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
 /// `advertises_rgba`). Shared by the plain and `2` query forms so both forms
 /// advertise exactly the same set.
 fn served_surface_formats() -> &'static [VkSurfaceFormatKHR] {
+    // The HDR set contains exactly what the create path can present: the
+    // scan-out pool's BGRA layout and the 10-bit layout, each with both colour
+    // spaces. Two rules fix that shape.
+    //
+    // Every format is paired with both colours because vkd3d's
+    // `dxgi_vk_swap_chain_select_format` demands an entry whose format AND
+    // colour space match the request, and its only wildcard fallback exists on
+    // the sRGB path: a title that switches to PQ while keeping an 8-bit
+    // backbuffer stops creating swapchains entirely without the
+    // `(B8G8R8A8_UNORM, HDR10_ST2084)` pair. Order matters to a client that
+    // takes the first entry carrying a colour space (DXVK): the 10-bit pair
+    // comes first, because 8-bit PQ shreds the tone range.
+    //
+    // Nothing else may appear. An entry the create path refuses is worse than a
+    // missing one — the client takes the offer, the create fails, and it
+    // retries forever: measured, advertising `R8G8B8A8_UNORM` without the RGBA
+    // opt-in made DXVK loop on an in-game HDR toggle, and advertising FP16 made
+    // it take `fmt=97 cs=1000104008` and loop against a refusal, because the
+    // scan-out pool cannot serve 16 bits.
+    const K_HDR: [VkSurfaceFormatKHR; 4] = [
+        VkSurfaceFormatKHR {
+            format: VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+            colorSpace: VK_COLOR_SPACE_HDR10_ST2084_EXT,
+        },
+        VkSurfaceFormatKHR {
+            format: VK_FORMAT_B8G8R8A8_UNORM,
+            colorSpace: VK_COLOR_SPACE_HDR10_ST2084_EXT,
+        },
+        VkSurfaceFormatKHR {
+            format: VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+            colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+        },
+        VkSurfaceFormatKHR {
+            format: VK_FORMAT_B8G8R8A8_UNORM,
+            colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+        },
+    ];
+
+    // The RGBA opt-in is the only case where the create path serves
+    // `R8G8B8A8_UNORM`, so it is the only case that may advertise it.
+    const K_HDR_RGBA: [VkSurfaceFormatKHR; 6] = [
+        K_HDR[0],
+        K_HDR[1],
+        K_HDR[2],
+        K_HDR[3],
+        VkSurfaceFormatKHR {
+            format: VK_FORMAT_R8G8B8A8_UNORM,
+            colorSpace: VK_COLOR_SPACE_HDR10_ST2084_EXT,
+        },
+        VkSurfaceFormatKHR {
+            format: VK_FORMAT_R8G8B8A8_UNORM,
+            colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+        },
+    ];
+    if hdr_session() {
+        if rate_ok(&RATE_SURFFMT, Duration::from_secs(1)) {
+            let mut list = String::new();
+            for f in K_HDR.iter() {
+                list.push_str(&format!(" {:#x}/{:#x}", f.format as u32, f.colorSpace));
+            }
+            crate::logf!(gndrm_obf::obf!(
+                "proxy surface formats served (hdr): n={} {}",
+                if advertises_rgba() { 6 } else { 4 },
+                list
+            ));
+        }
+        return if advertises_rgba() {
+            &K_HDR_RGBA
+        } else {
+            &K_HDR
+        };
+    }
     const K_FMTS: [VkSurfaceFormatKHR; 2] = [
         VkSurfaceFormatKHR {
             format: VK_FORMAT_B8G8R8A8_UNORM,
@@ -6420,6 +6680,8 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceFormatsKHR(
     count: *mut u32,
     formats: *mut VkSurfaceFormatKHR,
 ) -> VkResult {
+    HB_FMT.fetch_add(1, Ordering::Relaxed);
+    wsi_hb();
     if unsafe { find_surface(surface) }.is_null() {
         crate::logf!(gndrm_obf::obf!(
             "proxy surface formats query: {surface:#x} not one of ours"
@@ -6545,6 +6807,8 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfacePresentModesKHR(
     count: *mut u32,
     modes: *mut VkPresentModeKHR,
 ) -> VkResult {
+    HB_PMODES.fetch_add(1, Ordering::Relaxed);
+    wsi_hb();
     if unsafe { find_surface(surface) }.is_null() {
         crate::logf!(gndrm_obf::obf!(
             "proxy surface present-modes query: {surface:#x} not one of ours"
@@ -6710,6 +6974,8 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceFormats2KHR(
     count: *mut u32,
     formats: *mut VkSurfaceFormat2KHR,
 ) -> VkResult {
+    HB_FMT2.fetch_add(1, Ordering::Relaxed);
+    wsi_hb();
     if info.is_null() || count.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -7162,6 +7428,17 @@ fn vk_format_to_fourcc(format: VkFormat) -> u32 {
         // (`PRIMARY_FORMATS`), so this keeps the two descriptions in agreement.
         VK_FORMAT_B8G8R8A8_UNORM => GN_DRM_FORMAT_ARGB8888,
         VK_FORMAT_R8G8B8A8_UNORM => GN_DRM_FORMAT_ABGR8888,
+        // The HDR swapchain: 2:10:10:10 B,G,R,A, the layout gamescope scans out
+        // as XBGR2101010 and the pool serves as R10G10B10A2.
+        // `ARGB2101010`, not the `ABGR2101010` the Vulkan format name implies:
+        // DXGI's `R10G10B10A2` puts red in the high ten bits, and that is the
+        // word a D3D client leaves in the buffer whatever VkFormat it rendered
+        // through. Measured on Ori by toggling the game's own HDR: declared as
+        // ABGR the same view came out blue (mean 2,51,89) where SDR shows warm
+        // (114,42,28) — red and blue exchanged; declared as ARGB it is correct.
+        // gamescope maps this fourcc back to `A2R10G10B10_UNORM_PACK32`, so the
+        // import describes the contents.
+        VK_FORMAT_A2B10G10R10_UNORM_PACK32 => GN_DRM_FORMAT_ARGB2101010,
         _ => 0,
     }
 }
@@ -7174,7 +7451,17 @@ fn advertises_rgba() -> bool {
 }
 
 fn swapchain_format_allowed(format: VkFormat, allow_rgba: bool) -> bool {
-    format == SCANOUT_SWAPCHAIN_FORMAT || (allow_rgba && format == VK_FORMAT_R8G8B8A8_UNORM)
+    format == SCANOUT_SWAPCHAIN_FORMAT
+        || (allow_rgba && format == VK_FORMAT_R8G8B8A8_UNORM)
+        || (hdr_session() && format == VK_FORMAT_A2B10G10R10_UNORM_PACK32)
+}
+
+/// Whether this session asked for HDR output. The app sets `GNDRM_HDR` in its
+/// own process before forking the guest, so the guest — and this shim inside
+/// it — sees the flag. It is the same flag the daemon gates the 10-bit pool
+/// buffer and the HDR EDID on, which is what keeps the three consistent.
+fn hdr_session() -> bool {
+    std::env::var_os("GNDRM_HDR").is_some_and(|v| v == "1")
 }
 
 unsafe fn slot_release(sc: *mut GnSwapchain, s: *mut GnSlot) {

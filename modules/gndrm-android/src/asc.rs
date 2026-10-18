@@ -1058,12 +1058,12 @@ impl AscState {
                     // Format and content are two questions; the published
                     // dataspace answers the first under the existing rule.
                     //
-                    // Format — is the buffer on the layer 10-bit? The pool serves
-                    // `R10G10B10A2_UNORM` whenever the session asked for HDR
-                    // (`served_ahb_format` follows `hdr_output_enabled`), and
-                    // gamescope scans out a 10-bit fourcc to match. This is a fact
-                    // about the pixels' layout, not their transfer function, and it
-                    // is what the dataspace is keyed on — unchanged.
+                    // Format — is the buffer on the layer 10-bit? Read from the
+                    // committed framebuffer's own fourcc: the pool serves the layout
+                    // the client asked for, so a 10-bit scan-out is a 10-bit buffer
+                    // by construction. This is a fact about the pixels' layout, not
+                    // their transfer function, and it is what the dataspace is
+                    // keyed on — together with the content encoding below.
                     //
                     // Content — are those pixels PQ-encoded in fact? The committed
                     // fourcc cannot answer that: on the forced-composition path
@@ -1083,7 +1083,14 @@ impl AscState {
                         || served_ahb_format(SCANOUT_FORMAT_BGRA_8888)
                             == ffi::AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM;
                     let hdr_content = gndrm_daemon::hdr_output_active();
-                    let dataspace = if hdr_buffer {
+                    // The dataspace describes the encoding the pixels are in,
+                    // which is the *output* encoding gamescope chose — not the
+                    // buffer's bit depth. A 10-bit buffer carrying a frame
+                    // gamescope tone-mapped to Gamma 22 is SDR data, and tagging
+                    // it PQ makes the compositor model-map it a second time.
+                    // `hdr_content` is gamescope's own connector state (the
+                    // register its HDR commit sets), so the tag follows it.
+                    let dataspace = if hdr_buffer && hdr_content {
                         ffi::ADATASPACE_BT2020_PQ
                     } else {
                         ffi::ADATASPACE_UNKNOWN
@@ -2458,6 +2465,53 @@ fn build_show(
         // for the 8-bit one. setColor's dataspace above only applies to the
         // background colour layer, not the buffer.
         (api.st_set_buffer_dataspace)(tx, sc, dataspace);
+        // PQ on the layer is not enough for the display to enter its HDR mode:
+        // SurfaceFlinger reports no HDR layer present and converts the frame to
+        // BT709/sRGB for an SDR output, which clips it. The HDR static metadata
+        // is what marks the layer HDR to the hardware composer, so it goes with
+        // the buffer, in the same transaction.
+        if dataspace == ffi::ADATASPACE_BT2020_PQ {
+            // UNGATED one-shot: whether the HDR metadata actually went out is
+            // the difference between "the composer ignored it" and "we never
+            // called", and no other probe can see that.
+            {
+                static ONCE: core::sync::atomic::AtomicBool =
+                    core::sync::atomic::AtomicBool::new(false);
+                if !ONCE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                    crate::log_always!(
+                        "gndrm-daemon: asc hdr metadata cta861_3={} smpte2086={} cap={}",
+                        api.st_set_hdr_metadata_cta861_3.is_some(),
+                        api.st_set_hdr_metadata_smpte2086.is_some(),
+                        gndrm_daemon::hdr_output_capability().is_some()
+                    );
+                }
+            }
+            if let Some(cap) = gndrm_daemon::hdr_output_capability() {
+                if let Some(set_cta) = api.st_set_hdr_metadata_cta861_3 {
+                    let md = ffi::AHdrMetadataCta8613 {
+                        max_content_light_level: cap.max_nits,
+                        max_frame_average_light_level: cap.fall_nits,
+                    };
+                    (set_cta)(tx, sc, &md);
+                }
+                if let Some(set_smpte) = api.st_set_hdr_metadata_smpte2086 {
+                    // BT.2020 primaries and D65: the colour volume the PQ buffer
+                    // is encoded against, with the panel's own luminances.
+                    let md = ffi::AHdrMetadataSmpte2086 {
+                        display_primary_red: ffi::AColorXy { x: 0.708, y: 0.292 },
+                        display_primary_green: ffi::AColorXy { x: 0.170, y: 0.797 },
+                        display_primary_blue: ffi::AColorXy { x: 0.131, y: 0.046 },
+                        white_point: ffi::AColorXy {
+                            x: 0.3127,
+                            y: 0.3290,
+                        },
+                        max_luminance: cap.max_nits,
+                        min_luminance: cap.min_nits,
+                    };
+                    (set_smpte)(tx, sc, &md);
+                }
+            }
+        }
         // The completion reports the previous release fence, which is what
         // gates re-publishing this buffer.
         (api.st_set_on_complete)(tx, ctx.cast(), on_complete);

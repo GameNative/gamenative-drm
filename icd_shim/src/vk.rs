@@ -163,9 +163,18 @@ pub const VK_LAYER_LINK_INFO: i32 = 0; // VkLayerFunction
 pub type VkFormat = i32;
 pub const VK_FORMAT_R8G8B8A8_UNORM: VkFormat = 37;
 pub const VK_FORMAT_B8G8R8A8_UNORM: VkFormat = 44;
+/// `VK_FORMAT_A2B10G10R10_UNORM_PACK32`: the 10-bit 2:10:10:10 layout the HDR
+/// scan-out buffer uses, offered to the guest as the PQ surface format.
+pub const VK_FORMAT_A2B10G10R10_UNORM_PACK32: VkFormat = 58;
 
 pub type VkColorSpaceKHR = i32;
 pub const VK_COLOR_SPACE_SRGB_NONLINEAR_KHR: VkColorSpaceKHR = 0;
+/// `VK_COLOR_SPACE_HDR10_ST2084_EXT`: PQ (SMPTE ST 2084) on BT.2020, from
+/// `VK_EXT_swapchain_colorspace`. Only meaningful to a client when that
+/// extension is enumerated, which the proxy does when the session is HDR.
+pub const VK_COLOR_SPACE_HDR10_ST2084_EXT: VkColorSpaceKHR = 1_000_104_008;
+/// `VK_FORMAT_R8G8B8A8_SRGB`: the RGBA counterpart of the above.
+pub const VK_FORMAT_R8G8B8A8_SRGB: VkFormat = 43;
 
 pub type VkImageType = i32;
 pub const VK_IMAGE_TYPE_2D: VkImageType = 1;

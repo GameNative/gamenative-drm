@@ -293,6 +293,45 @@ pub type FnStStatsReleaseASurfaceControls =
 pub type FnAhbGetNativeHandle =
     unsafe extern "C" fn(buffer: *const AHardwareBuffer) -> *mut NativeHandle;
 
+/// `AColor_xy` (`android/hdr_metadata.h`): one chromaticity, CIE xy.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AColorXy {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// `AHdrMetadata_smpte2086`: mastering-display colour volume.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AHdrMetadataSmpte2086 {
+    pub display_primary_red: AColorXy,
+    pub display_primary_green: AColorXy,
+    pub display_primary_blue: AColorXy,
+    pub white_point: AColorXy,
+    pub max_luminance: f32,
+    pub min_luminance: f32,
+}
+
+/// `AHdrMetadata_cta861_3`: static content light levels, in nits.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AHdrMetadataCta8613 {
+    pub max_content_light_level: f32,
+    pub max_frame_average_light_level: f32,
+}
+
+pub type FnStSetHdrMetadataCta8613 = unsafe extern "C" fn(
+    transaction: *mut ASurfaceTransaction,
+    surface_control: *mut ASurfaceControl,
+    metadata: *const AHdrMetadataCta8613,
+);
+pub type FnStSetHdrMetadataSmpte2086 = unsafe extern "C" fn(
+    transaction: *mut ASurfaceTransaction,
+    surface_control: *mut ASurfaceControl,
+    metadata: *const AHdrMetadataSmpte2086,
+);
+
 /// `<android/looper.h>`. Optional in the table below.
 ///
 /// `ASurfaceTransaction` completions are delivered by libgui on its own binder
@@ -334,6 +373,11 @@ pub struct ScApi {
     pub st_set_buffer_dataspace: FnStSetBufferDataSpace,
     pub st_set_buffer_transparency: FnStSetBufferTransparency,
     pub st_set_on_complete: FnStSetOnComplete,
+    /// HDR static metadata, API 29. Optional: a layer without it still presents,
+    /// it just is not marked HDR, and the display then tone-maps the frame onto
+    /// an SDR output instead of entering its HDR mode.
+    pub st_set_hdr_metadata_cta861_3: Option<FnStSetHdrMetadataCta8613>,
+    pub st_set_hdr_metadata_smpte2086: Option<FnStSetHdrMetadataSmpte2086>,
     pub st_stats_previous_release_fence_fd: FnStStatsGetPreviousReleaseFenceFd,
     pub st_stats_get_controls: FnStStatsGetASurfaceControls,
     pub st_stats_release_controls: FnStStatsReleaseASurfaceControls,
@@ -392,6 +436,14 @@ impl ScApi {
                     c"ASurfaceTransaction_setBufferTransparency",
                 )?,
                 st_set_on_complete: sym(handle, c"ASurfaceTransaction_setOnComplete")?,
+                st_set_hdr_metadata_cta861_3: sym(
+                    handle,
+                    c"ASurfaceTransaction_setHdrMetadata_cta861_3",
+                ),
+                st_set_hdr_metadata_smpte2086: sym(
+                    handle,
+                    c"ASurfaceTransaction_setHdrMetadata_smpte2086",
+                ),
                 st_stats_previous_release_fence_fd: sym(
                     handle,
                     c"ASurfaceTransactionStats_getPreviousReleaseFenceFd",
