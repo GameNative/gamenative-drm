@@ -450,13 +450,9 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
     if fnptr.is_some() {
         return fnptr;
     }
-    unsafe {
-        proxy::serve_unlisted(
-            name,
-            DRIVER.gipa?(instance, pName),
-            proxy::DispatchCtx::Instance,
-        )
-    }
+    let raw = unsafe { DRIVER.gipa?(instance, pName) };
+    proxy::note_instance_miss(name, raw.is_none());
+    proxy::serve_unlisted(name, raw, proxy::DispatchCtx::Instance)
 }
 
 /// # Safety: loader-ICD v5 interface (called by the Khronos loader).
@@ -485,5 +481,6 @@ pub unsafe extern "C" fn vk_icdGetPhysicalDeviceProcAddr(
             None => DRIVER.gipa?(instance, pName),
         }
     };
+    proxy::note_instance_miss(name, raw.is_none());
     proxy::serve_unlisted(name, raw, proxy::DispatchCtx::PhysicalDevice)
 }

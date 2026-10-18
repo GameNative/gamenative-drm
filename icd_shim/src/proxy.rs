@@ -4032,6 +4032,29 @@ pub fn serve_unlisted(
 }
 
 pub static GDPA_MISSED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Entry points the *driver* has no implementation for, asked through the
+/// instance and physical-device paths. Named once each, like `GDPA_MISSED`:
+/// the loader resolves device functions through these paths too, so a name the
+/// driver lacks here is a name a client receives as a no-op.
+pub static GIPA_MISSED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Record an unresolvable entry point asked through the instance or
+/// physical-device path. Names the shim masks deliberately are not misses —
+/// they are refusals, and `unimplemented_wsi_ext` already says why.
+pub fn note_instance_miss(name: &CStr, driver_has_none: bool) {
+    if !driver_has_none || unimplemented_wsi_ext(name) {
+        return;
+    }
+    if let Ok(mut missed) = GIPA_MISSED.lock() {
+        let n = name.to_string_lossy().into_owned();
+        if missed.len() < 64 && !missed.contains(&n) {
+            crate::logf!(gndrm_obf::obf!(
+                "proxy: instance-path MISS (driver has no entry point): {n}"
+            ));
+            missed.push(n);
+        }
+    }
+}
 static REAL_PROC_SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 unsafe extern "C" fn gn_vkGetDeviceProcAddr(
@@ -6600,9 +6623,13 @@ fn served_surface_formats() -> &'static [VkSurfaceFormatKHR] {
     // opt-in made DXVK loop on an in-game HDR toggle, and advertising FP16 made
     // it take `fmt=97 cs=1000104008` and loop against a refusal, because the
     // scan-out pool cannot serve 16 bits.
-    const K_HDR: [VkSurfaceFormatKHR; 4] = [
+    const K_HDR: [VkSurfaceFormatKHR; 9] = [
         VkSurfaceFormatKHR {
             format: VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+            colorSpace: VK_COLOR_SPACE_HDR10_ST2084_EXT,
+        },
+        VkSurfaceFormatKHR {
+            format: VK_FORMAT_A2R10G10B10_UNORM_PACK32,
             colorSpace: VK_COLOR_SPACE_HDR10_ST2084_EXT,
         },
         VkSurfaceFormatKHR {
@@ -6614,18 +6641,36 @@ fn served_surface_formats() -> &'static [VkSurfaceFormatKHR] {
             colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
         },
         VkSurfaceFormatKHR {
+            format: VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+            colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+        },
+        VkSurfaceFormatKHR {
             format: VK_FORMAT_B8G8R8A8_UNORM,
             colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+        },
+        VkSurfaceFormatKHR {
+            format: VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+            colorSpace: VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT,
+        },
+        VkSurfaceFormatKHR {
+            format: VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+            colorSpace: VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT,
+        },
+        VkSurfaceFormatKHR {
+            format: VK_FORMAT_B8G8R8A8_UNORM,
+            colorSpace: VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT,
         },
     ];
 
     // The RGBA opt-in is the only case where the create path serves
     // `R8G8B8A8_UNORM`, so it is the only case that may advertise it.
-    const K_HDR_RGBA: [VkSurfaceFormatKHR; 6] = [
+    const K_HDR_RGBA: [VkSurfaceFormatKHR; 8] = [
         K_HDR[0],
         K_HDR[1],
         K_HDR[2],
         K_HDR[3],
+        K_HDR[4],
+        K_HDR[5],
         VkSurfaceFormatKHR {
             format: VK_FORMAT_R8G8B8A8_UNORM,
             colorSpace: VK_COLOR_SPACE_HDR10_ST2084_EXT,
@@ -6643,7 +6688,7 @@ fn served_surface_formats() -> &'static [VkSurfaceFormatKHR] {
             }
             crate::logf!(gndrm_obf::obf!(
                 "proxy surface formats served (hdr): n={} {}",
-                if advertises_rgba() { 6 } else { 4 },
+                K_HDR.len(),
                 list
             ));
         }
@@ -7428,17 +7473,16 @@ fn vk_format_to_fourcc(format: VkFormat) -> u32 {
         // (`PRIMARY_FORMATS`), so this keeps the two descriptions in agreement.
         VK_FORMAT_B8G8R8A8_UNORM => GN_DRM_FORMAT_ARGB8888,
         VK_FORMAT_R8G8B8A8_UNORM => GN_DRM_FORMAT_ABGR8888,
-        // The HDR swapchain: 2:10:10:10 B,G,R,A, the layout gamescope scans out
-        // as XBGR2101010 and the pool serves as R10G10B10A2.
-        // `ARGB2101010`, not the `ABGR2101010` the Vulkan format name implies:
-        // DXGI's `R10G10B10A2` puts red in the high ten bits, and that is the
-        // word a D3D client leaves in the buffer whatever VkFormat it rendered
-        // through. Measured on Ori by toggling the game's own HDR: declared as
-        // ABGR the same view came out blue (mean 2,51,89) where SDR shows warm
-        // (114,42,28) — red and blue exchanged; declared as ARGB it is correct.
-        // gamescope maps this fourcc back to `A2R10G10B10_UNORM_PACK32`, so the
-        // import describes the contents.
-        VK_FORMAT_A2B10G10R10_UNORM_PACK32 => GN_DRM_FORMAT_ARGB2101010,
+        // The two 10-bit layouts differ only in which channel sits in the high
+        // ten bits, and the fourcc must say which one the buffer actually is:
+        // `A2R10G10B10` (58, red high) is the pool's own layout and gamescope
+        // reads it back as `ARGB2101010`; `A2B10G10R10` (64, blue high) is the
+        // canonical Vulkan layout vkd3d asks for and reads back as
+        // `ABGR2101010`. Declaring the wrong one exchanges red and blue —
+        // measured on Ori: an HDR frame that should read warm (114,42,28) came
+        // out blue (2,51,89).
+        VK_FORMAT_A2R10G10B10_UNORM_PACK32 => GN_DRM_FORMAT_ARGB2101010,
+        VK_FORMAT_A2B10G10R10_UNORM_PACK32 => GN_DRM_FORMAT_ABGR2101010,
         _ => 0,
     }
 }
@@ -7453,7 +7497,9 @@ fn advertises_rgba() -> bool {
 fn swapchain_format_allowed(format: VkFormat, allow_rgba: bool) -> bool {
     format == SCANOUT_SWAPCHAIN_FORMAT
         || (allow_rgba && format == VK_FORMAT_R8G8B8A8_UNORM)
-        || (hdr_session() && format == VK_FORMAT_A2B10G10R10_UNORM_PACK32)
+        || (hdr_session()
+            && (format == VK_FORMAT_A2B10G10R10_UNORM_PACK32
+                || format == VK_FORMAT_A2R10G10B10_UNORM_PACK32))
 }
 
 /// Whether this session asked for HDR output. The app sets `GNDRM_HDR` in its

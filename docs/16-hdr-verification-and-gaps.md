@@ -174,13 +174,21 @@ path never reaches the block after `select_format`.
 Both creates in the failing session are `960x540 fmt=44 cs=0` — SDR. The title
 never obtains an HDR swapchain at all; the stall is its *first* HDR attempt.
 
-That is the contradiction this document leaves open: every exit the source
-allows is excluded by measurement, and the only remaining way to see the
-request is from inside the shipped `d3d12core.dll`. The next instrument is a
-patched build of that library printing `(dxgi_format, colour_space)` at
-`dxgi_vk_swap_chain_select_format` — which needs `widl`, available on Arch only
-through Wine. Six list shapes have been tried against this symptom; none moved
-it.
+**Resolved.** An instrumented `d3d12core.dll` (vkd3d-proton `v3.0.1` and
+`v2.14.1` both, built with mingw + `widl` and logging the pair at `ERR`) showed
+the request: `dxgi_fmt=24 dxgi_cs=12` → **`vk_format=64 vk_cs=HDR10_ST2084`**.
+`64` is `VK_FORMAT_A2B10G10R10_UNORM_PACK32` — and the shim's constant of that
+name had the value **58**, which is `VK_FORMAT_A2R10G10B10_UNORM_PACK32`. The
+scan-out pool is `R10G10B10A2`, i.e. red-high, so 58 was the honest constant for
+the *pool*; the shim simply never advertised the canonical blue-high layout, and
+vkd3d asks for that one. `select_format` therefore matched nothing and the
+recreate returned before `vkCreateSwapchainKHR`, every frame, silently.
+
+Serving both layouts — `(A2B10G10R10, PQ)`, `(A2R10G10B10, PQ)` and the 8-bit
+pairs — makes the create happen (`fmt=64 cs=1000104008`, 60 fps, presents
+climbing), and the colour is right because each layout carries its own fourcc:
+`A2R10G10B10` → `ARGB2101010`, `A2B10G10R10` → `ABGR2101010`. Declaring the
+wrong one is what exchanged red and blue in an earlier arm.
 
 **Consequences for the features built on it.** The guest-side HDR path is
 proven for DXVK (above) and blocked for vkd3d. `--hdr-enabled` with the game's

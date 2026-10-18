@@ -163,12 +163,21 @@ pub const VK_LAYER_LINK_INFO: i32 = 0; // VkLayerFunction
 pub type VkFormat = i32;
 pub const VK_FORMAT_R8G8B8A8_UNORM: VkFormat = 37;
 pub const VK_FORMAT_B8G8R8A8_UNORM: VkFormat = 44;
-/// `VK_FORMAT_A2B10G10R10_UNORM_PACK32`: the 10-bit 2:10:10:10 layout the HDR
-/// scan-out buffer uses, offered to the guest as the PQ surface format.
-pub const VK_FORMAT_A2B10G10R10_UNORM_PACK32: VkFormat = 58;
+/// `VK_FORMAT_A2R10G10B10_UNORM_PACK32` (58): 10-bit with **red** in the high
+/// ten bits. This is the layout the scan-out pool's `R10G10B10A2` buffer has,
+/// so it is what DXVK has been rendering into.
+pub const VK_FORMAT_A2R10G10B10_UNORM_PACK32: VkFormat = 58;
+/// `VK_FORMAT_A2B10G10R10_UNORM_PACK32` (64): 10-bit with **blue** in the high
+/// ten bits — the canonical Vulkan layout, and what vkd3d maps
+/// `DXGI_FORMAT_R10G10B10A2_UNORM` to. Serving only 58 is why a D3D12 title in
+/// HDR could never select a surface format.
+pub const VK_FORMAT_A2B10G10R10_UNORM_PACK32: VkFormat = 64;
 
 pub type VkColorSpaceKHR = i32;
 pub const VK_COLOR_SPACE_SRGB_NONLINEAR_KHR: VkColorSpaceKHR = 0;
+/// `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`: linear-light scRGB, the colour
+/// space `convert_color_space` returns for `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`.
+pub const VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT: VkColorSpaceKHR = 1_000_104_002;
 /// `VK_COLOR_SPACE_HDR10_ST2084_EXT`: PQ (SMPTE ST 2084) on BT.2020, from
 /// `VK_EXT_swapchain_colorspace`. Only meaningful to a client when that
 /// extension is enumerated, which the proxy does when the session is HDR.
