@@ -18,6 +18,8 @@
     Java_app_gamenative_display_GameNativeDrm_nativeRetargetSurface;
     Java_app_gamenative_display_GameNativeDrm_nativeGamescopeCommand;
     Java_app_gamenative_display_GameNativeDrm_nativeSetFpsLimit;
+    Java_app_gamenative_display_GameNativeDrm_nativeReshadeSetEffect;
+    Java_app_gamenative_display_GameNativeDrm_nativeReshadeDisable;
     Java_app_gamenative_display_GameNativeDrm_nativeSetPanelRefreshHz;
     Java_app_gamenative_display_GameNativeDrm_nativeStart;
     Java_app_gamenative_display_GameNativeDrm_nativeStop;

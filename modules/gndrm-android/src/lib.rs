@@ -1175,7 +1175,34 @@ fn set_panel_refresh_hz(refresh_hz: jint) {
     PANEL_REFRESH_MHZ.store(refresh_hz as u32 * 1000, Ordering::Relaxed);
 }
 
-/// `GameNativeDrm.nativeInjectorStop()`.
+/// `GameNativeDrm.nativeReshadeSetEffect(name)` — load and enable a ReShade
+/// effect from the bundled shader set. Never blocks; the injector applies it.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeReshadeSetEffect(
+    mut env: JNIEnv,
+    _class: JClass,
+    name: JString,
+) {
+    if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(s) = env.get_string(&name) {
+            injector::reshade_set_effect(&s.to_string_lossy());
+        }
+    })) {
+        report_panic("gndrm-reshade", e.as_ref());
+    }
+}
+
+/// `GameNativeDrm.nativeReshadeDisable()` — turn the loaded effect off.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeReshadeDisable(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    if let Err(e) = std::panic::catch_unwind(injector::reshade_disable) {
+        report_panic("gndrm-reshade", e.as_ref());
+    }
+}
+
 /// `GameNativeDrm.nativeSetFpsLimit(fps)` — cap gamescope's frame rate for this
 /// app (0 = uncapped). Never blocks.
 #[no_mangle]
@@ -1197,6 +1224,7 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetFpsLim
     }
 }
 
+/// `GameNativeDrm.nativeInjectorStop()`.
 #[no_mangle]
 pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeInjectorStop(
     _env: JNIEnv,

@@ -68,6 +68,26 @@ use gscontrol::client::gamescope_control::{
     Event as GsControlEvent, GamescopeControl, TargetRefreshCycleFlag,
 };
 
+// gamescope's ReShade protocol, vendored (from gamescope, MIT) and generated the
+// same way. It loads an effect by name and enables/disables it at runtime; the
+// effect file is resolved by gamescope against
+// `<home>/.local/share/gamescope/reshade/Shaders`.
+#[allow(dead_code, non_camel_case_types, unused_imports, clippy::all)]
+mod gsreshade {
+    pub mod client {
+        use wayland_client;
+        use wayland_client::protocol::*;
+
+        pub mod __interfaces {
+            use wayland_client::protocol::__interfaces::*;
+            wayland_scanner::generate_interfaces!("protocols/gamescope-reshade.xml");
+        }
+        use self::__interfaces::*;
+        wayland_scanner::generate_client_code!("protocols/gamescope-reshade.xml");
+    }
+}
+use gsreshade::client::gamescope_reshade::{Event as GsReshadeEvent, GamescopeReshade};
+
 // gamescope's private concommand protocol, vendored (from gamescope, MIT) and
 // generated the same way. Its `execute` request runs an allowlisted concommand
 // inside the compositor — the route for settings that have no control request.
@@ -107,6 +127,10 @@ enum InputEvent {
         name: String,
         value: String,
     },
+    /// Load a ReShade effect by name (`game.fx`, relative to the shader set).
+    ReshadeSetEffect(String),
+    ReshadeEnable,
+    ReshadeDisable,
 }
 
 struct InjectorHandle {
@@ -312,6 +336,24 @@ pub fn gamescope_command(command: &str) -> bool {
     true
 }
 
+/// Load a ReShade effect and enable it. `name` is the file name gamescope
+/// resolves under `<home>/.local/share/gamescope/reshade/Shaders`, e.g.
+/// `GNVibrance.fx`. Enabling after loading is what the protocol expects: the
+/// effect stays disabled at `set_effect` so uniforms can be set first.
+pub fn reshade_set_effect(name: &str) {
+    let name = name.trim();
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return;
+    }
+    post(InputEvent::ReshadeSetEffect(name.to_string()));
+    post(InputEvent::ReshadeEnable);
+}
+
+/// Turn the loaded ReShade effect off.
+pub fn reshade_disable() {
+    post(InputEvent::ReshadeDisable);
+}
+
 /// Last `active_display_info` gamescope sent: connector, display flags and the
 /// valid refresh rates for combined fps-limit + refresh control.
 #[derive(Clone, Default)]
@@ -387,6 +429,8 @@ struct State {
     gs_control: Option<GamescopeControl>,
     /// gamescope's private concommand global; absent if not offered.
     gs_private: Option<GamescopePrivate>,
+    /// gamescope's ReShade global; absent if the build has no ReShade support.
+    gs_reshade: Option<GamescopeReshade>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
@@ -427,6 +471,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     state.gs_private =
                         Some(registry.bind::<GamescopePrivate, _, _>(name, 1, qh, ()));
                 }
+                "gamescope_reshade" => {
+                    state.gs_reshade =
+                        Some(registry.bind::<GamescopeReshade, _, _>(name, 1, qh, ()));
+                }
                 _ => {}
             }
         }
@@ -454,6 +502,21 @@ empty_dispatch!(ZwlrVirtualPointerV1);
 empty_dispatch!(ZwpVirtualKeyboardManagerV1);
 empty_dispatch!(ZwpVirtualKeyboardV1);
 empty_dispatch!(wayland_client::protocol::wl_display::WlDisplay);
+
+impl Dispatch<GamescopeReshade, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _reshade: &GamescopeReshade,
+        event: GsReshadeEvent,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // The protocol has one event today, so the match is exhaustive.
+        let GsReshadeEvent::EffectReady { effect_path } = event;
+        log_info!("{}", gndrm_obf::obf!("reshade effect ready: {effect_path}"));
+    }
+}
 
 impl Dispatch<GamescopePrivate, ()> for State {
     fn event(
@@ -559,6 +622,7 @@ fn connect_and_run(
         keyboard: None,
         gs_control: None,
         gs_private: None,
+        gs_reshade: None,
     };
     event_queue
         .roundtrip(&mut state)
@@ -616,7 +680,15 @@ fn connect_and_run(
                 // here during the resume transition (this thread still holding
                 // the pre-resume flag) is one the app just flushed. Left in the
                 // connection's outgoing buffer, the next flush delivers it.
-                if !suspended || matches!(ev, InputEvent::Command { .. }) {
+                if !suspended
+                    || matches!(
+                        ev,
+                        InputEvent::Command { .. }
+                            | InputEvent::ReshadeSetEffect(_)
+                            | InputEvent::ReshadeEnable
+                            | InputEvent::ReshadeDisable
+                    )
+                {
                     apply(&state, ev);
                 }
             }
@@ -694,6 +766,21 @@ fn apply(state: &State, ev: InputEvent) {
                 };
                 p.axis(t, axis_enum, f64::from(value));
                 p.frame();
+            }
+        }
+        InputEvent::ReshadeSetEffect(path) => {
+            if let Some(r) = &state.gs_reshade {
+                r.set_effect(path);
+            }
+        }
+        InputEvent::ReshadeEnable => {
+            if let Some(r) = &state.gs_reshade {
+                r.enable_effect();
+            }
+        }
+        InputEvent::ReshadeDisable => {
+            if let Some(r) = &state.gs_reshade {
+                r.disable_effect();
             }
         }
         InputEvent::Key(code, pressed) => {
