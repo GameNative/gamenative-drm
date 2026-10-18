@@ -336,13 +336,20 @@ pub fn gamescope_command(command: &str) -> bool {
     true
 }
 
-/// Load a ReShade effect and enable it. `name` is the file name gamescope
-/// resolves under `<home>/.local/share/gamescope/reshade/Shaders`, e.g.
-/// `GNVibrance.fx`. Enabling after loading is what the protocol expects: the
-/// effect stays disabled at `set_effect` so uniforms can be set first.
+/// Load a ReShade effect and enable it. `name` is the path gamescope resolves
+/// under `<home>/.local/share/gamescope/reshade/Shaders`, e.g.
+/// `gamenative/Vibrant.fx`. Enabling after loading is what the protocol expects:
+/// the effect stays disabled at `set_effect` so uniforms can be set first.
 pub fn reshade_set_effect(name: &str) {
     let name = name.trim();
-    if name.is_empty() || name.contains('/') || name.contains('\\') {
+    // A pack subdirectory is a legitimate path, so separators are allowed; what
+    // is refused is anything that would leave the shader tree.
+    let escapes = name.starts_with('/')
+        || name.contains('\\')
+        || name
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..");
+    if name.is_empty() || escapes {
         return;
     }
     post(InputEvent::ReshadeSetEffect(name.to_string()));
