@@ -34,7 +34,7 @@ use crate::vk::*;
 use crate::wlproto::{self, wl_display, wl_proxy};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 // First-N diagnostics for the present pipeline handoffs (acquire ->
 // present -> worker commit -> compositor release). Bounded counters, so
@@ -122,7 +122,12 @@ static LOG_COMMIT: AtomicUsize = AtomicUsize::new(0);
 /// The splash-clear transition is one-shot, so a walk every `N` presents — a
 /// handful of milliseconds of latency — is ample, and it keeps a per-frame X
 /// round trip out of the present path.
-const GAME_WINDOW_CHECK_EVERY: u32 = 30;
+const GAME_WINDOW_CHECK_EVERY: u32 = 120;
+/// Walks to attempt before giving up. A window that is not identifiable after
+/// this many presents (the guest never maps one, or it maps one the predicate
+/// cannot classify) will not become identifiable later, and each walk is an X11
+/// round trip on the present path.
+const GAME_WINDOW_GIVE_UP: u32 = 240;
 /// Presents counted since the last game-window tree walk.
 static GAME_WINDOW_CHECK: AtomicU32 = AtomicU32::new(0);
 /// Set once the game-window notification has been sent; stops all further
@@ -256,12 +261,26 @@ static HB_DESTROY: AtomicUsize = AtomicUsize::new(0);
 static HB_ACQ: AtomicUsize = AtomicUsize::new(0);
 static HB_PRESENT: AtomicUsize = AtomicUsize::new(0);
 static HB_IMAGES: AtomicUsize = AtomicUsize::new(0);
-static RATE_HB: Mutex<Option<Instant>> = Mutex::new(None);
+/// Heartbeat gate as raw monotonic milliseconds. The heartbeat runs on the
+/// present path, so it must not take a lock: a `Mutex<Option<Instant>>` there
+/// competed with the swapchain state for the same cache lines every frame.
+static RATE_HB_MS: AtomicU64 = AtomicU64::new(0);
+/// Process-relative origin for the heartbeat's raw-millisecond gate.
+static PROC_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 /// Print the WSI call counters at most once a second. Cumulative, so two
 /// consecutive lines differ by the calls made in between.
 fn wsi_hb() {
-    if !rate_ok(&RATE_HB, Duration::from_secs(1)) {
+    let epoch = *PROC_EPOCH.get_or_init(Instant::now);
+    let ms = epoch.elapsed().as_millis() as u64;
+    let prev = RATE_HB_MS.load(Ordering::Relaxed);
+    if ms.saturating_sub(prev) < 1000 {
+        return;
+    }
+    if RATE_HB_MS
+        .compare_exchange(prev, ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
         return;
     }
     crate::logf!(gndrm_obf::obf!(
@@ -637,10 +656,8 @@ unsafe fn maybe_report_game_window(surf: *mut GnSurface) {
     if GAME_WINDOW_REPORTED.load(Ordering::Relaxed) {
         return;
     }
-    if !GAME_WINDOW_CHECK
-        .fetch_add(1, Ordering::Relaxed)
-        .is_multiple_of(GAME_WINDOW_CHECK_EVERY)
-    {
+    let n = GAME_WINDOW_CHECK.fetch_add(1, Ordering::Relaxed);
+    if n >= GAME_WINDOW_GIVE_UP || !n.is_multiple_of(GAME_WINDOW_CHECK_EVERY) {
         return;
     }
     let present = unsafe { (*surf).x11 };
@@ -1395,7 +1412,6 @@ unsafe extern "C" fn gn_vkAcquireNextImageKHR(
     index: *mut u32,
 ) -> VkResult {
     HB_ACQ.fetch_add(1, Ordering::Relaxed);
-    wsi_hb();
     let sc = unsafe { find_swapchain(swapchain) };
     if sc.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;

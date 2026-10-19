@@ -115,6 +115,11 @@ const PUBLISH_LOG_EVERY: u64 = 121;
 /// the publish path when dumps are off.
 static DUMP_DIR: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
 
+/// Whether the HDR static metadata has been set on the current PQ layer. It
+/// describes the panel, not the frame, so it is issued once per entry into PQ
+/// rather than once per commit; the flag clears when the layer leaves PQ.
+static PQ_METADATA_SET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// The dump directory if the environment requests one.
 fn dump_dir() -> Option<&'static std::ffi::OsString> {
     DUMP_DIR
@@ -2470,11 +2475,21 @@ fn build_show(
         // BT709/sRGB for an SDR output, which clips it. The HDR static metadata
         // is what marks the layer HDR to the hardware composer, so it goes with
         // the buffer, in the same transaction.
+        // PQ on the layer is not enough for the display to enter its HDR mode:
+        // SurfaceFlinger reports no HDR layer present and converts the frame to
+        // BT709/sRGB for an SDR output, which clips it. The HDR static metadata
+        // is what marks the layer HDR to the hardware composer, so it goes with
+        // the buffer, in the same transaction.
+        //
+        // It describes the panel, not the frame, so it is set when the layer
+        // enters PQ and left alone until it leaves. Re-issuing it per commit
+        // cost two binder transactions per frame for values the composer
+        // already had; leaving PQ re-arms it, so an HDR toggle still lands.
         if dataspace == ffi::ADATASPACE_BT2020_PQ {
-            // UNGATED one-shot: whether the HDR metadata actually went out is
-            // the difference between "the composer ignored it" and "we never
-            // called", and no other probe can see that.
-            {
+            if !PQ_METADATA_SET.load(core::sync::atomic::Ordering::Relaxed) {
+                // UNGATED one-shot: whether the HDR metadata actually went out is
+                // the difference between "the composer ignored it" and "we never
+                // called", and no other probe can see that.
                 static ONCE: core::sync::atomic::AtomicBool =
                     core::sync::atomic::AtomicBool::new(false);
                 if !ONCE.swap(true, core::sync::atomic::Ordering::Relaxed) {
@@ -2485,32 +2500,36 @@ fn build_show(
                         gndrm_daemon::hdr_output_capability().is_some()
                     );
                 }
-            }
-            if let Some(cap) = gndrm_daemon::hdr_output_capability() {
-                if let Some(set_cta) = api.st_set_hdr_metadata_cta861_3 {
-                    let md = ffi::AHdrMetadataCta8613 {
-                        max_content_light_level: cap.max_nits,
-                        max_frame_average_light_level: cap.fall_nits,
-                    };
-                    (set_cta)(tx, sc, &md);
+                if let Some(cap) = gndrm_daemon::hdr_output_capability() {
+                    if let Some(set_cta) = api.st_set_hdr_metadata_cta861_3 {
+                        let md = ffi::AHdrMetadataCta8613 {
+                            max_content_light_level: cap.max_nits,
+                            max_frame_average_light_level: cap.fall_nits,
+                        };
+                        (set_cta)(tx, sc, &md);
+                    }
+                    if let Some(set_smpte) = api.st_set_hdr_metadata_smpte2086 {
+                        // BT.2020 primaries and D65: the colour volume the PQ
+                        // buffer is encoded against, with the panel's own
+                        // luminances.
+                        let md = ffi::AHdrMetadataSmpte2086 {
+                            display_primary_red: ffi::AColorXy { x: 0.708, y: 0.292 },
+                            display_primary_green: ffi::AColorXy { x: 0.170, y: 0.797 },
+                            display_primary_blue: ffi::AColorXy { x: 0.131, y: 0.046 },
+                            white_point: ffi::AColorXy {
+                                x: 0.3127,
+                                y: 0.3290,
+                            },
+                            max_luminance: cap.max_nits,
+                            min_luminance: cap.min_nits,
+                        };
+                        (set_smpte)(tx, sc, &md);
+                    }
                 }
-                if let Some(set_smpte) = api.st_set_hdr_metadata_smpte2086 {
-                    // BT.2020 primaries and D65: the colour volume the PQ buffer
-                    // is encoded against, with the panel's own luminances.
-                    let md = ffi::AHdrMetadataSmpte2086 {
-                        display_primary_red: ffi::AColorXy { x: 0.708, y: 0.292 },
-                        display_primary_green: ffi::AColorXy { x: 0.170, y: 0.797 },
-                        display_primary_blue: ffi::AColorXy { x: 0.131, y: 0.046 },
-                        white_point: ffi::AColorXy {
-                            x: 0.3127,
-                            y: 0.3290,
-                        },
-                        max_luminance: cap.max_nits,
-                        min_luminance: cap.min_nits,
-                    };
-                    (set_smpte)(tx, sc, &md);
-                }
+                PQ_METADATA_SET.store(true, core::sync::atomic::Ordering::Relaxed);
             }
+        } else {
+            PQ_METADATA_SET.store(false, core::sync::atomic::Ordering::Relaxed);
         }
         // The completion reports the previous release fence, which is what
         // gates re-publishing this buffer.
