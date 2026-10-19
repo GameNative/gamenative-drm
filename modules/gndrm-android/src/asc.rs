@@ -115,6 +115,19 @@ const PUBLISH_LOG_EVERY: u64 = 121;
 /// the publish path when dumps are off.
 static DUMP_DIR: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
 
+/// Daemon diagnostics are opt-in per session (`GNDRM_LOG_DAEMON`, set by the
+/// launcher in this process): the daemon shares the app's address space, so a
+/// container's `GNDRM_LOG_*` cannot reach it, and a shipped session must not
+/// describe the presenter in logcat. Every message is also `obf!`-encoded, so
+/// the shipped binary does not carry the text either.
+macro_rules! asc_log {
+    ($($arg:tt)*) => {
+        if gndrm_daemon::verbose_logging() {
+            $crate::log_always!($($arg)*)
+        }
+    };
+}
+
 /// Whether the HDR static metadata has been set on the current PQ layer. It
 /// describes the panel, not the frame, so it is issued once per entry into PQ
 /// rather than once per commit; the flag clears when the layer leaves PQ.
@@ -850,12 +863,15 @@ impl AscState {
         {
             static PUBLISH_SEEN: AtomicBool = AtomicBool::new(false);
             if !PUBLISH_SEEN.swap(true, Ordering::Relaxed) {
-                crate::log_always!(
-                    "gndrm-daemon: publish entry fb={} ino_set={} api_set={} sc_set={}",
-                    fb.id,
-                    ino.is_some(),
-                    self.api.is_some(),
-                    !self.sc.is_null()
+                asc_log!(
+                    "{}",
+                    gndrm_obf::obf!(
+                        "gndrm-daemon: publish entry fb={} ino_set={} api_set={} sc_set={}",
+                        fb.id,
+                        ino.is_some(),
+                        self.api.is_some(),
+                        !self.sc.is_null()
+                    )
                 );
             }
         }
@@ -917,9 +933,9 @@ impl AscState {
         );
         if self.last_rect_log != Some(key) {
             self.last_rect_log = Some(key);
-            crate::log_always!(
-                "gndrm-daemon: asc layer rect src=({},{})-({},{}) dst=({},{})-({},{}) panel={}x{} band left={} top={} right={} bottom={} drawable={}",
-                key.0,
+            asc_log!(
+                "{}",
+                gndrm_obf::obf!("gndrm-daemon: asc layer rect src=({},{})-({},{}) dst=({},{})-({},{}) panel={}x{} band left={} top={} right={} bottom={} drawable={}",key.0,
                 key.1,
                 key.2,
                 key.3,
@@ -933,7 +949,7 @@ impl AscState {
                 dst.top,
                 self.panel_w - dst.right,
                 self.panel_h - dst.bottom,
-                drawable,
+                drawable,)
             );
         }
 
@@ -974,15 +990,16 @@ impl AscState {
                 // anything on the panel for. Once per inode.
                 if !self.logged_unregistered.contains(&ino) {
                     self.logged_unregistered.push(ino);
-                    crate::log_always!(
-                        "gndrm-daemon: asc DROPPED frame: no AHardwareBuffer for dma-buf ino {ino} (misses={misses})"
+                    asc_log!(
+                        "{}",
+                        gndrm_obf::obf!("gndrm-daemon: asc DROPPED frame: no AHardwareBuffer for dma-buf ino {ino} (misses={misses})")
                     );
-                    crate::log_always!(
-                        "gndrm-daemon: asc dropped framebuffer: {}x{} fmt={:#x} pitch={} (ino {ino})",
-                        fb.width,
+                    asc_log!(
+                        "{}",
+                        gndrm_obf::obf!("gndrm-daemon: asc dropped framebuffer: {}x{} fmt={:#x} pitch={} (ino {ino})",fb.width,
                         fb.height,
                         fb.pixel_format,
-                        fb.pitches[0]
+                        fb.pitches[0])
                     );
                 }
                 close_fence(fence);
@@ -1049,15 +1066,16 @@ impl AscState {
                     // prints one line rather than one per frame.
                     if stale && !self.logged_stale.contains(&ino) {
                         self.logged_stale.push(ino);
-                        crate::log_always!(
-                            "gndrm-daemon: asc STALE re-publish: no AHardwareBuffer for dma-buf ino {ino}; re-publishing ino {published_ino} (misses={misses})"
+                        asc_log!(
+                            "{}",
+                            gndrm_obf::obf!("gndrm-daemon: asc STALE re-publish: no AHardwareBuffer for dma-buf ino {ino}; re-publishing ino {published_ino} (misses={misses})")
                         );
-                        crate::log_always!(
-                            "gndrm-daemon: asc stale framebuffer: {}x{} fmt={:#x} pitch={} (ino {ino})",
-                            fb.width,
+                        asc_log!(
+                            "{}",
+                            gndrm_obf::obf!("gndrm-daemon: asc stale framebuffer: {}x{} fmt={:#x} pitch={} (ino {ino})",fb.width,
                             fb.height,
                             fb.pixel_format,
-                            fb.pitches[0]
+                            fb.pitches[0])
                         );
                     }
                     // Format and content are two questions; the published
@@ -1100,9 +1118,10 @@ impl AscState {
                     } else {
                         ffi::ADATASPACE_UNKNOWN
                     };
-                    // UNGATED: the per-frame HDR decision and both inputs to it,
+                    // Opt-in (`GNDRM_LOG_DAEMON`, set by the launcher in this
+                    // process): the per-frame HDR decision and both inputs to it,
                     // printed on a change of any of the three and every
-                    // [`PUBLISH_LOG_EVERY`]-th frame regardless. `n` and `ino`
+                    // [`PUBLISH_LOG_EVERY`]-th frame while it is on. `n` and `ino`
                     // pair with the commit probe's `commit #N fb=`: publishes per
                     // second against commits per second, and whether the buffer
                     // actually published is still moving. A publish index that
@@ -1110,8 +1129,9 @@ impl AscState {
                     // re-publish (the composite output stopped arriving).
                     let hdr_key = (fb.pixel_format, hdr_buffer, hdr_content);
                     let publish_n = self.frames + 1;
-                    if self.last_hdr_log != Some(hdr_key)
-                        || publish_n.is_multiple_of(PUBLISH_LOG_EVERY)
+                    if gndrm_daemon::verbose_logging()
+                        && (self.last_hdr_log != Some(hdr_key)
+                            || publish_n.is_multiple_of(PUBLISH_LOG_EVERY))
                     {
                         self.last_hdr_log = Some(hdr_key);
                         // The alpha field and two reference words, sampled only
@@ -1125,16 +1145,16 @@ impl AscState {
                             }
                             None => "a=none".to_string(),
                         };
-                        crate::log_always!(
-                            "gndrm-daemon: asc hdr decision n={} fb={} ino={} {} fmt={:#x} buffer10={} conn_hdr={} dataspace={:#x}",
-                            publish_n,
+                        asc_log!(
+                            "{}",
+                            gndrm_obf::obf!("gndrm-daemon: asc hdr decision n={} fb={} ino={} {} fmt={:#x} buffer10={} conn_hdr={} dataspace={:#x}",publish_n,
                             fb.id,
                             published_ino,
                             sample,
                             fb.pixel_format,
                             hdr_buffer,
                             hdr_content,
-                            dataspace
+                            dataspace)
                         );
                     }
                     let rect = ShowRect {
@@ -1150,15 +1170,15 @@ impl AscState {
                     // round.
                     if self.hidden {
                         self.hidden = false;
-                        crate::log_always!(
-                            "gndrm-daemon: asc layer shown again fb={} dst=({},{})-({},{}) panel={}x{}",
-                            fb.id,
+                        asc_log!(
+                            "{}",
+                            gndrm_obf::obf!("gndrm-daemon: asc layer shown again fb={} dst=({},{})-({},{}) panel={}x{}",fb.id,
                             dst.left,
                             dst.top,
                             dst.right,
                             dst.bottom,
                             self.panel_w,
-                            self.panel_h
+                            self.panel_h)
                         );
                     }
                     match build_show(&api, self.sc, ahb, ctx, rect, fence) {
@@ -1195,9 +1215,9 @@ impl AscState {
                     // logcat. A steady state prints once at the transition.
                     if !self.hidden {
                         self.hidden = true;
-                        crate::log_always!(
-                            "gndrm-daemon: asc layer HIDDEN (plane not drawable) fb={} src=({},{})-({},{}) dst=({},{})-({},{}) panel={}x{}",
-                            fb.id,
+                        asc_log!(
+                            "{}",
+                            gndrm_obf::obf!("gndrm-daemon: asc layer HIDDEN (plane not drawable) fb={} src=({},{})-({},{}) dst=({},{})-({},{}) panel={}x{}",fb.id,
                             src.left,
                             src.top,
                             src.right,
@@ -1207,7 +1227,7 @@ impl AscState {
                             dst.right,
                             dst.bottom,
                             self.panel_w,
-                            self.panel_h
+                            self.panel_h)
                         );
                     }
                     if let Some(tx) = build_hide(&api, self.sc) {
@@ -1235,10 +1255,10 @@ impl AscState {
                 {
                     static CLEAR_FIRED: AtomicBool = AtomicBool::new(false);
                     if !CLEAR_FIRED.swap(true, Ordering::Relaxed) {
-                        crate::log_always!(
-                            "gndrm-daemon: splash-clear latch fired splash_cleared={} game_window_present={} clear_attempted=true",
-                            self.splash_cleared,
-                            crate::GAME_WINDOW_PRESENT.load(Ordering::Relaxed)
+                        asc_log!(
+                            "{}",
+                            gndrm_obf::obf!("gndrm-daemon: splash-clear latch fired splash_cleared={} game_window_present={} clear_attempted=true",self.splash_cleared,
+                            crate::GAME_WINDOW_PRESENT.load(Ordering::Relaxed))
                         );
                     }
                 }
@@ -1392,12 +1412,15 @@ impl AscState {
         // UNGATED: a rebuilt layer has just been given the retained frame back.
         // This runs once per layer rebuild (session bring-up, a display power
         // cycle), never per frame.
-        crate::log_always!(
-            "gndrm-daemon: asc re-published retained ino {} onto a {}x{} layer (frames={})",
-            lp.ino,
-            self.panel_w,
-            self.panel_h,
-            self.frames
+        asc_log!(
+            "{}",
+            gndrm_obf::obf!(
+                "gndrm-daemon: asc re-published retained ino {} onto a {}x{} layer (frames={})",
+                lp.ino,
+                self.panel_w,
+                self.panel_h,
+                self.frames
+            )
         );
     }
 
@@ -1474,9 +1497,9 @@ impl Drop for AscState {
         // ends with the daemon having published nothing, or with the layer
         // hidden, is a different failure from one that published to the end —
         // and this is the last line the presenter can print.
-        crate::log_always!(
-            "gndrm-daemon: asc teardown frames_published={} hidden={} last_publish_ino={} last_dst=({},{})-({},{}) panel={}x{}",
-            self.frames,
+        asc_log!(
+            "{}",
+            gndrm_obf::obf!("gndrm-daemon: asc teardown frames_published={} hidden={} last_publish_ino={} last_dst=({},{})-({},{}) panel={}x{}",self.frames,
             self.hidden,
             self.last_publish.map_or(0, |lp| lp.ino),
             self.last_publish.map_or(0, |lp| lp.dst.left),
@@ -1484,7 +1507,7 @@ impl Drop for AscState {
             self.last_publish.map_or(0, |lp| lp.dst.right),
             self.last_publish.map_or(0, |lp| lp.dst.bottom),
             self.panel_w,
-            self.panel_h
+            self.panel_h)
         );
         // Return every buffer before the layer goes: the presenter owns the
         // daemon's reference on each, and SurfaceFlinger may still be reading
@@ -1567,10 +1590,10 @@ fn log_first_non_request_frame(frame: &[u8], note: Option<GameWindowNote>) {
     let magic = frame
         .get(0..4)
         .map_or(0, |m| u32::from_le_bytes([m[0], m[1], m[2], m[3]]));
-    crate::log_always!(
-        "gndrm-daemon: scan-out channel non-request frame magic={magic:#010x} note_decoded={} game_window_present={}",
-        note.is_some(),
-        crate::GAME_WINDOW_PRESENT.load(Ordering::Relaxed)
+    asc_log!(
+        "{}",
+        gndrm_obf::obf!("gndrm-daemon: scan-out channel non-request frame magic={magic:#010x} note_decoded={} game_window_present={}",note.is_some(),
+        crate::GAME_WINDOW_PRESENT.load(Ordering::Relaxed))
     );
 }
 
@@ -2493,11 +2516,14 @@ fn build_show(
                 static ONCE: core::sync::atomic::AtomicBool =
                     core::sync::atomic::AtomicBool::new(false);
                 if !ONCE.swap(true, core::sync::atomic::Ordering::Relaxed) {
-                    crate::log_always!(
-                        "gndrm-daemon: asc hdr metadata cta861_3={} smpte2086={} cap={}",
-                        api.st_set_hdr_metadata_cta861_3.is_some(),
-                        api.st_set_hdr_metadata_smpte2086.is_some(),
-                        gndrm_daemon::hdr_output_capability().is_some()
+                    asc_log!(
+                        "{}",
+                        gndrm_obf::obf!(
+                            "gndrm-daemon: asc hdr metadata cta861_3={} smpte2086={} cap={}",
+                            api.st_set_hdr_metadata_cta861_3.is_some(),
+                            api.st_set_hdr_metadata_smpte2086.is_some(),
+                            gndrm_daemon::hdr_output_capability().is_some()
+                        )
                     );
                 }
                 if let Some(cap) = gndrm_daemon::hdr_output_capability() {

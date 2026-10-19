@@ -92,6 +92,12 @@ const PRIMARY_FORMATS_HDR: &[u32] = &[
     DRM_FORMAT_XBGR2101010,
 ];
 
+/// Cached `GNDRM_LOG_DAEMON` verdict (see [`verbose_logging`]).
+static VERBOSE_GATE: AtomicU8 = AtomicU8::new(VERBOSE_UNRESOLVED);
+const VERBOSE_UNRESOLVED: u8 = 0;
+const VERBOSE_OFF: u8 = 1;
+const VERBOSE_ON: u8 = 2;
+
 /// The primary plane's format list for the current session.
 fn primary_formats() -> &'static [u32] {
     primary_formats_for(hdr_output_enabled())
@@ -145,6 +151,34 @@ pub fn hdr_output_enabled() -> bool {
 /// Also clears the connector HDR-output mirror ([`hdr_output_active`]): a new
 /// session's connector starts un-driven, so a value left over from the previous
 /// session would tag this session's first frames with the previous one's state.
+/// Whether the per-frame daemon diagnostics are enabled for this session.
+///
+/// They are off unless the launcher sets `GNDRM_LOG_DAEMON` in this process:
+/// the daemon shares the app's address space, so a container's `GNDRM_LOG_*`
+/// cannot reach it, and a shipped session must not narrate how the presenter
+/// works. Resolved once per session like [`hdr_output_enabled`].
+#[must_use]
+pub fn verbose_logging() -> bool {
+    match VERBOSE_GATE.load(Ordering::Relaxed) {
+        VERBOSE_ON => true,
+        VERBOSE_OFF => false,
+        _ => {
+            let on = matches!(
+                std::env::var_os("GNDRM_LOG_DAEMON"),
+                Some(v) if !v.is_empty() && v != "0"
+            );
+            VERBOSE_GATE.store(if on { VERBOSE_ON } else { VERBOSE_OFF }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Drop the cached [`verbose_logging`] verdict at session start, so a session
+/// launched without the variable does not inherit the previous one's.
+pub fn reset_verbose_logging() {
+    VERBOSE_GATE.store(VERBOSE_UNRESOLVED, Ordering::Relaxed);
+}
+
 pub fn reset_hdr_output_cache() {
     HDR_GATE.store(HDR_UNRESOLVED, Ordering::Relaxed);
     CONNECTOR_HDR_ACTIVE.store(false, Ordering::Relaxed);
@@ -443,6 +477,9 @@ pub struct Device {
     /// carried) surfaces once per modifier rather than once per registration.
     addfb_mods: Vec<u64>,
     pub(crate) logged_first_commit: bool,
+    /// The last (primary fb, previous fb, crtc active) triple the opt-in commit
+    /// diagnostic printed. A commit that repeats it is not worth a line.
+    pub(crate) logged_commit_state: Option<(u32, u32, bool)>,
     pub(crate) commit_count: u32,
     /// Last plane set the census logged (see `commit::plane_census_text`):
     /// comparing against it logs every change, not just the rate policy's
@@ -537,6 +574,7 @@ impl Device {
             logged_exhaustion: Vec::new(),
             addfb_mods: Vec::new(),
             logged_first_commit: false,
+            logged_commit_state: None,
             commit_count: 0,
             plane_census: String::new(),
         }

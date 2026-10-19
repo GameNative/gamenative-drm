@@ -170,7 +170,23 @@ impl Device {
         // is the ground truth for "stretched/misplaced frame" bugs (run 12:
         // taskbar band at top of a white screen).
         self.commit_count = self.commit_count.wrapping_add(1);
-        if self.commit_count <= 30 || self.commit_count.is_multiple_of(120) {
+        // Opt-in (`GNDRM_LOG_DAEMON`): a shipped session must not narrate how the
+        // presenter works, and the daemon shares the app's address space so no
+        // container `GNDRM_LOG_*` can gate this. When it is on, a commit is
+        // logged when the plane's state changes rather than once per second of
+        // identical state; the first commits and a slow heartbeat keep the
+        // startup sequence visible.
+        let want_commit_log = crate::verbose_logging();
+        let commit_state = {
+            let p = self.primary_state();
+            (p.fb_id, prev_primary_fb, self.crtc_state().active)
+        };
+        if want_commit_log
+            && (self.commit_count <= 10
+                || self.logged_commit_state != Some(commit_state)
+                || self.commit_count.is_multiple_of(1200))
+        {
+            self.logged_commit_state = Some(commit_state);
             let p = self.primary_state();
             let (w, h, fmt, pitch) = self
                 .stores

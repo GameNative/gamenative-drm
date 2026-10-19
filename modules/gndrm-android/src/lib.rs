@@ -55,7 +55,9 @@ use jni::{JNIEnv, JavaVM};
 
 use gndrm_daemon::diag;
 use gndrm_daemon::server;
-use gndrm_daemon::{reset_hdr_output_cache, Device, FrameCap, NullPresenter, PanelDesc};
+use gndrm_daemon::{
+    reset_hdr_output_cache, reset_verbose_logging, Device, FrameCap, NullPresenter, PanelDesc,
+};
 
 /// Return codes are negative errno-style values (`0` = success).
 const E_BUSY: jint = -16;
@@ -149,20 +151,20 @@ fn cache_java_vm(env: &mut JNIEnv) {
 /// swallowed; nothing on this path may panic.
 pub(crate) fn clear_booting_splash() {
     let outcome = call_app_static("clearBootingSplash");
-    // UNGATED one-shot: the last hop of the splash-clear chain. This method's
-    // own line is gated (`GNDRM_LOG_*`), and the container's environment does
-    // not reach this app process, so the upcall's outcome is otherwise
-    // invisible on device. Latched, and the caller's own latch already makes
-    // the call once per session.
+    // One-shot: the last hop of the splash-clear chain. A failure is always
+    // logged — it is the only signal that the app's splash was never cleared —
+    // while success is opt-in with the rest of the daemon diagnostics, so a
+    // shipped session does not narrate its startup.
     {
         static LOGGED: AtomicBool = AtomicBool::new(false);
-        if !LOGGED.swap(true, Ordering::Relaxed) {
+        let failed = matches!(outcome, AppCall::Failed);
+        if !LOGGED.swap(true, Ordering::Relaxed) && (failed || gndrm_daemon::verbose_logging()) {
             crate::log_always!(
-                "gndrm-daemon: splash-clear upcall clearBootingSplash outcome={}",
-                match outcome {
-                    AppCall::Ok => "ok",
-                    AppCall::Failed => "failed",
-                }
+                "{}",
+                gndrm_obf::obf!(
+                    "gndrm-daemon: splash-clear upcall clearBootingSplash outcome={}",
+                    if failed { "failed" } else { "ok" }
+                )
             );
         }
     }
@@ -703,6 +705,10 @@ fn start(
     // `Os.setenv`) after this returns and before the guest forks, so the first
     // plane query — which is what resolves the flag — sees this session's value.
     reset_hdr_output_cache();
+    // Same reason: the launcher sets `GNDRM_LOG_DAEMON` per session (or not at
+    // all), so the per-frame diagnostics must re-read it rather than carry the
+    // previous session's verdict into this one.
+    reset_verbose_logging();
     // First JNI entry point to run: capture the VM so the presenter thread can
     // push the booting-splash event when the game's own window is reported.
     cache_java_vm(env);

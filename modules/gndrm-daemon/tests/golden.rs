@@ -2301,14 +2301,24 @@ fn plane_census_names_every_plane_in_z_order() {
 /// arrive, and the plane is blank (fb=0)" and "no commit arrives at all" are
 /// otherwise indistinguishable, because the absence of any other daemon line
 /// means the same thing in both cases.
+/// `GNDRM_LOG_DAEMON` is process-wide and the gate caches it, so the two
+/// session-flag tests must not overlap.
+static SESSION_FLAG: Mutex<()> = Mutex::new(());
+
 #[test]
-fn commit_probe_reports_fb_id_and_running_count_ungated() {
+fn commit_probe_reports_fb_id_and_running_count_when_enabled() {
+    let _serial = SESSION_FLAG.lock().unwrap();
     let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&logs);
+    // The probe is opt-in per session: the launcher sets this in the app's
+    // process, which the daemon shares.
+    std::env::set_var("GNDRM_LOG_DAEMON", "1");
+    gndrm_daemon::reset_verbose_logging();
     let mut d = Device::new(PanelDesc::default(), Box::<NullPresenter>::default());
     d.set_clock(Box::new(|| (1000, 500)));
     // The always sink only; `set_logger` is deliberately not called, so the
-    // gated diagnostics stay off and anything the probe prints is ungated.
+    // gated diagnostics stay off and anything the probe prints is the opt-in
+    // probe rather than a `GNDRM_LOG_*`-gated line.
     d.set_always_logger(Box::new(move |m: &str| {
         sink.lock().unwrap().push(m.to_string());
     }));
@@ -2349,6 +2359,54 @@ fn commit_probe_reports_fb_id_and_running_count_ungated() {
     assert!(
         !lines.iter().any(|l| l.contains("atomic #")),
         "only the ungated probe may print when no gated sink is installed: {lines:?}"
+    );
+
+    // SAFETY: caller's fds.
+    unsafe {
+        libc::close(fd);
+    }
+    let _ = handle;
+    std::env::remove_var("GNDRM_LOG_DAEMON");
+    gndrm_daemon::reset_verbose_logging();
+}
+
+/// The same probe with the session's opt-in absent: a shipped session says
+/// nothing about the presenter's per-commit state.
+#[test]
+fn commit_probe_is_silent_without_the_session_flag() {
+    let _serial = SESSION_FLAG.lock().unwrap();
+    let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&logs);
+    std::env::remove_var("GNDRM_LOG_DAEMON");
+    gndrm_daemon::reset_verbose_logging();
+    let mut d = Device::new(PanelDesc::default(), Box::<NullPresenter>::default());
+    d.set_clock(Box::new(|| (1000, 500)));
+    d.set_always_logger(Box::new(move |m: &str| {
+        sink.lock().unwrap().push(m.to_string());
+    }));
+
+    let blob = create_mode_blob(&mut d).0;
+    let (handle, fb, fd) = import_fb(&mut d);
+    let sets = modeset_sets(&d, blob, fb);
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(
+            &sets,
+            DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_PAGE_FLIP_EVENT,
+            1,
+        ),
+    ));
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(&sets, DRM_MODE_ATOMIC_ALLOW_MODESET, 2),
+    ));
+
+    let lines = logs.lock().unwrap().clone();
+    assert!(
+        !lines.iter().any(|l| l.contains("commit #")),
+        "no commit probe may print without GNDRM_LOG_DAEMON: {lines:?}"
     );
 
     // SAFETY: caller's fds.
