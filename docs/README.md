@@ -44,6 +44,9 @@ winlator X11 path (which remains the default for normal launches).
 12. [12-present-latency-budget.md](12-present-latency-budget.md) — the present-latency budget: what each frame on the paced path pays, and why the flip event is emitted with the publish.
 13. [13-single-layer-windowing.md](13-single-layer-windowing.md) — the window/layer model on the single-layer path: what plays layer 0/1/N here, why the content-override mechanism exists, the per-patch layer audit, and the target architecture.
 14. [14-guest-surface-commit-stall.md](14-guest-surface-commit-stall.md) — the guest-surface route's queued defect: the commit stream stalls when the guest's Vulkan swapchain comes up, the two candidate causes, and the instrumentation that would decide between them.
+15. [15-fps-limiter-pacing-and-vsync.md](15-fps-limiter-pacing-and-vsync.md) — the fps limiter's deadline grid and how it meets the panel's vsync.
+16. [16-hdr-verification-and-gaps.md](16-hdr-verification-and-gaps.md) — what HDR verification measured, and the gaps left open.
+17. [17-lsfg-frame-generation.md](17-lsfg-frame-generation.md) — plan for a `gamenative_drm` LSFG backend: the app's own engine inside the ICD shim, reading the container's `Lossless.dll` and building its own shader cache, reusing `LsfgVkManager` and the quick-menu tab, with the artifacts and the measurements that decide it.
 
 ## One-paragraph summary
 

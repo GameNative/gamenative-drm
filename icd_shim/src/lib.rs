@@ -67,6 +67,7 @@ pub fn vkshim_enabled() -> bool {
     }
 }
 
+pub mod lsfg;
 pub mod proxy;
 pub mod scanout;
 pub mod segv;
