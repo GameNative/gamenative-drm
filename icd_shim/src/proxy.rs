@@ -2082,6 +2082,9 @@ unsafe extern "C" fn gn_vkCreateImage(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let ci_ref = unsafe { &*ci };
+    if let Some(r) = unsafe { crate::export::try_create_image(gd, ci, alloc, out) } {
+        return r;
+    }
     let res = unsafe { (*gd).f.create_image.unwrap()((*gd).real, ci, alloc, out) };
     // Gate first: when GNDRM_LOG_VKSHIM is off (the default) this is one flag
     // load and a branch — no lock, no map insert, no formatting. The detector
@@ -3879,6 +3882,94 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
         },
     ),
     (
+        c"vkGetPhysicalDeviceImageFormatProperties2",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                crate::export::gn_vkGetPhysicalDeviceImageFormatProperties2
+                    as unsafe extern "C" fn(
+                        VkPhysicalDevice,
+                        *const VkPhysicalDeviceImageFormatInfo2,
+                        *mut VkImageFormatProperties2,
+                    ) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkGetPhysicalDeviceImageFormatProperties2KHR",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                crate::export::gn_vkGetPhysicalDeviceImageFormatProperties2
+                    as unsafe extern "C" fn(
+                        VkPhysicalDevice,
+                        *const VkPhysicalDeviceImageFormatInfo2,
+                        *mut VkImageFormatProperties2,
+                    ) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkAllocateMemory",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                crate::export::gn_vkAllocateMemory
+                    as unsafe extern "C" fn(
+                        VkDevice,
+                        *const VkMemoryAllocateInfo,
+                        *const VkAllocationCallbacks,
+                        *mut VkDeviceMemory,
+                    ) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkGetMemoryFdKHR",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                crate::export::gn_vkGetMemoryFdKHR
+                    as unsafe extern "C" fn(VkDevice, *const VkMemoryGetFdInfoKHR, *mut i32) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkGetImageDrmFormatModifierPropertiesEXT",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                crate::export::gn_vkGetImageDrmFormatModifierPropertiesEXT
+                    as unsafe extern "C" fn(VkDevice, VkImage, *mut c_void) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkUpdateDescriptorSets",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                crate::export::gn_vkUpdateDescriptorSets
+                    as unsafe extern "C" fn(VkDevice, u32, *const c_void, u32, *const c_void),
+            )
+        },
+    ),
+    (
+        c"vkGetImageSubresourceLayout",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                crate::export::gn_vkGetImageSubresourceLayout
+                    as unsafe extern "C" fn(
+                        VkDevice,
+                        VkImage,
+                        *const VkImageSubresource,
+                        *mut VkSubresourceLayout,
+                    ),
+            )
+        },
+    ),
+    (
         c"vkGetPhysicalDeviceSurfaceFormats2KHR",
         HandlerScope::ProxyOnly,
         unsafe {
@@ -3939,9 +4030,26 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
     ),
 ];
 
+const EXPORT_EMU_NAMES: [&CStr; 7] = [
+    c"vkUpdateDescriptorSets",
+    c"vkAllocateMemory",
+    c"vkGetPhysicalDeviceImageFormatProperties2",
+    c"vkGetPhysicalDeviceImageFormatProperties2KHR",
+    c"vkGetMemoryFdKHR",
+    c"vkGetImageDrmFormatModifierPropertiesEXT",
+    c"vkGetImageSubresourceLayout",
+];
+
+fn export_emu_gated(name: &CStr) -> bool {
+    !crate::export::enabled() && EXPORT_EMU_NAMES.contains(&name)
+}
+
 /// Handler-registry lookup for GIPA and GPDPA: the proxy-only handlers
 /// (instances, devices, surfaces), which only work while the WSI proxy is up.
 pub fn instance_func(name: &CStr) -> PFN_vkVoidFunction {
+    if export_emu_gated(name) {
+        return None;
+    }
     SHIM_HANDLERS
         .iter()
         .find(|(n, scope, _)| *scope == HandlerScope::ProxyOnly && *n == name)
@@ -3951,6 +4059,9 @@ pub fn instance_func(name: &CStr) -> PFN_vkVoidFunction {
 /// Handler-registry lookup for vkGetDeviceProcAddr and the ICD entry points:
 /// the always-available device handlers.
 pub fn device_func(name: &CStr) -> PFN_vkVoidFunction {
+    if export_emu_gated(name) {
+        return None;
+    }
     SHIM_HANDLERS
         .iter()
         .find(|(n, scope, _)| *scope == HandlerScope::Always && *n == name)
@@ -5218,7 +5329,7 @@ unsafe fn find_instance(inst: VkInstance) -> *mut GnInstance {
     ptr::null_mut()
 }
 
-unsafe fn find_instance_by_pd(pd: VkPhysicalDevice) -> *mut GnInstance {
+pub(crate) unsafe fn find_instance_by_pd(pd: VkPhysicalDevice) -> *mut GnInstance {
     let g = G.lock().unwrap();
     let mut p = g.instances;
     while !p.is_null() {
@@ -5232,7 +5343,7 @@ unsafe fn find_instance_by_pd(pd: VkPhysicalDevice) -> *mut GnInstance {
     ptr::null_mut()
 }
 
-unsafe fn find_device(dev: VkDevice) -> *mut GnDevice {
+pub(crate) unsafe fn find_device(dev: VkDevice) -> *mut GnDevice {
     let g = G.lock().unwrap();
     let mut p = g.devices;
     while !p.is_null() {
@@ -5573,7 +5684,7 @@ unsafe fn find_swapchain(sc: VkSwapchainKHR) -> *mut GnSwapchain {
     ptr::null_mut()
 }
 
-unsafe fn gn_real_device_proc(gd: *mut GnDevice, name: &CStr) -> PFN_vkVoidFunction {
+pub(crate) unsafe fn gn_real_device_proc(gd: *mut GnDevice, name: &CStr) -> PFN_vkVoidFunction {
     let (handle, gipa, inst) = {
         let g = G.lock().unwrap();
         let inst = if !gd.is_null() {
@@ -5648,7 +5759,7 @@ unsafe fn gn_real_device_proc(gd: *mut GnDevice, name: &CStr) -> PFN_vkVoidFunct
     fnptr
 }
 
-unsafe fn gn_real_inst_proc(inst: VkInstance, name: &CStr) -> PFN_vkVoidFunction {
+pub(crate) unsafe fn gn_real_inst_proc(inst: VkInstance, name: &CStr) -> PFN_vkVoidFunction {
     let (handle, gipa) = {
         let g = G.lock().unwrap();
         (g.real_handle, g.real_gipa)
