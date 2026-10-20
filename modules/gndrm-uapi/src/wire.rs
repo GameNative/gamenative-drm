@@ -536,6 +536,77 @@ impl FrameCapSubscribe {
     }
 }
 
+/// Frame-generation settings, asked for by the shim and answered by the daemon.
+///
+/// One type, two directions: the shim sends a request (all fields zero) and the
+/// daemon replies with the settings the app last pushed through
+/// `GameNativeDrm.nativeSetLsfgConfig`. A request carries no fields so a shim can
+/// ask without knowing the shape of the answer.
+///
+/// Encoded little-endian, 24 bytes: `magic:u32, enabled:u32, multiplier:u32,
+/// flow_per_mille:u32, performance:u32, fps_limit:u32`.
+pub const LSFG_MAGIC: u32 = 0x474E_4C31;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LsfgConfig {
+    /// Non-zero when the user wants frame generation. Explicit, because
+    /// `multiplier` alone cannot express "off": a session that was started with
+    /// the environment set would otherwise fall back to it and keep generating.
+    pub enabled: u32,
+    /// Generations per source frame, 2-4.
+    pub multiplier: u32,
+    /// Flow scale x 1000, so the wire stays integer-only.
+    pub flow_per_mille: u32,
+    /// Non-zero when the engine should use the lower-cost shader set.
+    pub performance: u32,
+    /// The user's cap on the **source** rate; the presenter presents at
+    /// `fps_limit * multiplier`. 0 = uncapped.
+    pub fps_limit: u32,
+}
+
+impl LsfgConfig {
+    pub const LEN: usize = 24;
+
+    /// What the shim sends: no fields, only the magic.
+    #[must_use]
+    pub fn request() -> Self {
+        Self::default()
+    }
+
+    /// Whether these settings are still the untouched request shape.
+    #[must_use]
+    pub fn is_request(&self) -> bool {
+        *self == Self::default()
+    }
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[0..4].copy_from_slice(&LSFG_MAGIC.to_le_bytes());
+        b[4..8].copy_from_slice(&self.enabled.to_le_bytes());
+        b[8..12].copy_from_slice(&self.multiplier.to_le_bytes());
+        b[12..16].copy_from_slice(&self.flow_per_mille.to_le_bytes());
+        b[16..20].copy_from_slice(&self.performance.to_le_bytes());
+        b[20..24].copy_from_slice(&self.fps_limit.to_le_bytes());
+        b
+    }
+
+    /// `None` when `b` is not exactly one encoded frame.
+    #[must_use]
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN || u32::from_le_bytes(b[0..4].try_into().ok()?) != LSFG_MAGIC {
+            return None;
+        }
+        Some(Self {
+            enabled: u32::from_le_bytes(b[4..8].try_into().ok()?),
+            multiplier: u32::from_le_bytes(b[8..12].try_into().ok()?),
+            flow_per_mille: u32::from_le_bytes(b[12..16].try_into().ok()?),
+            performance: u32::from_le_bytes(b[16..20].try_into().ok()?),
+            fps_limit: u32::from_le_bytes(b[20..24].try_into().ok()?),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,6 +11,9 @@
      * calls it once per device, before the first create. */
     vkd_load;
     vkd_unload;
+    /* DXBC -> SPIR-V, for the cache builder when the DLL has no pre-built
+     * SPIR-V variant. Resolved by dlsym, never linked against. */
+    lsfg_translate_dxbc;
     vkr_lsfg_create;
     vkr_lsfg_destroy;
     vkr_lsfg_configure;

@@ -44,7 +44,10 @@ if [ "$OUT_KIND" = "android" ]; then
     # payload does not have to carry libc++_shared.so. The NDK driver links
     # `-lc++_shared` by default, so the choice is made through its own flag.
     LINK_STDLIB=(-static-libstdc++)
-    LINK_EXTRA=(-Wl,--strip-all)
+    # -llog: the engine's Android logging calls __android_log_print, and liblog is
+    # a separate library — without it the symbol stays undefined and dlopen with
+    # RTLD_NOW refuses the whole library.
+    LINK_EXTRA=(-Wl,--strip-all -Wl,-z,max-page-size=16384 -llog)
 else
     CC="${CC:-cc}"
     CXX="${CXX:-g++}"

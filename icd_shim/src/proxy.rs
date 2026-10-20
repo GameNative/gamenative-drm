@@ -692,13 +692,31 @@ unsafe fn x11_reap(sc: *mut GnSwapchain) {
         if fence == 0 || !busy {
             continue;
         }
+        if unsafe { (*s).release_held } {
+            // Already returned; waiting for the paced floor. `acquire_take_free`
+            // frees it when the floor passes, so re-arming here would advance the
+            // schedule once per reap for the same release.
+            continue;
+        }
         if unsafe { (*present).fence_idle(fence) } {
+            // Same floor the wayland arm applies on `wl_buffer.release`: the
+            // X11 route has no release listener, so a gamescope session would
+            // otherwise see no pacing at all.
+            let now_ns = monotonic_ns();
+            let floor_ns = crate::scanout::note_release(now_ns);
             let _g = unsafe { (*sc).shared.lock().unwrap() };
-            unsafe {
-                (*s).in_flight = false;
-                (*sc).cv_free.notify_all();
-                drop(_g);
+            if now_ns < floor_ns {
+                unsafe {
+                    (*s).floor_ns = floor_ns;
+                    (*s).release_held = true;
+                }
+            } else {
+                unsafe {
+                    (*s).in_flight = false;
+                    (*sc).cv_free.notify_all();
+                }
             }
+            drop(_g);
             N_REL.fetch_add(1, Ordering::Relaxed);
             if rate_ok(&RATE_REL, RATE_EVERY) {
                 crate::logf!(gndrm_obf::obf!("x11 release: slot={i} {}", slot_flags(sc)));
@@ -971,6 +989,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         // already requests it in `ci.imageUsage`.
         usage: ci.imageUsage,
         slots: Vec::new(),
+        guest_slots: 0,
         worker: None,
         shared: Mutex::new(ScShared {
             jobs: VecDeque::with_capacity(GN_JOB_CAP),
@@ -1103,7 +1122,7 @@ unsafe extern "C" fn gn_vkGetSwapchainImagesKHR(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     unsafe {
-        let n_slots = (*sc).slots.len();
+        let n_slots = (*sc).guest_slots as usize;
         if images.is_null() {
             *count = n_slots as u32;
             return VK_SUCCESS;
@@ -1227,7 +1246,7 @@ unsafe fn slice_to_floor(sc: *mut GnSwapchain, slice: Duration) -> Duration {
 /// newer buffer) and its own back-pressure, not just this condition relaxed.
 unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
     let now_ns = monotonic_ns();
-    for k in 0..unsafe { (*sc).slots.len() } {
+    for k in 0..unsafe { (*sc).guest_slots as usize } {
         let s = unsafe { (*sc).slots.as_mut_ptr().add(k) };
         // A slot the compositor returned while the daemon's floor for it was
         // still ahead becomes free the instant that floor passes, and this scan
@@ -1630,7 +1649,7 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
     let indices = unsafe { slice_or_empty(pi.pImageIndices, nsc) };
     for i in 0..nsc {
         let sc = unsafe { find_swapchain(swapchains[i]) };
-        if sc.is_null() || indices[i] as usize >= unsafe { (*sc).slots.len() } {
+        if sc.is_null() || indices[i] as usize >= unsafe { (*sc).guest_slots as usize } {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         let slot = unsafe { (*sc).slots.as_mut_ptr().add(indices[i] as usize) };
@@ -4794,6 +4813,10 @@ pub struct GnDevice {
     pub queues: *mut GnQueue, // wrapper list
     pub cmds: *mut GnCmd,     // wrapper list
     pub next: *mut GnDevice,
+    // Frame generation for this device, or null. Declared last: `repr(C)` plus
+    // the thunks' fixed offset for `scratch`/`real` mean fields may only be
+    // appended, never inserted.
+    pub lsfg: *mut crate::lsfg::Session,
 }
 
 #[repr(C)]
@@ -4876,7 +4899,11 @@ pub struct GnSwapchain {
     /// the app's request; see `effective_present_mode`). Read by
     /// `present_dispatch` on every present.
     pub present_mode: VkPresentModeKHR,
+    /// Every slot the shim owns: the guest's first (`guest_slots` of them), then
+    /// the generation destinations, which the guest never sees.
     pub slots: Vec<GnSlot>,
+    /// How many leading entries of `slots` are the guest's swapchain images.
+    pub guest_slots: u32,
     pub worker: Option<std::thread::JoinHandle<()>>,
     pub shared: Mutex<ScShared>,
     pub cv_put: Condvar,
@@ -5120,7 +5147,7 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
         // from the daemon is read here because a release is the one event this
         // shim sees on every frame. Ahead of the floor, so the release it paces
         // is measured against the target it arrived under.
-        crate::scanout::poll_cap_change();
+        crate::scanout::poll_notes();
         // The floor this release is held to, measured from this shim's own
         // previous release (see `scanout::note_release`): the instant the slot
         // may go back to the guest.
@@ -7097,6 +7124,39 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceWaylandPresentationSupportKHR(
 
 // ------------------------------------------------------- device functions
 
+/// Did the guest enable `shaderFloat16` on this device?
+///
+/// The fp16 shader variant needs the feature enabled on the device its pipelines
+/// are built on — which is the guest's device, not one we create. Enabling it
+/// ourselves is not an option (the device belongs to the guest), so the fp16
+/// variant is used only when the guest already asked for it; otherwise the fp32
+/// variant, which needs nothing.
+unsafe fn guest_enabled_fp16(ci: &VkDeviceCreateInfo) -> bool {
+    const SHADER_FLOAT16_INT8_FEATURES: i32 = 1_000_082_000;
+    #[repr(C)]
+    struct Float16 {
+        s_type: i32,
+        next: *const c_void,
+        shader_float16: u32,
+        int8: u32,
+    }
+    #[repr(C)]
+    struct Chain {
+        s_type: i32,
+        next: *const Chain,
+    }
+    let mut p = ci.pNext.cast::<Chain>();
+    while !p.is_null() {
+        unsafe {
+            if (*p).s_type == SHADER_FLOAT16_INT8_FEATURES {
+                return (*p.cast::<Float16>()).shader_float16 != 0;
+            }
+            p = (*p).next;
+        }
+    }
+    false
+}
+
 unsafe extern "C" fn gn_vkCreateDevice(
     pd: VkPhysicalDevice,
     ci: *const VkDeviceCreateInfo,
@@ -7221,6 +7281,7 @@ unsafe extern "C" fn gn_vkCreateDevice(
         queues: ptr::null_mut(),
         cmds: ptr::null_mut(),
         next: ptr::null_mut(),
+        lsfg: ptr::null_mut(),
     });
     // Real-device function resolution never uses the hooks'
     // vkGetDeviceProcAddr: its answers are vulkan::driver::* trampolines
@@ -7297,6 +7358,15 @@ unsafe extern "C" fn gn_vkCreateDevice(
         unsafe { (*ci.pQueueCreateInfos).queueFamilyIndex }
     };
     let gd = Box::into_raw(gd);
+    // Frame generation, when the guest asked for it. Opened before the device is
+    // published so the session sees the same handles the guest will use; every
+    // failure inside leaves `lsfg` null and the session runs unframed.
+    let gipa = G.lock().unwrap().real_gipa;
+    unsafe {
+        (*gd).lsfg =
+            crate::lsfg::Session::open((*gi).real, pd, (*gd).real, gipa, guest_enabled_fp16(ci))
+                .map_or(ptr::null_mut(), |session| Box::into_raw(Box::new(session)));
+    }
     {
         let mut g = G.lock().unwrap();
         unsafe {
@@ -7323,6 +7393,12 @@ unsafe extern "C" fn gn_vkDestroyDevice(device: VkDevice, _alloc: *const VkAlloc
         return;
     }
     unsafe {
+        if !(*gd).lsfg.is_null() {
+            // The engine's context owns pipelines and images on this device, so
+            // it is torn down before the device itself.
+            drop(Box::from_raw((*gd).lsfg));
+            (*gd).lsfg = ptr::null_mut();
+        }
         if let Some(wait_idle) = (*gd).f.wait_idle {
             wait_idle((*gd).real);
         }
