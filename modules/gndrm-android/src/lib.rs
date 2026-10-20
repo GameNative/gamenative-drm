@@ -97,35 +97,6 @@ static CAP_CHANGED_FD: AtomicI32 = AtomicI32::new(-1);
 /// still gets it for every later session.
 static PANEL_REFRESH_MHZ: AtomicU32 = AtomicU32::new(0);
 
-// TEMPORARY: gamescope's upload buffer is a fixed 1920x1080 (rendervulkan.hpp
-// upload_buffer_size) and patch A33 sizes the blank texture to the mode, so a
-// larger mode aborts gamescope. Revert the cap once gamescope is rebuilt.
-// Connector mode when it had to be capped below the window size, else 0.
-static CAPPED_MODE: AtomicU32 = AtomicU32::new(0);
-
-/// The connector mode for a `w`x`h` window: the window itself, or the window
-/// scaled to fit 1920x1080 when larger (gamescope's upload buffer and blank
-/// texture are sized for 1080p).
-fn mode_for_panel(w: u16, h: u16) -> (u16, u16) {
-    let (long, short) = (f64::from(w.max(h)), f64::from(w.min(h)));
-    let s = (1920.0 / long).min(1080.0 / short);
-    if s >= 1.0 {
-        return (w, h);
-    }
-    let f = |v: u16| ((f64::from(v) * s) as u16) & !1;
-    (f(w), f(h))
-}
-
-/// The capped connector mode, `None` when the mode is the window size.
-pub(crate) fn capped_mode() -> Option<(i32, i32)> {
-    let v = CAPPED_MODE.load(Ordering::Relaxed);
-    if v == 0 {
-        None
-    } else {
-        Some(((v >> 16) as i32, (v & 0xffff) as i32))
-    }
-}
-
 /// The app's `JavaVM`, cached from the first JNI entry point (`nativeStart`).
 /// Needed by the presenter thread, which is a Rust-spawned thread with no
 /// `JNIEnv` of its own: it attaches with [`JavaVM::attach_current_thread`] to
@@ -826,19 +797,9 @@ fn start(
     } else {
         (width as u16, height as u16)
     };
-    let (mode_w, mode_h) = mode_for_panel(panel_w, panel_h);
-    if (mode_w, mode_h) == (panel_w, panel_h) {
-        CAPPED_MODE.store(0, Ordering::Relaxed);
-    } else {
-        CAPPED_MODE.store(u32::from(mode_w) << 16 | u32::from(mode_h), Ordering::Relaxed);
-        log_info!(
-            "{}",
-            gndrm_obf::obf!("mode capped to {mode_w}x{mode_h} for a {panel_w}x{panel_h} window")
-        );
-    }
     let panel = PanelDesc {
-        width: mode_w,
-        height: mode_h,
+        width: panel_w,
+        height: panel_h,
         mm_width: 0,
         mm_height: 0,
         refresh_mhz: PANEL_REFRESH_MHZ.load(Ordering::Relaxed),
