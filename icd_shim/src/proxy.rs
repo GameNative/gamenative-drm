@@ -7397,6 +7397,38 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceWaylandPresentationSupportKHR(
 
 // ------------------------------------------------------- device functions
 
+/// The driver's own device extension names for `pd`, unfiltered.
+unsafe fn driver_device_exts(gi: *mut GnInstance, pd: VkPhysicalDevice) -> Vec<std::ffi::CString> {
+    let Some(gipa) = G.lock().unwrap().real_gipa else {
+        return Vec::new();
+    };
+    let real: Option<PFN_vkEnumerateDeviceExtensionProperties> = unsafe {
+        std::mem::transmute(gipa((*gi).real, c"vkEnumerateDeviceExtensionProperties".as_ptr()))
+    };
+    let Some(real) = real else {
+        return Vec::new();
+    };
+    let mut n: u32 = 0;
+    if unsafe { real(pd, ptr::null(), &mut n, ptr::null_mut()) } != VK_SUCCESS {
+        return Vec::new();
+    }
+    let mut buf = vec![
+        VkExtensionProperties {
+            extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
+            specVersion: 0,
+        };
+        n as usize
+    ];
+    let r = unsafe { real(pd, ptr::null(), &mut n, buf.as_mut_ptr()) };
+    if r != VK_SUCCESS && r != VK_INCOMPLETE {
+        return Vec::new();
+    }
+    buf[..n as usize]
+        .iter()
+        .map(|e| unsafe { CStr::from_ptr(e.extensionName.as_ptr()) }.to_owned())
+        .collect()
+}
+
 unsafe extern "C" fn gn_vkCreateDevice(
     pd: VkPhysicalDevice,
     ci: *const VkDeviceCreateInfo,
@@ -7421,6 +7453,7 @@ unsafe extern "C" fn gn_vkCreateDevice(
         c"VK_EXT_image_drm_format_modifier",
     ];
     let strip_robustness2 = ROBUSTNESS2_FAKED.load(Ordering::Relaxed);
+    let have = unsafe { driver_device_exts(gi, pd) };
     let mut exts: [*const c_char; 48] = [ptr::null(); 48];
     let mut n: usize = 0;
     let names = unsafe {
@@ -7447,6 +7480,9 @@ unsafe extern "C" fn gn_vkCreateDevice(
             continue;
         }
         if unimplemented_wsi_ext(n_)
+            || (n_ == c"VK_EXT_hdr_metadata"
+                && !have.is_empty()
+                && !have.iter().any(|h| h.as_c_str() == n_))
             || (strip_robustness2 && n_ == c"VK_EXT_robustness2")
             || (crate::placed::faked() && n_ == crate::placed::EXT_NAME)
         {
@@ -7474,6 +7510,13 @@ unsafe extern "C" fn gn_vkCreateDevice(
             if unsafe { CStr::from_ptr(e) } == add {
                 continue 'add;
             }
+        }
+        if !have.is_empty() && !have.iter().any(|h| h.as_c_str() == add) {
+            crate::logf!(gndrm_obf::obf!(
+                "proxy device: driver lacks {}, not adding it",
+                add.to_string_lossy()
+            ));
+            continue;
         }
         if n < exts.len() {
             exts[n] = add.as_ptr();
