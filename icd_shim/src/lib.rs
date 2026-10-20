@@ -220,8 +220,41 @@ fn is_gamescope_binary() -> bool {
         .any(|a| a.rsplit(|&b| b == b'/').next() == Some(b"gamescope".as_slice()))
 }
 
+/// Guest-only: an ICD (the container's wrapper) to drive instead of the system loader.
+fn wrapper_icd() -> Option<std::ffi::CString> {
+    if is_gamescope_binary() {
+        return None;
+    }
+    let p = std::env::var_os("GN_VKSHIM_WRAPPER_ICD")?;
+    if p.is_empty() || std::fs::metadata(&p).is_err() {
+        return None;
+    }
+    std::ffi::CString::new(p.into_encoded_bytes()).ok()
+}
+
+fn negotiate_icd(h: *mut c_void) {
+    let sym = unsafe { libc::dlsym(h, c"vk_icdNegotiateLoaderICDInterfaceVersion".as_ptr()) };
+    if sym.is_null() {
+        return;
+    }
+    let f: unsafe extern "C" fn(*mut u32) -> VkResult = unsafe { std::mem::transmute(sym) };
+    let mut v: u32 = 5;
+    let r = unsafe { f(&mut v) };
+    logf!(gndrm_obf::obf!("wrapper icd: negotiated interface {v} ({r})"));
+}
+
 fn try_system_driver() {
-    let h = unsafe { libc::dlopen(SYSTEM_LOADER.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    let wrapper = wrapper_icd();
+    let path = wrapper.as_deref().unwrap_or(SYSTEM_LOADER);
+    let h = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    if h.is_null() && wrapper.is_some() {
+        logf!(gndrm_obf::obf!("wrapper icd: dlopen failed: {}", dlerror_str()));
+        return;
+    }
+    if wrapper.is_some() {
+        logf!(gndrm_obf::obf!("wrapper icd: driving {}", path.to_string_lossy()));
+        negotiate_icd(h);
+    }
     if h.is_null() {
         logf!(gndrm_obf::obf!(
             "dlopen system vulkan loader failed: {}",
@@ -244,7 +277,10 @@ fn try_system_driver() {
         proxy::set_fake_robustness2(true);
         export::set_enabled(true);
     }
-    placed::set_enabled(true);
+    // The wrapper ICD emulates VK_EXT_map_memory_placed itself.
+    if wrapper.is_none() {
+        placed::set_enabled(true);
+    }
     proxy::set_real_gipa(gipa);
     proxy::set_real_handle(h);
     unsafe {
