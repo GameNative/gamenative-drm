@@ -3945,6 +3945,105 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
         },
     ),
     (
+        c"vkGetPhysicalDeviceFeatures2",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                crate::placed::gn_vkGetPhysicalDeviceFeatures2
+                    as unsafe extern "C" fn(VkPhysicalDevice, *mut c_void),
+            )
+        },
+    ),
+    (
+        c"vkGetPhysicalDeviceFeatures2KHR",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                crate::placed::gn_vkGetPhysicalDeviceFeatures2
+                    as unsafe extern "C" fn(VkPhysicalDevice, *mut c_void),
+            )
+        },
+    ),
+    (
+        c"vkGetPhysicalDeviceProperties2",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                crate::placed::gn_vkGetPhysicalDeviceProperties2
+                    as unsafe extern "C" fn(VkPhysicalDevice, *mut c_void),
+            )
+        },
+    ),
+    (
+        c"vkGetPhysicalDeviceProperties2KHR",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                crate::placed::gn_vkGetPhysicalDeviceProperties2
+                    as unsafe extern "C" fn(VkPhysicalDevice, *mut c_void),
+            )
+        },
+    ),
+    (
+        c"vkMapMemory2KHR",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                crate::placed::gn_vkMapMemory2KHR
+                    as unsafe extern "C" fn(VkDevice, *const c_void, *mut *mut c_void) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkMapMemory2",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                crate::placed::gn_vkMapMemory2KHR
+                    as unsafe extern "C" fn(VkDevice, *const c_void, *mut *mut c_void) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkUnmapMemory2KHR",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                crate::placed::gn_vkUnmapMemory2KHR
+                    as unsafe extern "C" fn(VkDevice, *const c_void) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkUnmapMemory2",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                crate::placed::gn_vkUnmapMemory2KHR
+                    as unsafe extern "C" fn(VkDevice, *const c_void) -> VkResult,
+            )
+        },
+    ),
+    (
+        c"vkUnmapMemory",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                crate::placed::gn_vkUnmapMemory as unsafe extern "C" fn(VkDevice, VkDeviceMemory),
+            )
+        },
+    ),
+    (
+        c"vkFreeMemory",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                crate::placed::gn_vkFreeMemory
+                    as unsafe extern "C" fn(VkDevice, VkDeviceMemory, *const VkAllocationCallbacks),
+            )
+        },
+    ),
+    (
         c"vkUpdateDescriptorSets",
         HandlerScope::Always,
         unsafe {
@@ -4030,9 +4129,8 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
     ),
 ];
 
-const EXPORT_EMU_NAMES: [&CStr; 7] = [
+const EXPORT_EMU_NAMES: [&CStr; 6] = [
     c"vkUpdateDescriptorSets",
-    c"vkAllocateMemory",
     c"vkGetPhysicalDeviceImageFormatProperties2",
     c"vkGetPhysicalDeviceImageFormatProperties2KHR",
     c"vkGetMemoryFdKHR",
@@ -4040,8 +4138,25 @@ const EXPORT_EMU_NAMES: [&CStr; 7] = [
     c"vkGetImageSubresourceLayout",
 ];
 
+const PLACED_NAMES: [&CStr; 11] = [
+    c"vkAllocateMemory",
+    c"vkGetPhysicalDeviceFeatures2",
+    c"vkGetPhysicalDeviceFeatures2KHR",
+    c"vkGetPhysicalDeviceProperties2",
+    c"vkGetPhysicalDeviceProperties2KHR",
+    c"vkMapMemory2KHR",
+    c"vkMapMemory2",
+    c"vkUnmapMemory2KHR",
+    c"vkUnmapMemory2",
+    c"vkUnmapMemory",
+    c"vkFreeMemory",
+];
+
 fn export_emu_gated(name: &CStr) -> bool {
-    !crate::export::enabled() && EXPORT_EMU_NAMES.contains(&name)
+    (!crate::export::enabled() && EXPORT_EMU_NAMES.contains(&name))
+        || (!crate::placed::enabled()
+            && PLACED_NAMES.contains(&name)
+            && !(crate::export::enabled() && name == c"vkAllocateMemory"))
 }
 
 /// Handler-registry lookup for GIPA and GPDPA: the proxy-only handlers
@@ -6209,7 +6324,7 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
                 extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
                 specVersion: 0,
             };
-            n as usize + 2
+            n as usize + 3
         ];
         let mut got = n;
         let res = real(pd, layer, &mut got, buf.as_mut_ptr());
@@ -6219,6 +6334,7 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
         let mut kept = 0usize;
         let mut has_hdr_metadata = false;
         let mut has_robustness2 = false;
+        let mut has_placed = false;
         for i in 0..got as usize {
             let name = CStr::from_ptr(buf[i].extensionName.as_ptr());
             if unimplemented_wsi_ext(name) {
@@ -6229,6 +6345,9 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
             }
             if name == c"VK_EXT_robustness2" {
                 has_robustness2 = true;
+            }
+            if name == crate::placed::EXT_NAME {
+                has_placed = true;
             }
             buf[kept] = buf[i];
             kept += 1;
@@ -6269,6 +6388,18 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
                     "proxy: advertised VK_EXT_robustness2 (driver does not list it)"
                 ));
             }
+        }
+        if !has_placed && layer.is_null() && crate::placed::enabled() {
+            let mut prop = VkExtensionProperties {
+                extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
+                specVersion: 1,
+            };
+            for (j, b) in crate::placed::EXT_NAME.to_bytes().iter().enumerate() {
+                prop.extensionName[j] = *b as std::os::raw::c_char;
+            }
+            buf[kept] = prop;
+            kept += 1;
+            crate::placed::note_faked();
         }
         if props.is_null() {
             *count = kept as u32;
@@ -7282,8 +7413,12 @@ unsafe extern "C" fn gn_vkCreateDevice(
         // The guest must never enable a WSI extension the proxy cannot honour
         // (see `unimplemented_wsi_ext`); drop it before the driver sees it.
         let n_ = unsafe { CStr::from_ptr(name) };
+        if crate::placed::faked() && n_ == crate::placed::EXT_NAME {
+            crate::placed::note_requested();
+        }
         if unimplemented_wsi_ext(n_)
             || (strip_robustness2 && n_ == c"VK_EXT_robustness2")
+            || (crate::placed::faked() && n_ == crate::placed::EXT_NAME)
         {
             crate::logf!(gndrm_obf::obf!(
                 "proxy device: masking {}",
@@ -7296,7 +7431,15 @@ unsafe extern "C" fn gn_vkCreateDevice(
             n += 1;
         }
     }
-    'add: for add in ADD_EXTS {
+    let placed_exts: &[&CStr] = if crate::placed::enabled() {
+        &[
+            c"VK_ANDROID_external_memory_android_hardware_buffer",
+            c"VK_EXT_queue_family_foreign",
+        ]
+    } else {
+        &[]
+    };
+    'add: for add in ADD_EXTS.iter().chain(placed_exts.iter()).copied() {
         for &e in &exts[..n] {
             if unsafe { CStr::from_ptr(e) } == add {
                 continue 'add;
@@ -7356,6 +7499,9 @@ unsafe extern "C" fn gn_vkCreateDevice(
     let mut strip: Vec<VkStructureType> = Vec::new();
     if strip_robustness2 {
         strip.push(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
+    }
+    if crate::placed::faked() {
+        strip.push(crate::placed::STYPE_FEATURES);
     }
     let mut unlinked: Vec<(*mut VkBaseOutStructure, *mut VkBaseOutStructure)> = Vec::new();
     let mut prev: *mut VkBaseOutStructure = ptr::null_mut();
