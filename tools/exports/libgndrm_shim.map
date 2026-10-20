@@ -19,5 +19,10 @@
     ioctl;
     mmap;
     mmap64;
+    msgget;
+    msgsnd;
+    msgrcv;
+    msgctl;
+    fchmod;
   local: *;
 };
