@@ -22,6 +22,12 @@
 //!     shim-owned dma-buf swapchain. If both the open and the proxy's
 //!     prerequisites fail, the shim falls back to the payload freedreno
 //!     build so the guest never ends up driverless.
+//!   - with no /dev/kgsl-3d0 (a non-Adreno GPU) or GN_VKSHIM_SYSTEM_DRIVER=1,
+//!     every process (gamescope included) gets the Android system loader
+//!     (/system/lib64/libvulkan.so) driven through the WSI proxy. The proxy is
+//!     required there even without a surface: the outer loader stamps the
+//!     first word of every dispatchable handle, and the system loader keeps
+//!     its own per-handle data in that same word.
 //!
 //! GN_VKSHIM_NO_ADRENOTOOLS=1 skips the adrenotools path entirely;
 //! GN_VKSHIM_NO_PROXY=1 keeps the passthrough-or-fallback behavior without
@@ -186,6 +192,73 @@ fn ext_list_has(props: &[VkExtensionProperties], name: &CStr) -> bool {
     })
 }
 
+const SYSTEM_LOADER: &CStr = c"/system/lib64/libvulkan.so";
+
+fn kgsl_present() -> bool {
+    match std::fs::metadata("/dev/kgsl-3d0") {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+fn system_driver_forced() -> bool {
+    std::env::var_os("GN_VKSHIM_SYSTEM_DRIVER").is_some_and(|v| v == OsStr::new("1"))
+}
+
+/// gamescope runs as `linker64 .../bin/gamescope`, so comm alone can miss it.
+fn is_gamescope_binary() -> bool {
+    if is_gamescope_process() {
+        return true;
+    }
+    let cmdline = std::fs::read("/proc/self/cmdline").unwrap_or_default();
+    cmdline
+        .split(|&b| b == 0)
+        .take(2)
+        .any(|a| a.rsplit(|&b| b == b'/').next() == Some(b"gamescope".as_slice()))
+}
+
+fn try_system_driver() {
+    let h = unsafe { libc::dlopen(SYSTEM_LOADER.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    if h.is_null() {
+        logf!(gndrm_obf::obf!(
+            "dlopen system vulkan loader failed: {}",
+            dlerror_str()
+        ));
+        return;
+    }
+    let Some(gipa) = (unsafe { resolve_gipa(h) }) else {
+        logf!(gndrm_obf::obf!(
+            "system vulkan loader exports no vkGetInstanceProcAddr"
+        ));
+        return;
+    };
+    if !proxy::device_prereqs(gipa) {
+        logf!(gndrm_obf::obf!("system vulkan driver fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode"));
+        return;
+    }
+    let gamescope = is_gamescope_binary();
+    if gamescope {
+        proxy::set_fake_robustness2(true);
+    }
+    proxy::set_real_gipa(gipa);
+    proxy::set_real_handle(h);
+    unsafe {
+        DRIVER.proxy_active = true;
+        DRIVER.handle = h;
+    }
+    if gamescope {
+        logf!(gndrm_obf::obf!(
+            "gamescope process: using system vulkan driver via WSI proxy [shim {}]",
+            SHIM_BUILD
+        ));
+    } else {
+        logf!(gndrm_obf::obf!(
+            "guest process: using system vulkan driver via WSI proxy [shim {}]",
+            SHIM_BUILD
+        ));
+    }
+}
+
 fn try_adrenotools() {
     let path = std::env::var("ADRENOTOOLS_DRIVER_PATH").ok();
     let redirect = std::env::var("ADRENOTOOLS_REDIRECT_DIR").ok();
@@ -340,27 +413,21 @@ fn init_once() {
     // before any driver code runs, so it sits in front of wine's SEH handler.
     #[cfg(feature = "segv_dump")]
     crate::segv::install();
-    if is_gamescope_process() {
-        let h = unsafe {
-            libc::dlopen(
-                c"libvulkan_freedreno.so".as_ptr(),
-                libc::RTLD_NOW | libc::RTLD_LOCAL,
-            )
-        };
-        logf!(gndrm_obf::obf!(
-            "gamescope process: payload freedreno {}",
-            if h.is_null() {
-                dlerror_str()
-            } else {
-                "loaded".into()
-            }
-        ));
-        unsafe { DRIVER.handle = h };
-    } else {
-        if std::env::var_os("GN_VKSHIM_NO_ADRENOTOOLS").is_none() {
-            try_adrenotools();
+    let kgsl = kgsl_present();
+    if !kgsl || system_driver_forced() {
+        if kgsl {
+            logf!(gndrm_obf::obf!(
+                "GN_VKSHIM_SYSTEM_DRIVER=1: using the system vulkan loader"
+            ));
+        } else {
+            logf!(gndrm_obf::obf!(
+                "no /dev/kgsl-3d0: using the system vulkan loader"
+            ));
         }
-        if unsafe { DRIVER.handle }.is_null() {
+        try_system_driver();
+    }
+    if kgsl && unsafe { DRIVER.handle }.is_null() {
+        if is_gamescope_process() {
             let h = unsafe {
                 libc::dlopen(
                     c"libvulkan_freedreno.so".as_ptr(),
@@ -368,7 +435,7 @@ fn init_once() {
                 )
             };
             logf!(gndrm_obf::obf!(
-                "guest process: falling back to payload freedreno {}",
+                "gamescope process: payload freedreno {}",
                 if h.is_null() {
                     dlerror_str()
                 } else {
@@ -376,6 +443,27 @@ fn init_once() {
                 }
             ));
             unsafe { DRIVER.handle = h };
+        } else {
+            if std::env::var_os("GN_VKSHIM_NO_ADRENOTOOLS").is_none() {
+                try_adrenotools();
+            }
+            if unsafe { DRIVER.handle }.is_null() {
+                let h = unsafe {
+                    libc::dlopen(
+                        c"libvulkan_freedreno.so".as_ptr(),
+                        libc::RTLD_NOW | libc::RTLD_LOCAL,
+                    )
+                };
+                logf!(gndrm_obf::obf!(
+                    "guest process: falling back to payload freedreno {}",
+                    if h.is_null() {
+                        dlerror_str()
+                    } else {
+                        "loaded".into()
+                    }
+                ));
+                unsafe { DRIVER.handle = h };
+            }
         }
     }
     let handle = unsafe { DRIVER.handle };
