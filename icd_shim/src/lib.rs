@@ -76,6 +76,7 @@ pub fn vkshim_enabled() -> bool {
 pub mod divisor;
 pub mod export;
 pub mod placed;
+pub mod lsfg;
 pub mod proxy;
 pub mod scanout;
 pub mod segv;

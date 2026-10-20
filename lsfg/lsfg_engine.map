@@ -1,0 +1,27 @@
+/* Export allowlist for liblsfg_engine.so.
+ *
+ * Two groups: the embedder's seam (the host table installer and the ABI tag) and
+ * the engine API `vkr_lsfg.h` declares. Everything else — the shader chain, the
+ * translator, libc++'s internals — stays local. */
+{
+  global:
+    lsfg_engine_abi;
+    lsfg_engine_set_host;
+    /* Fills the engine's vk* dispatch from the real driver's table; the shim
+     * calls it once per device, before the first create. */
+    vkd_load;
+    vkd_unload;
+    vkr_lsfg_create;
+    vkr_lsfg_destroy;
+    vkr_lsfg_configure;
+    vkr_lsfg_set_refresh_rate;
+    vkr_lsfg_set_guest_extent;
+    vkr_lsfg_needs_rebuild;
+    vkr_lsfg_prepare;
+    vkr_lsfg_plan;
+    vkr_lsfg_process;
+    vkr_lsfg_generate_into;
+    vkr_lsfg_forget_targets;
+    vkr_lsfg_reset;
+  local: *;
+};

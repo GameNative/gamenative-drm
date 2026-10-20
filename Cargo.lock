@@ -6,6 +6,7 @@ version = 4
 name = "adrenotools_gamescope"
 version = "0.1.0"
 dependencies = [
+ "gndrm-lsfg",
  "gndrm-obf",
  "gndrm-uapi",
  "libc",
@@ -106,6 +107,14 @@ version = "0.1.0"
 dependencies = [
  "gndrm-obf",
  "gndrm-uapi",
+ "libc",
+]
+
+[[package]]
+name = "gndrm-lsfg"
+version = "0.1.0"
+dependencies = [
+ "gndrm-obf",
  "libc",
 ]
 
