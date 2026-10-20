@@ -73,6 +73,7 @@ pub fn vkshim_enabled() -> bool {
     }
 }
 
+pub mod divisor;
 pub mod export;
 pub mod placed;
 pub mod proxy;
