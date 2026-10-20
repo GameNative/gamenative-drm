@@ -19,5 +19,6 @@
     ioctl;
     mmap;
     mmap64;
+    fchmod;
   local: *;
 };
