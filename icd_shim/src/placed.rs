@@ -150,6 +150,7 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceFeatures2(pd: VkPhysicalDevice, f
         return;
     };
     unsafe { real(pd, f) };
+    unsafe { crate::divisor::features2(f) };
     if !enabled() || f.is_null() {
         return;
     }
@@ -170,7 +171,7 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceProperties2(pd: VkPhysicalDevice,
     }) else {
         return;
     };
-    unsafe { real(pd, p) };
+    unsafe { crate::divisor::properties2(p, &|q| real(pd, q)) };
     if !enabled() || p.is_null() {
         return;
     }

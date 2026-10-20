@@ -6324,7 +6324,7 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
                 extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
                 specVersion: 0,
             };
-            n as usize + 3
+            n as usize + 4
         ];
         let mut got = n;
         let res = real(pd, layer, &mut got, buf.as_mut_ptr());
@@ -6335,6 +6335,8 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
         let mut has_hdr_metadata = false;
         let mut has_robustness2 = false;
         let mut has_placed = false;
+        let mut has_divisor_ext = false;
+        let mut has_divisor_khr = false;
         for i in 0..got as usize {
             let name = CStr::from_ptr(buf[i].extensionName.as_ptr());
             if unimplemented_wsi_ext(name) {
@@ -6348,6 +6350,12 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
             }
             if name == crate::placed::EXT_NAME {
                 has_placed = true;
+            }
+            if name == crate::divisor::EXT_NAME {
+                has_divisor_ext = true;
+            }
+            if name == crate::divisor::KHR_NAME {
+                has_divisor_khr = true;
             }
             buf[kept] = buf[i];
             kept += 1;
@@ -6400,6 +6408,18 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
             buf[kept] = prop;
             kept += 1;
             crate::placed::note_faked();
+        }
+        if !has_divisor_ext && has_divisor_khr && layer.is_null() && crate::placed::enabled() {
+            let mut prop = VkExtensionProperties {
+                extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
+                specVersion: 3,
+            };
+            for (j, b) in crate::divisor::EXT_NAME.to_bytes().iter().enumerate() {
+                prop.extensionName[j] = *b as std::os::raw::c_char;
+            }
+            buf[kept] = prop;
+            kept += 1;
+            crate::divisor::note_faked();
         }
         if props.is_null() {
             *count = kept as u32;
@@ -7415,6 +7435,16 @@ unsafe extern "C" fn gn_vkCreateDevice(
         let n_ = unsafe { CStr::from_ptr(name) };
         if crate::placed::faked() && n_ == crate::placed::EXT_NAME {
             crate::placed::note_requested();
+        }
+        if crate::divisor::faked() && n_ == crate::divisor::EXT_NAME {
+            let khr_listed = names
+                .iter()
+                .any(|&o| unsafe { CStr::from_ptr(o) } == crate::divisor::KHR_NAME);
+            if !khr_listed && n < exts.len() {
+                exts[n] = crate::divisor::KHR_NAME.as_ptr();
+                n += 1;
+            }
+            continue;
         }
         if unimplemented_wsi_ext(n_)
             || (strip_robustness2 && n_ == c"VK_EXT_robustness2")
