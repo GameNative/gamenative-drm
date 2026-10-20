@@ -901,11 +901,22 @@ impl AscState {
         };
         // KMS clips the plane to the mode: the destination rect is the CRTC
         // rect bounded by the panel.
+        // A capped mode is scaled up to the window (TEMPORARY, see CAPPED_MODE).
+        let cap = crate::capped_mode();
+        let (pw, ph) = (self.panel_w, self.panel_h);
+        let sx = |v: c_int| match cap {
+            Some((mw, _)) if mw > 0 => (i64::from(v) * i64::from(pw) / i64::from(mw)) as c_int,
+            _ => v,
+        };
+        let sy = |v: c_int| match cap {
+            Some((_, mh)) if mh > 0 => (i64::from(v) * i64::from(ph) / i64::from(mh)) as c_int,
+            _ => v,
+        };
         let dst = ffi::ARect {
-            left: plane.crtc_x.max(0),
-            top: plane.crtc_y.max(0),
-            right: (plane.crtc_x + plane.crtc_w).min(self.panel_w),
-            bottom: (plane.crtc_y + plane.crtc_h).min(self.panel_h),
+            left: sx(plane.crtc_x.max(0)),
+            top: sy(plane.crtc_y.max(0)),
+            right: sx(plane.crtc_x + plane.crtc_w).min(self.panel_w),
+            bottom: sy(plane.crtc_y + plane.crtc_h).min(self.panel_h),
         };
         let drawable = src.right > src.left
             && src.bottom > src.top
