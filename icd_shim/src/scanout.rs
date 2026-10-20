@@ -17,7 +17,7 @@
 //! pre-existing behaviour rather than a broken one.
 
 use gndrm_uapi::wire::{
-    FrameCapNote, FrameCapSubscribe, GameWindowNote, ScanoutAllocReq, ScanoutAllocResp,
+    FrameCapNote, FrameCapSubscribe, GameWindowNote, LsfgConfig, ScanoutAllocReq, ScanoutAllocResp,
     CAP_FRAME_CAP, FPS_UNCAPPED, SCANOUT_FORMAT_BGRA_8888,
 };
 use std::os::fd::RawFd;
@@ -116,14 +116,24 @@ fn release_floor(target_fps: u32, last_release_ns: u64, now_ns: u64) -> u64 {
 #[must_use]
 pub(crate) fn note_release(now_ns: u64) -> u64 {
     let mut c = CAP.lock().unwrap_or_else(|e| e.into_inner());
-    let free_at = release_floor(c.target_fps, c.last_release_ns, now_ns);
+    // The effective rate, not the note's: while frame generation runs the source
+    // cap comes from the app through `lsfg::live()`, and the daemon's own note is
+    // 0 (the app disarms gamescope's limiter in that case).
+    let target = crate::lsfg::source_cap().unwrap_or(c.target_fps);
+    let free_at = release_floor(target, c.last_release_ns, now_ns);
     c.last_release_ns = free_at;
     free_at
 }
 
 /// Adopt one frame-cap note: the target it carries.
 fn apply_note(note: FrameCapNote) {
-    crate::logf!(gndrm_obf::obf!("scanout frame cap: fps={}", note.fps));
+    // 0 while frame generation paces the session: log what is actually in force,
+    // not what the note carried.
+    crate::logf!(gndrm_obf::obf!(
+        "scanout frame cap: fps={} effective={}",
+        note.fps,
+        target_fps()
+    ));
     NOTES_N.fetch_add(1, Ordering::Relaxed);
     let mut c = CAP.lock().unwrap_or_else(|e| e.into_inner());
     c.target_fps = note.fps;
@@ -133,6 +143,12 @@ fn apply_note(note: FrameCapNote) {
 /// the shim's census, so a round can tell "no note arrived" from "a note
 /// arrived whose floor never bound".
 pub(crate) fn target_fps() -> u32 {
+    // Frame generation owns the source rate while it is on: the app disarms
+    // gamescope's limiter in that case, so a zero from the daemon's cap note is
+    // not "uncapped", it is "paced by the presenter".
+    if let Some(cap) = crate::lsfg::source_cap() {
+        return cap;
+    }
     CAP.lock().unwrap_or_else(|e| e.into_inner()).target_fps
 }
 
@@ -226,6 +242,64 @@ enum Failure {
 /// buffer in the pool's BGRA layout. `None` when the channel is unset,
 /// unreachable, or refuses; the caller then allocates locally.
 #[must_use]
+/// Ask the daemon for the app's frame-generation settings.
+///
+/// Same channel as [`allocate`], deliberately: the daemon serves a single
+/// scan-out reader, so a second connection would displace the allocator's. Call
+/// this before the first allocation of a session, when nothing is in flight —
+/// then the only frames on the wire are notes the daemon pushes, which are
+/// skipped by magic.
+pub fn lsfg_config() -> Option<LsfgConfig> {
+    let path = std::env::var("GAMENATIVE_DRM_SOCKET").ok()?;
+    if path.is_empty() {
+        return None;
+    }
+    let mut ch = CHAN.lock().unwrap_or_else(|e| e.into_inner());
+    if *ch < 0 {
+        *ch = connect(&path);
+        if *ch < 0 {
+            return None;
+        }
+    }
+    let wire = LsfgConfig::request().encode();
+    // SAFETY: `*ch` is this module's descriptor; both buffers outlive the calls.
+    unsafe {
+        let mut iov = libc::iovec {
+            iov_base: wire.as_ptr().cast_mut().cast(),
+            iov_len: wire.len(),
+        };
+        let mut msg: libc::msghdr = core::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        if libc::sendmsg(*ch, &msg, libc::MSG_NOSIGNAL) < 0 {
+            libc::close(*ch);
+            *ch = -1;
+            return None;
+        }
+        // Bounded: a channel that answers with neither our reply nor a frame we
+        // recognise is not going to, and the caller has env defaults to fall back
+        // to.
+        for _ in 0..4 {
+            let mut buf = [0u8; 64];
+            let n = libc::recv(*ch, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT);
+            if n < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+                    // Give the daemon a moment; it answers within one poll turn.
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    continue;
+                }
+                libc::close(*ch);
+                *ch = -1;
+                return None;
+            }
+            if let Some(settings) = LsfgConfig::decode(&buf[..n as usize]) {
+                return (!settings.is_request()).then_some(settings);
+            }
+        }
+    }
+    None
+}
+
 pub fn allocate(width: u32, height: u32) -> Option<ScanoutBuf> {
     let path = std::env::var("GAMENATIVE_DRM_SOCKET").ok()?;
     if path.is_empty() {
@@ -388,7 +462,18 @@ fn exchange(fd: RawFd, width: u32, height: u32) -> Result<ScanoutBuf, Failure> {
             }
 
             if n as usize == ScanoutAllocResp::LEN {
-                if let Some(note) = FrameCapNote::decode(&buf) {
+                if let Some(config) = LsfgConfig::decode(&buf) {
+                    // A settings push, not the reply: apply it and keep waiting.
+                    if recv_fd >= 0 {
+                        libc::close(recv_fd);
+                    }
+                    if !config.is_request() {
+                        crate::lsfg::apply(config);
+                    }
+                    if frames < MAX_BURST_FRAMES {
+                        continue;
+                    }
+                } else if let Some(note) = FrameCapNote::decode(&buf) {
                     // A note carries no buffer.
                     if recv_fd >= 0 {
                         libc::close(recv_fd);
@@ -435,7 +520,7 @@ fn exchange(fd: RawFd, width: u32, height: u32) -> Result<ScanoutBuf, Failure> {
 /// exists while `exchange` holds this same lock across its send and receive, so
 /// a lock that is free means no reply is in flight and any frame on the socket
 /// is a push. A push skipped then is read on the next release.
-pub(crate) fn poll_cap_change() {
+pub(crate) fn poll_notes() {
     let ch = match CHAN.try_lock() {
         Ok(g) => g,
         Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
@@ -444,18 +529,31 @@ pub(crate) fn poll_cap_change() {
     if *ch < 0 {
         return;
     }
-    let mut buf = [0u8; FrameCapNote::LEN];
+    // One frame of the largest push. SEQPACKET preserves boundaries but truncates
+    // on a short buffer, so this must cover both `FrameCapNote` and `LsfgConfig`.
+    let mut buf = [0u8; PUSH_LEN];
     // SAFETY: `*ch` is the connection this module owns and `buf` is one full
     // frame; MSG_DONTWAIT leaves a frame that has not arrived for the next
     // call, and a read of any other length is a peer that closed.
     let n = unsafe { libc::recv(*ch, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
-    if n as usize != FrameCapNote::LEN {
+    let Ok(len) = usize::try_from(n) else {
+        return;
+    };
+    if len == 0 {
         return;
     }
-    if let Some(note) = FrameCapNote::decode(&buf) {
+    // Dispatch on the magic: both push types are the same socket, in either order.
+    if let Some(note) = FrameCapNote::decode(&buf[..len]) {
         apply_note(note);
+    } else if let Some(config) = LsfgConfig::decode(&buf[..len]) {
+        if !config.is_request() {
+            crate::lsfg::apply(config);
+        }
     }
 }
+
+/// Largest frame the daemon pushes unsolicited.
+const PUSH_LEN: usize = 24;
 
 #[cfg(test)]
 mod tests {

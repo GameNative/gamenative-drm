@@ -269,13 +269,20 @@ one generation and no pacing change.
 3. **Image count.** `multiplier − 1` extra images are in flight; the swapchain's
    `max_swapchain_images` and the slot table must allow them, or a generated frame
    waits for a released slot.
-4. **Commit and pacing.** A generated frame enters the daemon's deferral exactly
+4. **Frame capture has to happen before the commit, not after.** The engine's
+   `vkr_lsfg_process` copies its source out of `VK_IMAGE_LAYOUT_GENERAL` — correct
+   for the app, whose source is a compute-written composite image, but a guest
+   swapchain image arrives in `PRESENT_SRC_KHR`. The shim must transition in and
+   back out, and must do it in the submission that already waits the slot's
+   fence and *before* handing the buffer to the compositor: once committed, the
+   next release can return the slot to the guest, which will render into it.
+5. **Commit and pacing.** A generated frame enters the daemon's deferral exactly
    like a real one. Whether consecutive commits land on consecutive deadlines or
    arrive as a burst is unproven; if they burst, the shim spaces the presents and
    the daemon stays unchanged.
-5. **Format.** 8-bit BGRA is the shipped case. 10-bit (`A2B10G10R10`) storage in
+6. **Format.** 8-bit BGRA is the shipped case. 10-bit (`A2B10G10R10`) storage in
    the engine is plausible on this driver and untested — a goal, not an assumption.
-6. **Where the cache is written.** Inside the container, next to the DLL, so a
+7. **Where the cache is written.** Inside the container, next to the DLL, so a
    guest-side rebuild and a guest-side read use the same file the app installed.
    The app-private `filesDir` store is not reachable from here.
 
@@ -318,17 +325,21 @@ one generation and no pacing change.
    opens the library, checks the ABI and installs the host table.
 2. ~~The Rust `lsfg/` modules (`pe.rs`, `cache.rs`).~~ Done: 11 unit tests,
    including a byte-for-byte cache round-trip and the SPIR-V renumbering order.
-3. Wire the shim: `vkd_load` at device create, `ensure_cache` against the
-   container's `Lossless.dll`, `vkr_lsfg_create`/`configure`, and the fp16 probe
-   on the device — FG off in every other sense, prove the engine initialises and
-   reports what it found (goal 8), with no frame generated yet.
-4. One generated frame per real frame, multiplier 2, no pacing change: prove it
+3. ~~Wire the shim.~~ Done: the device is created, `vkd_load` is handed the real
+   driver's table, the cache is built from `GNDRM_LSFG_DLL` when it does not
+   match, the engine context is created and configured, and the session is torn
+   down with the device. fp16 is chosen only when the **guest** enabled
+   `shaderFloat16` on the device being created — the feature has to be on the
+   device the pipelines are built on, and that device is not ours.
+4. Swapchain: destination slots, `vkr_lsfg_prepare` on create/recreate, and the
+   generation plan — still with nothing presented.
+5. One generated frame per real frame, multiplier 2, no pacing change: prove it
    reaches the display intact (goal 1).
-5. Pacing in the shim if the commits burst (goal 2).
-6. Cost and latency at 2× and 3× (goals 4, 5); decide whether fp16 and
+6. Pacing in the shim if the commits burst (goal 2).
+7. Cost and latency at 2× and 3× (goals 4, 5); decide whether fp16 and
    performance mode change the answer.
-7. HDR (goal 6), robustness (goal 7), absent-DLL path (goal 9).
-8. Re-check the layer ban (goal 10) and the X11 backends for regressions.
+8. HDR (goal 6), robustness (goal 7), absent-DLL path (goal 9).
+9. Re-check the layer ban (goal 10) and the X11 backends for regressions.
 
 ## Non-goals
 

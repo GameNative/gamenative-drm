@@ -83,15 +83,20 @@ struct Header {
     variant: Variant,
 }
 
-extern "C" {
-    /// dxvk's DXBC→SPIR-V translator, in `lsfg/dxbc`. Returns a `malloc`ed
-    /// buffer the caller owns.
-    fn lsfg_translate_dxbc(
-        bytecode: *const u8,
-        size: u32,
-        out_words: *mut *mut u32,
-        out_word_count: *mut u32,
-    ) -> bool;
+/// dxvk's DXBC→SPIR-V translator, as `lsfg/dxbc` compiles it. Returns a
+/// `malloc`ed buffer the caller owns.
+pub type TranslateFn = unsafe extern "C" fn(*const u8, u32, *mut *mut u32, *mut u32) -> bool;
+
+/// Installed by whoever loaded the engine library; this crate never links
+/// against it. Translation is only reached when the DLL carries DXBC rather than
+/// pre-built SPIR-V, and an unset translator is reported as a translation
+/// failure — frame generation off, not a crash.
+static TRANSLATOR: std::sync::OnceLock<TranslateFn> = std::sync::OnceLock::new();
+
+/// Hand this crate the translator. First call wins; the engine library is loaded
+/// once per process.
+pub fn set_translator(translate: TranslateFn) {
+    let _ = TRANSLATOR.set(translate);
 }
 
 /// FNV-1a over the whole DLL, with the offset basis GameNative's cache uses.
@@ -213,7 +218,8 @@ fn translate(blob: &[u8]) -> Option<Vec<u32>> {
     let size = u32::try_from(blob.len()).ok()?;
     let mut words: *mut u32 = std::ptr::null_mut();
     let mut count = 0u32;
-    let ok = unsafe { lsfg_translate_dxbc(blob.as_ptr(), size, &raw mut words, &raw mut count) };
+    let translate = *TRANSLATOR.get()?;
+    let ok = unsafe { translate(blob.as_ptr(), size, &raw mut words, &raw mut count) };
     if !ok {
         return None;
     }
