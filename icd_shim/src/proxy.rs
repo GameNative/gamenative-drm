@@ -7984,7 +7984,36 @@ unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
     // tiling, modifier) plus a pure read-only modifier-support query.
     unsafe { query_linear_modifier_support(gd, (*sc).format, (*sc).usage, VK_IMAGE_TILING_LINEAR) };
     unsafe { trace_image_create(&ici, "img-create linear", &TRACE_IMAGE_CI_LINEAR) };
-    let res = unsafe { f.create_image.unwrap()(dev, &ici, ptr::null(), &mut (*s).image) };
+    let mut res = unsafe { f.create_image.unwrap()(dev, &ici, ptr::null(), &mut (*s).image) };
+    if res != VK_SUCCESS {
+        // Drivers that import dma-bufs only through DRM-modifier tiling (Mali):
+        // the same LINEAR layout, stated explicitly at the slot's stride.
+        let plane = VkSubresourceLayout {
+            offset: 0,
+            size: 0,
+            rowPitch: u64::from((*s).stride),
+            arrayPitch: 0,
+            depthPitch: 0,
+        };
+        let explicit = VkImageDrmFormatModifierExplicitCreateInfoEXT {
+            sType: VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+            pNext: &ext_img as *const _ as *const c_void,
+            drmFormatModifier: GN_DRM_MOD_LINEAR,
+            drmFormatModifierPlaneCount: 1,
+            pPlaneLayouts: &plane,
+        };
+        let ici2 = VkImageCreateInfo {
+            pNext: &explicit as *const _ as *const c_void,
+            tiling: VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+            ..ici
+        };
+        let r1 = res;
+        res = unsafe { f.create_image.unwrap()(dev, &ici2, ptr::null(), &mut (*s).image) };
+        crate::logf!(gndrm_obf::obf!(
+            "proxy import image: LINEAR tiling {r1}; explicit LINEAR modifier (pitch {}) {res}",
+            (*s).stride
+        ));
+    }
     if res != VK_SUCCESS {
         crate::logf!(gndrm_obf::obf!("proxy import image create failed: {res}"));
         return res;
