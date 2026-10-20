@@ -4668,6 +4668,18 @@ fn max_swapchain_images() -> u32 {
     }
 }
 
+const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT: VkStructureType = 1000286000;
+
+// gamescope hard-requires VK_EXT_robustness2; some system drivers (Mali-G710)
+// lack it. Advertised to gamescope only, then stripped with its feature struct
+// before the driver sees the create.
+static FAKE_ROBUSTNESS2: AtomicBool = AtomicBool::new(false);
+static ROBUSTNESS2_FAKED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_fake_robustness2(on: bool) {
+    FAKE_ROBUSTNESS2.store(on, Ordering::Relaxed);
+}
+
 /// The WSI surface the proxy does not implement, by extension name and by the
 /// command names those extensions add.
 ///
@@ -5573,30 +5585,35 @@ unsafe fn gn_real_device_proc(gd: *mut GnDevice, name: &CStr) -> PFN_vkVoidFunct
         };
         (g.real_handle, g.real_gipa, inst)
     };
-    let mut fnptr: PFN_vkVoidFunction = None;
-    let mut via = "miss";
     // Which handle a name resolves through decides whether the guest gets the
     // driver's own implementation or the hooks' replacement. The copy/memory
     // entry points are exactly where the guest's calls came back empty, so
     // allow forcing the driver's own (GN_VKSHIM_PREFER_DRIVER_PROC=1).
     let prefer_driver = std::env::var_os("GN_VKSHIM_PREFER_DRIVER_PROC").is_some();
-    if !handle.is_null() && !prefer_driver {
-        let sym = unsafe { libc::dlsym(handle, name.as_ptr()) };
-        if !sym.is_null() {
-            via = "dlsym";
-            fnptr =
-                Some(unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn()>(sym) });
-        }
-    }
-    if fnptr.is_none() && !inst.is_null() {
-        if let Some(gipa) = gipa {
-            fnptr = unsafe { gipa(inst, name.as_ptr()) };
-            if fnptr.is_some() {
-                via = "gipa";
+    let lookup = |n: &CStr| -> (PFN_vkVoidFunction, &'static str) {
+        if !handle.is_null() && !prefer_driver {
+            let sym = unsafe { libc::dlsym(handle, n.as_ptr()) };
+            if !sym.is_null() {
+                return (
+                    Some(unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn()>(sym) }),
+                    "dlsym",
+                );
             }
         }
-    }
-    // Core names the driver only exports under an extension spelling.
+        if !inst.is_null() {
+            if let Some(gipa) = gipa {
+                let f = unsafe { gipa(inst, n.as_ptr()) };
+                if f.is_some() {
+                    return (f, "gipa");
+                }
+            }
+        }
+        (None, "miss")
+    };
+    let (mut fnptr, mut via) = lookup(name);
+    // Core names the driver only exports under an extension spelling. One
+    // hop only: alias_of maps both ways, so recursing ping-pongs forever when
+    // neither spelling resolves.
     if fnptr.is_none() {
         if let Some(alias) = name
             .to_str()
@@ -5604,7 +5621,7 @@ unsafe fn gn_real_device_proc(gd: *mut GnDevice, name: &CStr) -> PFN_vkVoidFunct
             .and_then(crate::vk_dispatch_gen::alias_of)
         {
             let c = std::ffi::CString::new(alias).unwrap();
-            fnptr = unsafe { gn_real_device_proc(gd, &c) };
+            fnptr = lookup(&c).0;
             if fnptr.is_some() {
                 via = "alias";
             }
@@ -6074,14 +6091,14 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
         if res != VK_SUCCESS {
             return res;
         }
-        // One spare slot: the proxy appends `VK_EXT_hdr_metadata` when the
-        // driver does not list it (see below).
+        // Spare slots: the proxy appends `VK_EXT_hdr_metadata` and, for
+        // gamescope, `VK_EXT_robustness2` when the driver does not list them.
         let mut buf = vec![
             VkExtensionProperties {
                 extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
                 specVersion: 0,
             };
-            n as usize + 1
+            n as usize + 2
         ];
         let mut got = n;
         let res = real(pd, layer, &mut got, buf.as_mut_ptr());
@@ -6090,6 +6107,7 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
         }
         let mut kept = 0usize;
         let mut has_hdr_metadata = false;
+        let mut has_robustness2 = false;
         for i in 0..got as usize {
             let name = CStr::from_ptr(buf[i].extensionName.as_ptr());
             if unimplemented_wsi_ext(name) {
@@ -6097,6 +6115,9 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
             }
             if name == c"VK_EXT_hdr_metadata" {
                 has_hdr_metadata = true;
+            }
+            if name == c"VK_EXT_robustness2" {
+                has_robustness2 = true;
             }
             buf[kept] = buf[i];
             kept += 1;
@@ -6120,6 +6141,23 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
             crate::logf!(gndrm_obf::obf!(
                 "proxy: advertised VK_EXT_hdr_metadata (driver does not list it)"
             ));
+        }
+        if !has_robustness2 && layer.is_null() && FAKE_ROBUSTNESS2.load(Ordering::Relaxed) {
+            let mut prop = VkExtensionProperties {
+                extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
+                specVersion: 1,
+            };
+            let name = b"VK_EXT_robustness2\0";
+            for (j, b) in name.iter().enumerate() {
+                prop.extensionName[j] = *b as std::os::raw::c_char;
+            }
+            buf[kept] = prop;
+            kept += 1;
+            if !ROBUSTNESS2_FAKED.swap(true, Ordering::Relaxed) {
+                crate::logf!(gndrm_obf::obf!(
+                    "proxy: advertised VK_EXT_robustness2 (driver does not list it)"
+                ));
+            }
         }
         if props.is_null() {
             *count = kept as u32;
@@ -7120,6 +7158,7 @@ unsafe extern "C" fn gn_vkCreateDevice(
         c"VK_EXT_external_memory_dma_buf",
         c"VK_EXT_image_drm_format_modifier",
     ];
+    let strip_robustness2 = ROBUSTNESS2_FAKED.load(Ordering::Relaxed);
     let mut exts: [*const c_char; 48] = [ptr::null(); 48];
     let mut n: usize = 0;
     let names = unsafe {
@@ -7132,7 +7171,9 @@ unsafe extern "C" fn gn_vkCreateDevice(
         // The guest must never enable a WSI extension the proxy cannot honour
         // (see `unimplemented_wsi_ext`); drop it before the driver sees it.
         let n_ = unsafe { CStr::from_ptr(name) };
-        if unimplemented_wsi_ext(n_) {
+        if unimplemented_wsi_ext(n_)
+            || (strip_robustness2 && n_ == c"VK_EXT_robustness2")
+        {
             crate::logf!(gndrm_obf::obf!(
                 "proxy device: masking {}",
                 n_.to_string_lossy()
@@ -7201,7 +7242,35 @@ unsafe extern "C" fn gn_vkCreateDevice(
             p = (*p).pNext;
         }
     }
+    let mut strip: Vec<VkStructureType> = Vec::new();
+    if strip_robustness2 {
+        strip.push(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
+    }
+    let mut unlinked: Vec<(*mut VkBaseOutStructure, *mut VkBaseOutStructure)> = Vec::new();
+    let mut prev: *mut VkBaseOutStructure = ptr::null_mut();
+    let mut p = ci2.pNext as *mut VkBaseOutStructure;
+    while !p.is_null() {
+        unsafe {
+            let next = (*p).pNext;
+            if strip.contains(&(*p).sType) {
+                if prev.is_null() {
+                    ci2.pNext = next as *const c_void;
+                } else {
+                    (*prev).pNext = next;
+                }
+                unlinked.push((prev, p));
+            } else {
+                prev = p;
+            }
+            p = next;
+        }
+    }
     let res = unsafe { (*gi).f.create_device.unwrap()(pd, &ci2, alloc, out) };
+    for &(prev, p) in unlinked.iter().rev() {
+        if !prev.is_null() {
+            unsafe { (*prev).pNext = p };
+        }
+    }
     if res != VK_SUCCESS {
         return res;
     }
