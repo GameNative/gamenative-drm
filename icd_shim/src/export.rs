@@ -357,6 +357,9 @@ pub unsafe extern "C" fn gn_vkAllocateMemory(
     alloc: *const VkAllocationCallbacks,
     out: *mut VkDeviceMemory,
 ) -> VkResult {
+    if let Some(r) = unsafe { crate::placed::try_allocate(device, ai, alloc, out) } {
+        return r;
+    }
     let Some((dev, real)) = (unsafe { real_dev::<PFN_vkAllocateMemory>(device, c"vkAllocateMemory") }) else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };

@@ -74,6 +74,7 @@ pub fn vkshim_enabled() -> bool {
 }
 
 pub mod export;
+pub mod placed;
 pub mod proxy;
 pub mod scanout;
 pub mod segv;
@@ -242,6 +243,7 @@ fn try_system_driver() {
         proxy::set_fake_robustness2(true);
         export::set_enabled(true);
     }
+    placed::set_enabled(true);
     proxy::set_real_gipa(gipa);
     proxy::set_real_handle(h);
     unsafe {
