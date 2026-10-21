@@ -3925,6 +3925,16 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
         },
     ),
     (
+        c"vkDestroyImage",
+        HandlerScope::Always,
+        unsafe {
+            std::mem::transmute(
+                crate::export::gn_vkDestroyImage
+                    as unsafe extern "C" fn(VkDevice, VkImage, *const VkAllocationCallbacks),
+            )
+        },
+    ),
+    (
         c"vkGetMemoryFdKHR",
         HandlerScope::Always,
         unsafe {
@@ -4129,7 +4139,8 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
     ),
 ];
 
-const EXPORT_EMU_NAMES: [&CStr; 6] = [
+const EXPORT_EMU_NAMES: [&CStr; 7] = [
+    c"vkDestroyImage",
     c"vkUpdateDescriptorSets",
     c"vkGetPhysicalDeviceImageFormatProperties2",
     c"vkGetPhysicalDeviceImageFormatProperties2KHR",
@@ -4156,7 +4167,8 @@ fn export_emu_gated(name: &CStr) -> bool {
     (!crate::export::enabled() && EXPORT_EMU_NAMES.contains(&name))
         || (!crate::placed::enabled()
             && PLACED_NAMES.contains(&name)
-            && !(crate::export::enabled() && name == c"vkAllocateMemory"))
+            && !(crate::export::enabled()
+                && (name == c"vkAllocateMemory" || name == c"vkFreeMemory")))
 }
 
 /// Handler-registry lookup for GIPA and GPDPA: the proxy-only handlers

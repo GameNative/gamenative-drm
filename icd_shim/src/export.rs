@@ -24,6 +24,7 @@ const EXT_MEM_FEATURE_DEDICATED_ONLY: u32 = 0x1;
 const EXT_MEM_FEATURE_EXPORTABLE: u32 = 0x2;
 const EXT_MEM_FEATURE_IMPORTABLE: u32 = 0x4;
 const MOD_LINEAR: u64 = 0;
+const STYPE_IMPORT_AHB: VkStructureType = 1000129003;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static LOGGED_QUERY: AtomicBool = AtomicBool::new(false);
@@ -187,6 +188,61 @@ mod tests {
         assert!(!enabled());
     }
 
+    fn entry(image: VkImage, height: u32) -> EmuImage {
+        EmuImage {
+            image,
+            fd: -1,
+            stride: 64,
+            height,
+            linear_tiling: false,
+        }
+    }
+
+    #[test]
+    fn a_reused_image_handle_resolves_to_the_newest_entry() {
+        let _g = SERIAL.lock().unwrap();
+        let h: VkImage = 0x5eed_0001;
+        register_image(entry(h, 16));
+        MEMS.lock().unwrap().push((0x5eed_1001, h));
+        let (dropped, mems) = forget_image(h).unwrap();
+        assert_eq!(dropped.height, 16);
+        assert_eq!(mems, 1);
+        assert!(emu_image(h).is_none());
+        register_image(entry(h, 1080));
+        assert_eq!(emu_image(h).unwrap().height, 1080);
+        assert!(forget_image(h).is_some());
+        assert!(forget_image(h).is_none());
+    }
+
+    #[test]
+    fn registering_over_a_live_handle_replaces_the_old_entry() {
+        let _g = SERIAL.lock().unwrap();
+        let h: VkImage = 0x5eed_0002;
+        register_image(entry(h, 16));
+        MEMS.lock().unwrap().push((0x5eed_1002, h));
+        register_image(entry(h, 720));
+        assert_eq!(emu_image(h).unwrap().height, 720);
+        assert_eq!(
+            IMAGES
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.image == h)
+                .count(),
+            1
+        );
+        assert!(!MEMS.lock().unwrap().iter().any(|(_, i)| *i == h));
+        forget_image(h);
+    }
+
+    #[test]
+    fn freeing_memory_drops_its_pair() {
+        let _g = SERIAL.lock().unwrap();
+        MEMS.lock().unwrap().push((0x5eed_1003, 0x5eed_0003));
+        forget_memory(0x5eed_1003);
+        assert!(!MEMS.lock().unwrap().iter().any(|(m, _)| *m == 0x5eed_1003));
+    }
+
     #[test]
     fn the_linear_modifier_is_the_one_gamescope_flips() {
         // DRM_FORMAT_MOD_LINEAR; the export query answers with this modifier.
@@ -199,8 +255,67 @@ fn emu_image(image: VkImage) -> Option<EmuImage> {
         .lock()
         .ok()?
         .iter()
-        .find(|e| e.image == image)
+        .rfind(|e| e.image == image)
         .copied()
+}
+
+fn close_fd(fd: i32) {
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+    }
+}
+
+fn register_image(e: EmuImage) {
+    let Ok(mut v) = IMAGES.lock() else {
+        return;
+    };
+    v.retain(|old| {
+        if old.image != e.image {
+            return true;
+        }
+        crate::logf!(gndrm_obf::obf!(
+            "export-emu: image {:#x} reused; dropping stale fd={}",
+            old.image,
+            old.fd
+        ));
+        close_fd(old.fd);
+        false
+    });
+    v.push(e);
+    drop(v);
+    if let Ok(mut m) = MEMS.lock() {
+        m.retain(|(_, i)| *i != e.image);
+    }
+}
+
+fn forget_image(image: VkImage) -> Option<(EmuImage, usize)> {
+    let e = {
+        let mut v = IMAGES.lock().ok()?;
+        let mut found = None;
+        v.retain(|old| {
+            if old.image != image {
+                return true;
+            }
+            if let Some(prev) = found.replace(*old) {
+                close_fd(prev.fd);
+            }
+            false
+        });
+        found?
+    };
+    close_fd(e.fd);
+    let mems = MEMS.lock().map_or(0, |mut m| {
+        let before = m.len();
+        m.retain(|(_, i)| *i != image);
+        before - m.len()
+    });
+    Some((e, mems))
+}
+
+pub fn forget_memory(mem: VkDeviceMemory) {
+    if let Ok(mut m) = MEMS.lock() {
+        m.retain(|(mm, _)| *mm != mem);
+    }
 }
 
 unsafe fn real_dev<T>(device: VkDevice, name: &CStr) -> Option<(VkDevice, T)> {
@@ -461,15 +576,13 @@ pub unsafe fn try_create_image(
             "explicit-modifier"
         }
     ));
-    if let Ok(mut v) = IMAGES.lock() {
-        v.push(EmuImage {
-            image,
-            fd: buf.fd,
-            stride: buf.stride,
-            height: ci.extent.height,
-            linear_tiling,
-        });
-    }
+    register_image(EmuImage {
+        image,
+        fd: buf.fd,
+        stride: buf.stride,
+        height: ci.extent.height,
+        linear_tiling,
+    });
     Some(VK_SUCCESS)
 }
 
@@ -487,7 +600,10 @@ pub unsafe extern "C" fn gn_vkAllocateMemory(
     else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
-    if !enabled() {
+    if !enabled()
+        || unsafe { !find_in((*ai).pNext, VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR).is_null() }
+        || unsafe { !find_in((*ai).pNext, STYPE_IMPORT_AHB).is_null() }
+    {
         return unsafe { real(dev, ai, alloc, out) };
     }
     let ded = unsafe {
@@ -507,6 +623,20 @@ pub unsafe extern "C" fn gn_vkAllocateMemory(
     let fd = unsafe { libc::fcntl(emu.fd, libc::F_DUPFD_CLOEXEC, 0) };
     if fd < 0 {
         return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    let pool_size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+    if pool_size >= 0 {
+        unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+    }
+    if pool_size >= 0 && (pool_size as u64) < unsafe { (*ai).allocationSize } {
+        crate::logf!(gndrm_obf::obf!(
+            "export-emu: pool fd for image {:#x} is {} bytes < size={}; driver allocate",
+            emu.image,
+            pool_size,
+            unsafe { (*ai).allocationSize }
+        ));
+        unsafe { libc::close(fd) };
+        return unsafe { real(dev, ai, alloc, out) };
     }
     let ded2 = VkMemoryDedicatedAllocateInfo {
         sType: VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
@@ -541,6 +671,27 @@ pub unsafe extern "C" fn gn_vkAllocateMemory(
         m.push((unsafe { *out }, emu.image));
     }
     VK_SUCCESS
+}
+
+pub unsafe extern "C" fn gn_vkDestroyImage(
+    device: VkDevice,
+    image: VkImage,
+    alloc: *const VkAllocationCallbacks,
+) {
+    let Some((dev, real)) = (unsafe { real_dev::<PFN_vkDestroyImage>(device, c"vkDestroyImage") })
+    else {
+        return;
+    };
+    if enabled() && image != 0 {
+        if let Some((e, mems)) = forget_image(image) {
+            crate::logf!(gndrm_obf::obf!(
+                "export-emu: drop image {:#x} pool fd={} mems={mems}",
+                e.image,
+                e.fd
+            ));
+        }
+    }
+    unsafe { real(dev, image, alloc) }
 }
 
 pub unsafe extern "C" fn gn_vkGetMemoryFdKHR(

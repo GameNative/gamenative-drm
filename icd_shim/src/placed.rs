@@ -555,6 +555,7 @@ pub unsafe extern "C" fn gn_vkFreeMemory(
     } else {
         None
     };
+    crate::export::forget_memory(mem);
     unsafe { real(dev, mem, alloc) };
     if let (Some(b), Some(api)) = (backed, ahb_api()) {
         unsafe { (api.release)(b.ahb) };
