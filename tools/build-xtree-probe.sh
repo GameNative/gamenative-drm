@@ -51,6 +51,7 @@ mkdir -p "$(dirname "$OUT")"
 # prefix (its stdio.h etc. would otherwise shadow bionic's).
 "$CLANG" -O2 -Wall -Wextra -Wno-nullability-completeness \
     -idirafter "$PREFIX/include" \
+    -Wl,-z,max-page-size=16384 \
     -o "$OUT" tools/xtree-probe.c \
     -L "$PREFIX/lib" -lxcb
 

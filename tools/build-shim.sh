@@ -76,7 +76,12 @@ if [ "${1:-}" = "android" ]; then
     # The version script pins the export allowlist; --exclude-libs,ALL drops
     # archive symbols. llvm-strip then removes the static symbol table from the
     # shipped .so (the leak this hardening closes).
+    # 16 KB page alignment: the payload ships this .so and Android 16 KB-page
+    # devices (and Play's 16 KB requirement) refuse a library whose LOAD
+    # segments are aligned below that. NDK r27's driver default is not enough
+    # here, so it is explicit, like the gamescope toolchain's flag.
     "$TC/bin/aarch64-linux-android$API-clang" $CFLAGS -shared $LDFLAGS \
+        -Wl,-z,max-page-size=16384 \
         -o "$AOUT/libgndrm_shim.so" "$CSRC" -ldl -landroid
     "$TC/bin/llvm-strip" --strip-unneeded "$AOUT/libgndrm_shim.so"
     echo "android: $AOUT/libgndrm_shim.so (NDK $(basename "$NDK"), API $API)"
