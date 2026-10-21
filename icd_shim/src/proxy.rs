@@ -889,10 +889,12 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
     true
 }
 
-/// Serialises `vkQueueSubmit` on the queues the shim shares with the guest. The
-/// generation batch is submitted from the present worker while the guest is
-/// submitting on the same queue from its render thread; without this the two
-/// overlap and one of them is lost, which reads as "the batch never ran".
+/// Serialises every submit the shim makes or forwards on the queues it shares
+/// with the guest: the guest's `vkQueueSubmit`/`vkQueueSubmit2`, the acquire and
+/// present-wait submits, and the generation batch from the present worker. A
+/// queue needs external synchronisation, and any two of these can run on
+/// different threads at once; an overlap loses a submission, its fences never
+/// signal, and the guest waits on them forever.
 static SUBMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Counts for the pass: how many generated frames were committed, and how many
@@ -2243,7 +2245,10 @@ unsafe fn gn_acquire_common(
             signalSemaphoreCount: if sem != 0 { 1 } else { 0 },
             pSignalSemaphores: if sem != 0 { &sem } else { ptr::null() },
         };
-        let res = unsafe { (*gd).f.submit.unwrap()((*gq).real, 1, &si, fence) };
+        let res = {
+            let _submit = SUBMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            unsafe { (*gd).f.submit.unwrap()((*gq).real, 1, &si, fence) }
+        };
         if res != VK_SUCCESS {
             let _g = (*sc).shared.lock().unwrap();
             (*(*sc).slots.as_mut_ptr().add(idx as usize)).acquired = false;
@@ -2543,7 +2548,10 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
                 ptr::null()
             },
         };
-        let res = unsafe { (*gd).f.submit.unwrap()(real_q, 1, &si, (*slot).fence) };
+        let res = {
+            let _submit = SUBMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            unsafe { (*gd).f.submit.unwrap()(real_q, 1, &si, (*slot).fence) }
+        };
         if res != VK_SUCCESS {
             crate::logf!(gndrm_obf::obf!("proxy: present wait submit failed: {res}"));
             return res;
@@ -2836,6 +2844,7 @@ unsafe fn submit2_impl(
             ));
         }
     }
+    let _submit = SUBMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { real_fn((*gq).real, count, translated, fence) }
 }
 
