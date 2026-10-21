@@ -406,10 +406,11 @@ fn connect(path: &str) -> RawFd {
 }
 
 /// The most frames one reply burst may hold on this channel: the allocator
-/// reply, plus a frame-cap note the daemon may put ahead of it (the answer to
-/// the subscribe, or a target the user changed while a request was in flight).
-/// Beyond this the peer is not speaking this protocol.
-const MAX_BURST_FRAMES: usize = 4;
+/// reply, plus the notes and settings the daemon may put ahead of it (the
+/// answer to the subscribe, or every cap change the app made while a request
+/// was in flight, two frames each). Beyond this the peer is not speaking this
+/// protocol.
+const MAX_BURST_FRAMES: usize = 32;
 
 /// One request/response exchange: send a geometry request, receive the reply
 /// and its descriptor.
@@ -444,7 +445,10 @@ fn exchange(fd: RawFd, width: u32, height: u32) -> Result<ScanoutBuf, Failure> {
         let mut frames = 0usize;
         loop {
             frames += 1;
-            let mut buf = [0u8; ScanoutAllocResp::LEN];
+            // Sized for the largest frame the daemon can put on this socket: a
+            // settings push is far longer than the reply, and SEQPACKET truncates
+            // a frame to the buffer, which would make it unreadable.
+            let mut buf = [0u8; PUSH_LEN];
             let mut riov = libc::iovec {
                 iov_base: buf.as_mut_ptr().cast(),
                 iov_len: buf.len(),
@@ -473,8 +477,9 @@ fn exchange(fd: RawFd, width: u32, height: u32) -> Result<ScanoutBuf, Failure> {
                 cmsg = libc::CMSG_NXTHDR(&rmsg, cmsg);
             }
 
-            if n as usize == ScanoutAllocResp::LEN {
-                if let Some(config) = LsfgConfig::decode(&buf) {
+            if n > 0 {
+                let buf = &buf[..n as usize];
+                if let Some(config) = LsfgConfig::decode(buf) {
                     // A settings push, not the reply: apply it and keep waiting.
                     if recv_fd >= 0 {
                         libc::close(recv_fd);
@@ -485,7 +490,7 @@ fn exchange(fd: RawFd, width: u32, height: u32) -> Result<ScanoutBuf, Failure> {
                     if frames < MAX_BURST_FRAMES {
                         continue;
                     }
-                } else if let Some(note) = FrameCapNote::decode(&buf) {
+                } else if let Some(note) = FrameCapNote::decode(buf) {
                     // A note carries no buffer.
                     if recv_fd >= 0 {
                         libc::close(recv_fd);
@@ -494,7 +499,7 @@ fn exchange(fd: RawFd, width: u32, height: u32) -> Result<ScanoutBuf, Failure> {
                     if frames < MAX_BURST_FRAMES {
                         continue;
                     }
-                } else if let Some(r) = ScanoutAllocResp::decode(&buf) {
+                } else if let Some(r) = ScanoutAllocResp::decode(buf) {
                     if r.ret != 0 || recv_fd < 0 {
                         // A refusal carries no buffer; the channel stays
                         // usable.
