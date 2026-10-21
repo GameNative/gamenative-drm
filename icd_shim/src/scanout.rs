@@ -114,7 +114,14 @@ fn release_floor(target_fps: u32, last_release_ns: u64, now_ns: u64) -> u64 {
 /// observes are the same sequence. That is what makes consecutive frees at
 /// least one period apart, which is the cap.
 #[must_use]
-pub(crate) fn note_release(now_ns: u64) -> u64 {
+pub(crate) fn note_release(now_ns: u64, guest_slot: bool) -> u64 {
+    // Only a guest slot's release is paced. A generated frame is the thing the
+    // floor exists to make room for: holding its release to the source period
+    // throttles the output back to the source rate, which is exactly the
+    // behaviour that makes frame generation look like it does nothing.
+    if !guest_slot {
+        return now_ns;
+    }
     let mut c = CAP.lock().unwrap_or_else(|e| e.into_inner());
     // The effective rate, not the note's: while frame generation runs the source
     // cap comes from the app through `lsfg::live()`, and the daemon's own note is
@@ -280,7 +287,7 @@ pub fn lsfg_config() -> Option<LsfgConfig> {
         // recognise is not going to, and the caller has env defaults to fall back
         // to.
         for _ in 0..4 {
-            let mut buf = [0u8; 64];
+            let mut buf = [0u8; PUSH_LEN];
             let n = libc::recv(*ch, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT);
             if n < 0 {
                 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
@@ -553,7 +560,7 @@ pub(crate) fn poll_notes() {
 }
 
 /// Largest frame the daemon pushes unsolicited.
-const PUSH_LEN: usize = 24;
+const PUSH_LEN: usize = LsfgConfig::LEN;
 
 #[cfg(test)]
 mod tests {

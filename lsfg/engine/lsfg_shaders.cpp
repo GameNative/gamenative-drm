@@ -5,6 +5,8 @@
 #include "lsfg_common.hpp"
 #include "lsfg_host.h"
 
+#include <vector>
+
 #include <android/log.h>
 
 #define LOG_TAG "LsfgShaders"
@@ -25,10 +27,39 @@ LsfgShaders::LsfgShaders(const Device& device_, const std::string& cache_path)
     for (uint32_t i = 0; i < set.count; i++) {
         const LsfgModule& module = set.modules[i];
 
+        // The translated generate shader declares its output storage image as
+        // `format Unknown` (the DXBC UAV is typeless), while every other pass
+        // names `Rgba8`. A storage image written through an Unknown-format
+        // binding produces no writes here at all, so state the format the
+        // targets are actually created with (see `engine_storage_format` on the
+        // embedder side). Sampled images keep Unknown: their format comes from
+        // the view, which is correct for both RGBA8 frames and RGBA16F motion.
+        std::vector<uint32_t> patched(module.words, module.words + module.word_count);
+        uint32_t patched_images = 0;
+        for (size_t word = 5; word + 1 <= patched.size();) {
+            const uint32_t count = patched[word] >> 16;
+            const uint32_t opcode = patched[word] & 0xffffu;
+            if (count == 0) break;
+            // OpTypeImage: result id, sampled type, dim, depth, arrayed, ms,
+            // sampled, image format.
+            constexpr uint32_t SPIRV_OP_TYPE_IMAGE = 25;
+            constexpr uint32_t SPIRV_IMAGE_FORMAT_RGBA8 = 4;
+            if (opcode == SPIRV_OP_TYPE_IMAGE && count >= 9 && word + 8 < patched.size()
+                && patched[word + 7] == 2 && patched[word + 8] == 0) {
+                patched[word + 8] = SPIRV_IMAGE_FORMAT_RGBA8;
+                patched_images++;
+            }
+            word += count;
+        }
+        if (patched_images != 0) {
+            SHADER_LOGI("Shader %u: %u storage image(s) given the Rgba8 format", module.id,
+                        patched_images);
+        }
+
         VkShaderModuleCreateInfo module_ci{};
         module_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        module_ci.codeSize = static_cast<size_t>(module.word_count) * sizeof(uint32_t);
-        module_ci.pCode = module.words;
+        module_ci.codeSize = patched.size() * sizeof(uint32_t);
+        module_ci.pCode = patched.data();
 
         VkShaderModule handle = VK_NULL_HANDLE;
         if (vkd.CreateShaderModule(device, &module_ci, nullptr, &handle) != VK_SUCCESS) {

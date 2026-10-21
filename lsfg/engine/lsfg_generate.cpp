@@ -97,14 +97,6 @@ void LsfgGenerate::SetTarget(const Device& device, size_t slot, uint32_t target,
     }
 }
 
-void LsfgGenerate::ForgetTargets() {
-    for (auto& generation : generations) {
-        for (auto& entry : generation.targets) {
-            entry.view = VK_NULL_HANDLE;
-        }
-    }
-}
-
 void LsfgGenerate::Dispatch(VkCommandBuffer cmdbuf, uint64_t frame_count, size_t slot,
                             uint32_t target, VkImage image, VkExtent2D extent) {
     const Target& entry = generations[slot].targets[target];
@@ -130,4 +122,12 @@ void LsfgGenerate::Dispatch(VkCommandBuffer cmdbuf, uint64_t frame_count, size_t
                          0, 0, nullptr, 0, nullptr, 1, &after);
 }
 
+void LsfgGenerate::ForgetTargets() {
+    for (auto& generation : generations) {
+        for (auto& target : generation.targets) {
+            target.view = VK_NULL_HANDLE;
+        }
+    }
 }
+
+}  // namespace lsfg

@@ -98,6 +98,7 @@ static LSFG_SETTINGS: Mutex<LsfgConfig> = Mutex::new(LsfgConfig {
     flow_per_mille: 0,
     performance: 0,
     fps_limit: 0,
+    dll: [0; gndrm_uapi::wire::LSFG_DLL_PATH_MAX],
 });
 
 /// Whether the app has pushed any settings this process. A push of `enabled = 0`
@@ -118,14 +119,20 @@ pub(crate) fn lsfg_settings() -> Option<LsfgConfig> {
 /// shim asks, so a change reaches the next device the guest creates.
 #[no_mangle]
 pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetLsfgConfig(
-    _env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     enabled: jboolean,
     multiplier: jint,
     flow_per_mille: jint,
     performance: jint,
     fps_limit: jint,
+    dll: JString,
 ) {
+    // Read the string before the guarded section: `JNIEnv` is not unwind-safe.
+    let dll_path = env
+        .get_string(&dll)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     if let Err(e) = std::panic::catch_unwind(|| {
         let mut settings = LSFG_SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
         settings.enabled = u32::from(enabled != 0);
@@ -133,6 +140,9 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetLsfgCo
         settings.flow_per_mille = flow_per_mille.clamp(0, 1000) as u32;
         settings.performance = u32::from(performance != 0);
         settings.fps_limit = fps_limit.max(0) as u32;
+        // The presenter cannot read the container's environment, so the path of
+        // the DLL it has to read the shaders from rides with the settings.
+        settings.set_dll_path(&dll_path);
         LSFG_CONFIGURED.store(true, Ordering::Relaxed);
         // Wake a subscribed shim: it reads the pushed settings on its next
         // release, so a change made in the Quick Menu lands within a frame.
