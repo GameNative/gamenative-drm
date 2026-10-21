@@ -841,6 +841,9 @@ unsafe fn lsfg_session(gd: *mut GnDevice) -> *mut crate::lsfg::Session {
 /// while the guest is acquiring.
 unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
     let guest = unsafe { (*sc).guest_slots as usize };
+    if unsafe { (*sc).gen_no_grow } {
+        return unsafe { (*sc).slots.len() } > guest;
+    }
     const GEN_USAGE: VkImageUsageFlags = VK_IMAGE_USAGE_TRANSFER_DST_BIT
         | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
         | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -872,7 +875,15 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
             unsafe { slot_init_with_usage(sc, (*sc).slots.as_mut_ptr().add(index), GEN_USAGE) };
         if res != VK_SUCCESS {
             crate::logf!(gndrm_obf::obf!("lsfg: destination slot init failed: {res}"));
-            return false;
+            // The half-made slot must not stay in the table: every later pass over
+            // the slots would take it for a real one. And no further growth: the
+            // allocator refused once, so the set stays at what it has.
+            unsafe {
+                slot_release(sc, (*sc).slots.as_mut_ptr().add(index));
+                (*sc).slots.pop();
+                (*sc).gen_no_grow = true;
+            }
+            return unsafe { (*sc).slots.len() } > guest;
         }
     }
     true
@@ -917,7 +928,15 @@ pub struct GenDue {
     pub deadline: u64,
     pub slot: i32,
     pub batch: usize,
+    /// Past this instant a generated frame whose batch has still not retired
+    /// is dropped, so the source frame behind it goes out and the guest keeps
+    /// its images coming back.
+    pub drop_at: u64,
 }
+
+/// How long a generated frame may wait on its batch past its slot before it is
+/// dropped: a couple of source periods at the slowest cap this is used with.
+const GEN_GRACE_NS: u64 = 60_000_000;
 
 /// The most destinations a swapchain gets: three batches' worth plus one, which
 /// covers a compositor that returns a buffer two source periods after it was
@@ -1372,6 +1391,7 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
                     deadline: base + step * (k as u64 + 1),
                     slot: *index as i32,
                     batch,
+                    drop_at: base + step * (k as u64 + 1) + GEN_GRACE_NS,
                 })
             };
         }
@@ -1382,6 +1402,7 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
                 deadline: real_at,
                 slot: src_idx,
                 batch: GEN_NO_BATCH,
+                drop_at: u64::MAX,
             });
             (*gd).gen_last_deadline = real_at;
         }
@@ -1420,8 +1441,8 @@ unsafe fn flush_due(sc: *mut GnSwapchain) {
         return;
     }
     let mut committed = 0u32;
-    while let Some((deadline, slot, batch)) =
-        (unsafe { (*gd).gen_due.front() }).map(|d| (d.deadline, d.slot, d.batch))
+    while let Some((deadline, slot, batch, drop_at)) =
+        (unsafe { (*gd).gen_due.front() }).map(|d| (d.deadline, d.slot, d.batch, d.drop_at))
     {
         let now = monotonic_ns();
         if deadline > now {
@@ -1442,6 +1463,14 @@ unsafe fn flush_due(sc: *mut GnSwapchain) {
                 }
                 if !ready {
                     GEN_LATE.fetch_add(1, Ordering::Relaxed);
+                    if now > drop_at {
+                        // The batch is not coming in time for this frame to mean
+                        // anything: drop it rather than hold the source frame
+                        // behind it.
+                        GEN_SKIPS.fetch_add(1, Ordering::Relaxed);
+                        unsafe { (*gd).gen_due.pop_front() };
+                        continue;
+                    }
                     if let Some(d) = unsafe { (*gd).gen_due.front_mut() } {
                         d.deadline = now + 1_000_000;
                     }
@@ -1794,6 +1823,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         usage: ci.imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         slots: Vec::new(),
         guest_slots: 0,
+        gen_no_grow: false,
         worker: None,
         shared: Mutex::new(ScShared {
             jobs: VecDeque::with_capacity(GN_JOB_CAP),
@@ -5789,6 +5819,8 @@ pub struct GnSwapchain {
     pub cv_free: Condvar,
     pub x11_trace: u32,
     pub next: *mut GnSwapchain,
+    /// Set once a destination could not be made: the set stops growing.
+    pub gen_no_grow: bool,
 }
 
 // ---------------------------------------------------------------- wayland
