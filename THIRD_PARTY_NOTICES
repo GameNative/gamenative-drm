@@ -1,0 +1,34 @@
+# Third-Party Notices
+
+`gamenative-drm` ships no third-party binary artifact. Vendored source under
+`lsfg/` is compiled into `libadrenotools_gamescope.so`, which is packaged into
+GameNative.
+
+---
+
+## LSFG frame-generation engine (`lsfg/engine/`)
+
+Adopted from GameNative's `app/src/main/cpp/lsfg/`, which is
+**GPL-3.0-or-later**. The authors, provenance (lsfg-vk, the Eden Emulator LSFG
+port, WinNative's Winlator adaptation) and license text are recorded in
+GameNative's `THIRD_PARTY_NOTICES`, which ships with the application this library
+is packaged into.
+
+`libadrenotools_gamescope.so`, once this engine is linked into it, is
+distributed under GPL-3.0-or-later — the same license as that application.
+
+The compute passes are built from shaders extracted at runtime from the user's
+own `Lossless.dll` (Lossless Scaling on Steam). Neither the DLL nor its shaders
+are distributed.
+
+## dxbc (DXVK's DXBC-to-SPIR-V compiler, `lsfg/thirdparty/dxbc/`)
+
+**zlib/libpng**, Philip Rebohle and DXVK contributors, extracted by PancakeTAS.
+License text: `lsfg/thirdparty/dxbc/LICENSE.md`. Also recorded in GameNative's
+`THIRD_PARTY_NOTICES`.
+
+---
+
+The MIT `LICENSE` in this repository covers its own code — the daemon, the DRM
+UAPI crate, the obfuscation crates and the tools — none of which links either
+component above.

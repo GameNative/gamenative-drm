@@ -692,13 +692,32 @@ unsafe fn x11_reap(sc: *mut GnSwapchain) {
         if fence == 0 || !busy {
             continue;
         }
+        if unsafe { (*s).release_held } {
+            // Already returned; waiting for the paced floor. `acquire_take_free`
+            // frees it when the floor passes, so re-arming here would advance the
+            // schedule once per reap for the same release.
+            continue;
+        }
         if unsafe { (*present).fence_idle(fence) } {
+            // Same floor the wayland arm applies on `wl_buffer.release`: the
+            // X11 route has no release listener, so a gamescope session would
+            // otherwise see no pacing at all.
+            let now_ns = monotonic_ns();
+            // The X11 route only ever reaps guest slots.
+            let floor_ns = crate::scanout::note_release(now_ns, true);
             let _g = unsafe { (*sc).shared.lock().unwrap() };
-            unsafe {
-                (*s).in_flight = false;
-                (*sc).cv_free.notify_all();
-                drop(_g);
+            if now_ns < floor_ns {
+                unsafe {
+                    (*s).floor_ns = floor_ns;
+                    (*s).release_held = true;
+                }
+            } else {
+                unsafe {
+                    (*s).in_flight = false;
+                    (*sc).cv_free.notify_all();
+                }
             }
+            drop(_g);
             N_REL.fetch_add(1, Ordering::Relaxed);
             if rate_ok(&RATE_REL, RATE_EVERY) {
                 crate::logf!(gndrm_obf::obf!("x11 release: slot={i} {}", slot_flags(sc)));
@@ -706,6 +725,798 @@ unsafe fn x11_reap(sc: *mut GnSwapchain) {
         }
     }
 }
+
+/// One image barrier for the capture round trip.
+fn lsfg_barrier(
+    image: VkImage,
+    src_access: VkAccessFlags,
+    dst_access: VkAccessFlags,
+    old: VkImageLayout,
+    new: VkImageLayout,
+) -> VkImageMemoryBarrier {
+    let mut b: VkImageMemoryBarrier = unsafe { std::mem::zeroed() };
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.srcAccessMask = src_access;
+    b.dstAccessMask = dst_access;
+    b.oldLayout = old;
+    b.newLayout = new;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    b.subresourceRange.levelCount = 1;
+    b.subresourceRange.layerCount = 1;
+    b
+}
+
+/// Commit a slot the present path did not produce (a generation destination).
+/// The caller has already waited the submission that wrote it.
+unsafe fn commit_generated(sc: *mut GnSwapchain, slot_index: usize) {
+    let s = unsafe { (*sc).slots.as_mut_ptr().add(slot_index) };
+    {
+        let _g = unsafe { (*sc).shared.lock().unwrap() };
+        unsafe {
+            (*s).in_flight = true;
+            (*s).acquired = false;
+        }
+    }
+    if unsafe { (*(*sc).surf).parent.is_null() } {
+        unsafe { x11_present_slot(sc, s, slot_index as i32) };
+        return;
+    }
+    if unsafe { (*s).buf.is_null() } {
+        unsafe { (*s).buf = slot_make_buffer(sc, s) };
+    }
+    if unsafe { (*s).buf.is_null() } {
+        let _g = unsafe { (*sc).shared.lock().unwrap() };
+        unsafe {
+            (*s).in_flight = false;
+            (*sc).cv_free.notify_all();
+        }
+        return;
+    }
+    let parent = unsafe { (*(*sc).surf).parent };
+    let _sg = SEND_LOCK.lock().unwrap();
+    unsafe {
+        wlproto::surface_attach(parent, (*s).buf, 0, 0);
+        wlproto::surface_damage_buffer(
+            parent,
+            0,
+            0,
+            (*sc).extent.width as i32,
+            (*sc).extent.height as i32,
+        );
+        wlproto::surface_commit(parent);
+        wlproto::wl_display_flush((*(*sc).surf).dpy);
+    }
+}
+
+/// The device's generation session, opened or replaced when the settings call
+/// for a different factor.
+///
+/// The app's settings arrive through the daemon after the device is created, so
+/// the session cannot be opened at create time. An attempt is made once per
+/// settings change: a failure (no DLL, unreadable cache, engine refused) is not
+/// retried on every frame, and a change of multiplier replaces the engine
+/// context, which is fixed at creation.
+unsafe fn lsfg_session(gd: *mut GnDevice) -> *mut crate::lsfg::Session {
+    let wanted = crate::lsfg::wanted();
+    let mut current = unsafe { (*gd).lsfg };
+    if !current.is_null() && wanted == Some(unsafe { (*current).multiplier() }) {
+        return current;
+    }
+    if !current.is_null() {
+        unsafe { (*current).close((*gd).real, &(*gd).f) };
+        drop(unsafe { Box::from_raw(current) });
+        unsafe { (*gd).lsfg = ptr::null_mut() };
+        current = ptr::null_mut();
+    }
+    if wanted.is_none() {
+        return current;
+    }
+    let epoch = crate::lsfg::epoch();
+    if epoch == unsafe { (*gd).lsfg_epoch } {
+        return current;
+    }
+    unsafe { (*gd).lsfg_epoch = epoch };
+    let gipa = G.lock().unwrap().real_gipa;
+    let opened = unsafe {
+        crate::lsfg::Session::open((*(*gd).inst).real, (*gd).pd, (*gd).real, gipa, (*gd).fp16)
+    };
+    match opened {
+        Some(session) => {
+            let ptr = Box::into_raw(Box::new(session));
+            unsafe { (*gd).lsfg = ptr };
+            ptr
+        }
+        None => ptr::null_mut(),
+    }
+}
+
+/// Grow the generation destinations so `count` of them exist.
+///
+/// The swapchain's capacity for them is reserved at creation, so appending
+/// cannot move the guest's slots — the guest only ever indexes below
+/// `guest_slots`, which is what makes this safe to do from the present worker
+/// while the guest is acquiring.
+unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
+    let guest = unsafe { (*sc).guest_slots as usize };
+    if unsafe { (*sc).gen_no_grow } {
+        return unsafe { (*sc).slots.len() } > guest;
+    }
+    const GEN_USAGE: VkImageUsageFlags = VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+        | VK_IMAGE_USAGE_SAMPLED_BIT;
+    while unsafe { (*sc).slots.len() } < guest + count {
+        let index = unsafe { (*sc).slots.len() };
+        unsafe {
+            (*sc).slots.push(GnSlot {
+                owner: sc,
+                image: 0,
+                mem: 0,
+                fd: -1,
+                stride: 0,
+                offset: 0,
+                modifier: 0,
+                buf: ptr::null_mut(),
+                xpix: 0,
+                xfence: 0,
+                fence: 0,
+                sem: 0,
+                acquired: false,
+                in_flight: false,
+                acq_seq: 0,
+                ino: 0,
+                floor_ns: 0,
+                release_held: false,
+            });
+        }
+        let res =
+            unsafe { slot_init_with_usage(sc, (*sc).slots.as_mut_ptr().add(index), GEN_USAGE) };
+        if res != VK_SUCCESS {
+            crate::logf!(gndrm_obf::obf!("lsfg: destination slot init failed: {res}"));
+            // The half-made slot must not stay in the table: every later pass over
+            // the slots would take it for a real one. And no further growth: the
+            // allocator refused once, so the set stays at what it has.
+            unsafe {
+                slot_release(sc, (*sc).slots.as_mut_ptr().add(index));
+                (*sc).slots.pop();
+                (*sc).gen_no_grow = true;
+            }
+            return unsafe { (*sc).slots.len() } > guest;
+        }
+    }
+    true
+}
+
+/// Serialises every submit the shim makes or forwards on the queues it shares
+/// with the guest: the guest's `vkQueueSubmit`/`vkQueueSubmit2`, the acquire and
+/// present-wait submits, and the generation batch from the present worker. A
+/// queue needs external synchronisation, and any two of these can run on
+/// different threads at once; an overlap loses a submission, its fences never
+/// signal, and the guest waits on them forever.
+static SUBMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Counts for the pass: how many generated frames were committed, and how many
+/// frames were skipped because no destination was free.
+static GEN_COMMITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static GEN_SKIPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Releases seen for generation destinations: the compositor taking the buffer
+/// back. Compared with [`GEN_COMMITS`], it separates "presented" from
+/// "superseded".
+static GEN_RELEASES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Batches that built fewer frames than the engine planned, and why: no free
+/// destination, or the engine's plan itself under the multiplier.
+static GEN_SHORT_FREE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static GEN_SHORT_PLAN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static GEN_QUEUED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static GEN_LATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Batches kept in flight. Each holds a frame's generations until they are
+/// committed, so the ring covers the frame being built, the one whose
+/// generations are being shown, and one of slack.
+const GEN_BATCHES: usize = 3;
+/// Marks a queued source frame: it was written before it was queued, so it
+/// waits on no batch.
+const GEN_NO_BATCH: usize = usize::MAX;
+
+pub struct GenBatch {
+    pub fence: VkFence,
+    pub cmd: VkCommandBuffer,
+}
+
+/// One frame waiting for its slot on the output grid.
+pub struct GenDue {
+    pub deadline: u64,
+    pub slot: i32,
+    pub batch: usize,
+    /// Past this instant a generated frame whose batch has still not retired
+    /// is dropped, so the source frame behind it goes out and the guest keeps
+    /// its images coming back.
+    pub drop_at: u64,
+}
+
+/// How long a generated frame may wait on its batch past its slot before it is
+/// dropped: a couple of source periods at the slowest cap this is used with.
+const GEN_GRACE_NS: u64 = 60_000_000;
+
+/// The most destinations a swapchain gets: three batches' worth plus one, which
+/// covers a compositor that returns a buffer two source periods after it was
+/// committed.
+fn gen_destination_cap(capacity: u32) -> usize {
+    3 * capacity as usize + 2
+}
+
+/// Whether a batch has retired, without waiting for it.
+unsafe fn gen_batch_idle(gd: *mut GnDevice, batch: usize) -> bool {
+    let fence = match unsafe { (*gd).gen_batches.as_slice().get(batch) } {
+        Some(b) => b.fence,
+        None => return true,
+    };
+    if fence == 0 {
+        return true;
+    }
+    let Some(status) = (unsafe { (*gd).f.get_fence_status }) else {
+        return true;
+    };
+    (unsafe { status((*gd).real, fence) }) == VK_SUCCESS
+}
+
+/// Whether the swapchain's worker has a queued frame whose deadline has passed.
+unsafe fn gen_due_now(sc: *mut GnSwapchain) -> bool {
+    let gd = unsafe { (*sc).dev };
+    if unsafe { (*gd).gen_sc } != sc {
+        return false;
+    }
+    match unsafe { (*gd).gen_due.front() } {
+        Some(d) => d.deadline <= monotonic_ns(),
+        None => false,
+    }
+}
+
+/// Generate the extra frames the multiplier asks for and queue them, then the
+/// source frame behind them. Returns whether the source frame was queued; the
+/// caller commits it inline otherwise.
+///
+/// Runs from the present worker before the guest's frame is committed: the slot
+/// is still in flight, so the capture reads the frame the guest just finished
+/// and nothing can reuse the slot underneath it.
+unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
+    let gd = unsafe { (*sc).dev };
+    let now = monotonic_ns();
+    // The source interval, smoothed: the output grid when the user set no cap,
+    // and the floor of the grid when the guest runs under its cap.
+    {
+        let last = unsafe { (*gd).gen_last_source_ns };
+        unsafe { (*gd).gen_last_source_ns = now };
+        if last != 0 {
+            let d = now.saturating_sub(last);
+            if (2_000_000..=250_000_000).contains(&d) {
+                let p = unsafe { (*gd).gen_period_ns };
+                unsafe { (*gd).gen_period_ns = if p == 0 { d } else { (p * 3 + d) / 4 } };
+            }
+        }
+    }
+    let session = lsfg_session(gd);
+    if session.is_null() {
+        return false;
+    }
+    unsafe { (*session).sync_refresh_rate() };
+    let multiplier = unsafe { (*session).multiplier() };
+    let capacity = multiplier.saturating_sub(1);
+    if capacity == 0 {
+        return false;
+    }
+    // A batch slot whose previous recording has retired and whose frames are
+    // all committed. Nothing waits here: a batch still running means the chain
+    // is over budget, and this frame goes out on its own.
+    let batch = unsafe { (*gd).gen_next } % GEN_BATCHES;
+    if !unsafe { gen_batch_idle(gd, batch) }
+        || unsafe { (*gd).gen_due.iter().any(|d| d.batch == batch) }
+    {
+        GEN_SKIPS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    // The queue ahead is bounded: a guest running ahead of its cap must not
+    // stack frames further and further into the future.
+    let period = unsafe { (*gd).gen_period_ns };
+    if period != 0 && unsafe { (*gd).gen_last_deadline } > now + 2 * period {
+        GEN_SKIPS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    while unsafe { (*gd).gen_batches.len() } < GEN_BATCHES {
+        unsafe {
+            (*gd).gen_batches.push(GenBatch {
+                fence: 0,
+                cmd: ptr::null_mut(),
+            })
+        };
+    }
+    // The retired batch's recording goes back to the pool now, not at submit
+    // time, when the GPU may still be executing it.
+    let old_cmd = unsafe { (&mut (*gd).gen_batches)[batch].cmd };
+    if !old_cmd.is_null() {
+        if let Some(free) = unsafe { (*gd).f.free_cmd } {
+            unsafe { free((*gd).real, (*gd).cmd_pool, 1, &old_cmd) };
+        }
+        unsafe { (&mut (*gd).gen_batches)[batch].cmd = ptr::null_mut() };
+    }
+    // Destinations for the batch being shown and the one being built, plus one
+    // so a late release never costs a whole batch. The compositor can hold a
+    // buffer longer than that, so the set grows below when a batch finds too
+    // few free, up to `gen_destination_cap`.
+    if !lsfg_destinations(sc, 2 * capacity as usize + 1) {
+        return false;
+    }
+
+    let width = unsafe { (*sc).extent.width };
+    let height = unsafe { (*sc).extent.height };
+    let f = unsafe { (*gd).f };
+    if !unsafe {
+        (*session).prepare(
+            (*gd).real,
+            &f,
+            &(*gd).mem_props,
+            width,
+            height,
+            (*sc).format,
+        )
+    } {
+        return false;
+    }
+    // The engine reports no generation until its frame history exists, and that
+    // history is built by `process` — so the capture runs on every presented
+    // frame and only generation and blit are gated on the plan.
+    // The requested plan, not a panel-clamped one: the session's mode advertises
+    // the output rate this produces, so the compositor paces to it rather than
+    // discarding the extra frames.
+    let planned = unsafe { (*session).plan(capacity) };
+    let guest = unsafe { (*sc).guest_slots as usize };
+    // A destination is free once the compositor has released it and nothing
+    // queued still points at it.
+    let free: Vec<usize> = (guest..unsafe { (*sc).slots.len() })
+        .filter(|&i| {
+            let s = unsafe { (*sc).slots.as_ptr().add(i).as_ref().unwrap() };
+            !s.in_flight && !unsafe { (*gd).gen_due.iter().any(|d| d.slot as usize == i) }
+        })
+        .collect();
+    let mut free = free;
+    if free.len() < planned as usize {
+        GEN_SHORT_FREE.fetch_add(1, Ordering::Relaxed);
+        // The compositor returns buffers later than the ring assumed: add what
+        // this batch is short, within the cap. A new slot is free by definition.
+        let total = unsafe { (*sc).slots.len() } - guest;
+        let grow = (planned as usize - free.len())
+            .min(gen_destination_cap(capacity).saturating_sub(total));
+        if grow > 0 && lsfg_destinations(sc, total + grow) {
+            free.extend(guest + total..guest + total + grow);
+        }
+    }
+    let generations = (planned as usize).min(free.len()) as u32;
+    if planned < capacity {
+        GEN_SHORT_PLAN.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let (Some(alloc_cmd), Some(free_cmd), Some(submit)) = (f.alloc_cmd, f.free_cmd, f.submit)
+    else {
+        return false;
+    };
+    let Some(create_fence) = f.create_fence else {
+        return false;
+    };
+    let (Some(barrier), Some(blit)) = (f.cmd_pipeline_barrier, f.cmd_blit_image) else {
+        return false;
+    };
+    if unsafe { (*gd).cmd_pool } == 0 {
+        return false;
+    }
+    // A command buffer recorded in this pool is only valid on a queue of the
+    // pool's own family; the guest's newest queue is not necessarily one.
+    let queue = unsafe { lsfg_queue(gd) };
+    if queue.is_null() {
+        return false;
+    }
+    let real_queue = unsafe { (*queue).real };
+
+    let Some(begin_ptr) = (unsafe { gn_real_device_proc(gd, c"vkBeginCommandBuffer") }) else {
+        return false;
+    };
+    let Some(end_ptr) = (unsafe { gn_real_device_proc(gd, c"vkEndCommandBuffer") }) else {
+        return false;
+    };
+    let begin: unsafe extern "C" fn(VkCommandBuffer, *const VkCommandBufferBeginInfo) -> VkResult =
+        unsafe { std::mem::transmute(begin_ptr) };
+    let end: unsafe extern "C" fn(VkCommandBuffer) -> VkResult =
+        unsafe { std::mem::transmute(end_ptr) };
+
+    let mut cbi: VkCommandBufferAllocateInfo = unsafe { std::mem::zeroed() };
+    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbi.commandPool = unsafe { (*gd).cmd_pool };
+    cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbi.commandBufferCount = 1;
+    let mut cmd: VkCommandBuffer = std::ptr::null_mut();
+    let alloc_rc = unsafe { alloc_cmd((*gd).real, &cbi, &mut cmd) };
+    if alloc_rc != VK_SUCCESS {
+        return false;
+    }
+
+    let mut bi: VkCommandBufferBeginInfo = unsafe { std::mem::zeroed() };
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    let begin_rc = unsafe { begin(cmd, &bi) };
+    if begin_rc != VK_SUCCESS {
+        unsafe { free_cmd((*gd).real, (*gd).cmd_pool, 1, &cmd) };
+        return false;
+    }
+
+    let destinations: Vec<usize> = free.into_iter().take(generations as usize).collect();
+
+    // Capture: the guest slot was presented, so it is in PRESENT_SRC; the engine
+    // reads it as a general storage image.
+    let src_image = unsafe {
+        (*sc)
+            .slots
+            .as_ptr()
+            .add(src_idx as usize)
+            .as_ref()
+            .unwrap()
+            .image
+    };
+    let to_general = lsfg_barrier(
+        src_image,
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        VK_IMAGE_LAYOUT_GENERAL,
+    );
+    unsafe {
+        barrier(
+            cmd,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0,
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            1,
+            &to_general,
+        )
+    };
+
+    let api = unsafe { (*session).api() };
+    unsafe {
+        (api.process)(
+            (*session).root(),
+            cmd,
+            src_image,
+            width,
+            height,
+            generations,
+        )
+    };
+
+    let targets = unsafe { (*session).targets() };
+    // The engine indexes its per-generation target views by an opaque slot id;
+    // the reference renderer offsets them past its frame-in-flight images
+    // (`MAX_FRAMES_IN_FLIGHT + g`), so mirror that spacing here.
+    const GEN_TARGET_BASE: usize = 3;
+    let mut built = 0usize;
+    for (generation, target) in targets.iter().take(generations as usize).enumerate() {
+        unsafe {
+            (api.generate_into)(
+                (*session).root(),
+                cmd,
+                generation as u32,
+                (GEN_TARGET_BASE + generation) as u32,
+                target.image,
+                target.view,
+                width,
+                height,
+            )
+        };
+        let slot_image = unsafe {
+            (*sc)
+                .slots
+                .as_ptr()
+                .add(destinations[generation])
+                .as_ref()
+                .unwrap()
+                .image
+        };
+        let ready = [
+            lsfg_barrier(
+                target.image,
+                VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            ),
+            lsfg_barrier(
+                slot_image,
+                0,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            ),
+        ];
+        unsafe {
+            barrier(
+                cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0,
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                2,
+                ready.as_ptr(),
+            )
+        };
+        let mut region: VkImageBlit = unsafe { std::mem::zeroed() };
+        region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.srcSubresource.layerCount = 1;
+        region.srcOffsets[1] = VkOffset3D {
+            x: width as i32,
+            y: height as i32,
+            z: 1,
+        };
+        region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.dstSubresource.layerCount = 1;
+        region.dstOffsets[1] = VkOffset3D {
+            x: width as i32,
+            y: height as i32,
+            z: 1,
+        };
+        unsafe {
+            blit(
+                cmd,
+                target.image,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                slot_image,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1,
+                &region,
+                VK_FILTER_NEAREST,
+            )
+        };
+        let presented = lsfg_barrier(
+            slot_image,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            0,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        );
+        unsafe {
+            barrier(
+                cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                0,
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                1,
+                &presented,
+            )
+        };
+        built += 1;
+    }
+
+    let back = lsfg_barrier(
+        src_image,
+        VK_ACCESS_SHADER_READ_BIT,
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_IMAGE_LAYOUT_GENERAL,
+        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+    );
+    unsafe {
+        barrier(
+            cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            0,
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            1,
+            &back,
+        )
+    };
+
+    let end_rc = unsafe { end(cmd) };
+    if end_rc != VK_SUCCESS {
+        unsafe { free_cmd((*gd).real, (*gd).cmd_pool, 1, &cmd) };
+        return false;
+    }
+    // Submitted even with nothing built: the capture is what feeds the engine's
+    // frame history, and `process` has already counted this frame.
+    let fence = {
+        let existing = unsafe { (&mut (*gd).gen_batches)[batch].fence };
+        if existing == 0 {
+            let mut fci: VkFenceCreateInfo = unsafe { std::mem::zeroed() };
+            fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            let mut created: VkFence = 0;
+            if unsafe { create_fence((*gd).real, &fci, ptr::null(), &mut created) } != VK_SUCCESS {
+                unsafe { free_cmd((*gd).real, (*gd).cmd_pool, 1, &cmd) };
+                return false;
+            }
+            unsafe { (&mut (*gd).gen_batches)[batch].fence = created };
+            created
+        } else {
+            if let Some(reset) = f.reset_fences {
+                unsafe { reset((*gd).real, 1, &existing) };
+            }
+            existing
+        }
+    };
+    let mut si: VkSubmitInfo = unsafe { std::mem::zeroed() };
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    let rc = {
+        let _submit = SUBMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { submit(real_queue, 1, &si, fence) }
+    };
+    unsafe {
+        (&mut (*gd).gen_batches)[batch].cmd = cmd;
+        (*gd).gen_next = batch + 1;
+        (*gd).gen_sc = sc;
+    }
+    let mut queued = false;
+    if rc == VK_SUCCESS && built > 0 {
+        // One output slot per frame, the generated frames first and the source
+        // frame last, spaced evenly over one source period: the engine's frames
+        // sit between the previous source frame and this one. The period is the
+        // cap's, or the measured one when the guest runs slower than the cap or
+        // has none.
+        let rate = crate::lsfg::output_rate();
+        let cap_period = if rate > 0 {
+            1_000_000_000u64 / u64::from(rate) * u64::from(multiplier)
+        } else {
+            0
+        };
+        let source_period = match (cap_period, period) {
+            (0, 0) => 16_666_667,
+            (c, 0) => c,
+            (0, p) => p,
+            (c, p) => c.max(p),
+        };
+        let step = source_period / (built as u64 + 1);
+        let base = now.max(unsafe { (*gd).gen_last_deadline });
+        for (k, index) in destinations.iter().take(built).enumerate() {
+            unsafe {
+                (*gd).gen_due.push_back(GenDue {
+                    deadline: base + step * (k as u64 + 1),
+                    slot: *index as i32,
+                    batch,
+                    drop_at: base + step * (k as u64 + 1) + GEN_GRACE_NS,
+                })
+            };
+        }
+        GEN_QUEUED.fetch_add(built as u32, Ordering::Relaxed);
+        let real_at = base + step * (built as u64 + 1);
+        unsafe {
+            (*gd).gen_due.push_back(GenDue {
+                deadline: real_at,
+                slot: src_idx,
+                batch: GEN_NO_BATCH,
+                drop_at: u64::MAX,
+            });
+            (*gd).gen_last_deadline = real_at;
+        }
+        queued = true;
+    }
+    // Health, not a trace: one line every 600 batches.
+    static BATCHES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if BATCHES
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(600)
+    {
+        crate::logf!(gndrm_obf::obf!(
+            "lsfg: generated {} (skips {}, queued {}, short: free {} plan {}, late {}, released {})",
+            GEN_COMMITS.load(std::sync::atomic::Ordering::Relaxed),
+            GEN_SKIPS.load(std::sync::atomic::Ordering::Relaxed),
+            GEN_QUEUED.load(std::sync::atomic::Ordering::Relaxed),
+            GEN_SHORT_FREE.load(std::sync::atomic::Ordering::Relaxed),
+            GEN_SHORT_PLAN.load(std::sync::atomic::Ordering::Relaxed),
+            GEN_LATE.load(std::sync::atomic::Ordering::Relaxed),
+            GEN_RELEASES.load(std::sync::atomic::Ordering::Relaxed)
+        ));
+    }
+    queued
+}
+
+/// Commit every queued frame whose slot on the output grid has arrived.
+///
+/// Runs on the present worker whenever the next deadline passes, between jobs.
+/// A generated frame waits for its batch: the buffer is a plain dma-buf, so
+/// neither gamescope nor the display can wait on the Vulkan fence, and attaching
+/// early shows an unwritten image. The wait is bounded; past it the frame is
+/// pushed back rather than shown corrupt.
+unsafe fn flush_due(sc: *mut GnSwapchain) {
+    let gd = unsafe { (*sc).dev };
+    if unsafe { (*gd).gen_sc } != sc {
+        return;
+    }
+    let mut committed = 0u32;
+    while let Some((deadline, slot, batch, drop_at)) =
+        (unsafe { (*gd).gen_due.front() }).map(|d| (d.deadline, d.slot, d.batch, d.drop_at))
+    {
+        let now = monotonic_ns();
+        if deadline > now {
+            break;
+        }
+        if batch != GEN_NO_BATCH {
+            let fence = unsafe { (*gd).gen_batches.as_slice().get(batch) }.map_or(0, |b| b.fence);
+            if fence != 0 {
+                let mut ready = match unsafe { (*gd).f.get_fence_status } {
+                    Some(status) => (unsafe { status((*gd).real, fence) }) == VK_SUCCESS,
+                    None => true,
+                };
+                if !ready {
+                    if let Some(wait) = unsafe { (*gd).f.wait_fences } {
+                        ready = unsafe { wait((*gd).real, 1, &fence, VK_TRUE, 4_000_000) }
+                            == VK_SUCCESS;
+                    }
+                }
+                if !ready {
+                    GEN_LATE.fetch_add(1, Ordering::Relaxed);
+                    if now > drop_at {
+                        // The batch is not coming in time for this frame to mean
+                        // anything: drop it rather than hold the source frame
+                        // behind it.
+                        GEN_SKIPS.fetch_add(1, Ordering::Relaxed);
+                        unsafe { (*gd).gen_due.pop_front() };
+                        continue;
+                    }
+                    if let Some(d) = unsafe { (*gd).gen_due.front_mut() } {
+                        d.deadline = now + 1_000_000;
+                    }
+                    break;
+                }
+            }
+        }
+        unsafe { (*gd).gen_due.pop_front() };
+        if batch == GEN_NO_BATCH {
+            unsafe { commit_real(sc, slot, 0) };
+        } else {
+            unsafe { commit_generated(sc, slot as usize) };
+            committed += 1;
+        }
+    }
+    if committed > 0 {
+        GEN_COMMITS.fetch_add(committed, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The queue the generation batch submits on.
+///
+/// `(*gd).queues` is a stack of every queue the guest asked for, newest first,
+/// while the shim's command pool belongs to the family named by the *first*
+/// `VkDeviceQueueCreateInfo`. A command buffer recorded in a pool of family A
+/// may only be submitted to a queue of family A: anything else is invalid usage,
+/// and a driver is free to drop the whole submission without an error. A fence
+/// that comes back signalled ~40 us later with nothing written is what that
+/// looks like. Prefer a queue of the pool's family; fall back to the head only
+/// when the device has no queue of that family.
+unsafe fn lsfg_queue(gd: *mut GnDevice) -> *mut GnQueue {
+    let head = unsafe { (*gd).queues };
+    let mut q = head;
+    while !q.is_null() {
+        if unsafe { (*q).family } == unsafe { (*gd).queue_family } {
+            return q;
+        }
+        q = unsafe { (*q).next };
+    }
+    head
+}
+
+/// `pop_job`'s answer when a queued frame is due before any guest job.
+const JOB_FLUSH: i32 = -2;
 
 /// Take the pending job: a mailbox entry (the newest frame) wins, otherwise
 /// the oldest queued fifo job.
@@ -719,15 +1530,37 @@ fn take_job(g: &mut ScShared) -> Option<i32> {
 fn pop_job(sc: *mut GnSwapchain) -> i32 {
     let mut g = unsafe { (*sc).shared.lock().unwrap() };
     loop {
+        // A due frame goes out before the next guest frame is taken: its commit
+        // is quick, and the guest's fence wait is not.
+        if unsafe { gen_due_now(sc) } {
+            return JOB_FLUSH;
+        }
         if let Some(job) = take_job(&mut g) {
             return job;
         }
         if g.stopping {
             return -1;
         }
-        let (guard, res) = unsafe { (*sc).cv_put.wait_timeout(g, IDLE_EVERY).unwrap() };
+        // Wake at the next queued frame's deadline, or on the idle tick.
+        let timeout = {
+            let gd = unsafe { (*sc).dev };
+            let head = unsafe { (*gd).gen_due.front().map(|d| d.deadline) };
+            match head {
+                Some(deadline) => {
+                    let now = monotonic_ns();
+                    let wait = deadline.saturating_sub(now);
+                    Duration::from_nanos(wait.min(IDLE_EVERY.as_nanos() as u64))
+                        .max(Duration::from_micros(200))
+                }
+                None => IDLE_EVERY,
+            }
+        };
+        let (guard, res) = unsafe { (*sc).cv_put.wait_timeout(g, timeout).unwrap() };
         g = guard;
         if res.timed_out() {
+            if unsafe { gen_due_now(sc) } {
+                return JOB_FLUSH;
+            }
             // No present arrived: say so once every IDLE_EVERY with the slot
             // flags, so an app that stops presenting is visible instead of
             // silent.
@@ -749,6 +1582,10 @@ fn pop_job(sc: *mut GnSwapchain) -> i32 {
 fn worker_main(sc: *mut GnSwapchain) {
     loop {
         let idx = pop_job(sc);
+        if idx == JOB_FLUSH {
+            unsafe { flush_due(sc) };
+            continue;
+        }
         if idx < 0 {
             break;
         }
@@ -759,93 +1596,108 @@ fn worker_main(sc: *mut GnSwapchain) {
                 wait_fences((*(*sc).dev).real, 1, &(*s).fence, VK_TRUE, u64::MAX);
             }
             let fence_ms = t0.elapsed().as_millis();
-            // X11 route: the window carries its own content, so the frame is
-            // presented into it (DRI3 + Present) instead of committed to a
-            // wl_surface. The slot stays in flight until its idle fence
-            // triggers; x11_reap frees every slot whose fence has fired.
-            if (*(*sc).surf).parent.is_null() {
-                // X11 route: the window carries its own content, so the frame
-                // is presented into it (DRI3 + Present) instead of committed to
-                // a wl_surface. A present that cannot be made (route never came
-                // up, or pixmap/fence/present refused) frees the slot here:
-                // only a live present's idle fence releases a slot otherwise,
-                // and a guest waiting on a release that never comes stalls on
-                // its next acquire.
-                if x11_present_slot(sc, s, idx) {
-                    maybe_report_game_window((*sc).surf);
-                    x11_reap(sc);
-                } else {
-                    if !X11_DROP_LOGGED.swap(true, Ordering::Relaxed) {
-                        crate::logf!(gndrm_obf::obf!(
-                            "x11 route: present unavailable - frames dropped, slots kept free (guest keeps running)"
-                        ));
-                    }
-                    let _g = (*sc).shared.lock().unwrap();
-                    (*s).in_flight = false;
-                    (*sc).cv_free.notify_all();
-                    drop(_g);
-                }
+            // Before the commit, so the capture reads the frame the guest just
+            // finished while the slot is still ours. When the frame's generations
+            // were queued, the frame itself is queued behind them.
+            if lsfg_generate(sc, idx) {
                 continue;
             }
-            if (*s).buf.is_null() {
-                (*s).buf = slot_make_buffer(sc, s);
-            }
-            if (*s).buf.is_null() {
-                crate::logf!(gndrm_obf::obf!(
-                    "proxy: wl_buffer creation failed — dropping frame"
-                ));
+            commit_real(sc, idx, fence_ms);
+        }
+    }
+}
+
+/// Commit a guest frame: into its X11 window on that route, otherwise attached
+/// to the surface and committed. The slot's own fence has already been waited.
+unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
+    unsafe {
+        let s = (*sc).slots.as_mut_ptr().add(idx as usize);
+        // X11 route: the window carries its own content, so the frame is
+        // presented into it (DRI3 + Present) instead of committed to a
+        // wl_surface. The slot stays in flight until its idle fence
+        // triggers; x11_reap frees every slot whose fence has fired.
+        if (*(*sc).surf).parent.is_null() {
+            // X11 route: the window carries its own content, so the frame
+            // is presented into it (DRI3 + Present) instead of committed to
+            // a wl_surface. A present that cannot be made (route never came
+            // up, or pixmap/fence/present refused) frees the slot here:
+            // only a live present's idle fence releases a slot otherwise,
+            // and a guest waiting on a release that never comes stalls on
+            // its next acquire.
+            if x11_present_slot(sc, s, idx) {
+                maybe_report_game_window((*sc).surf);
+                x11_reap(sc);
+            } else {
+                if !X11_DROP_LOGGED.swap(true, Ordering::Relaxed) {
+                    crate::logf!(gndrm_obf::obf!(
+                        "x11 route: present unavailable - frames dropped, slots kept free (guest keeps running)"
+                    ));
+                }
                 let _g = (*sc).shared.lock().unwrap();
                 (*s).in_flight = false;
                 (*sc).cv_free.notify_all();
                 drop(_g);
-                continue;
             }
-            let parent = (*(*sc).surf).parent;
-            let t1 = Instant::now();
-            let flush_rc = {
-                let _sg = SEND_LOCK.lock().unwrap();
-                // Declare this swapchain's *effective* present mode — the mode
-                // `present_dispatch` honours — so gamescope's view matches what
-                // the shim actually does. A slot becomes reusable only on the
-                // compositor's wl_buffer.release, and gamescope reads the
-                // declared mode once per commit and paces only the commits it
-                // reads as FIFO — so the declaration rides every commit.
-                // Declaring the effective mode (not a hardcoded FIFO) is what
-                // lets a window's fps limit, or the absence of one, be seen by
-                // the compositor as the shim applies it.
-                wlproto::swapchain_set_present_mode(
-                    (*(*sc).surf).swapchain_obj,
-                    gamescope_present_mode((*sc).present_mode),
-                );
-                wlproto::surface_attach(parent, (*s).buf, 0, 0);
-                wlproto::surface_damage_buffer(
-                    parent,
-                    0,
-                    0,
-                    (*sc).extent.width as i32,
-                    (*sc).extent.height as i32,
-                );
-                wlproto::surface_commit(parent);
-                wlproto::wl_display_flush((*(*sc).surf).dpy)
-            };
-            // Override/Wayland route (the default; `GN_VKSHIM_GUEST_SURFACE`
-            // unset or not exactly "1"): same tree-walk cadence as the
-            // guest-surface arm above, so the game's own window clears the
-            // splash on this route too.
-            maybe_report_game_window((*sc).surf);
-            let commit_ms = t1.elapsed().as_millis();
-            let n = LOG_COMMIT.fetch_add(1, Ordering::Relaxed);
-            let done = N_COMMIT_OK.fetch_add(1, Ordering::Relaxed);
-            if n < LOG_FIRST_N || n.is_multiple_of(120) || fence_ms >= 100 {
-                crate::logf!(gndrm_obf::obf!(
-                    "proxy commit: sc={sc:?} idx={idx} {}x{} flush_rc={flush_rc} dpy_err={} fence={fence_ms}ms commit={commit_ms}ms #{} {}",
-                    (*sc).extent.width,
-                    (*sc).extent.height,
-                    wlproto::wl_display_get_error((*(*sc).surf).dpy),
-                    done + 1,
-                    counters(),
-                ));
-            }
+            return;
+        }
+        if (*s).buf.is_null() {
+            (*s).buf = slot_make_buffer(sc, s);
+        }
+        if (*s).buf.is_null() {
+            crate::logf!(gndrm_obf::obf!(
+                "proxy: wl_buffer creation failed — dropping frame"
+            ));
+            let _g = (*sc).shared.lock().unwrap();
+            (*s).in_flight = false;
+            (*sc).cv_free.notify_all();
+            drop(_g);
+            return;
+        }
+        let parent = (*(*sc).surf).parent;
+        let t1 = Instant::now();
+        let flush_rc = {
+            let _sg = SEND_LOCK.lock().unwrap();
+            // Declare this swapchain's *effective* present mode — the mode
+            // `present_dispatch` honours — so gamescope's view matches what
+            // the shim actually does. A slot becomes reusable only on the
+            // compositor's wl_buffer.release, and gamescope reads the
+            // declared mode once per commit and paces only the commits it
+            // reads as FIFO — so the declaration rides every commit.
+            // Declaring the effective mode (not a hardcoded FIFO) is what
+            // lets a window's fps limit, or the absence of one, be seen by
+            // the compositor as the shim applies it.
+            wlproto::swapchain_set_present_mode(
+                (*(*sc).surf).swapchain_obj,
+                gamescope_present_mode((*sc).present_mode),
+            );
+            wlproto::surface_attach(parent, (*s).buf, 0, 0);
+            wlproto::surface_damage_buffer(
+                parent,
+                0,
+                0,
+                (*sc).extent.width as i32,
+                (*sc).extent.height as i32,
+            );
+            wlproto::surface_commit(parent);
+            wlproto::wl_display_flush((*(*sc).surf).dpy)
+        };
+        // Override/Wayland route (the default; `GN_VKSHIM_GUEST_SURFACE`
+        // unset or not exactly "1"): same tree-walk cadence as the
+        // guest-surface arm above, so the game's own window clears the
+        // splash on this route too.
+        maybe_report_game_window((*sc).surf);
+        let commit_ms = t1.elapsed().as_millis();
+        let n = LOG_COMMIT.fetch_add(1, Ordering::Relaxed);
+        let done = N_COMMIT_OK.fetch_add(1, Ordering::Relaxed);
+        if n < LOG_FIRST_N || n.is_multiple_of(120) || fence_ms >= 100 {
+            crate::logf!(gndrm_obf::obf!(
+                "proxy commit: sc={sc:?} idx={idx} {}x{} flush_rc={flush_rc} dpy_err={} fence={fence_ms}ms commit={commit_ms}ms #{} {}",
+                (*sc).extent.width,
+                (*sc).extent.height,
+                wlproto::wl_display_get_error((*(*sc).surf).dpy),
+                done + 1,
+                counters(),
+            ));
         }
     }
 }
@@ -861,6 +1713,13 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     let ci = unsafe { &*ci };
     let gd = unsafe { find_device(device) };
     let surf = unsafe { find_surface(ci.surface) };
+    // The app pushes its LSFG settings to the daemon before the session starts,
+    // so the daemon's answer is what the first present opens its session from.
+    // Adopting it here fills the live copy, which nothing else does at launch:
+    // the push path only fires on a change.
+    if let Some(config) = crate::scanout::lsfg_config() {
+        crate::lsfg::apply(config);
+    }
     crate::logf!(gndrm_obf::obf!(
         "proxy swapchain create: device={device:?} surface={:#x} {}x{} fmt={} cs={} min={} mode={} old={:#x} -> gd={:?} surf={:?}",
         ci.surface,
@@ -960,17 +1819,13 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         extent: ci.imageExtent,
         fourcc,
         present_mode: mode,
-        // The slot image carries exactly the usage the guest asked for. The
-        // present path needs no image usage of its own: the X11 route wraps the
-        // slot's dma-buf in a DRI3 pixmap, the wayland route in a linux-dmabuf
-        // wl_buffer, and every shim-side read of a slot is a CPU `mmap` of that
-        // dma-buf — no `vkCmdCopy*`/`vkCmdBlit*` ever sources or targets a slot,
-        // so neither TRANSFER_SRC nor TRANSFER_DST is required by the shim. The
-        // two transfer bits the shim used to force OR-in are therefore dropped;
-        // a guest that needs one (DXVK's swapchain clears use TRANSFER_DST)
-        // already requests it in `ci.imageUsage`.
-        usage: ci.imageUsage,
+        // The slot image carries the usage the guest asked for, plus TRANSFER_SRC:
+        // the engine copies the presented frame out of it, and generation can be
+        // turned on after the swapchain exists.
+        usage: ci.imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         slots: Vec::new(),
+        guest_slots: 0,
+        gen_no_grow: false,
         worker: None,
         shared: Mutex::new(ScShared {
             jobs: VecDeque::with_capacity(GN_JOB_CAP),
@@ -1018,6 +1873,12 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             return res;
         }
     }
+    // The guest's slots are a prefix; generation destinations are appended by
+    // the present worker when the settings first ask for them, so the vector's
+    // capacity is reserved here and the guest's images never move.
+    sc.guest_slots = n_slots;
+    sc.slots.reserve(3);
+
     // What the guest was told the surface can be, next to what the slot images
     // actually are. One line, once: a disagreement here names a guest that
     // sized its viewport to a different image than the shim renders into.
@@ -1103,7 +1964,7 @@ unsafe extern "C" fn gn_vkGetSwapchainImagesKHR(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     unsafe {
-        let n_slots = (*sc).slots.len();
+        let n_slots = (*sc).guest_slots as usize;
         if images.is_null() {
             *count = n_slots as u32;
             return VK_SUCCESS;
@@ -1137,6 +1998,26 @@ unsafe extern "C" fn gn_vkDestroySwapchainKHR(
     let sc = unsafe { find_swapchain(swapchain) };
     if sc.is_null() {
         return;
+    }
+    // A batch still in flight on this swapchain owns slots that are about to be
+    // destroyed: wait it out, once, and drop the batch.
+    {
+        let gd = unsafe { (*sc).dev };
+        if unsafe { !(*gd).gen_sc.is_null() && (*gd).gen_sc == sc } {
+            for batch in unsafe { (*gd).gen_batches.iter() } {
+                if batch.fence != 0 {
+                    if let Some(wait) = unsafe { (*gd).f.wait_fences } {
+                        unsafe { wait((*gd).real, 1, &batch.fence, VK_TRUE, u64::MAX) };
+                    }
+                }
+            }
+            unsafe {
+                (*gd).gen_due.clear();
+                (*gd).gen_last_deadline = 0;
+                (*gd).gen_last_source_ns = 0;
+                (*gd).gen_sc = ptr::null_mut();
+            }
+        }
     }
     {
         let mut g = unsafe { (*sc).shared.lock().unwrap() };
@@ -1227,7 +2108,7 @@ unsafe fn slice_to_floor(sc: *mut GnSwapchain, slice: Duration) -> Duration {
 /// newer buffer) and its own back-pressure, not just this condition relaxed.
 unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
     let now_ns = monotonic_ns();
-    for k in 0..unsafe { (*sc).slots.len() } {
+    for k in 0..unsafe { (*sc).guest_slots as usize } {
         let s = unsafe { (*sc).slots.as_mut_ptr().add(k) };
         // A slot the compositor returned while the daemon's floor for it was
         // still ahead becomes free the instant that floor passes, and this scan
@@ -1364,7 +2245,10 @@ unsafe fn gn_acquire_common(
             signalSemaphoreCount: if sem != 0 { 1 } else { 0 },
             pSignalSemaphores: if sem != 0 { &sem } else { ptr::null() },
         };
-        let res = unsafe { (*gd).f.submit.unwrap()((*gq).real, 1, &si, fence) };
+        let res = {
+            let _submit = SUBMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            unsafe { (*gd).f.submit.unwrap()((*gq).real, 1, &si, fence) }
+        };
         if res != VK_SUCCESS {
             let _g = (*sc).shared.lock().unwrap();
             (*(*sc).slots.as_mut_ptr().add(idx as usize)).acquired = false;
@@ -1630,7 +2514,7 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
     let indices = unsafe { slice_or_empty(pi.pImageIndices, nsc) };
     for i in 0..nsc {
         let sc = unsafe { find_swapchain(swapchains[i]) };
-        if sc.is_null() || indices[i] as usize >= unsafe { (*sc).slots.len() } {
+        if sc.is_null() || indices[i] as usize >= unsafe { (*sc).guest_slots as usize } {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         let slot = unsafe { (*sc).slots.as_mut_ptr().add(indices[i] as usize) };
@@ -1664,7 +2548,10 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
                 ptr::null()
             },
         };
-        let res = unsafe { (*gd).f.submit.unwrap()(real_q, 1, &si, (*slot).fence) };
+        let res = {
+            let _submit = SUBMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            unsafe { (*gd).f.submit.unwrap()(real_q, 1, &si, (*slot).fence) }
+        };
         if res != VK_SUCCESS {
             crate::logf!(gndrm_obf::obf!("proxy: present wait submit failed: {res}"));
             return res;
@@ -1768,6 +2655,7 @@ unsafe fn submit_impl(
                 .collect::<Vec<_>>()
         ));
     }
+    let _submit = SUBMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { (*gd).f.submit.unwrap()((*gq).real, count, args[2] as *const VkSubmitInfo, fence) }
 }
 
@@ -1956,6 +2844,7 @@ unsafe fn submit2_impl(
             ));
         }
     }
+    let _submit = SUBMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { real_fn((*gq).real, count, translated, fence) }
 }
 
@@ -4967,6 +5856,7 @@ pub struct RealDevFns {
     pub destroy_fence: Option<PFN_vkDestroyFence>,
     pub wait_fences: Option<PFN_vkWaitForFences>,
     pub reset_fences: Option<PFN_vkResetFences>,
+    pub get_fence_status: Option<PFN_vkGetFenceStatus>,
     pub create_sem: Option<PFN_vkCreateSemaphore>,
     pub destroy_sem: Option<PFN_vkDestroySemaphore>,
     pub alloc_cmd: Option<PFN_vkAllocateCommandBuffers>,
@@ -4980,6 +5870,17 @@ pub struct RealDevFns {
     pub wait_idle: Option<PFN_vkDeviceWaitIdle>,
     pub queue_wait_idle: Option<PFN_vkQueueWaitIdle>,
     pub destroy_device: Option<PFN_vkDestroyDevice>,
+    /// Command pool for the shim's own submissions (frame generation). Created
+    /// with the device and destroyed before it.
+    pub create_cmd_pool: Option<
+        unsafe extern "C" fn(
+            VkDevice,
+            *const VkCommandPoolCreateInfo,
+            *const c_void,
+            *mut VkCommandPool,
+        ) -> VkResult,
+    >,
+    pub destroy_cmd_pool: Option<unsafe extern "C" fn(VkDevice, VkCommandPool, *const c_void)>,
     // Slot read-back for the bounded one-shot `x11 view` line.
     pub map_mem: Option<PFN_vkMapMemory>,
     pub unmap_mem: Option<PFN_vkUnmapMemory>,
@@ -5044,6 +5945,40 @@ pub struct GnDevice {
     pub queues: *mut GnQueue, // wrapper list
     pub cmds: *mut GnCmd,     // wrapper list
     pub next: *mut GnDevice,
+    /// Queue family the shim's own command pool belongs to.
+    pub queue_family: u32,
+    /// The shim's command pool for frame generation, or 0.
+    pub cmd_pool: VkCommandPool,
+    /// Whether the guest enabled float16, so a lazily opened session picks the
+    /// same shader variant the device can run.
+    pub fp16: bool,
+    /// The settings epoch the session was last attempted at.
+    pub lsfg_epoch: u32,
+    /// Generation batches in flight, each with its own fence and command buffer:
+    /// a batch's command buffer must outlive its submission, and its fence is
+    /// what the committed frames of that batch wait on. One shared fence would
+    /// make a flush wait on the newest batch, not the one whose frames are due.
+    pub gen_batches: Vec<GenBatch>,
+    /// The batch slot the next generation records into.
+    pub gen_next: usize,
+    /// The swapchain the pending batches belong to, or null.
+    pub gen_sc: *mut GnSwapchain,
+    /// Frames waiting for their slot on the output grid, in commit order: the
+    /// generated frames of a source frame first, then the source frame itself.
+    /// Committing a batch inline would put source and generated frame inside one
+    /// compositor frame, and gamescope composites that once.
+    pub gen_due: VecDeque<GenDue>,
+    /// The deadline of the last queued frame, so a new batch is scheduled after
+    /// it rather than on top of it.
+    pub gen_last_deadline: u64,
+    /// When the previous source frame reached the presenter, and the smoothed
+    /// interval between source frames: the output grid when there is no cap.
+    pub gen_last_source_ns: u64,
+    pub gen_period_ns: u64,
+    // Frame generation for this device, or null. Declared last: `repr(C)` plus
+    // the thunks' fixed offset for `scratch`/`real` mean fields may only be
+    // appended, never inserted.
+    pub lsfg: *mut crate::lsfg::Session,
 }
 
 #[repr(C)]
@@ -5052,6 +5987,12 @@ pub struct GnQueue {
     pub real: VkQueue,
     pub gd: *mut GnDevice,
     pub next: *mut GnQueue,
+    /// Queue family this wrapper was handed out for. The shim's own command
+    /// pool must belong to the family of the queue it submits on: a batch
+    /// recorded in a pool of one family and submitted to a queue of another is
+    /// invalid usage, and drivers are free to drop it silently. Appended last so
+    /// the fixed offsets the thunks rely on do not move.
+    pub family: u32,
 }
 
 #[repr(C)]
@@ -5126,13 +6067,19 @@ pub struct GnSwapchain {
     /// the app's request; see `effective_present_mode`). Read by
     /// `present_dispatch` on every present.
     pub present_mode: VkPresentModeKHR,
+    /// Every slot the shim owns: the guest's first (`guest_slots` of them), then
+    /// the generation destinations, which the guest never sees.
     pub slots: Vec<GnSlot>,
+    /// How many leading entries of `slots` are the guest's swapchain images.
+    pub guest_slots: u32,
     pub worker: Option<std::thread::JoinHandle<()>>,
     pub shared: Mutex<ScShared>,
     pub cv_put: Condvar,
     pub cv_free: Condvar,
     pub x11_trace: u32,
     pub next: *mut GnSwapchain,
+    /// Set once a destination could not be made: the set stops growing.
+    pub gen_no_grow: bool,
 }
 
 // ---------------------------------------------------------------- wayland
@@ -5370,17 +6317,29 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
         // from the daemon is read here because a release is the one event this
         // shim sees on every frame. Ahead of the floor, so the release it paces
         // is measured against the target it arrived under.
-        crate::scanout::poll_cap_change();
+        crate::scanout::poll_notes();
         // The floor this release is held to, measured from this shim's own
         // previous release (see `scanout::note_release`): the instant the slot
         // may go back to the guest.
         let now_ns = monotonic_ns();
-        let floor_ns = crate::scanout::note_release(now_ns);
+        // Destinations are appended after the guest's slots; only a release that
+        // frees a guest slot advances the cap's schedule.
+        let guest_slot = {
+            let guest = (*sc).guest_slots as usize;
+            let slots = (*sc).slots.as_ptr();
+            ((slot as usize - slots as usize) / core::mem::size_of::<GnSlot>()) < guest
+        };
+        let floor_ns = crate::scanout::note_release(now_ns, guest_slot);
         let capped = crate::scanout::target_fps() != 0;
-        let held = now_ns < floor_ns;
+        // The floor paces the guest, so only a guest slot is held to it: a
+        // generation destination held back is one fewer for the next batch.
+        let held = guest_slot && now_ns < floor_ns;
         let _g = (*sc).shared.lock().unwrap();
         if capped {
             REL_CAPPED_N.fetch_add(1, Ordering::Relaxed);
+        }
+        if !guest_slot {
+            GEN_RELEASES.fetch_add(1, Ordering::Relaxed);
         }
         if held {
             // This runs on the Wayland dispatch thread, so the hold is state,
@@ -7441,6 +8400,39 @@ unsafe fn driver_device_exts(gi: *mut GnInstance, pd: VkPhysicalDevice) -> Vec<s
         .collect()
 }
 
+/// Did the guest enable `shaderFloat16` on this device?
+///
+/// The fp16 shader variant needs the feature enabled on the device its pipelines
+/// are built on — which is the guest's device, not one we create. Enabling it
+/// ourselves is not an option (the device belongs to the guest), so the fp16
+/// variant is used only when the guest already asked for it; otherwise the fp32
+/// variant, which needs nothing.
+unsafe fn guest_enabled_fp16(ci: &VkDeviceCreateInfo) -> bool {
+    const SHADER_FLOAT16_INT8_FEATURES: i32 = 1_000_082_000;
+    #[repr(C)]
+    struct Float16 {
+        s_type: i32,
+        next: *const c_void,
+        shader_float16: u32,
+        int8: u32,
+    }
+    #[repr(C)]
+    struct Chain {
+        s_type: i32,
+        next: *const Chain,
+    }
+    let mut p = ci.pNext.cast::<Chain>();
+    while !p.is_null() {
+        unsafe {
+            if (*p).s_type == SHADER_FLOAT16_INT8_FEATURES {
+                return (*p.cast::<Float16>()).shader_float16 != 0;
+            }
+            p = (*p).next;
+        }
+    }
+    false
+}
+
 unsafe extern "C" fn gn_vkCreateDevice(
     pd: VkPhysicalDevice,
     ci: *const VkDeviceCreateInfo,
@@ -7632,6 +8624,18 @@ unsafe extern "C" fn gn_vkCreateDevice(
         queues: ptr::null_mut(),
         cmds: ptr::null_mut(),
         next: ptr::null_mut(),
+        queue_family: 0,
+        cmd_pool: 0,
+        fp16: false,
+        lsfg_epoch: 0,
+        gen_batches: Vec::new(),
+        gen_next: 0,
+        gen_sc: ptr::null_mut(),
+        gen_due: VecDeque::new(),
+        gen_last_deadline: 0,
+        gen_last_source_ns: 0,
+        gen_period_ns: 0,
+        lsfg: ptr::null_mut(),
     });
     // Real-device function resolution never uses the hooks'
     // vkGetDeviceProcAddr: its answers are vulkan::driver::* trampolines
@@ -7668,6 +8672,7 @@ unsafe extern "C" fn gn_vkCreateDevice(
     resolve!(destroy_fence, "vkDestroyFence");
     resolve!(wait_fences, "vkWaitForFences");
     resolve!(reset_fences, "vkResetFences");
+    resolve!(get_fence_status, "vkGetFenceStatus");
     resolve!(create_sem, "vkCreateSemaphore");
     resolve!(destroy_sem, "vkDestroySemaphore");
     resolve!(alloc_cmd, "vkAllocateCommandBuffers");
@@ -7677,6 +8682,8 @@ unsafe extern "C" fn gn_vkCreateDevice(
     resolve!(wait_idle, "vkDeviceWaitIdle");
     resolve!(queue_wait_idle, "vkQueueWaitIdle");
     resolve!(destroy_device, "vkDestroyDevice");
+    resolve!(create_cmd_pool, "vkCreateCommandPool");
+    resolve!(destroy_cmd_pool, "vkDestroyCommandPool");
     resolve!(map_mem, "vkMapMemory");
     resolve!(unmap_mem, "vkUnmapMemory");
     resolve!(cmd_pipeline_barrier, "vkCmdPipelineBarrier");
@@ -7707,7 +8714,23 @@ unsafe extern "C" fn gn_vkCreateDevice(
     } else {
         unsafe { (*ci.pQueueCreateInfos).queueFamilyIndex }
     };
+    gd.queue_family = qf;
+    // A pool of our own: the guest's pools belong to the guest and must not be
+    // used for submissions it did not make.
+    if let Some(create_pool) = gd.f.create_cmd_pool {
+        let mut pci: VkCommandPoolCreateInfo = unsafe { std::mem::zeroed() };
+        pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pci.queueFamilyIndex = qf;
+        let mut pool: VkCommandPool = 0;
+        if unsafe { create_pool(gd.real, &pci, ptr::null(), &mut pool) } == VK_SUCCESS {
+            gd.cmd_pool = pool;
+        }
+    }
     let gd = Box::into_raw(gd);
+    // Frame generation is opened on the first present that has settings, not
+    // here: the app pushes them through the daemon after this device exists, so
+    // an attempt at create time would never see them.
+    unsafe { (*gd).fp16 = guest_enabled_fp16(ci) };
     {
         let mut g = G.lock().unwrap();
         unsafe {
@@ -7734,8 +8757,37 @@ unsafe extern "C" fn gn_vkDestroyDevice(device: VkDevice, _alloc: *const VkAlloc
         return;
     }
     unsafe {
+        if !(*gd).lsfg.is_null() {
+            // The engine's context owns pipelines and images on this device, so
+            // it is torn down before the device itself.
+            (*(*gd).lsfg).close((*gd).real, &(*gd).f);
+            drop(Box::from_raw((*gd).lsfg));
+            (*gd).lsfg = ptr::null_mut();
+        }
         if let Some(wait_idle) = (*gd).f.wait_idle {
             wait_idle((*gd).real);
+        }
+        for batch in (*gd).gen_batches.drain(..) {
+            if batch.fence != 0 {
+                if let Some(wait) = (*gd).f.wait_fences {
+                    wait((*gd).real, 1, &batch.fence, VK_TRUE, u64::MAX);
+                }
+                if let Some(destroy_fence) = (*gd).f.destroy_fence {
+                    destroy_fence((*gd).real, batch.fence, ptr::null());
+                }
+            }
+            if !batch.cmd.is_null() && (*gd).cmd_pool != 0 {
+                if let Some(free) = (*gd).f.free_cmd {
+                    free((*gd).real, (*gd).cmd_pool, 1, &batch.cmd);
+                }
+            }
+        }
+        (*gd).gen_due.clear();
+        if (*gd).cmd_pool != 0 {
+            if let Some(destroy_pool) = (*gd).f.destroy_cmd_pool {
+                destroy_pool((*gd).real, (*gd).cmd_pool, ptr::null());
+            }
+            (*gd).cmd_pool = 0;
         }
         if let Some(destroy_device) = (*gd).f.destroy_device {
             destroy_device((*gd).real, ptr::null());
@@ -7797,6 +8849,7 @@ unsafe extern "C" fn gn_vkGetDeviceQueue(
         real: ptr::null_mut(),
         gd,
         next: ptr::null_mut(),
+        family,
     });
     unsafe {
         if let Some(get_queue) = (*gd).f.get_queue {
@@ -7845,6 +8898,7 @@ unsafe extern "C" fn gn_vkGetDeviceQueue2(
         real: ptr::null_mut(),
         gd,
         next: ptr::null_mut(),
+        family: unsafe { (*info).queueFamilyIndex },
     });
     unsafe {
         real_fn((*gd).real, info, &mut gq.real);
@@ -8319,6 +9373,16 @@ fn mem_type_desc(gd: *mut GnDevice, idx: u32) -> String {
 /// — the daemon's scan-out pool when that channel is up, a local system-heap
 /// allocation otherwise — and bound through the imported-fd path.
 unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
+    unsafe { slot_init_with_usage(sc, s, (*sc).usage) }
+}
+
+/// `slot_init` with a chosen image usage. A generation destination is written by
+/// a blit and sampled by the compositor, which is not what a guest slot asks for.
+unsafe fn slot_init_with_usage(
+    sc: *mut GnSwapchain,
+    s: *mut GnSlot,
+    usage: VkImageUsageFlags,
+) -> VkResult {
     let gd = (*sc).dev;
     let dev = unsafe { (*gd).real };
     let f = unsafe { (*gd).f };
@@ -8385,7 +9449,7 @@ unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
         // scan-out pixels. No explicit DRM modifier is requested: the
         // guest's LINEAR tiling is the layout contract on its own.
         tiling: VK_IMAGE_TILING_LINEAR,
-        usage: (*sc).usage,
+        usage,
         sharingMode: VK_SHARING_MODE_EXCLUSIVE,
         queueFamilyIndexCount: 0,
         pQueueFamilyIndices: ptr::null(),
@@ -8393,7 +9457,7 @@ unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
     };
     // One-shot diagnostic dump of the exact create-info (pNext chain,
     // tiling, modifier) plus a pure read-only modifier-support query.
-    unsafe { query_linear_modifier_support(gd, (*sc).format, (*sc).usage, VK_IMAGE_TILING_LINEAR) };
+    unsafe { query_linear_modifier_support(gd, (*sc).format, usage, VK_IMAGE_TILING_LINEAR) };
     unsafe { trace_image_create(&ici, "img-create linear", &TRACE_IMAGE_CI_LINEAR) };
     let mut res = unsafe { f.create_image.unwrap()(dev, &ici, ptr::null(), &mut (*s).image) };
     if res != VK_SUCCESS {

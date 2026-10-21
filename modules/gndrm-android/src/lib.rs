@@ -58,6 +58,7 @@ use gndrm_daemon::server;
 use gndrm_daemon::{
     reset_hdr_output_cache, reset_verbose_logging, Device, FrameCap, NullPresenter, PanelDesc,
 };
+use gndrm_uapi::wire::LsfgConfig;
 
 /// Return codes are negative errno-style values (`0` = success).
 const E_BUSY: jint = -16;
@@ -85,6 +86,81 @@ pub(crate) static FRAME_CAP: Mutex<FrameCap> = Mutex::new(FrameCap::new());
 /// [`asc::serve_scanout`] parked in `poll` and have it push a new target to the
 /// shim. `-1` while no scan-out thread holds one.
 static CAP_CHANGED_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Frame-generation settings pushed by the app through
+/// [`Java_app_gamenative_display_GameNativeDrm_nativeSetLsfgConfig`] and handed
+/// to the shim when it asks on the scan-out channel. Whether the app configured a
+/// session at all is [`LSFG_CONFIGURED`], not a sentinel in these fields: an
+/// explicit `enabled = 0` is a real answer the shim must honour.
+static LSFG_SETTINGS: Mutex<LsfgConfig> = Mutex::new(LsfgConfig {
+    enabled: 0,
+    multiplier: 0,
+    flow_per_mille: 0,
+    performance: 0,
+    fps_limit: 0,
+    dll: [0; gndrm_uapi::wire::LSFG_DLL_PATH_MAX],
+    refresh_mhz: 0,
+});
+
+/// Whether the app has pushed any settings this process. A push of `enabled = 0`
+/// is a real answer ("off") and must not be confused with "never configured",
+/// which is what the shim falls back to the environment for.
+static LSFG_CONFIGURED: AtomicBool = AtomicBool::new(false);
+
+/// The settings the shim should use, or `None` when the app never set any.
+pub(crate) fn lsfg_settings() -> Option<LsfgConfig> {
+    let mut settings = *LSFG_SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
+    // The panel rate is the daemon's, not the app's: it arrives through
+    // `nativeSetPanelRefreshHz` before the session starts. The presenter paces on
+    // its own grid and only reports against this.
+    settings.refresh_mhz = PANEL_REFRESH_MHZ.load(Ordering::Relaxed);
+    LSFG_CONFIGURED.load(Ordering::Relaxed).then_some(settings)
+}
+
+/// `GameNativeDrm.nativeSetLsfgConfig(enabled, multiplier, flowPerMille, performance, fpsLimit, dllPath)`.
+///
+/// Called by the app before or during a session; the value is read when the
+/// shim asks, so a change reaches the next device the guest creates.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetLsfgConfig(
+    mut env: JNIEnv,
+    _class: JClass,
+    enabled: jboolean,
+    multiplier: jint,
+    flow_per_mille: jint,
+    performance: jboolean,
+    fps_limit: jint,
+    dll: JString,
+) {
+    // Read the string before the guarded section: `JNIEnv` is not unwind-safe.
+    let dll_path = env
+        .get_string(&dll)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if let Err(e) = std::panic::catch_unwind(|| {
+        let mut settings = LSFG_SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
+        settings.enabled = u32::from(enabled != 0);
+        settings.multiplier = multiplier.clamp(0, 4) as u32;
+        settings.flow_per_mille = flow_per_mille.clamp(0, 1000) as u32;
+        settings.performance = u32::from(performance != 0);
+        settings.fps_limit = fps_limit.max(0) as u32;
+        // The presenter cannot read the container's environment, so the path of
+        // the DLL it has to read the shaders from rides with the settings.
+        settings.set_dll_path(&dll_path);
+        LSFG_CONFIGURED.store(true, Ordering::Relaxed);
+        // Wake a subscribed shim: it reads the pushed settings on its next
+        // release, so a change made in the Quick Menu lands within a frame.
+        let fd = CAP_CHANGED_FD.load(Ordering::Relaxed);
+        if fd >= 0 {
+            let one: u64 = 1;
+            // SAFETY: the cap-change eventfd, live while a scan-out thread holds
+            // it; EFD_NONBLOCK and one increment cannot fill the counter.
+            unsafe { libc::write(fd, (&raw const one).cast(), 8) };
+        }
+    }) {
+        report_panic("gndrm-lsfg", e.as_ref());
+    }
+}
 
 /// The panel's real refresh rate in millihertz, supplied by the app through
 /// [`Java_app_gamenative_display_GameNativeDrm_nativeSetPanelRefreshHz`] before
@@ -802,7 +878,22 @@ fn start(
         height: panel_h,
         mm_width: 0,
         mm_height: 0,
-        refresh_mhz: PANEL_REFRESH_MHZ.load(Ordering::Relaxed),
+        // Frame generation presents more frames than the panel accepts, and
+        // gamescope paces its own paint loop off this mode rate: advertising only
+        // the panel's rate caps the output at the panel and discards every
+        // generated frame above it. The mode therefore carries the rate the
+        // session is asked to produce, floored at the panel's own.
+        refresh_mhz: {
+            let panel_hz = PANEL_REFRESH_MHZ.load(Ordering::Relaxed);
+            let output_hz = lsfg_settings().map_or(0, |s| {
+                s.refresh_mhz.max(
+                    s.fps_limit
+                        .saturating_mul(s.multiplier)
+                        .saturating_mul(1000),
+                )
+            });
+            panel_hz.max(output_hz)
+        },
     };
     let fds = Arc::new(Mutex::new(AcceptedFds {
         rpc: -1,
@@ -1178,7 +1269,14 @@ fn set_panel_refresh_hz(refresh_hz: jint) {
         );
         return;
     }
+    eprintln!("gndrm-daemon: panel refresh {} Hz", refresh_hz);
     PANEL_REFRESH_MHZ.store(refresh_hz as u32 * 1000, Ordering::Relaxed);
+    // The presenter paces against this: a session that started before the mode was
+    // known would otherwise keep an unclamped plan until the user changes a setting.
+    LSFG_SETTINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .refresh_mhz = refresh_hz as u32 * 1000;
 }
 
 /// `GameNativeDrm.nativeReshadeSetEffect(name)` — load and enable a ReShade

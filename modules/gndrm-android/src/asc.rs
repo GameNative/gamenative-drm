@@ -67,8 +67,8 @@ use gndrm_daemon::diag::{self, Diag, Reply, Role, Stage, State, TrackedMutex, LO
 use gndrm_daemon::scanout::{Geometry, Removed, Reservation as CacheReservation, ReusePool};
 use gndrm_daemon::{FrameCap, Framebuffer, PlaneState, Presenter};
 use gndrm_uapi::wire::{
-    FrameCapSubscribe, GameWindowNote, ScanoutAllocReq, ScanoutAllocResp, CAP_FRAME_CAP,
-    SCANOUT_FORMAT_BGRA_8888,
+    FrameCapSubscribe, GameWindowNote, LsfgConfig, ScanoutAllocReq, ScanoutAllocResp,
+    CAP_FRAME_CAP, SCANOUT_FORMAT_BGRA_8888,
 };
 
 use crate::ffi;
@@ -1695,6 +1695,13 @@ pub fn serve_scanout(
                 if send_resp(fd, &note.encode(), None).is_err() {
                     return ScanoutChannel::Closed;
                 }
+                // The same event carries a settings change; the two are pushed
+                // together because one wake cannot say which of them moved.
+                if let Some(settings) = crate::lsfg_settings() {
+                    if send_resp(fd, &settings.encode(), None).is_err() {
+                        return ScanoutChannel::Closed;
+                    }
+                }
             }
         }
         if pfds[1].revents != 0 {
@@ -1762,12 +1769,33 @@ pub fn serve_scanout(
         // latches that for this connection and answers with the current target
         // at once, so a shim that connects mid-session starts in step. A
         // connection that never subscribes is sent no note at all.
+        if let Some(req) = LsfgConfig::decode(&buf[..n]) {
+            // The shim asking for the app's frame-generation settings. An
+            // unconfigured session answers with the untouched request shape, which
+            // the shim reads as "use your defaults" rather than as "off".
+            debug_assert!(req.is_request());
+            let reply = crate::lsfg_settings().unwrap_or_else(LsfgConfig::request);
+            if send_resp(fd, &reply.encode(), None).is_err() {
+                return ScanoutChannel::Closed;
+            }
+            continue;
+        }
         if let Some(sub) = FrameCapSubscribe::decode(&buf[..n]) {
             if sub.caps & CAP_FRAME_CAP != 0 {
                 cap_aware = true;
                 let note = cap_now().note();
                 if send_resp(fd, &note.encode(), None).is_err() {
                     return ScanoutChannel::Closed;
+                }
+                // The frame-generation settings ride with the subscription: a
+                // presenter that connects after the app configured itself (the
+                // usual case — the app pushes at launch, the shim connects when
+                // the guest first allocates) would otherwise wait for the next
+                // change the user makes.
+                if let Some(settings) = crate::lsfg_settings() {
+                    if send_resp(fd, &settings.encode(), None).is_err() {
+                        return ScanoutChannel::Closed;
+                    }
                 }
             }
             log_info!(

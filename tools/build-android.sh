@@ -35,6 +35,8 @@ PROFILE="--release"; DIR=release
 if [ "${1:-}" = "debug" ]; then PROFILE=""; DIR=debug; fi
 
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG"
+# build.rs resolves the NDK the same way; exporting it keeps the two in step.
+export ANDROID_NDK_HOME="$NDK"
 # 16 KB page-size support (Google Play requirement): matches the gamescope
 # toolchain flag in android/cross/aarch64-linux-android.txt.
 # --remap-path-prefix keeps the build host's paths (workspace root, cargo
