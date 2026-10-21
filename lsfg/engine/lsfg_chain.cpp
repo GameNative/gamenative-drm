@@ -34,6 +34,9 @@ LsfgChain::LsfgChain(const Device& device, const LsfgShaders& shaders, VkExtent2
         if (!image.Valid()) return;
     }
 
+    output = LsfgImage(device, extent, format);
+    if (!output.Valid()) return;
+
     mipmaps = LsfgMipmaps(device, shaders, resources, descriptor_pool, frames, flow_scale);
     if (!mipmaps.Valid()) return;
 

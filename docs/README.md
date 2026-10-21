@@ -47,6 +47,7 @@ winlator X11 path (which remains the default for normal launches).
 15. [15-fps-limiter-pacing-and-vsync.md](15-fps-limiter-pacing-and-vsync.md) — the fps limiter's deadline grid and how it meets the panel's vsync.
 16. [16-hdr-verification-and-gaps.md](16-hdr-verification-and-gaps.md) — what HDR verification measured, and the gaps left open.
 17. [17-lsfg-frame-generation.md](17-lsfg-frame-generation.md) — plan for a `gamenative_drm` LSFG backend: the app's own engine inside the ICD shim, reading the container's `Lossless.dll` and building its own shader cache, reusing `LsfgVkManager` and the quick-menu tab, with the artifacts and the measurements that decide it.
+18. [18-lsfg-driver-facts.md](18-lsfg-driver-facts.md) — the properties the LSFG presenter rests on, each one silent when broken: queue-family matching, the engine writing only into its own images, the blit capture, destination depth, guest-only release pacing, the `Rgba8` storage binding, and the settings channel that carries the DLL path.
 
 ## One-paragraph summary
 

@@ -543,11 +543,14 @@ impl FrameCapSubscribe {
 /// `GameNativeDrm.nativeSetLsfgConfig`. A request carries no fields so a shim can
 /// ask without knowing the shape of the answer.
 ///
-/// Encoded little-endian, 24 bytes: `magic:u32, enabled:u32, multiplier:u32,
-/// flow_per_mille:u32, performance:u32, fps_limit:u32`.
+/// Encoded little-endian, 280 bytes: `magic:u32, enabled:u32, multiplier:u32,
+/// flow_per_mille:u32, performance:u32, fps_limit:u32, dll:[u8; 256]`.
 pub const LSFG_MAGIC: u32 = 0x474E_4C31;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Bytes of `Lossless.dll` path carried in a config, NUL-padded.
+pub const LSFG_DLL_PATH_MAX: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LsfgConfig {
     /// Non-zero when the user wants frame generation. Explicit, because
     /// `multiplier` alone cannot express "off": a session that was started with
@@ -562,10 +565,46 @@ pub struct LsfgConfig {
     /// The user's cap on the **source** rate; the presenter presents at
     /// `fps_limit * multiplier`. 0 = uncapped.
     pub fps_limit: u32,
+    /// Absolute path of the container's `Lossless.dll`, NUL-padded. It travels
+    /// with the settings because the presenter runs in the app's process, where
+    /// the container's environment is not present.
+    pub dll: [u8; LSFG_DLL_PATH_MAX],
+}
+
+impl Default for LsfgConfig {
+    fn default() -> Self {
+        Self {
+            enabled: 0,
+            multiplier: 0,
+            flow_per_mille: 0,
+            performance: 0,
+            fps_limit: 0,
+            dll: [0; LSFG_DLL_PATH_MAX],
+        }
+    }
 }
 
 impl LsfgConfig {
-    pub const LEN: usize = 24;
+    pub const LEN: usize = 24 + LSFG_DLL_PATH_MAX;
+
+    /// The DLL path as a string, or `None` when it is empty.
+    #[must_use]
+    pub fn dll_path(&self) -> Option<&std::ffi::CStr> {
+        let end = self.dll.iter().position(|b| *b == 0)?;
+        if end == 0 {
+            return None;
+        }
+        std::ffi::CStr::from_bytes_with_nul(&self.dll[..=end]).ok()
+    }
+
+    /// Store a path, truncating one that does not fit rather than losing the
+    /// rest of the settings with it.
+    pub fn set_dll_path(&mut self, path: &str) {
+        self.dll = [0; LSFG_DLL_PATH_MAX];
+        let bytes = path.as_bytes();
+        let len = bytes.len().min(LSFG_DLL_PATH_MAX - 1);
+        self.dll[..len].copy_from_slice(&bytes[..len]);
+    }
 
     /// What the shim sends: no fields, only the magic.
     #[must_use]
@@ -588,6 +627,7 @@ impl LsfgConfig {
         b[12..16].copy_from_slice(&self.flow_per_mille.to_le_bytes());
         b[16..20].copy_from_slice(&self.performance.to_le_bytes());
         b[20..24].copy_from_slice(&self.fps_limit.to_le_bytes());
+        b[24..].copy_from_slice(&self.dll);
         b
     }
 
@@ -603,6 +643,11 @@ impl LsfgConfig {
             flow_per_mille: u32::from_le_bytes(b[12..16].try_into().ok()?),
             performance: u32::from_le_bytes(b[16..20].try_into().ok()?),
             fps_limit: u32::from_le_bytes(b[20..24].try_into().ok()?),
+            dll: {
+                let mut dll = [0u8; LSFG_DLL_PATH_MAX];
+                dll.copy_from_slice(&b[24..]);
+                dll
+            },
         })
     }
 }

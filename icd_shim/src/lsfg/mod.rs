@@ -245,11 +245,56 @@ static LIVE: Live = Live {
     fps_limit: std::sync::atomic::AtomicU32::new(0),
 };
 
+/// The last settings applied to this process, kept because a session opened
+/// later than the push must not have to ask the daemon again — the request can
+/// fail while the push already succeeded, and the settings carry the DLL path
+/// the engine cannot be opened without.
+static APPLIED: std::sync::Mutex<Option<gndrm_uapi::wire::LsfgConfig>> =
+    std::sync::Mutex::new(None);
+
+/// The last settings applied here, if any.
+#[must_use]
+pub fn applied() -> Option<gndrm_uapi::wire::LsfgConfig> {
+    *APPLIED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Bumped whenever the multiplier or the on/off state changes. The session is
+/// opened lazily on the present path — the app's settings arrive after the
+/// device exists — so a change has to be visible as "something new to act on"
+/// rather than as a retry on every frame.
+static EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The generation factor to run at, or `None` when the user has it off.
+#[must_use]
+pub fn wanted() -> Option<u32> {
+    let (enabled, multiplier, _) = live();
+    (enabled && multiplier >= 2).then_some(multiplier)
+}
+
+/// The rate generated frames are committed at: the source cap times the
+/// multiplier, or 0 when generation is off. This is the grid the generated
+/// commits are spaced on.
+#[must_use]
+pub fn output_rate() -> u32 {
+    let (_, output) = grid();
+    output
+}
+
+/// The settings epoch: equal to `wanted`'s generation changes.
+#[must_use]
+pub fn epoch() -> u32 {
+    EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Adopt a settings frame. `enabled = 0` is the user turning generation off and
 /// is honoured as such — it does not fall back to the launch-time environment.
 pub fn apply(config: gndrm_uapi::wire::LsfgConfig) {
     use std::sync::atomic::Ordering::Relaxed;
+    *APPLIED.lock().unwrap_or_else(|e| e.into_inner()) = Some(config);
     let previous = live();
+    if previous.0 != (config.enabled != 0) || previous.1 != config.multiplier {
+        EPOCH.fetch_add(1, Relaxed);
+    }
     LIVE.enabled.store(config.enabled, Relaxed);
     LIVE.multiplier.store(config.multiplier, Relaxed);
     LIVE.flow_per_mille.store(config.flow_per_mille, Relaxed);
@@ -303,6 +348,21 @@ pub fn grid() -> (u32, u32) {
     (cap, cap.saturating_mul(multiplier.max(1)))
 }
 
+/// One generation's render target: the engine writes here, and the shim blits the
+/// result into a destination slot.
+///
+/// Optimal tiling, because `generate_into` writes through a storage image and this
+/// driver does not support storage on a LINEAR image — the destination slots are
+/// LINEAR dma-bufs, which is why the copy exists.
+pub struct Target {
+    pub image: crate::vk::VkImage,
+    pub view: crate::vk::VkImageView,
+    mem: crate::vk::VkDeviceMemory,
+    pub width: u32,
+    pub height: u32,
+    pub format: crate::vk::VkFormat,
+}
+
 /// One device's frame-generation state.
 ///
 /// Created with the device and destroyed with it. Nothing is generated until the
@@ -313,6 +373,11 @@ pub struct Session {
     /// `VkrLsfg*` — owned by this session, freed in `Drop`.
     root: *mut c_void,
     multiplier: u32,
+    targets: Vec<Target>,
+    /// Source frames handed to the engine; the pacer uses it to count warm-up.
+    source_frames: u64,
+    /// Geometry the engine was last prepared for.
+    prepared: Option<(u32, u32, crate::vk::VkFormat)>,
 }
 
 // The engine handle is only touched under the shim's own serialisation (device
@@ -344,7 +409,9 @@ impl Session {
         // The app's settings arrive through the daemon, over the same channel
         // scan-out allocation uses: `GameNativeDrm.nativeSetLsfgConfig` stores
         // them in this process's daemon, and the shim asks for them here.
-        let from_daemon = crate::scanout::lsfg_config();
+        // The daemon first, then whatever a push already delivered: the request
+        // can fail while the push succeeded, and both carry the DLL path.
+        let from_daemon = crate::scanout::lsfg_config().or_else(applied);
         // A configured session answers for both directions: `enabled = 0` is the
         // user turning it off, and must not fall through to the environment, which
         // was captured at launch.
@@ -354,13 +421,36 @@ impl Session {
                 return None;
             }
         }
-        let multiplier = from_daemon
-            .map(|s| s.multiplier)
-            .or_else(|| std::env::var(MULTIPLIER_ENV).ok()?.parse().ok())?;
+        let multiplier = match from_daemon.map(|s| s.multiplier).or_else(|| {
+            std::env::var(MULTIPLIER_ENV)
+                .ok()
+                .and_then(|v| v.parse().ok())
+        }) {
+            Some(multiplier) => multiplier,
+            None => {
+                crate::logf!(gndrm_obf::obf!("lsfg: no settings (daemon and env empty)"));
+                return None;
+            }
+        };
         if multiplier < 2 {
             return None;
         }
-        let dll = std::env::var(DLL_ENV).ok().map(std::path::PathBuf::from)?;
+        // The settings carry the container's DLL path: this process is the
+        // app's, where the container's environment never arrives. The variable
+        // stays as the guest-side answer for a launch that predates them.
+        let dll = from_daemon
+            .as_ref()
+            .and_then(|c| {
+                c.dll_path()
+                    .map(|p| std::path::PathBuf::from(p.to_string_lossy().into_owned()))
+            })
+            .or_else(|| std::env::var(DLL_ENV).ok().map(std::path::PathBuf::from));
+        let Some(dll) = dll else {
+            crate::logf!(gndrm_obf::obf!(
+                "lsfg: no Lossless.dll path from the app or {DLL_ENV}"
+            ));
+            return None;
+        };
         if !dll.is_file() {
             crate::logf!(gndrm_obf::obf!(
                 "lsfg: no Lossless.dll at {}; frame generation off",
@@ -433,18 +523,24 @@ impl Session {
 
         // Seed the live state with this session's decision: a push only arrives
         // when the user changes something, so `live()` must already be right.
-        apply(gndrm_uapi::wire::LsfgConfig {
+        let mut current = gndrm_uapi::wire::LsfgConfig {
             enabled: 1,
             multiplier,
             flow_per_mille: (flow * 1000.0) as u32,
             performance: from_daemon.map_or(0, |s| s.performance),
             fps_limit: source_cap,
-        });
+            dll: [0; gndrm_uapi::wire::LSFG_DLL_PATH_MAX],
+        };
+        current.set_dll_path(&dll.to_string_lossy());
+        apply(current);
 
         Some(Self {
             engine,
             root,
             multiplier,
+            targets: Vec::new(),
+            source_frames: 0,
+            prepared: None,
         })
     }
 
@@ -464,6 +560,206 @@ impl Session {
     #[must_use]
     pub fn root(&self) -> *mut c_void {
         self.root
+    }
+}
+
+impl Session {
+    /// Make sure the engine is prepared for this geometry and that one render
+    /// target per generation exists.
+    ///
+    /// # Safety
+    /// `device` and `f` must belong to the real device this session was opened on.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn prepare(
+        &mut self,
+        device: crate::vk::VkDevice,
+        f: &crate::proxy::RealDevFns,
+        mem_props: &crate::vk::VkPhysicalDeviceMemoryProperties,
+        width: u32,
+        height: u32,
+        format: crate::vk::VkFormat,
+    ) -> bool {
+        let count = self.multiplier.saturating_sub(1);
+        if count == 0 {
+            return false;
+        }
+        // The engine writes into its target through an `rgba8` storage image, so
+        // the images it is given must be R,G,B,A in byte order even though the
+        // scan-out slots are B,G,R,A. See `engine_storage_format`.
+        let format = crate::vk::engine_storage_format(format);
+        let key = (width, height, format);
+        if self.prepared != Some(key) {
+            if unsafe { (self.engine.api.prepare)(self.root, width, height, format) } {
+                self.prepared = Some(key);
+            } else {
+                return false;
+            }
+        }
+        if self.targets.len() == count as usize
+            && self
+                .targets
+                .first()
+                .is_some_and(|t| t.width == width && t.height == height && t.format == format)
+        {
+            return true;
+        }
+        unsafe { self.drop_targets(device, f) };
+
+        let (
+            Some(create_image),
+            Some(get_reqs),
+            Some(alloc),
+            Some(bind),
+            Some(view_fn),
+            Some(free),
+        ) = (
+            f.create_image,
+            f.get_mem_reqs,
+            f.alloc_mem,
+            f.bind_mem,
+            f.create_image_view,
+            f.free_mem,
+        )
+        else {
+            return false;
+        };
+        let Some(destroy_image) = f.destroy_image else {
+            return false;
+        };
+
+        for _ in 0..count {
+            let mut ici: crate::vk::VkImageCreateInfo = unsafe { std::mem::zeroed() };
+            ici.sType = crate::vk::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            ici.imageType = crate::vk::VK_IMAGE_TYPE_2D;
+            ici.format = format;
+            ici.extent = crate::vk::VkExtent3D {
+                width,
+                height,
+                depth: 1,
+            };
+            ici.mipLevels = 1;
+            ici.arrayLayers = 1;
+            ici.samples = crate::vk::VK_SAMPLE_COUNT_1_BIT;
+            ici.tiling = crate::vk::VK_IMAGE_TILING_OPTIMAL;
+            // The engine no longer writes this image: it generates into its own
+            // image (a compute store into an image the engine did not create
+            // never lands on this driver) and copies the result here. So this is
+            // a transfer image only: filled by that copy, blitted out to a slot.
+            ici.usage = crate::vk::VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                | crate::vk::VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            ici.sharingMode = crate::vk::VK_SHARING_MODE_EXCLUSIVE;
+            ici.initialLayout = crate::vk::VK_IMAGE_LAYOUT_UNDEFINED;
+
+            let mut image: crate::vk::VkImage = 0;
+            if unsafe { create_image(device, &ici, std::ptr::null(), &mut image) }
+                != crate::vk::VK_SUCCESS
+            {
+                crate::logf!(gndrm_obf::obf!("lsfg: target image create failed"));
+                return false;
+            }
+
+            let mut reqs: crate::vk::VkMemoryRequirements = unsafe { std::mem::zeroed() };
+            unsafe { get_reqs(device, image, &mut reqs) };
+            let mut ai: crate::vk::VkMemoryAllocateInfo = unsafe { std::mem::zeroed() };
+            ai.sType = crate::vk::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            ai.allocationSize = reqs.size;
+            // A render target belongs in device-local memory. The lowest matching
+            // type is not always one: on this driver a host-visible system heap can
+            // come first, and a compute store into such an image never lands (the
+            // engine's generate pass writes nothing while a clear into the same
+            // image does). Prefer DEVICE_LOCAL and fall back to the first match.
+            let mut fallback = u32::MAX;
+            for i in 0..32 {
+                if reqs.memoryTypeBits & (1 << i) == 0 {
+                    continue;
+                }
+                if fallback == u32::MAX {
+                    fallback = i;
+                }
+                if mem_props.memoryTypes[i as usize].propertyFlags
+                    & crate::vk::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+                    != 0
+                {
+                    ai.memoryTypeIndex = i;
+                    break;
+                }
+            }
+            if ai.memoryTypeIndex == 0 && fallback != u32::MAX {
+                ai.memoryTypeIndex = fallback;
+            }
+            let mut mem: crate::vk::VkDeviceMemory = 0;
+            if unsafe { alloc(device, &ai, std::ptr::null(), &mut mem) } != crate::vk::VK_SUCCESS {
+                unsafe { destroy_image(device, image, std::ptr::null()) };
+                crate::logf!(gndrm_obf::obf!("lsfg: target memory alloc failed"));
+                return false;
+            }
+            if unsafe { bind(device, image, mem, 0) } != crate::vk::VK_SUCCESS {
+                unsafe { free(device, mem, std::ptr::null()) };
+                unsafe { destroy_image(device, image, std::ptr::null()) };
+                crate::logf!(gndrm_obf::obf!("lsfg: target bind failed"));
+                return false;
+            }
+
+            let mut vci: crate::vk::VkImageViewCreateInfo = unsafe { std::mem::zeroed() };
+            vci.sType = crate::vk::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            vci.image = image;
+            vci.viewType = crate::vk::VK_IMAGE_VIEW_TYPE_2D;
+            vci.format = format;
+            vci.subresourceRange.aspectMask = crate::vk::VK_IMAGE_ASPECT_COLOR_BIT;
+            vci.subresourceRange.levelCount = 1;
+            vci.subresourceRange.layerCount = 1;
+            let mut view: crate::vk::VkImageView = 0;
+            if unsafe { view_fn(device, &vci, std::ptr::null(), &mut view) }
+                != crate::vk::VK_SUCCESS
+            {
+                unsafe { free(device, mem, std::ptr::null()) };
+                unsafe { destroy_image(device, image, std::ptr::null()) };
+                crate::logf!(gndrm_obf::obf!("lsfg: target view create failed"));
+                return false;
+            }
+
+            self.targets.push(Target {
+                image,
+                view,
+                mem,
+                width,
+                height,
+                format,
+            });
+        }
+        crate::logf!(gndrm_obf::obf!(
+            "lsfg: {} target(s) {}x{} fmt {}",
+            self.targets.len(),
+            width,
+            height,
+            format
+        ));
+        true
+    }
+
+    /// Generations this source frame yields, and advance the frame counter.
+    pub fn plan(&mut self, capacity: u32) -> u32 {
+        let frames = self.source_frames;
+        self.source_frames = self.source_frames.wrapping_add(1);
+        unsafe { (self.engine.api.plan)(self.root, capacity, frames) }
+    }
+
+    #[must_use]
+    pub fn targets(&self) -> &[Target] {
+        &self.targets
+    }
+
+    unsafe fn drop_targets(&mut self, device: crate::vk::VkDevice, f: &crate::proxy::RealDevFns) {
+        for target in self.targets.drain(..) {
+            // No `vkDestroyImageView` in the device table; the view dies with the
+            // image, which the device destroys on teardown.
+            if let Some(destroy_image) = f.destroy_image {
+                unsafe { destroy_image(device, target.image, std::ptr::null()) };
+            }
+            if let Some(free) = f.free_mem {
+                unsafe { free(device, target.mem, std::ptr::null()) };
+            }
+        }
     }
 }
 

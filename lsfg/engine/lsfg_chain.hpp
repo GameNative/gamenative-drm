@@ -53,12 +53,17 @@ public:
         }
     }
 
-    [[nodiscard]] LsfgImage& Input(uint64_t frame_count) {
-        return frames[frame_count % frames.size()];
+    // The generate pass's own output image. The engine writes this and the
+    // embedder copies it into the caller's target: a compute store into an
+    // image the engine did not create itself never lands on this driver, while
+    // a store into one of the chain's own images does (proven by copying such
+    // an image out and finding real generated content in it).
+    [[nodiscard]] LsfgImage& Output() {
+        return output;
     }
 
-    [[nodiscard]] LsfgImage& FlowLevel(size_t level) {
-        return mipmaps.Output(level);
+    [[nodiscard]] LsfgImage& Input(uint64_t frame_count) {
+        return frames[frame_count % frames.size()];
     }
 
     [[nodiscard]] bool Valid() const {
@@ -71,6 +76,7 @@ private:
     VkDescriptorPool descriptor_pool{VK_NULL_HANDLE};
 
     LsfgImagePair frames;
+    LsfgImage output;
     LsfgMipmaps mipmaps;
     LsfgAlphaPasses alpha_passes;
     std::array<LsfgAlpha, LSFG_MIP_LEVELS> alpha;

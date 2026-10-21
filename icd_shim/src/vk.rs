@@ -185,6 +185,25 @@ pub const VK_COLOR_SPACE_HDR10_ST2084_EXT: VkColorSpaceKHR = 1_000_104_008;
 /// `VK_FORMAT_R8G8B8A8_SRGB`: the RGBA counterpart of the above.
 pub const VK_FORMAT_R8G8B8A8_SRGB: VkFormat = 43;
 
+/// The format a frame-generation image must have for a scan-out format.
+///
+/// The engine's shaders declare their storage image as `rgba8`, and their
+/// history images are sampled as `rgba8` too, so the images handed to the engine
+/// must be **R,G,B,A in byte order**. The scan-out pool is B8G8R8A8 (or
+/// A2B10G10R10), so passing the swapchain format straight through gives the
+/// engine a BGRA view of an `rgba8` storage image — undefined behaviour, and on
+/// this driver the generate dispatch then writes nothing at all (every generated
+/// destination buffer reads back as all-zero). Map the channel order and keep
+/// `vkCmdBlitImage` to do the swap back into the scan-out slot.
+#[must_use]
+pub const fn engine_storage_format(format: VkFormat) -> VkFormat {
+    match format {
+        VK_FORMAT_B8G8R8A8_UNORM => VK_FORMAT_R8G8B8A8_UNORM,
+        VK_FORMAT_A2B10G10R10_UNORM_PACK32 => VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+        other => other,
+    }
+}
+
 pub type VkImageType = i32;
 pub const VK_IMAGE_TYPE_2D: VkImageType = 1;
 
@@ -233,10 +252,23 @@ pub const VK_PRESENT_MODE_FIFO_RELAXED_KHR: VkPresentModeKHR = 3;
 pub type VkPipelineStageFlags = u32;
 pub const VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: VkPipelineStageFlags = 0x1;
 pub const VK_PIPELINE_STAGE_TRANSFER_BIT: VkPipelineStageFlags = 0x1000;
+pub const VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT: VkPipelineStageFlags = 0x400;
+pub const VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT: VkPipelineStageFlags = 0x800;
+pub const VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: VkPipelineStageFlags = 0x2000;
 pub const VK_PIPELINE_STAGE_ALL_COMMANDS_BIT: VkPipelineStageFlags = 0x10000;
 
 pub type VkAccessFlags = u32;
 pub const VK_ACCESS_TRANSFER_WRITE_BIT: VkAccessFlags = 0x1000;
+pub const VK_ACCESS_SHADER_READ_BIT: VkAccessFlags = 0x20;
+pub const VK_ACCESS_SHADER_WRITE_BIT: VkAccessFlags = 0x40;
+pub const VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT: VkAccessFlags = 0x100;
+
+/// `VkImageViewType`.
+pub const VK_IMAGE_VIEW_TYPE_2D: i32 = 0;
+/// `VkStructureType` for `VkImageViewCreateInfo`.
+pub const VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO: i32 = 14;
+/// `VkFilter`: the generation blit is 1:1, so the choice cannot change a pixel.
+pub const VK_FILTER_NEAREST: i32 = 0;
 
 pub type VkImageAspectFlags = u32;
 pub const VK_IMAGE_ASPECT_COLOR_BIT: VkImageAspectFlags = 0x1;
@@ -975,6 +1007,7 @@ pub type PFN_vkDestroyFence = unsafe extern "C" fn(VkDevice, VkFence, *const VkA
 pub type PFN_vkWaitForFences =
     unsafe extern "C" fn(VkDevice, u32, *const VkFence, VkBool32, u64) -> VkResult;
 pub type PFN_vkResetFences = unsafe extern "C" fn(VkDevice, u32, *const VkFence) -> VkResult;
+pub type PFN_vkGetFenceStatus = unsafe extern "C" fn(VkDevice, VkFence) -> VkResult;
 pub type PFN_vkCreateSemaphore = unsafe extern "C" fn(
     VkDevice,
     *const VkSemaphoreCreateInfo,

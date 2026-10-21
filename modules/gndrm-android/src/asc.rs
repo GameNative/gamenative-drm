@@ -1787,6 +1787,16 @@ pub fn serve_scanout(
                 if send_resp(fd, &note.encode(), None).is_err() {
                     return ScanoutChannel::Closed;
                 }
+                // The frame-generation settings ride with the subscription: a
+                // presenter that connects after the app configured itself (the
+                // usual case — the app pushes at launch, the shim connects when
+                // the guest first allocates) would otherwise wait for the next
+                // change the user makes.
+                if let Some(settings) = crate::lsfg_settings() {
+                    if send_resp(fd, &settings.encode(), None).is_err() {
+                        return ScanoutChannel::Closed;
+                    }
+                }
             }
             log_info!(
                 "{}",

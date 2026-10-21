@@ -64,8 +64,19 @@ void CopyPresentedFrame(VkCommandBuffer cmd, VkImage source, lsfg::LsfgImage& de
     region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     region.dstSubresource.layerCount = 1;
     region.extent = {extent.width, extent.height, 1};
-    vkd.CmdCopyImage(cmd, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination.Handle(),
-                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    // A copy does not convert formats, a blit does. The presented frame is in the
+    // scan-out order (B,G,R,A) and every chain image is R,G,B,A, so a copy would
+    // carry B into R and the whole chain — and the generated frame — would come
+    // out with red and blue exchanged.
+    VkImageBlit blit{};
+    blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blit.srcSubresource.layerCount = 1;
+    blit.srcOffsets[1] = {static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1};
+    blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blit.dstSubresource.layerCount = 1;
+    blit.dstOffsets[1] = {static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1};
+    vkd.CmdBlitImage(cmd, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination.Handle(),
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
 
     const VkImageMemoryBarrier after[] = {
         MakeTransitionBarrier(source, VK_ACCESS_TRANSFER_READ_BIT,
@@ -83,7 +94,50 @@ void CopyPresentedFrame(VkCommandBuffer cmd, VkImage source, lsfg::LsfgImage& de
     destination.SetLayout(VK_IMAGE_LAYOUT_GENERAL);
 }
 
+// Copy a chain image into the caller's target image.
+//
+// The generate pass writes its own image rather than the caller's: a compute
+// store into an image the engine did not create never lands on this driver
+// (the same dispatch into a chain-owned image does), so the result is copied
+// out here. Both are RGBA8, so this is a plain copy — no format conversion.
+void CopyChainImage(VkCommandBuffer cmd, lsfg::LsfgImage& source, VkImage target,
+               VkExtent2D extent) {
+    const VkImageMemoryBarrier before[] = {
+        MakeTransitionBarrier(source.Handle(), VK_ACCESS_SHADER_WRITE_BIT,
+                              VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+        MakeTransitionBarrier(target, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                              VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+    };
+    vkd.CmdPipelineBarrier(cmd,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2,
+                           before);
+
+    VkImageCopy region{};
+    region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.srcSubresource.layerCount = 1;
+    region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.dstSubresource.layerCount = 1;
+    region.extent = {extent.width, extent.height, 1};
+    vkd.CmdCopyImage(cmd, source.Handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    const VkImageMemoryBarrier after[] = {
+        MakeTransitionBarrier(source.Handle(), VK_ACCESS_TRANSFER_READ_BIT,
+                              VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                              VK_IMAGE_LAYOUT_GENERAL),
+        MakeTransitionBarrier(target, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
+    };
+    vkd.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           0, 0, nullptr, 0, nullptr, 2, after);
 }
+
+}  // namespace
 
 struct VkrLsfg {
     lsfg::Device device;
@@ -266,10 +320,17 @@ void vkr_lsfg_generate_into(VkrLsfg* lsfg, VkCommandBuffer cmd, uint32_t generat
     if (!lsfg || !lsfg->chain || !lsfg->chain->Valid()) return;
     if (target_index >= lsfg::LSFG_MAX_TARGETS) return;
 
+    // Generate into the chain's own image, then copy it out. The pass itself is
+    // fine: a dispatch into an image the engine created lands, and the same
+    // dispatch into the embedder's target image writes nothing at all on this
+    // driver (the target then stays at whatever it held, showing as black).
+    lsfg::LsfgImage& out = lsfg->chain->Output();
     lsfg->chain->SetTarget(lsfg->device, lsfg->last_generations, generation, target_index,
-                           target_view);
+                           out.View());
     lsfg->chain->DispatchGeneration(cmd, lsfg->last_count, lsfg->last_generations, generation,
-                                    target_index, target_image, VkExtent2D{width, height});
+                                    target_index, out.Handle(), VkExtent2D{width, height});
+    CopyChainImage(cmd, out, target_image, VkExtent2D{width, height});
+    (void)target_view;
 }
 
 void vkr_lsfg_forget_targets(VkrLsfg* lsfg) {
