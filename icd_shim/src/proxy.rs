@@ -929,6 +929,7 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) {
     if session.is_null() {
         return;
     }
+    unsafe { (*session).sync_refresh_rate() };
     let capacity = unsafe { (*session).multiplier() }.saturating_sub(1);
     if capacity == 0 {
         return;
@@ -955,6 +956,9 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) {
     // The engine reports no generation until its frame history exists, and that
     // history is built by `process` — so the capture runs on every presented
     // frame and only generation and blit are gated on the plan.
+    // The requested plan, not a panel-clamped one: the session's mode advertises
+    // the output rate this produces, so the compositor paces to it rather than
+    // discarding the extra frames.
     let planned = unsafe { (*session).plan(capacity) };
     let guest = unsafe { (*sc).guest_slots as usize };
     let total = unsafe { (*sc).slots.len() }.saturating_sub(guest);
