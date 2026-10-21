@@ -886,6 +886,78 @@ static int pass_openat(int dirfd, const char *path, int flags, mode_t mode)
     return (int)syscall(SYS_openat, dirfd, path, flags, mode);
 }
 
+/*
+ * wlroots' shm pairs (keymap, dma-buf format table) reopen a memfd read-only
+ * through /proc/self/fd and then fchmod it to 0. App SELinux may refuse
+ * either on a memfd; the shm then never exists and neither does the
+ * linux-dmabuf global. A refused reopen falls back to a dup, a refused
+ * fchmod is reported as done.
+ */
+static bool fd_is_memfd(int fd)
+{
+    char link[64], target[80];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, target, sizeof(target) - 1);
+    if (n <= 0)
+        return false;
+    target[n] = 0;
+    return strncmp(target, "/memfd:", 7) == 0;
+}
+
+static int proc_fd_number(const char *path)
+{
+    static const char prefix[] = "/proc/self/fd/";
+    if (!path || strncmp(path, prefix, sizeof(prefix) - 1) != 0)
+        return -1;
+    const char *p = path + sizeof(prefix) - 1;
+    if (!*p)
+        return -1;
+    int n = 0;
+    for (; *p; p++) {
+        if (*p < '0' || *p > '9')
+            return -1;
+        n = n * 10 + (*p - '0');
+    }
+    return n;
+}
+
+static int memfd_reopen_fallback(const char *path, int ret)
+{
+    static bool logged;
+    if (ret >= 0 || (errno != EACCES && errno != EPERM))
+        return ret;
+    int saved = errno;
+    int n = proc_fd_number(path);
+    if (n < 0 || !fd_is_memfd(n)) {
+        errno = saved;
+        return ret;
+    }
+    int d = (int)syscall(SYS_fcntl, n, F_DUPFD_CLOEXEC, 0);
+    if (d < 0) {
+        errno = saved;
+        return ret;
+    }
+    if (!logged) {
+        logged = true;
+        LOG("memfd reopen refused (errno %d); using a dup\n", saved);
+    }
+    return d;
+}
+
+int fchmod(int fd, mode_t mode)
+{
+    static bool logged;
+    int r = (int)syscall(SYS_fchmod, fd, mode);
+    if (r < 0 && (errno == EACCES || errno == EPERM) && fd_is_memfd(fd)) {
+        if (!logged) {
+            logged = true;
+            LOG("memfd fchmod refused (errno %d); ignored\n", errno);
+        }
+        return 0;
+    }
+    return r;
+}
+
 int open(const char *path, int flags, ...)
 {
     mode_t mode = 0;
@@ -897,7 +969,7 @@ int open(const char *path, int flags, ...)
     }
     if (should_intercept(path))
         return open_common(node_kind_for_path(path));
-    return pass_open(path, flags, mode);
+    return memfd_reopen_fallback(path, pass_open(path, flags, mode));
 }
 
 int open64(const char *path, int flags, ...)
@@ -911,7 +983,7 @@ int open64(const char *path, int flags, ...)
     }
     if (should_intercept(path))
         return open_common(node_kind_for_path(path));
-    return pass_open64(path, flags, mode);
+    return memfd_reopen_fallback(path, pass_open64(path, flags, mode));
 }
 
 int openat(int dirfd, const char *path, int flags, ...)
@@ -925,7 +997,7 @@ int openat(int dirfd, const char *path, int flags, ...)
     }
     if (should_intercept(path))
         return open_common(node_kind_for_path(path));
-    return pass_openat(dirfd, path, flags, mode);
+    return memfd_reopen_fallback(path, pass_openat(dirfd, path, flags, mode));
 }
 
 int close(int fd)

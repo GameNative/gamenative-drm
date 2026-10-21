@@ -22,6 +22,12 @@
 //!     shim-owned dma-buf swapchain. If both the open and the proxy's
 //!     prerequisites fail, the shim falls back to the payload freedreno
 //!     build so the guest never ends up driverless.
+//!   - with no /dev/kgsl-3d0 (a non-Adreno GPU) or GN_VKSHIM_SYSTEM_DRIVER=1,
+//!     every process (gamescope included) gets the Android system loader
+//!     (/system/lib64/libvulkan.so) driven through the WSI proxy. The proxy is
+//!     required there even without a surface: the outer loader stamps the
+//!     first word of every dispatchable handle, and the system loader keeps
+//!     its own per-handle data in that same word.
 //!
 //! GN_VKSHIM_NO_ADRENOTOOLS=1 skips the adrenotools path entirely;
 //! GN_VKSHIM_NO_PROXY=1 keeps the passthrough-or-fallback behavior without
@@ -67,6 +73,9 @@ pub fn vkshim_enabled() -> bool {
     }
 }
 
+pub mod divisor;
+pub mod export;
+pub mod placed;
 pub mod proxy;
 pub mod scanout;
 pub mod segv;
@@ -184,6 +193,177 @@ fn ext_list_has(props: &[VkExtensionProperties], name: &CStr) -> bool {
         let n = unsafe { CStr::from_ptr(p.extensionName.as_ptr()) };
         n == name
     })
+}
+
+const SYSTEM_LOADER: &CStr = c"/system/lib64/libvulkan.so";
+
+fn kgsl_present() -> bool {
+    // `GN_VKSHIM_ADRENO=1` pins the Adreno path where the device node cannot be
+    // the answer — a host build running the probe tests, or a system driver that
+    // must still be exercised behind the payload driver. Without it the node is
+    // the only evidence.
+    if std::env::var_os("GN_VKSHIM_ADRENO").is_some_and(|v| v == OsStr::new("1")) {
+        return true;
+    }
+    match std::fs::metadata("/dev/kgsl-3d0") {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+fn system_driver_forced() -> bool {
+    std::env::var_os("GN_VKSHIM_SYSTEM_DRIVER").is_some_and(|v| v == OsStr::new("1"))
+}
+
+/// gamescope runs as `linker64 .../bin/gamescope`, so comm alone can miss it.
+fn is_gamescope_binary() -> bool {
+    if is_gamescope_process() {
+        return true;
+    }
+    let cmdline = std::fs::read("/proc/self/cmdline").unwrap_or_default();
+    cmdline
+        .split(|&b| b == 0)
+        .take(2)
+        .any(|a| a.rsplit(|&b| b == b'/').next() == Some(b"gamescope".as_slice()))
+}
+
+/// Guest-only: an ICD (the container's wrapper) to drive instead of the system loader.
+fn wrapper_icd() -> Option<std::ffi::CString> {
+    if is_gamescope_binary() {
+        return None;
+    }
+    // An explicit path wins: it is what a launcher sets when it already knows the
+    // container's driver, and what a debug run overrides.
+    if let Some(p) = std::env::var_os("GN_VKSHIM_WRAPPER_ICD") {
+        if !p.is_empty() && std::fs::metadata(&p).is_ok() {
+            return std::ffi::CString::new(p.into_encoded_bytes()).ok();
+        }
+    }
+    // Otherwise the container answers for itself. A guest's working directory is
+    // inside its container (`imagefs/home/xuser-<SOURCE>_<APPID>/`), whose
+    // `.container` names the graphics driver the user picked; a wrapper driver is
+    // the one that has to be driven through its own ICD, and it always sits at
+    // `<imagefs>/usr/lib/libvulkan_wrapper.so`.
+    let path = wrapper_icd_beside(current_dir_container()?)?;
+    std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()
+}
+
+/// The ICD a wrapper driver provides inside this container, if it is there.
+fn wrapper_icd_beside(container: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    let text = std::fs::read_to_string(container.join(".container")).ok()?;
+    if !graphics_driver(&text)?
+        .to_ascii_lowercase()
+        .starts_with("wrapper")
+    {
+        return None;
+    }
+    // `<imagefs>/home/xuser-X` -> `<imagefs>/usr/lib/libvulkan_wrapper.so`
+    let icd = container
+        .parent()?
+        .parent()?
+        .join("usr/lib/libvulkan_wrapper.so");
+    icd.is_file().then_some(icd)
+}
+
+/// `"graphicsDriver":"wrapper-..."` from a container config, without a JSON parser.
+fn graphics_driver(text: &str) -> Option<&str> {
+    let key = "\"graphicsDriver\"";
+    let at = text.find(key)? + key.len();
+    let rest = text[at..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    (!rest[..end].is_empty()).then(|| &rest[..end])
+}
+
+/// The guest's container directory: the nearest ancestor holding `.container`.
+fn current_dir_container() -> Option<std::path::PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    for _ in 0..6 {
+        if dir.join(".container").is_file() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn negotiate_icd(h: *mut c_void) {
+    let sym = unsafe { libc::dlsym(h, c"vk_icdNegotiateLoaderICDInterfaceVersion".as_ptr()) };
+    if sym.is_null() {
+        return;
+    }
+    let f: unsafe extern "C" fn(*mut u32) -> VkResult = unsafe { std::mem::transmute(sym) };
+    let mut v: u32 = 5;
+    let r = unsafe { f(&mut v) };
+    logf!(gndrm_obf::obf!(
+        "wrapper icd: negotiated interface {v} ({r})"
+    ));
+}
+
+fn try_system_driver() {
+    let wrapper = wrapper_icd();
+    let path = wrapper.as_deref().unwrap_or(SYSTEM_LOADER);
+    let h = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    if h.is_null() && wrapper.is_some() {
+        logf!(gndrm_obf::obf!(
+            "wrapper icd: dlopen failed: {}",
+            dlerror_str()
+        ));
+        return;
+    }
+    if wrapper.is_some() {
+        logf!(gndrm_obf::obf!(
+            "wrapper icd: driving {}",
+            path.to_string_lossy()
+        ));
+        negotiate_icd(h);
+    }
+    if h.is_null() {
+        logf!(gndrm_obf::obf!(
+            "dlopen system vulkan loader failed: {}",
+            dlerror_str()
+        ));
+        return;
+    }
+    let Some(gipa) = (unsafe { resolve_gipa(h) }) else {
+        logf!(gndrm_obf::obf!(
+            "system vulkan loader exports no vkGetInstanceProcAddr"
+        ));
+        return;
+    };
+    if !proxy::device_prereqs(gipa) {
+        logf!(gndrm_obf::obf!("system vulkan driver fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode"));
+        return;
+    }
+    let gamescope = is_gamescope_binary();
+    if gamescope {
+        proxy::set_fake_robustness2(true);
+        export::set_enabled(true);
+    }
+    // The wrapper ICD emulates VK_EXT_map_memory_placed itself.
+    if wrapper.is_none() {
+        placed::set_enabled(true);
+    }
+    proxy::set_real_gipa(gipa);
+    proxy::set_real_handle(h);
+    unsafe {
+        DRIVER.proxy_active = true;
+        DRIVER.handle = h;
+    }
+    if gamescope {
+        logf!(gndrm_obf::obf!(
+            "gamescope process: using system vulkan driver via WSI proxy [shim {}]",
+            SHIM_BUILD
+        ));
+    } else {
+        logf!(gndrm_obf::obf!(
+            "guest process: using system vulkan driver via WSI proxy [shim {}]",
+            SHIM_BUILD
+        ));
+    }
 }
 
 fn try_adrenotools() {
@@ -340,27 +520,21 @@ fn init_once() {
     // before any driver code runs, so it sits in front of wine's SEH handler.
     #[cfg(feature = "segv_dump")]
     crate::segv::install();
-    if is_gamescope_process() {
-        let h = unsafe {
-            libc::dlopen(
-                c"libvulkan_freedreno.so".as_ptr(),
-                libc::RTLD_NOW | libc::RTLD_LOCAL,
-            )
-        };
-        logf!(gndrm_obf::obf!(
-            "gamescope process: payload freedreno {}",
-            if h.is_null() {
-                dlerror_str()
-            } else {
-                "loaded".into()
-            }
-        ));
-        unsafe { DRIVER.handle = h };
-    } else {
-        if std::env::var_os("GN_VKSHIM_NO_ADRENOTOOLS").is_none() {
-            try_adrenotools();
+    let kgsl = kgsl_present();
+    if !kgsl || system_driver_forced() {
+        if kgsl {
+            logf!(gndrm_obf::obf!(
+                "GN_VKSHIM_SYSTEM_DRIVER=1: using the system vulkan loader"
+            ));
+        } else {
+            logf!(gndrm_obf::obf!(
+                "no /dev/kgsl-3d0: using the system vulkan loader"
+            ));
         }
-        if unsafe { DRIVER.handle }.is_null() {
+        try_system_driver();
+    }
+    if kgsl && unsafe { DRIVER.handle }.is_null() {
+        if is_gamescope_process() {
             let h = unsafe {
                 libc::dlopen(
                     c"libvulkan_freedreno.so".as_ptr(),
@@ -368,7 +542,7 @@ fn init_once() {
                 )
             };
             logf!(gndrm_obf::obf!(
-                "guest process: falling back to payload freedreno {}",
+                "gamescope process: payload freedreno {}",
                 if h.is_null() {
                     dlerror_str()
                 } else {
@@ -376,6 +550,27 @@ fn init_once() {
                 }
             ));
             unsafe { DRIVER.handle = h };
+        } else {
+            if std::env::var_os("GN_VKSHIM_NO_ADRENOTOOLS").is_none() {
+                try_adrenotools();
+            }
+            if unsafe { DRIVER.handle }.is_null() {
+                let h = unsafe {
+                    libc::dlopen(
+                        c"libvulkan_freedreno.so".as_ptr(),
+                        libc::RTLD_NOW | libc::RTLD_LOCAL,
+                    )
+                };
+                logf!(gndrm_obf::obf!(
+                    "guest process: falling back to payload freedreno {}",
+                    if h.is_null() {
+                        dlerror_str()
+                    } else {
+                        "loaded".into()
+                    }
+                ));
+                unsafe { DRIVER.handle = h };
+            }
         }
     }
     let handle = unsafe { DRIVER.handle };
@@ -483,4 +678,37 @@ pub unsafe extern "C" fn vk_icdGetPhysicalDeviceProcAddr(
     };
     proxy::note_instance_miss(name, raw.is_none());
     proxy::serve_unlisted(name, raw, proxy::DispatchCtx::PhysicalDevice)
+}
+
+#[cfg(test)]
+mod wrapper_detect_tests {
+    use super::graphics_driver;
+
+    #[test]
+    fn reads_the_driver_name_from_a_container_config() {
+        let text = r#"{"id":"x","graphicsDriver":"wrapper-turnip","lastUsed":3}"#;
+        assert_eq!(graphics_driver(text), Some("wrapper-turnip"));
+        // Whitespace on either side of the colon is what a pretty-printed config
+        // would carry; the guest's file is one line but this must not care.
+        let text = r#"{ "graphicsDriver" : "wrapper" , "a":1 }"#;
+        assert_eq!(graphics_driver(text), Some("wrapper"));
+    }
+
+    #[test]
+    fn a_native_driver_is_not_a_wrapper() {
+        let text = r#"{"graphicsDriver":"turnip"}"#;
+        assert_eq!(graphics_driver(text), Some("turnip"));
+        assert!(!graphics_driver(text)
+            .unwrap()
+            .to_ascii_lowercase()
+            .starts_with("wrapper"));
+    }
+
+    #[test]
+    fn an_absent_or_empty_field_is_none() {
+        assert_eq!(graphics_driver(r#"{"id":"x"}"#), None);
+        assert_eq!(graphics_driver(r#"{"graphicsDriver":""}"#), None);
+        assert_eq!(graphics_driver(r#"{"graphicsDriver":"#), None);
+        assert_eq!(graphics_driver(""), None);
+    }
 }

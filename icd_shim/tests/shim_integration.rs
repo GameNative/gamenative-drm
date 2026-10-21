@@ -54,6 +54,9 @@ fn run_probe_args(s: &Scenario, extra: &[&str]) -> (i32, String, String) {
     // These scenarios assert on the shim's `gn-vkshim:` diagnostics, which are
     // gated off by default; turn the gate on for the child under test.
     cmd.env("GNDRM_LOG_VKSHIM", "1");
+    // The probe runs on a host with no Adreno device node: pin the payload-driver
+    // path so the tests exercise what this suite is about, not the system loader.
+    cmd.env("GN_VKSHIM_ADRENO", "1");
     for (k, v) in &s.env {
         cmd.env(k, v);
     }
