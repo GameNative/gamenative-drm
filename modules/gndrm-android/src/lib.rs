@@ -99,6 +99,7 @@ static LSFG_SETTINGS: Mutex<LsfgConfig> = Mutex::new(LsfgConfig {
     performance: 0,
     fps_limit: 0,
     dll: [0; gndrm_uapi::wire::LSFG_DLL_PATH_MAX],
+    refresh_mhz: 0,
 });
 
 /// Whether the app has pushed any settings this process. A push of `enabled = 0`
@@ -108,9 +109,20 @@ static LSFG_CONFIGURED: AtomicBool = AtomicBool::new(false);
 
 /// The settings the shim should use, or `None` when the app never set any.
 pub(crate) fn lsfg_settings() -> Option<LsfgConfig> {
-    LSFG_CONFIGURED
-        .load(Ordering::Relaxed)
-        .then(|| *LSFG_SETTINGS.lock().unwrap_or_else(|e| e.into_inner()))
+    let mut settings = *LSFG_SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
+    // The panel rate is the daemon's, not the app's: it arrives through
+    // `nativeSetPanelRefreshHz` before the session starts, and the presenter needs
+    // it to know what the display can afford.
+    // The rate the session presents at, not the panel's: the engine clamps its
+    // generations to `floor(refresh / source) - 1`, so handing it the panel rate
+    // caps the output at the panel and discards every generated frame above it.
+    let panel_mhz = PANEL_REFRESH_MHZ.load(Ordering::Relaxed);
+    let output_mhz = settings
+        .fps_limit
+        .saturating_mul(settings.multiplier)
+        .saturating_mul(1000);
+    settings.refresh_mhz = panel_mhz.max(output_mhz);
+    LSFG_CONFIGURED.load(Ordering::Relaxed).then_some(settings)
 }
 
 /// `GameNativeDrm.nativeSetLsfgConfig(enabled, multiplier, flowPerMille, performance, fpsLimit)`.
@@ -127,6 +139,7 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetLsfgCo
     performance: jint,
     fps_limit: jint,
     dll: JString,
+    refresh_hz: jint,
 ) {
     // Read the string before the guarded section: `JNIEnv` is not unwind-safe.
     let dll_path = env
@@ -143,6 +156,22 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetLsfgCo
         // The presenter cannot read the container's environment, so the path of
         // the DLL it has to read the shaders from rides with the settings.
         settings.set_dll_path(&dll_path);
+        // The app reports the panel rate with the settings: the presenter needs
+        // it to clamp what the display can show, and the daemon's own copy is
+        // only set when the app happens to call the panel-rate setter first.
+        settings.refresh_mhz = if refresh_hz > 0 {
+            refresh_hz as u32 * 1000
+        } else {
+            PANEL_REFRESH_MHZ.load(Ordering::Relaxed)
+        };
+        // Raised to the session's output rate when frame generation is on; the
+        // panel value alone would clamp the plan to the panel.
+        settings.refresh_mhz = settings.refresh_mhz.max(
+            settings
+                .fps_limit
+                .saturating_mul(settings.multiplier)
+                .saturating_mul(1000),
+        );
         LSFG_CONFIGURED.store(true, Ordering::Relaxed);
         // Wake a subscribed shim: it reads the pushed settings on its next
         // release, so a change made in the Quick Menu lands within a frame.
@@ -874,7 +903,22 @@ fn start(
         height: panel_h,
         mm_width: 0,
         mm_height: 0,
-        refresh_mhz: PANEL_REFRESH_MHZ.load(Ordering::Relaxed),
+        // Frame generation presents more frames than the panel accepts, and
+        // gamescope paces its own paint loop off this mode rate: advertising only
+        // the panel's rate caps the output at the panel and discards every
+        // generated frame above it. The mode therefore carries the rate the
+        // session is asked to produce, floored at the panel's own.
+        refresh_mhz: {
+            let panel_hz = PANEL_REFRESH_MHZ.load(Ordering::Relaxed);
+            let output_hz = lsfg_settings().map_or(0, |s| {
+                s.refresh_mhz.max(
+                    s.fps_limit
+                        .saturating_mul(s.multiplier)
+                        .saturating_mul(1000),
+                )
+            });
+            panel_hz.max(output_hz)
+        },
     };
     let fds = Arc::new(Mutex::new(AcceptedFds {
         rpc: -1,
@@ -1250,7 +1294,14 @@ fn set_panel_refresh_hz(refresh_hz: jint) {
         );
         return;
     }
+    eprintln!("gndrm-daemon: panel refresh {} Hz", refresh_hz);
     PANEL_REFRESH_MHZ.store(refresh_hz as u32 * 1000, Ordering::Relaxed);
+    // The presenter paces against this: a session that started before the mode was
+    // known would otherwise keep an unclamped plan until the user changes a setting.
+    LSFG_SETTINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .refresh_mhz = refresh_hz as u32 * 1000;
 }
 
 /// `GameNativeDrm.nativeReshadeSetEffect(name)` — load and enable a ReShade

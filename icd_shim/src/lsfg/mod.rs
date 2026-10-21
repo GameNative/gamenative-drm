@@ -213,17 +213,6 @@ unsafe fn resolve_one<T>(handle: *mut c_void, name: &str) -> Option<T> {
     Some(unsafe { std::mem::transmute_copy::<*mut c_void, T>(&ptr) })
 }
 
-/// Environment names this backend reads. Container env, like `GNDRM_HDR`: they
-/// reach the guest process the ICD runs in, not the app.
-const MULTIPLIER_ENV: &str = "GNDRM_LSFG";
-const DLL_ENV: &str = "GNDRM_LSFG_DLL";
-const CACHE_ENV: &str = "GNDRM_LSFG_CACHE";
-const FLOW_ENV: &str = "GNDRM_LSFG_FLOW";
-/// The user's source cap, carried in the environment for the launch path: at
-/// start the app has not pushed anything through the daemon yet, and without this
-/// the session would run unpaced until the first Quick Menu change.
-const CAP_ENV: &str = "GNDRM_LSFG_FPS_LIMIT";
-
 /// The settings in force, kept live.
 ///
 /// The app can change the multiplier or the source cap mid-session; the daemon
@@ -236,6 +225,7 @@ struct Live {
     multiplier: std::sync::atomic::AtomicU32,
     flow_per_mille: std::sync::atomic::AtomicU32,
     fps_limit: std::sync::atomic::AtomicU32,
+    refresh_mhz: std::sync::atomic::AtomicU32,
 }
 
 static LIVE: Live = Live {
@@ -243,6 +233,7 @@ static LIVE: Live = Live {
     multiplier: std::sync::atomic::AtomicU32::new(0),
     flow_per_mille: std::sync::atomic::AtomicU32::new(0),
     fps_limit: std::sync::atomic::AtomicU32::new(0),
+    refresh_mhz: std::sync::atomic::AtomicU32::new(0),
 };
 
 /// The last settings applied to this process, kept because a session opened
@@ -299,13 +290,15 @@ pub fn apply(config: gndrm_uapi::wire::LsfgConfig) {
     LIVE.multiplier.store(config.multiplier, Relaxed);
     LIVE.flow_per_mille.store(config.flow_per_mille, Relaxed);
     LIVE.fps_limit.store(config.fps_limit, Relaxed);
+    LIVE.refresh_mhz.store(config.refresh_mhz, Relaxed);
     let now = (config.enabled != 0, config.multiplier, config.fps_limit);
     if previous != now {
         crate::logf!(gndrm_obf::obf!(
-            "lsfg: settings enabled={} multiplier={} source_cap={}",
+            "lsfg: settings enabled={} multiplier={} source_cap={} refresh_hz={}",
             now.0,
             now.1,
-            now.2
+            now.2,
+            refresh_hz()
         ));
     }
 }
@@ -345,7 +338,22 @@ pub fn grid() -> (u32, u32) {
     if !enabled || cap == 0 {
         return (0, 0);
     }
-    (cap, cap.saturating_mul(multiplier.max(1)))
+    let requested = cap.saturating_mul(multiplier.max(1));
+    let refresh = refresh_hz();
+    let output = if refresh == 0 {
+        requested
+    } else {
+        requested.min(refresh)
+    };
+    (cap, output)
+}
+
+/// The panel's refresh in whole hertz, or 0 when the daemon has not reported it.
+#[must_use]
+pub fn refresh_hz() -> u32 {
+    LIVE.refresh_mhz
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .div_euclid(1000)
 }
 
 /// One generation's render target: the engine writes here, and the shim blits the
@@ -374,6 +382,8 @@ pub struct Session {
     root: *mut c_void,
     multiplier: u32,
     targets: Vec<Target>,
+    /// The panel rate last handed to the engine, in hertz.
+    refresh_rate: f32,
     /// Source frames handed to the engine; the pacer uses it to count warm-up.
     source_frames: u64,
     /// Geometry the engine was last prepared for.
@@ -421,16 +431,9 @@ impl Session {
                 return None;
             }
         }
-        let multiplier = match from_daemon.map(|s| s.multiplier).or_else(|| {
-            std::env::var(MULTIPLIER_ENV)
-                .ok()
-                .and_then(|v| v.parse().ok())
-        }) {
-            Some(multiplier) => multiplier,
-            None => {
-                crate::logf!(gndrm_obf::obf!("lsfg: no settings (daemon and env empty)"));
-                return None;
-            }
+        let Some(multiplier) = from_daemon.map(|s| s.multiplier) else {
+            crate::logf!(gndrm_obf::obf!("lsfg: the app has sent no settings"));
+            return None;
         };
         if multiplier < 2 {
             return None;
@@ -438,17 +441,12 @@ impl Session {
         // The settings carry the container's DLL path: this process is the
         // app's, where the container's environment never arrives. The variable
         // stays as the guest-side answer for a launch that predates them.
-        let dll = from_daemon
-            .as_ref()
-            .and_then(|c| {
-                c.dll_path()
-                    .map(|p| std::path::PathBuf::from(p.to_string_lossy().into_owned()))
-            })
-            .or_else(|| std::env::var(DLL_ENV).ok().map(std::path::PathBuf::from));
+        let dll = from_daemon.as_ref().and_then(|c| {
+            c.dll_path()
+                .map(|p| std::path::PathBuf::from(p.to_string_lossy().into_owned()))
+        });
         let Some(dll) = dll else {
-            crate::logf!(gndrm_obf::obf!(
-                "lsfg: no Lossless.dll path from the app or {DLL_ENV}"
-            ));
+            crate::logf!(gndrm_obf::obf!("lsfg: no Lossless.dll path from the app"));
             return None;
         };
         if !dll.is_file() {
@@ -470,16 +468,13 @@ impl Session {
         // Cache beside the DLL unless the caller named one, and keyed by the
         // variant so a device that cannot run fp16 never invalidates the fp32
         // build (and vice versa).
-        let cache = std::env::var(CACHE_ENV)
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                let name = if fp16 {
-                    "lossless_fp16.lsfgc"
-                } else {
-                    "lossless_fp32.lsfgc"
-                };
-                dll.with_file_name(name)
-            });
+        // Beside the DLL, keyed by the variant so a device that cannot run fp16
+        // never invalidates the fp32 build (and vice versa).
+        let cache = dll.with_file_name(if fp16 {
+            "lossless_fp16.lsfgc"
+        } else {
+            "lossless_fp32.lsfgc"
+        });
         let status = gndrm_lsfg::ensure_cache(&dll, &cache, fp16);
         if status != gndrm_lsfg::LsfgStatus::Ok {
             crate::logf!(gndrm_obf::obf!(
@@ -503,14 +498,15 @@ impl Session {
         let flow = from_daemon
             .filter(|s| s.flow_per_mille != 0)
             .map(|s| s.flow_per_mille as f32 / 1000.0)
-            .or_else(|| std::env::var(FLOW_ENV).ok().and_then(|v| v.parse().ok()))
             .unwrap_or(0.8)
             .clamp(0.25, 1.0);
-        let source_cap = from_daemon
-            .map(|s| s.fps_limit)
-            .or_else(|| std::env::var(CAP_ENV).ok().and_then(|v| v.parse().ok()))
-            .unwrap_or(0);
-        unsafe { (engine.api.configure)(root, multiplier, 0, flow, 0.0) };
+        let source_cap = from_daemon.map(|s| s.fps_limit).unwrap_or(0);
+        // The panel rate is what lets the pacer clamp: without it the engine
+        // plans `multiplier` generations whatever the display can show.
+        let refresh = from_daemon
+            .map(|s| s.refresh_mhz as f32 / 1000.0)
+            .unwrap_or(0.0);
+        unsafe { (engine.api.configure)(root, multiplier, 0, flow, refresh) };
         let (source, output) = grid();
         crate::logf!(gndrm_obf::obf!(
             "lsfg: ready multiplier={} fp16={} source={} output={} cache={}",
@@ -530,6 +526,7 @@ impl Session {
             performance: from_daemon.map_or(0, |s| s.performance),
             fps_limit: source_cap,
             dll: [0; gndrm_uapi::wire::LSFG_DLL_PATH_MAX],
+            refresh_mhz: (refresh * 1000.0) as u32,
         };
         current.set_dll_path(&dll.to_string_lossy());
         apply(current);
@@ -539,6 +536,7 @@ impl Session {
             root,
             multiplier,
             targets: Vec::new(),
+            refresh_rate: refresh,
             source_frames: 0,
             prepared: None,
         })
@@ -548,6 +546,19 @@ impl Session {
     #[must_use]
     pub fn multiplier(&self) -> u32 {
         self.multiplier
+    }
+
+    /// Follow a change in the panel rate.
+    ///
+    /// The app reports it before the session starts, but a display mode change can
+    /// arrive later; the engine's pacer is the only consumer and it reads the
+    /// value on every plan.
+    pub fn sync_refresh_rate(&self) {
+        let hz = refresh_hz() as f32;
+        if (hz - self.refresh_rate).abs() < 0.5 {
+            return;
+        }
+        unsafe { (self.engine.api.set_refresh_rate)(self.root, hz) };
     }
 
     /// The engine's entry points, for the swapchain and present paths.

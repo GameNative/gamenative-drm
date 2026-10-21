@@ -569,6 +569,10 @@ pub struct LsfgConfig {
     /// with the settings because the presenter runs in the app's process, where
     /// the container's environment is not present.
     pub dll: [u8; LSFG_DLL_PATH_MAX],
+    /// The panel's refresh in millihertz. The engine paces against it and clamps
+    /// its generations to what the display can afford (`floor(refresh/source)`
+    /// frames per source frame); zero means unknown, which leaves it unclamped.
+    pub refresh_mhz: u32,
 }
 
 impl Default for LsfgConfig {
@@ -580,12 +584,13 @@ impl Default for LsfgConfig {
             performance: 0,
             fps_limit: 0,
             dll: [0; LSFG_DLL_PATH_MAX],
+            refresh_mhz: 0,
         }
     }
 }
 
 impl LsfgConfig {
-    pub const LEN: usize = 24 + LSFG_DLL_PATH_MAX;
+    pub const LEN: usize = 24 + LSFG_DLL_PATH_MAX + 4;
 
     /// The DLL path as a string, or `None` when it is empty.
     #[must_use]
@@ -627,7 +632,8 @@ impl LsfgConfig {
         b[12..16].copy_from_slice(&self.flow_per_mille.to_le_bytes());
         b[16..20].copy_from_slice(&self.performance.to_le_bytes());
         b[20..24].copy_from_slice(&self.fps_limit.to_le_bytes());
-        b[24..].copy_from_slice(&self.dll);
+        b[24..24 + LSFG_DLL_PATH_MAX].copy_from_slice(&self.dll);
+        b[24 + LSFG_DLL_PATH_MAX..].copy_from_slice(&self.refresh_mhz.to_le_bytes());
         b
     }
 
@@ -645,9 +651,10 @@ impl LsfgConfig {
             fps_limit: u32::from_le_bytes(b[20..24].try_into().ok()?),
             dll: {
                 let mut dll = [0u8; LSFG_DLL_PATH_MAX];
-                dll.copy_from_slice(&b[24..]);
+                dll.copy_from_slice(&b[24..24 + LSFG_DLL_PATH_MAX]);
                 dll
             },
+            refresh_mhz: u32::from_le_bytes(b[24 + LSFG_DLL_PATH_MAX..].try_into().ok()?),
         })
     }
 }
