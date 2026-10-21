@@ -239,17 +239,8 @@ fn wrapper_icd() -> Option<std::ffi::CString> {
             return std::ffi::CString::new(p.into_encoded_bytes()).ok();
         }
     }
-    // Otherwise the container answers for itself. A guest's working directory is
-    // inside its container (`imagefs/home/xuser-<SOURCE>_<APPID>/`), whose
-    // `.container` names the graphics driver the user picked; a wrapper driver is
-    // the one that has to be driven through its own ICD, and it always sits at
-    // `<imagefs>/usr/lib/libvulkan_wrapper.so`.
-    let path = wrapper_icd_beside(current_dir_container()?)?;
-    std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()
-}
-
-/// The ICD a wrapper driver provides inside this container, if it is there.
-fn wrapper_icd_beside(container: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    let prefix = std::env::var_os("WINEPREFIX")?;
+    let container = std::path::Path::new(&prefix).parent()?;
     let text = std::fs::read_to_string(container.join(".container")).ok()?;
     if !graphics_driver(&text)?
         .to_ascii_lowercase()
@@ -257,12 +248,28 @@ fn wrapper_icd_beside(container: std::path::PathBuf) -> Option<std::path::PathBu
     {
         return None;
     }
-    // `<imagefs>/home/xuser-X` -> `<imagefs>/usr/lib/libvulkan_wrapper.so`
-    let icd = container
-        .parent()?
-        .parent()?
-        .join("usr/lib/libvulkan_wrapper.so");
-    icd.is_file().then_some(icd)
+    let icd = wrapper_icd_for(container)?;
+    if !icd.is_file() {
+        return None;
+    }
+    logf!(gndrm_obf::obf!(
+        "wrapper icd: {} from {}",
+        icd.display(),
+        container.display()
+    ));
+    std::ffi::CString::new(icd.into_os_string().into_encoded_bytes()).ok()
+}
+
+/// `<imagefs>/usr/lib/libvulkan_wrapper.so` for a container in `<imagefs>/home`;
+/// a container in `imagefs_shared/home` uses the sibling `imagefs`.
+fn wrapper_icd_for(container: &std::path::Path) -> Option<std::path::PathBuf> {
+    let root = container.parent()?.parent()?;
+    let root = if root.file_name()? == "imagefs_shared" {
+        root.with_file_name("imagefs")
+    } else {
+        root.to_path_buf()
+    };
+    Some(root.join("usr/lib/libvulkan_wrapper.so"))
 }
 
 /// `"graphicsDriver":"wrapper-..."` from a container config, without a JSON parser.
@@ -274,20 +281,6 @@ fn graphics_driver(text: &str) -> Option<&str> {
     let rest = rest.strip_prefix('"')?;
     let end = rest.find('"')?;
     (!rest[..end].is_empty()).then(|| &rest[..end])
-}
-
-/// The guest's container directory: the nearest ancestor holding `.container`.
-fn current_dir_container() -> Option<std::path::PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    for _ in 0..6 {
-        if dir.join(".container").is_file() {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    None
 }
 
 fn negotiate_icd(h: *mut c_void) {
@@ -682,7 +675,26 @@ pub unsafe extern "C" fn vk_icdGetPhysicalDeviceProcAddr(
 
 #[cfg(test)]
 mod wrapper_detect_tests {
-    use super::graphics_driver;
+    use super::{graphics_driver, wrapper_icd_for};
+    use std::path::{Path, PathBuf};
+
+    const FILES: &str = "/data/user/0/app.gamenative/files";
+
+    fn wrapper_lib() -> PathBuf {
+        PathBuf::from(format!("{FILES}/imagefs/usr/lib/libvulkan_wrapper.so"))
+    }
+
+    #[test]
+    fn a_container_under_imagefs_home_uses_its_own_imagefs() {
+        let container = format!("{FILES}/imagefs/home/xuser-STEAM_1145350");
+        assert_eq!(wrapper_icd_for(Path::new(&container)), Some(wrapper_lib()));
+    }
+
+    #[test]
+    fn a_shared_container_uses_the_sibling_imagefs() {
+        let container = format!("{FILES}/imagefs_shared/home/xuser-STEAM_1145350");
+        assert_eq!(wrapper_icd_for(Path::new(&container)), Some(wrapper_lib()));
+    }
 
     #[test]
     fn reads_the_driver_name_from_a_container_config() {
