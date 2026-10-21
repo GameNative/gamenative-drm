@@ -331,21 +331,16 @@ pub fn source_cap() -> Option<u32> {
 ///
 /// The user's cap is the **source** rate: the guest renders that many frames, and
 /// the presenter presents `cap × multiplier` by inserting generated frames
-/// between them. `(0, 0)` when generation is off or uncapped.
+/// between them. Not clamped to the panel: the grid must hold every frame of a
+/// source period or the queue grows without bound; what the panel cannot show,
+/// the compositor drops. `(0, 0)` when generation is off or uncapped.
 #[must_use]
 pub fn grid() -> (u32, u32) {
     let (enabled, multiplier, cap) = live();
     if !enabled || cap == 0 {
         return (0, 0);
     }
-    let requested = cap.saturating_mul(multiplier.max(1));
-    let refresh = refresh_hz();
-    let output = if refresh == 0 {
-        requested
-    } else {
-        requested.min(refresh)
-    };
-    (cap, output)
+    (cap, cap.saturating_mul(multiplier.max(1)))
 }
 
 /// The panel's refresh in whole hertz, or 0 when the daemon has not reported it.
@@ -553,12 +548,13 @@ impl Session {
     /// The app reports it before the session starts, but a display mode change can
     /// arrive later; the engine's pacer is the only consumer and it reads the
     /// value on every plan.
-    pub fn sync_refresh_rate(&self) {
+    pub fn sync_refresh_rate(&mut self) {
         let hz = refresh_hz() as f32;
         if (hz - self.refresh_rate).abs() < 0.5 {
             return;
         }
         unsafe { (self.engine.api.set_refresh_rate)(self.root, hz) };
+        self.refresh_rate = hz;
     }
 
     /// The engine's entry points, for the swapchain and present paths.
@@ -758,6 +754,15 @@ impl Session {
     #[must_use]
     pub fn targets(&self) -> &[Target] {
         &self.targets
+    }
+
+    /// Free the device resources this session holds, before it is dropped: the
+    /// engine context goes in `Drop`, but the targets need the device's table.
+    ///
+    /// # Safety
+    /// `device` and `f` must belong to the real device this session was opened on.
+    pub unsafe fn close(&mut self, device: crate::vk::VkDevice, f: &crate::proxy::RealDevFns) {
+        unsafe { self.drop_targets(device, f) };
     }
 
     unsafe fn drop_targets(&mut self, device: crate::vk::VkDevice, f: &crate::proxy::RealDevFns) {
