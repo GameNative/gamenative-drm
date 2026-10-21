@@ -111,21 +111,13 @@ static LSFG_CONFIGURED: AtomicBool = AtomicBool::new(false);
 pub(crate) fn lsfg_settings() -> Option<LsfgConfig> {
     let mut settings = *LSFG_SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
     // The panel rate is the daemon's, not the app's: it arrives through
-    // `nativeSetPanelRefreshHz` before the session starts, and the presenter needs
-    // it to know what the display can afford.
-    // The rate the session presents at, not the panel's: the engine clamps its
-    // generations to `floor(refresh / source) - 1`, so handing it the panel rate
-    // caps the output at the panel and discards every generated frame above it.
-    let panel_mhz = PANEL_REFRESH_MHZ.load(Ordering::Relaxed);
-    let output_mhz = settings
-        .fps_limit
-        .saturating_mul(settings.multiplier)
-        .saturating_mul(1000);
-    settings.refresh_mhz = panel_mhz.max(output_mhz);
+    // `nativeSetPanelRefreshHz` before the session starts. The presenter paces on
+    // its own grid and only reports against this.
+    settings.refresh_mhz = PANEL_REFRESH_MHZ.load(Ordering::Relaxed);
     LSFG_CONFIGURED.load(Ordering::Relaxed).then_some(settings)
 }
 
-/// `GameNativeDrm.nativeSetLsfgConfig(enabled, multiplier, flowPerMille, performance, fpsLimit)`.
+/// `GameNativeDrm.nativeSetLsfgConfig(enabled, multiplier, flowPerMille, performance, fpsLimit, dllPath)`.
 ///
 /// Called by the app before or during a session; the value is read when the
 /// shim asks, so a change reaches the next device the guest creates.
@@ -136,10 +128,9 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetLsfgCo
     enabled: jboolean,
     multiplier: jint,
     flow_per_mille: jint,
-    performance: jint,
+    performance: jboolean,
     fps_limit: jint,
     dll: JString,
-    refresh_hz: jint,
 ) {
     // Read the string before the guarded section: `JNIEnv` is not unwind-safe.
     let dll_path = env
@@ -156,22 +147,6 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetLsfgCo
         // The presenter cannot read the container's environment, so the path of
         // the DLL it has to read the shaders from rides with the settings.
         settings.set_dll_path(&dll_path);
-        // The app reports the panel rate with the settings: the presenter needs
-        // it to clamp what the display can show, and the daemon's own copy is
-        // only set when the app happens to call the panel-rate setter first.
-        settings.refresh_mhz = if refresh_hz > 0 {
-            refresh_hz as u32 * 1000
-        } else {
-            PANEL_REFRESH_MHZ.load(Ordering::Relaxed)
-        };
-        // Raised to the session's output rate when frame generation is on; the
-        // panel value alone would clamp the plan to the panel.
-        settings.refresh_mhz = settings.refresh_mhz.max(
-            settings
-                .fps_limit
-                .saturating_mul(settings.multiplier)
-                .saturating_mul(1000),
-        );
         LSFG_CONFIGURED.store(true, Ordering::Relaxed);
         // Wake a subscribed shim: it reads the pushed settings on its next
         // release, so a change made in the Quick Menu lands within a frame.
