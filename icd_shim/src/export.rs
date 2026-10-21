@@ -105,8 +105,102 @@ fn four_bpp(format: VkFormat) -> bool {
     matches!(format, 37 | 43 | 44 | 50 | 58 | 64)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::c_void;
+    use std::ptr;
+    use std::sync::Mutex;
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    #[repr(C)]
+    struct Link {
+        s_type: VkStructureType,
+        p_next: *const c_void,
+        tag: u32,
+    }
+
+    fn link(s_type: VkStructureType, tag: u32, next: *const c_void) -> Link {
+        Link {
+            s_type,
+            p_next: next,
+            tag,
+        }
+    }
+
+    #[test]
+    fn four_bpp_accepts_the_8_bit_formats_and_refuses_wider_ones() {
+        // The formats the scan-out pool can serve: 32-bit-per-pixel colour.
+        for f in [37, 43, 44, 50, 58, 64] {
+            assert!(
+                four_bpp(f as VkFormat),
+                "format {f} should be four bytes per pixel"
+            );
+        }
+        // 16-bit-per-channel, single-channel and the undefined format are not.
+        for f in [0, 9, 97, 100, 109] {
+            assert!(
+                !four_bpp(f as VkFormat),
+                "format {f} should not be four bytes per pixel"
+            );
+        }
+    }
+
+    #[test]
+    fn find_in_walks_the_chain_and_returns_null_when_absent() {
+        let tail = link(STYPE_IMAGE_FORMAT_LIST_CREATE_INFO, 2, ptr::null());
+        let mid = link(1000147001, 1, (&raw const tail).cast());
+        let head = link(
+            STYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+            0,
+            (&raw const mid).cast(),
+        );
+
+        let found = unsafe { find_in((&raw const head).cast(), 1000147001) };
+        assert_eq!(found, (&raw const mid).cast::<c_void>());
+        let found = unsafe {
+            find_in(
+                (&raw const head).cast(),
+                STYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+            )
+        };
+        assert_eq!(found, (&raw const tail).cast::<c_void>());
+        let none = unsafe { find_in((&raw const head).cast(), 12345) };
+        assert!(none.is_null());
+    }
+
+    #[test]
+    fn find_in_accepts_an_empty_chain() {
+        assert!(unsafe { find_in(ptr::null(), STYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES) }.is_null());
+    }
+
+    #[test]
+    fn the_emulation_is_off_until_the_system_driver_path_enables_it() {
+        let _g = SERIAL.lock().unwrap();
+        // Exercised in both directions so the test does not depend on order.
+        set_enabled(false);
+        assert!(!enabled());
+        set_enabled(true);
+        assert!(enabled());
+        set_enabled(false);
+        assert!(!enabled());
+    }
+
+    #[test]
+    fn the_linear_modifier_is_the_one_gamescope_flips() {
+        // DRM_FORMAT_MOD_LINEAR; the export query answers with this modifier.
+        assert_eq!(MOD_LINEAR, 0);
+    }
+}
+
 fn emu_image(image: VkImage) -> Option<EmuImage> {
-    IMAGES.lock().ok()?.iter().find(|e| e.image == image).copied()
+    IMAGES
+        .lock()
+        .ok()?
+        .iter()
+        .find(|e| e.image == image)
+        .copied()
 }
 
 unsafe fn real_dev<T>(device: VkDevice, name: &CStr) -> Option<(VkDevice, T)> {
@@ -115,7 +209,9 @@ unsafe fn real_dev<T>(device: VkDevice, name: &CStr) -> Option<(VkDevice, T)> {
         return None;
     }
     let f = unsafe { gn_real_device_proc(gd, name) }?;
-    Some((unsafe { (*gd).real }, unsafe { std::mem::transmute_copy(&f) }))
+    Some((unsafe { (*gd).real }, unsafe {
+        std::mem::transmute_copy(&f)
+    }))
 }
 
 /// `vkGetPhysicalDeviceImageFormatProperties2`: a LINEAR DRM-modifier dma-buf
@@ -131,8 +227,9 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceImageFormatProperties2(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let raw = unsafe {
-        gn_real_inst_proc((*gi).real, c"vkGetPhysicalDeviceImageFormatProperties2")
-            .or_else(|| gn_real_inst_proc((*gi).real, c"vkGetPhysicalDeviceImageFormatProperties2KHR"))
+        gn_real_inst_proc((*gi).real, c"vkGetPhysicalDeviceImageFormatProperties2").or_else(|| {
+            gn_real_inst_proc((*gi).real, c"vkGetPhysicalDeviceImageFormatProperties2KHR")
+        })
     };
     let Some(raw) = raw else {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -143,10 +240,16 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceImageFormatProperties2(
         return res;
     }
     let modinfo = unsafe {
-        find_in((*info).pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT)
+        find_in(
+            (*info).pNext,
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
+        )
     } as *const VkPhysicalDeviceImageDrmFormatModifierInfoEXT;
     let extinfo = unsafe {
-        find_in((*info).pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO)
+        find_in(
+            (*info).pNext,
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+        )
     } as *const PhysicalDeviceExternalImageFormatInfo;
     if modinfo.is_null()
         || unsafe { (*modinfo).drmFormatModifier } != MOD_LINEAR
@@ -157,7 +260,10 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceImageFormatProperties2(
         return res;
     }
     let extprops = unsafe {
-        find_in((*props).pNext as *const c_void, STYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES)
+        find_in(
+            (*props).pNext as *const c_void,
+            STYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+        )
     } as *mut ExternalImageFormatProperties;
     if res == VK_SUCCESS
         && (extprops.is_null()
@@ -225,15 +331,26 @@ pub unsafe fn try_create_image(
     if ci.tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT || !four_bpp(ci.format) {
         return None;
     }
-    let list = unsafe { find_in(ci.pNext, VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT) }
-        as *const VkImageDrmFormatModifierListCreateInfoEXT;
-    let ext = unsafe { find_in(ci.pNext, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) }
-        as *const VkExternalMemoryImageCreateInfo;
+    let list = unsafe {
+        find_in(
+            ci.pNext,
+            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+        )
+    } as *const VkImageDrmFormatModifierListCreateInfoEXT;
+    let ext = unsafe {
+        find_in(
+            ci.pNext,
+            VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        )
+    } as *const VkExternalMemoryImageCreateInfo;
     if list.is_null() || ext.is_null() {
         return None;
     }
     let mods = unsafe {
-        std::slice::from_raw_parts((*list).pDrmFormatModifiers, (*list).drmFormatModifierCount as usize)
+        std::slice::from_raw_parts(
+            (*list).pDrmFormatModifiers,
+            (*list).drmFormatModifierCount as usize,
+        )
     };
     if !mods.contains(&MOD_LINEAR) {
         return None;
@@ -248,7 +365,8 @@ pub unsafe fn try_create_image(
     };
     let create = unsafe { (*gd).f.create_image.unwrap() };
     let dev = unsafe { (*gd).real };
-    let fl = unsafe { find_in(ci.pNext, STYPE_IMAGE_FORMAT_LIST_CREATE_INFO) } as *const ImageFormatListCreateInfo;
+    let fl = unsafe { find_in(ci.pNext, STYPE_IMAGE_FORMAT_LIST_CREATE_INFO) }
+        as *const ImageFormatListCreateInfo;
     let fl_copy = if fl.is_null() {
         None
     } else {
@@ -337,7 +455,11 @@ pub unsafe fn try_create_image(
         buf.fd,
         buf.ino,
         buf.stride,
-        if linear_tiling { "linear-tiling" } else { "explicit-modifier" }
+        if linear_tiling {
+            "linear-tiling"
+        } else {
+            "explicit-modifier"
+        }
     ));
     if let Ok(mut v) = IMAGES.lock() {
         v.push(EmuImage {
@@ -360,15 +482,25 @@ pub unsafe extern "C" fn gn_vkAllocateMemory(
     if let Some(r) = unsafe { crate::placed::try_allocate(device, ai, alloc, out) } {
         return r;
     }
-    let Some((dev, real)) = (unsafe { real_dev::<PFN_vkAllocateMemory>(device, c"vkAllocateMemory") }) else {
+    let Some((dev, real)) =
+        (unsafe { real_dev::<PFN_vkAllocateMemory>(device, c"vkAllocateMemory") })
+    else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
     if !enabled() {
         return unsafe { real(dev, ai, alloc, out) };
     }
-    let ded = unsafe { find_in((*ai).pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) }
-        as *const VkMemoryDedicatedAllocateInfo;
-    let emu = if ded.is_null() { None } else { emu_image(unsafe { (*ded).image }) };
+    let ded = unsafe {
+        find_in(
+            (*ai).pNext,
+            VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+        )
+    } as *const VkMemoryDedicatedAllocateInfo;
+    let emu = if ded.is_null() {
+        None
+    } else {
+        emu_image(unsafe { (*ded).image })
+    };
     let Some(emu) = emu else {
         return unsafe { real(dev, ai, alloc, out) };
     };
@@ -443,10 +575,14 @@ pub unsafe extern "C" fn gn_vkGetImageDrmFormatModifierPropertiesEXT(
 ) -> VkResult {
     type Pfn = unsafe extern "C" fn(VkDevice, VkImage, *mut c_void) -> VkResult;
     if emu_image(image).is_some() {
-        unsafe { (*(props as *mut ImageDrmFormatModifierProperties)).drmFormatModifier = MOD_LINEAR };
+        unsafe {
+            (*(props as *mut ImageDrmFormatModifierProperties)).drmFormatModifier = MOD_LINEAR
+        };
         return VK_SUCCESS;
     }
-    let Some((dev, real)) = (unsafe { real_dev::<Pfn>(device, c"vkGetImageDrmFormatModifierPropertiesEXT") }) else {
+    let Some((dev, real)) =
+        (unsafe { real_dev::<Pfn>(device, c"vkGetImageDrmFormatModifierPropertiesEXT") })
+    else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
     unsafe { real(dev, image, props) }
@@ -458,9 +594,9 @@ pub unsafe extern "C" fn gn_vkGetImageSubresourceLayout(
     sub: *const VkImageSubresource,
     out: *mut VkSubresourceLayout,
 ) {
-    let Some((dev, real)) =
-        (unsafe { real_dev::<PFN_vkGetImageSubresourceLayout>(device, c"vkGetImageSubresourceLayout") })
-    else {
+    let Some((dev, real)) = (unsafe {
+        real_dev::<PFN_vkGetImageSubresourceLayout>(device, c"vkGetImageSubresourceLayout")
+    }) else {
         return;
     };
     if let Some(e) = emu_image(image) {
@@ -546,7 +682,9 @@ pub unsafe extern "C" fn gn_vkUpdateDescriptorSets(
     if !enabled() || writes.is_null() || write_count == 0 {
         return unsafe { real(dev, write_count, writes, copy_count, copies) };
     }
-    let ws = unsafe { std::slice::from_raw_parts(writes as *const WriteDescriptorSet, write_count as usize) };
+    let ws = unsafe {
+        std::slice::from_raw_parts(writes as *const WriteDescriptorSet, write_count as usize)
+    };
     let mut out: Vec<WriteDescriptorSet> = Vec::with_capacity(ws.len() + 8);
     let mut skipped = 0usize;
     for w in ws {
@@ -584,5 +722,13 @@ pub unsafe extern "C" fn gn_vkUpdateDescriptorSets(
             "export-emu: skipped {skipped} null descriptor element(s) in {write_count} write(s)"
         ));
     }
-    unsafe { real(dev, out.len() as u32, out.as_ptr() as *const c_void, copy_count, copies) }
+    unsafe {
+        real(
+            dev,
+            out.len() as u32,
+            out.as_ptr() as *const c_void,
+            copy_count,
+            copies,
+        )
+    }
 }

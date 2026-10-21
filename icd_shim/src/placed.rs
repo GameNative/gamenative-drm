@@ -126,7 +126,9 @@ unsafe fn real_dev<T>(device: VkDevice, name: &CStr) -> Option<(VkDevice, T)> {
         return None;
     }
     let f = unsafe { gn_real_device_proc(gd, name) }?;
-    Some((unsafe { (*gd).real }, unsafe { std::mem::transmute_copy(&f) }))
+    Some((unsafe { (*gd).real }, unsafe {
+        std::mem::transmute_copy(&f)
+    }))
 }
 
 unsafe fn real_pd<T>(pd: VkPhysicalDevice, names: &[&CStr]) -> Option<T> {
@@ -145,7 +147,13 @@ unsafe fn real_pd<T>(pd: VkPhysicalDevice, names: &[&CStr]) -> Option<T> {
 pub unsafe extern "C" fn gn_vkGetPhysicalDeviceFeatures2(pd: VkPhysicalDevice, f: *mut c_void) {
     type Pfn = unsafe extern "C" fn(VkPhysicalDevice, *mut c_void);
     let Some(real) = (unsafe {
-        real_pd::<Pfn>(pd, &[c"vkGetPhysicalDeviceFeatures2", c"vkGetPhysicalDeviceFeatures2KHR"])
+        real_pd::<Pfn>(
+            pd,
+            &[
+                c"vkGetPhysicalDeviceFeatures2",
+                c"vkGetPhysicalDeviceFeatures2KHR",
+            ],
+        )
     }) else {
         return;
     };
@@ -154,7 +162,8 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceFeatures2(pd: VkPhysicalDevice, f
     if !enabled() || f.is_null() {
         return;
     }
-    let pf = unsafe { find_out((*(f as *mut BaseOut)).pNext, STYPE_FEATURES) } as *mut PlacedFeatures;
+    let pf =
+        unsafe { find_out((*(f as *mut BaseOut)).pNext, STYPE_FEATURES) } as *mut PlacedFeatures;
     if !pf.is_null() {
         unsafe {
             (*pf).memoryMapPlaced = 1;
@@ -167,7 +176,13 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceFeatures2(pd: VkPhysicalDevice, f
 pub unsafe extern "C" fn gn_vkGetPhysicalDeviceProperties2(pd: VkPhysicalDevice, p: *mut c_void) {
     type Pfn = unsafe extern "C" fn(VkPhysicalDevice, *mut c_void);
     let Some(real) = (unsafe {
-        real_pd::<Pfn>(pd, &[c"vkGetPhysicalDeviceProperties2", c"vkGetPhysicalDeviceProperties2KHR"])
+        real_pd::<Pfn>(
+            pd,
+            &[
+                c"vkGetPhysicalDeviceProperties2",
+                c"vkGetPhysicalDeviceProperties2KHR",
+            ],
+        )
     }) else {
         return;
     };
@@ -175,7 +190,8 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceProperties2(pd: VkPhysicalDevice,
     if !enabled() || p.is_null() {
         return;
     }
-    let pp = unsafe { find_out((*(p as *mut BaseOut)).pNext, STYPE_PROPERTIES) } as *mut PlacedProperties;
+    let pp = unsafe { find_out((*(p as *mut BaseOut)).pNext, STYPE_PROPERTIES) }
+        as *mut PlacedProperties;
     if !pp.is_null() {
         unsafe { (*pp).minPlacedMemoryMapAlignment = page_size() };
     }
@@ -306,8 +322,10 @@ pub unsafe fn try_allocate(
         return None;
     }
     unsafe {
-        let ded = find_in(ai_ref.pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO)
-            as *const VkMemoryDedicatedAllocateInfo;
+        let ded = find_in(
+            ai_ref.pNext,
+            VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+        ) as *const VkMemoryDedicatedAllocateInfo;
         if (!ded.is_null() && (*ded).image != 0)
             || !find_in(ai_ref.pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO).is_null()
             || !find_in(ai_ref.pNext, VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR).is_null()
@@ -320,7 +338,10 @@ pub unsafe fn try_allocate(
     let api = ahb_api()?;
     type PropsPfn = unsafe extern "C" fn(VkDevice, *const c_void, *mut AhbProperties) -> VkResult;
     let get_props: PropsPfn = unsafe {
-        std::mem::transmute(gn_real_device_proc(gd, c"vkGetAndroidHardwareBufferPropertiesANDROID")?)
+        std::mem::transmute(gn_real_device_proc(
+            gd,
+            c"vkGetAndroidHardwareBufferPropertiesANDROID",
+        )?)
     };
     let alloc_mem = unsafe { (*gd).f.alloc_mem }?;
     let dev = unsafe { (*gd).real };
@@ -334,8 +355,13 @@ pub unsafe fn try_allocate(
         ..Default::default()
     };
     let mut ahb: *mut c_void = ptr::null_mut();
-    if size > u64::from(u32::MAX) || unsafe { (api.allocate)(&desc, &mut ahb) } != 0 || ahb.is_null() {
-        crate::logf!(gndrm_obf::obf!("placed: AHB allocation of {size} bytes failed"));
+    if size > u64::from(u32::MAX)
+        || unsafe { (api.allocate)(&desc, &mut ahb) } != 0
+        || ahb.is_null()
+    {
+        crate::logf!(gndrm_obf::obf!(
+            "placed: AHB allocation of {size} bytes failed"
+        ));
         return None;
     }
     let mut props = AhbProperties {
@@ -458,7 +484,11 @@ pub unsafe extern "C" fn gn_vkMapMemory2KHR(
         ));
         return VK_ERROR_MEMORY_MAP_FAILED;
     };
-    let size = if mi.size == WHOLE_SIZE { b.size - mi.offset } else { mi.size };
+    let size = if mi.size == WHOLE_SIZE {
+        b.size - mi.offset
+    } else {
+        mi.size
+    };
     let len = round_page(size) as usize;
     let r = unsafe {
         libc::mmap(
@@ -498,7 +528,8 @@ pub unsafe extern "C" fn gn_vkUnmapMemory2KHR(device: VkDevice, info: *const c_v
 }
 
 pub unsafe extern "C" fn gn_vkUnmapMemory(device: VkDevice, mem: VkDeviceMemory) {
-    let Some((dev, real)) = (unsafe { real_dev::<PFN_vkUnmapMemory>(device, c"vkUnmapMemory") }) else {
+    let Some((dev, real)) = (unsafe { real_dev::<PFN_vkUnmapMemory>(device, c"vkUnmapMemory") })
+    else {
         return;
     };
     if enabled() && unsafe { unmap_backed(mem, false) } {
@@ -512,7 +543,8 @@ pub unsafe extern "C" fn gn_vkFreeMemory(
     mem: VkDeviceMemory,
     alloc: *const VkAllocationCallbacks,
 ) {
-    let Some((dev, real)) = (unsafe { real_dev::<PFN_vkFreeMemory>(device, c"vkFreeMemory") }) else {
+    let Some((dev, real)) = (unsafe { real_dev::<PFN_vkFreeMemory>(device, c"vkFreeMemory") })
+    else {
         return;
     };
     let backed = if enabled() && unsafe { unmap_backed(mem, false) } {
@@ -526,5 +558,90 @@ pub unsafe extern "C" fn gn_vkFreeMemory(
     unsafe { real(dev, mem, alloc) };
     if let (Some(b), Some(api)) = (backed, ahb_api()) {
         unsafe { (api.release)(b.ahb) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    #[repr(C)]
+    struct Link {
+        s_type: VkStructureType,
+        p_next: *mut c_void,
+        tag: u32,
+    }
+
+    fn link(s_type: VkStructureType, tag: u32, next: *mut c_void) -> Link {
+        Link {
+            s_type,
+            p_next: next,
+            tag,
+        }
+    }
+
+    #[test]
+    fn find_out_walks_the_chain() {
+        let mut tail = link(STYPE_PROPERTIES, 2, ptr::null_mut());
+        let mut mid = link(1000272003, 1, (&raw mut tail).cast());
+        let mut head = link(STYPE_FEATURES, 0, (&raw mut mid).cast());
+
+        assert_eq!(
+            unsafe { find_out((&raw mut head).cast(), 1000272003) },
+            (&raw mut mid).cast::<c_void>()
+        );
+        assert_eq!(
+            unsafe { find_out((&raw mut head).cast(), STYPE_PROPERTIES) },
+            (&raw mut tail).cast::<c_void>()
+        );
+        assert!(unsafe { find_out((&raw mut head).cast(), 999) }.is_null());
+    }
+
+    #[test]
+    fn find_in_walks_the_chain() {
+        let tail = link(STYPE_MAP_PLACED_INFO, 2, ptr::null_mut());
+        let head = link(
+            STYPE_FEATURES,
+            0,
+            (&raw const tail).cast::<c_void>() as *mut c_void,
+        );
+        assert_eq!(
+            unsafe { find_in((&raw const head).cast(), STYPE_MAP_PLACED_INFO) },
+            (&raw const tail).cast::<c_void>()
+        );
+        assert!(unsafe { find_in((&raw const head).cast(), 999) }.is_null());
+        assert!(unsafe { find_in(ptr::null(), STYPE_FEATURES) }.is_null());
+    }
+
+    #[test]
+    fn a_page_is_a_page() {
+        let p = page_size();
+        assert!(p >= 4096, "page size {p} is implausible");
+        assert_eq!(round_page(0), 0);
+        assert_eq!(round_page(1), p);
+        assert_eq!(round_page(p), p);
+        assert_eq!(round_page(p + 1), 2 * p);
+    }
+
+    #[test]
+    fn the_emulation_flags_start_off_and_follow_their_setters() {
+        let _g = SERIAL.lock().unwrap();
+        set_enabled(false);
+        assert!(!enabled());
+        set_enabled(true);
+        assert!(enabled());
+        set_enabled(false);
+        assert!(!enabled());
+    }
+
+    #[test]
+    fn the_stypes_are_the_extension_s_own() {
+        assert_eq!(STYPE_FEATURES, 1000272000);
+        // The map-placed bit is what a caller asks for; the extension name is
+        // the one advertised in place of the driver's.
+        assert_eq!(EXT_NAME.to_str().unwrap(), "VK_EXT_map_memory_placed");
     }
 }

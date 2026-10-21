@@ -198,6 +198,13 @@ fn ext_list_has(props: &[VkExtensionProperties], name: &CStr) -> bool {
 const SYSTEM_LOADER: &CStr = c"/system/lib64/libvulkan.so";
 
 fn kgsl_present() -> bool {
+    // `GN_VKSHIM_ADRENO=1` pins the Adreno path where the device node cannot be
+    // the answer — a host build running the probe tests, or a system driver that
+    // must still be exercised behind the payload driver. Without it the node is
+    // the only evidence.
+    if std::env::var_os("GN_VKSHIM_ADRENO").is_some_and(|v| v == OsStr::new("1")) {
+        return true;
+    }
     match std::fs::metadata("/dev/kgsl-3d0") {
         Ok(_) => true,
         Err(e) => e.kind() != std::io::ErrorKind::NotFound,
@@ -240,7 +247,9 @@ fn negotiate_icd(h: *mut c_void) {
     let f: unsafe extern "C" fn(*mut u32) -> VkResult = unsafe { std::mem::transmute(sym) };
     let mut v: u32 = 5;
     let r = unsafe { f(&mut v) };
-    logf!(gndrm_obf::obf!("wrapper icd: negotiated interface {v} ({r})"));
+    logf!(gndrm_obf::obf!(
+        "wrapper icd: negotiated interface {v} ({r})"
+    ));
 }
 
 fn try_system_driver() {
@@ -248,11 +257,17 @@ fn try_system_driver() {
     let path = wrapper.as_deref().unwrap_or(SYSTEM_LOADER);
     let h = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
     if h.is_null() && wrapper.is_some() {
-        logf!(gndrm_obf::obf!("wrapper icd: dlopen failed: {}", dlerror_str()));
+        logf!(gndrm_obf::obf!(
+            "wrapper icd: dlopen failed: {}",
+            dlerror_str()
+        ));
         return;
     }
     if wrapper.is_some() {
-        logf!(gndrm_obf::obf!("wrapper icd: driving {}", path.to_string_lossy()));
+        logf!(gndrm_obf::obf!(
+            "wrapper icd: driving {}",
+            path.to_string_lossy()
+        ));
         negotiate_icd(h);
     }
     if h.is_null() {
