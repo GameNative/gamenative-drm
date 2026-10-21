@@ -232,11 +232,62 @@ fn wrapper_icd() -> Option<std::ffi::CString> {
     if is_gamescope_binary() {
         return None;
     }
-    let p = std::env::var_os("GN_VKSHIM_WRAPPER_ICD")?;
-    if p.is_empty() || std::fs::metadata(&p).is_err() {
+    // An explicit path wins: it is what a launcher sets when it already knows the
+    // container's driver, and what a debug run overrides.
+    if let Some(p) = std::env::var_os("GN_VKSHIM_WRAPPER_ICD") {
+        if !p.is_empty() && std::fs::metadata(&p).is_ok() {
+            return std::ffi::CString::new(p.into_encoded_bytes()).ok();
+        }
+    }
+    // Otherwise the container answers for itself. A guest's working directory is
+    // inside its container (`imagefs/home/xuser-<SOURCE>_<APPID>/`), whose
+    // `.container` names the graphics driver the user picked; a wrapper driver is
+    // the one that has to be driven through its own ICD, and it always sits at
+    // `<imagefs>/usr/lib/libvulkan_wrapper.so`.
+    let path = wrapper_icd_beside(current_dir_container()?)?;
+    std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()
+}
+
+/// The ICD a wrapper driver provides inside this container, if it is there.
+fn wrapper_icd_beside(container: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    let text = std::fs::read_to_string(container.join(".container")).ok()?;
+    if !graphics_driver(&text)?
+        .to_ascii_lowercase()
+        .starts_with("wrapper")
+    {
         return None;
     }
-    std::ffi::CString::new(p.into_encoded_bytes()).ok()
+    // `<imagefs>/home/xuser-X` -> `<imagefs>/usr/lib/libvulkan_wrapper.so`
+    let icd = container
+        .parent()?
+        .parent()?
+        .join("usr/lib/libvulkan_wrapper.so");
+    icd.is_file().then_some(icd)
+}
+
+/// `"graphicsDriver":"wrapper-..."` from a container config, without a JSON parser.
+fn graphics_driver(text: &str) -> Option<&str> {
+    let key = "\"graphicsDriver\"";
+    let at = text.find(key)? + key.len();
+    let rest = text[at..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    (!rest[..end].is_empty()).then(|| &rest[..end])
+}
+
+/// The guest's container directory: the nearest ancestor holding `.container`.
+fn current_dir_container() -> Option<std::path::PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    for _ in 0..6 {
+        if dir.join(".container").is_file() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
 }
 
 fn negotiate_icd(h: *mut c_void) {
@@ -627,4 +678,37 @@ pub unsafe extern "C" fn vk_icdGetPhysicalDeviceProcAddr(
     };
     proxy::note_instance_miss(name, raw.is_none());
     proxy::serve_unlisted(name, raw, proxy::DispatchCtx::PhysicalDevice)
+}
+
+#[cfg(test)]
+mod wrapper_detect_tests {
+    use super::graphics_driver;
+
+    #[test]
+    fn reads_the_driver_name_from_a_container_config() {
+        let text = r#"{"id":"x","graphicsDriver":"wrapper-turnip","lastUsed":3}"#;
+        assert_eq!(graphics_driver(text), Some("wrapper-turnip"));
+        // Whitespace on either side of the colon is what a pretty-printed config
+        // would carry; the guest's file is one line but this must not care.
+        let text = r#"{ "graphicsDriver" : "wrapper" , "a":1 }"#;
+        assert_eq!(graphics_driver(text), Some("wrapper"));
+    }
+
+    #[test]
+    fn a_native_driver_is_not_a_wrapper() {
+        let text = r#"{"graphicsDriver":"turnip"}"#;
+        assert_eq!(graphics_driver(text), Some("turnip"));
+        assert!(!graphics_driver(text)
+            .unwrap()
+            .to_ascii_lowercase()
+            .starts_with("wrapper"));
+    }
+
+    #[test]
+    fn an_absent_or_empty_field_is_none() {
+        assert_eq!(graphics_driver(r#"{"id":"x"}"#), None);
+        assert_eq!(graphics_driver(r#"{"graphicsDriver":""}"#), None);
+        assert_eq!(graphics_driver(r#"{"graphicsDriver":"#), None);
+        assert_eq!(graphics_driver(""), None);
+    }
 }
