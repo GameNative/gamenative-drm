@@ -117,6 +117,71 @@ fn ensure_fixtures() {
     });
 }
 
+/// Runs icd_probe on the shim's system-driver arm: unlike `run_probe`, this
+/// leaves the Adreno pin off, so the shim consults `GNDRM_DRIVER_TYPE`/`PREFIX`
+/// for the guest's ICD instead of taking the payload path.
+fn run_probe_system(s: &Scenario) -> (i32, String, String) {
+    ensure_fixtures();
+    let dir = target_dir();
+    let mut cmd = Command::new(dir.join("icd_probe"));
+    cmd.env_clear();
+    cmd.env("LD_LIBRARY_PATH", &dir);
+    cmd.env("GNDRM_LOG_VKSHIM", "1");
+    for (k, v) in &s.env {
+        cmd.env(k, v);
+    }
+    cmd.arg(shim_so());
+    let out = cmd.output().expect("spawn icd_probe");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A wrapper driver is driven from the two values the launcher already sets: the
+/// driver id (`GNDRM_DRIVER_TYPE`) and the container's `usr` (`PREFIX`). Nothing
+/// else has to name the ICD path.
+#[test]
+fn wrapper_driver_is_driven_from_the_prefix() {
+    let dir = target_dir();
+    let prefix = dir.join(format!("gn-prefix-{}", std::process::id()));
+    std::fs::create_dir_all(prefix.join("lib")).unwrap();
+    let icd = prefix.join("lib/libvulkan_wrapper.so");
+    std::fs::copy(dir.join("libmock_vkdriver.so"), &icd).unwrap();
+    let env = vec![
+        ("GNDRM_DRIVER_TYPE", "wrapper-gamenative".to_string()),
+        ("PREFIX", prefix.display().to_string()),
+    ];
+    let (_code, _out, err) = run_probe_system(&Scenario { comm: None, env });
+    let _ = std::fs::remove_dir_all(&prefix);
+    assert!(
+        err.contains(&format!("wrapper icd: driving {}", icd.display())),
+        "stderr:\n{err}"
+    );
+}
+
+/// A native driver never has an ICD under the prefix, even when a wrapper's .so
+/// is still lying there after a driver switch.
+#[test]
+fn a_native_driver_never_drives_a_container_icd() {
+    let dir = target_dir();
+    let prefix = dir.join(format!("gn-prefix-native-{}", std::process::id()));
+    std::fs::create_dir_all(prefix.join("lib")).unwrap();
+    std::fs::copy(
+        dir.join("libmock_vkdriver.so"),
+        prefix.join("lib/libvulkan_wrapper.so"),
+    )
+    .unwrap();
+    let env = vec![
+        ("GNDRM_DRIVER_TYPE", "turnip".to_string()),
+        ("PREFIX", prefix.display().to_string()),
+    ];
+    let (_code, _out, err) = run_probe_system(&Scenario { comm: None, env });
+    let _ = std::fs::remove_dir_all(&prefix);
+    assert!(!err.contains("wrapper icd"), "stderr:\n{err}");
+}
+
 #[test]
 fn gamescope_process_gets_payload_freedreno() {
     let (code, out, err) = run_probe(&Scenario {
