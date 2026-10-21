@@ -302,6 +302,11 @@ pub fn lsfg_config() -> Option<LsfgConfig> {
             if let Some(settings) = LsfgConfig::decode(&buf[..n as usize]) {
                 return (!settings.is_request()).then_some(settings);
             }
+            // The answer to the subscription `connect` just sent, or a cap the
+            // user changed meanwhile: a note read here is still a note.
+            if let Some(note) = FrameCapNote::decode(&buf[..n as usize]) {
+                apply_note(note);
+            }
         }
     }
     None
