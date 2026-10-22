@@ -158,6 +158,13 @@ unsafe extern "C" {
     /// the caller does not want the buffer's release fence.
     pub fn AHardwareBuffer_unlock(buffer: *mut AHardwareBuffer, fence: *mut c_int);
     pub fn AHardwareBuffer_release(buffer: *mut AHardwareBuffer);
+    /// Sends `buffer`'s handle over a connected Unix socket; the peer turns it
+    /// back into its own reference with `AHardwareBuffer_recvHandleFromUnixSocket`.
+    /// Returns 0 or negative errno.
+    pub fn AHardwareBuffer_sendHandleToUnixSocket(
+        buffer: *const AHardwareBuffer,
+        socket_fd: c_int,
+    ) -> c_int;
 }
 
 // ------------------------------------ ASurfaceControl (API 29, dlopen only)

@@ -228,6 +228,20 @@ fn is_gamescope_binary() -> bool {
         .any(|a| a.rsplit(|&b| b == b'/').next() == Some(b"gamescope".as_slice()))
 }
 
+/// gamescope's Xwayland, also run through the linker. It keeps the payload
+/// driver: it is not the guest and must not take the guest's driver route.
+fn is_xwayland_binary() -> bool {
+    let comm = std::fs::read_to_string("/proc/self/comm").unwrap_or_default();
+    if comm.trim_end() == "Xwayland" {
+        return true;
+    }
+    let cmdline = std::fs::read("/proc/self/cmdline").unwrap_or_default();
+    cmdline
+        .split(|&b| b == 0)
+        .take(2)
+        .any(|a| a.rsplit(|&b| b == b'/').next() == Some(b"Xwayland".as_slice()))
+}
+
 /// Guest-only: an ICD (the container's wrapper) to drive instead of the system loader.
 fn wrapper_icd() -> Option<std::ffi::CString> {
     if is_gamescope_binary() {
@@ -272,46 +286,67 @@ fn negotiate_icd(h: *mut c_void) {
 
 fn try_system_driver() {
     let wrapper = wrapper_icd();
-    let path = wrapper.as_deref().unwrap_or(SYSTEM_LOADER);
-    let h = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
-    if h.is_null() && wrapper.is_some() {
-        logf!(gndrm_obf::obf!(
-            "wrapper icd: dlopen failed: {}",
-            dlerror_str()
-        ));
-        return;
+    // A guest may import its swapchain slots as AHardwareBuffers when the driver
+    // has no dma-buf import (Adreno's system driver); gamescope may not.
+    let allow_ahb = !is_gamescope_binary() && !is_xwayland_binary();
+    let mut opened: Option<(*mut c_void, GipaFn, bool)> = None;
+    if let Some(w) = wrapper.as_deref() {
+        let h = unsafe { libc::dlopen(w.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        if h.is_null() {
+            logf!(gndrm_obf::obf!(
+                "wrapper icd: dlopen failed: {}",
+                dlerror_str()
+            ));
+        } else {
+            logf!(gndrm_obf::obf!(
+                "wrapper icd: driving {}",
+                w.to_string_lossy()
+            ));
+            negotiate_icd(h);
+            match unsafe { resolve_gipa(h) } {
+                Some(gipa) if proxy::device_prereqs(gipa, allow_ahb) => {
+                    opened = Some((h, gipa, true));
+                }
+                Some(_) => logf!(gndrm_obf::obf!(
+                    "wrapper icd fails the proxy's prerequisite probe (see 'proxy prereq' above) — opening the system vulkan loader directly"
+                )),
+                None => logf!(gndrm_obf::obf!(
+                    "wrapper icd exports no vkGetInstanceProcAddr — opening the system vulkan loader directly"
+                )),
+            }
+        }
     }
-    if wrapper.is_some() {
-        logf!(gndrm_obf::obf!(
-            "wrapper icd: driving {}",
-            path.to_string_lossy()
-        ));
-        negotiate_icd(h);
+    if opened.is_none() {
+        let h = unsafe { libc::dlopen(SYSTEM_LOADER.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        if h.is_null() {
+            logf!(gndrm_obf::obf!(
+                "dlopen system vulkan loader failed: {}",
+                dlerror_str()
+            ));
+            return;
+        }
+        let Some(gipa) = (unsafe { resolve_gipa(h) }) else {
+            logf!(gndrm_obf::obf!(
+                "system vulkan loader exports no vkGetInstanceProcAddr"
+            ));
+            return;
+        };
+        if !proxy::device_prereqs(gipa, allow_ahb) {
+            logf!(gndrm_obf::obf!("system vulkan driver fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode"));
+            return;
+        }
+        opened = Some((h, gipa, false));
     }
-    if h.is_null() {
-        logf!(gndrm_obf::obf!(
-            "dlopen system vulkan loader failed: {}",
-            dlerror_str()
-        ));
-        return;
-    }
-    let Some(gipa) = (unsafe { resolve_gipa(h) }) else {
-        logf!(gndrm_obf::obf!(
-            "system vulkan loader exports no vkGetInstanceProcAddr"
-        ));
+    let Some((h, gipa, via_wrapper)) = opened else {
         return;
     };
-    if !proxy::device_prereqs(gipa) {
-        logf!(gndrm_obf::obf!("system vulkan driver fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode"));
-        return;
-    }
     let gamescope = is_gamescope_binary();
     if gamescope {
         proxy::set_fake_robustness2(true);
         export::set_enabled(true);
     }
     // The wrapper ICD emulates VK_EXT_map_memory_placed itself.
-    if wrapper.is_none() {
+    if !via_wrapper {
         placed::set_enabled(true);
     }
     proxy::set_real_gipa(gipa);
@@ -448,7 +483,7 @@ fn try_adrenotools() {
         return;
     };
     let gipa_fn: GipaFn = gipa;
-    if !proxy::device_prereqs(gipa_fn) {
+    if !proxy::device_prereqs(gipa_fn, false) {
         logf!(gndrm_obf::obf!("adrenotools driver {label} fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode"));
         return;
     }
@@ -520,6 +555,24 @@ fn init_once() {
         } else {
             if std::env::var_os("GN_VKSHIM_NO_ADRENOTOOLS").is_none() {
                 try_adrenotools();
+            }
+            // A wrapper container with no adrenotools driver is on the system
+            // driver: present through it (AHardwareBuffer import) before
+            // settling for the payload's own driver.
+            if unsafe { DRIVER.handle }.is_null()
+                && !system_driver_forced()
+                && !is_gamescope_binary()
+                && !is_xwayland_binary()
+                && std::env::var_os("ADRENOTOOLS_DRIVER_PATH").is_none_or(|p| p.is_empty())
+                && std::env::var_os("GNDRM_DRIVER_TYPE")
+                    .as_deref()
+                    .and_then(is_wrapper_driver)
+                    .unwrap_or(false)
+            {
+                logf!(gndrm_obf::obf!(
+                    "wrapper driver without adrenotools: trying the system vulkan driver"
+                ));
+                try_system_driver();
             }
             if unsafe { DRIVER.handle }.is_null() {
                 let h = unsafe {

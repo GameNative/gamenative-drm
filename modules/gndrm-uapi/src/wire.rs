@@ -272,8 +272,30 @@ pub struct ScanoutAllocReq {
     pub len: u64,
 }
 
+/// Set in a request's `format` when the client also wants the buffer's
+/// `AHardwareBuffer` itself: after the reply and its descriptor, the daemon
+/// sends the handle with `AHardwareBuffer_sendHandleToUnixSocket` on the same
+/// channel. A daemon that predates the flag sees an unknown format and refuses
+/// the request, so an out-of-step pair fails fast instead of desynchronising.
+pub const SCANOUT_REQ_AHB_HANDLE: u32 = 1 << 31;
+
 impl ScanoutAllocReq {
     pub const LEN: usize = 24;
+
+    /// Whether the client asked for the `AHardwareBuffer` handle as well.
+    #[must_use]
+    pub fn wants_ahb_handle(&self) -> bool {
+        self.format & SCANOUT_REQ_AHB_HANDLE != 0
+    }
+
+    /// The request with its flag bits cleared, i.e. the plain format.
+    #[must_use]
+    pub fn without_flags(self) -> Self {
+        Self {
+            format: self.format & !SCANOUT_REQ_AHB_HANDLE,
+            ..self
+        }
+    }
 
     /// Whether this request carries a length instead of a geometry.
     #[must_use]

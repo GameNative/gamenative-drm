@@ -18,8 +18,9 @@
 
 use gndrm_uapi::wire::{
     FrameCapNote, FrameCapSubscribe, GameWindowNote, LsfgConfig, ScanoutAllocReq, ScanoutAllocResp,
-    CAP_FRAME_CAP, FPS_UNCAPPED, SCANOUT_FORMAT_BGRA_8888,
+    CAP_FRAME_CAP, FPS_UNCAPPED, SCANOUT_FORMAT_BGRA_8888, SCANOUT_REQ_AHB_HANDLE,
 };
+use std::ffi::c_void;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -38,6 +39,46 @@ pub struct ScanoutBuf {
     pub ino: u64,
     /// Row stride in bytes, as the daemon's `AHardwareBuffer` reports it.
     pub stride: u32,
+    /// This process's reference to the buffer's `AHardwareBuffer`, when it was
+    /// asked for ([`allocate_ahb`]); null otherwise. The caller releases it
+    /// with [`ahb_release`].
+    pub ahb: *mut c_void,
+}
+
+struct AhbRecvApi {
+    recv: unsafe extern "C" fn(i32, *mut *mut c_void) -> i32,
+    release: unsafe extern "C" fn(*mut c_void),
+}
+
+fn ahb_recv_api() -> Option<&'static AhbRecvApi> {
+    static API: std::sync::OnceLock<Option<AhbRecvApi>> = std::sync::OnceLock::new();
+    API.get_or_init(|| unsafe {
+        let h = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+        if h.is_null() {
+            return None;
+        }
+        let r = libc::dlsym(h, c"AHardwareBuffer_recvHandleFromUnixSocket".as_ptr());
+        let rel = libc::dlsym(h, c"AHardwareBuffer_release".as_ptr());
+        if r.is_null() || rel.is_null() {
+            return None;
+        }
+        Some(AhbRecvApi {
+            recv: std::mem::transmute(r),
+            release: std::mem::transmute(rel),
+        })
+    })
+    .as_ref()
+}
+
+/// Drop a reference [`allocate_ahb`] handed out.
+pub fn ahb_release(ahb: *mut c_void) {
+    if ahb.is_null() {
+        return;
+    }
+    if let Some(api) = ahb_recv_api() {
+        // SAFETY: `ahb` is a reference this process received and still owns.
+        unsafe { (api.release)(ahb) };
+    }
 }
 
 /// The allocator connection, `-1` while not connected.
@@ -313,6 +354,18 @@ pub fn lsfg_config() -> Option<LsfgConfig> {
 }
 
 pub fn allocate(width: u32, height: u32) -> Option<ScanoutBuf> {
+    allocate_with(width, height, false)
+}
+
+/// [`allocate`], plus the buffer's `AHardwareBuffer`, for a driver that imports
+/// only through `VK_ANDROID_external_memory_android_hardware_buffer`. `None`
+/// when libandroid cannot receive a handle or the daemon does not send one.
+pub fn allocate_ahb(width: u32, height: u32) -> Option<ScanoutBuf> {
+    ahb_recv_api()?;
+    allocate_with(width, height, true)
+}
+
+fn allocate_with(width: u32, height: u32, want_ahb: bool) -> Option<ScanoutBuf> {
     let path = std::env::var("GAMENATIVE_DRM_SOCKET").ok()?;
     if path.is_empty() {
         return None;
@@ -329,7 +382,7 @@ pub fn allocate(width: u32, height: u32) -> Option<ScanoutBuf> {
                 return None;
             }
         }
-        match exchange(*ch, width, height) {
+        match exchange_with(*ch, width, height, want_ahb) {
             Ok(buf) => return Some(buf),
             Err(Failure::Refused) => return None,
             Err(Failure::Dead) => {
@@ -414,11 +467,21 @@ const MAX_BURST_FRAMES: usize = 32;
 
 /// One request/response exchange: send a geometry request, receive the reply
 /// and its descriptor.
+#[cfg(test)]
 fn exchange(fd: RawFd, width: u32, height: u32) -> Result<ScanoutBuf, Failure> {
+    exchange_with(fd, width, height, false)
+}
+
+fn exchange_with(
+    fd: RawFd,
+    width: u32,
+    height: u32,
+    want_ahb: bool,
+) -> Result<ScanoutBuf, Failure> {
     let req = ScanoutAllocReq {
         width,
         height,
-        format: SCANOUT_FORMAT_BGRA_8888,
+        format: SCANOUT_FORMAT_BGRA_8888 | if want_ahb { SCANOUT_REQ_AHB_HANDLE } else { 0 },
         len: u64::from(width) * u64::from(height) * 4,
     };
     let wire = req.encode();
@@ -508,10 +571,26 @@ fn exchange(fd: RawFd, width: u32, height: u32) -> Result<ScanoutBuf, Failure> {
                         }
                         return Err(Failure::Refused);
                     }
+                    let mut ahb: *mut c_void = core::ptr::null_mut();
+                    if want_ahb {
+                        // The daemon sends the handle right behind the reply.
+                        // Missing it leaves the channel out of step, so the
+                        // connection is dropped rather than reused.
+                        let got = ahb_recv_api()
+                            .map_or(-1, |api| (api.recv)(fd, &mut ahb));
+                        if got != 0 || ahb.is_null() {
+                            crate::logf!(gndrm_obf::obf!(
+                                "scan-out: AHardwareBuffer handle not received ({got})"
+                            ));
+                            libc::close(recv_fd);
+                            return Err(Failure::Dead);
+                        }
+                    }
                     return Ok(ScanoutBuf {
                         fd: recv_fd,
                         ino: r.ino,
                         stride: r.stride,
+                        ahb,
                     });
                 }
             }
