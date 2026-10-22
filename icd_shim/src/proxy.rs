@@ -4208,6 +4208,17 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
                 ) -> VkResult,
         )
     }),
+    (c"vkCreateXcbSurfaceKHR", HandlerScope::ProxyOnly, unsafe {
+        std::mem::transmute(
+            gn_vkCreateXcbSurfaceKHR
+                as unsafe extern "C" fn(
+                    VkInstance,
+                    *const VkXcbSurfaceCreateInfoKHR,
+                    *const VkAllocationCallbacks,
+                    *mut VkSurfaceKHR,
+                ) -> VkResult,
+        )
+    }),
     (c"vkDestroySurfaceKHR", HandlerScope::ProxyOnly, unsafe {
         std::mem::transmute(
             gn_vkDestroySurfaceKHR
@@ -4304,6 +4315,16 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
             std::mem::transmute(
                 gn_vkGetPhysicalDeviceXlibPresentationSupportKHR
                     as unsafe extern "C" fn(VkPhysicalDevice, u32, *mut c_void, usize) -> VkBool32,
+            )
+        },
+    ),
+    (
+        c"vkGetPhysicalDeviceXcbPresentationSupportKHR",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                gn_vkGetPhysicalDeviceXcbPresentationSupportKHR
+                    as unsafe extern "C" fn(VkPhysicalDevice, u32, *mut c_void, u32) -> VkBool32,
             )
         },
     ),
@@ -7158,7 +7179,10 @@ unsafe extern "C" fn gn_vkCreateInstance(
     let mut exts: Vec<*const c_char> = vec![ptr::null(); names.len() + 16];
     for &name in names {
         let n_ = unsafe { CStr::from_ptr(name) };
-        if n_ == c"VK_KHR_wayland_surface" || n_ == c"VK_KHR_xlib_surface" {
+        if n_ == c"VK_KHR_wayland_surface"
+            || n_ == c"VK_KHR_xlib_surface"
+            || n_ == c"VK_KHR_xcb_surface"
+        {
             continue; // proxied, not real
         }
         if n < exts.len() {
@@ -7288,16 +7312,17 @@ unsafe extern "C" fn gn_vkEnumerateInstanceExtensionProperties(
     let Some(real_enum) = real_enum else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
-    // Extensions the proxy answers itself. The two surface extensions are always
+    // Extensions the proxy answers itself. The three surface extensions are always
     // hidden from the real driver; `VK_EXT_swapchain_colorspace` is added in an
     // HDR session because it defines the PQ colourspace the surface formats
     // advertise, and a client that does not see the extension must ignore it.
-    let names: [&[u8]; 3] = [
+    let names: [&[u8]; 4] = [
         b"VK_KHR_wayland_surface\0",
         b"VK_KHR_xlib_surface\0",
+        b"VK_KHR_xcb_surface\0",
         b"VK_EXT_swapchain_colorspace\0",
     ];
-    let extra: u32 = 2;
+    let extra: u32 = 3;
     unsafe {
         if pProps.is_null() {
             let mut n: u32 = 0;
@@ -7320,9 +7345,10 @@ unsafe extern "C" fn gn_vkEnumerateInstanceExtensionProperties(
         }
         let total = n + extra;
         if cap >= total {
-            // Both surface extensions are proxied: winewayland clients use
+            // The surface extensions are proxied: winewayland clients use
             // the wayland one, winex11 clients (the gamescope path) the xlib
-            // one — the real driver never sees either. `VK_EXT_swapchain_colorspace`
+            // one, and Mesa's zink/kopper and EGL x11 the xcb one — the real
+            // driver never sees any of them. `VK_EXT_swapchain_colorspace`
             // is NOT advertised: exposing it made vkd3d-proton titles present once
             // per swapchain and then stop, while the PQ surface format alone is
             // enough for DXVK to report an HDR10 output.
@@ -7690,28 +7716,51 @@ unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
         ));
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+    unsafe { x11_window_surface(gi, ci.window as u32, out) }
+}
+
+/// The X window id is the same number under Xlib and xcb, and both routes open
+/// their own X connection, so the caller's Display / xcb_connection_t is unused.
+unsafe extern "C" fn gn_vkCreateXcbSurfaceKHR(
+    instance: VkInstance,
+    ci: *const VkXcbSurfaceCreateInfoKHR,
+    _alloc: *const VkAllocationCallbacks,
+    out: *mut VkSurfaceKHR,
+) -> VkResult {
+    let ci = unsafe { &*ci };
+    let gi = unsafe { find_instance(instance) };
+    if gi.is_null() {
+        crate::logf!(gndrm_obf::obf!(
+            "proxy xcb surface create FAILED: instance {instance:?} not one of ours"
+        ));
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    unsafe { x11_window_surface(gi, ci.window, out) }
+}
+
+unsafe fn x11_window_surface(gi: *mut GnInstance, window: u32, out: *mut VkSurfaceKHR) -> VkResult {
     // Present-route capability switch (`GN_VKSHIM_GUEST_SURFACE`, see
     // `use_guest_surface`). The DEFAULT (unset, or anything but exactly "1") is
     // the gamescope override/Wayland surface, taken here; `=1` opts in to the
     // DRI3-into-wine's-X-window route below, which carries wine's GDI/2D and
     // hands the shim the real window.
     if !use_guest_surface() {
-        return unsafe { xlib_override_surface(gi, ci.window as u32, out) };
+        return unsafe { xlib_override_surface(gi, window, out) };
     }
-    let x11 = if ci.window == 0 {
+    let x11 = if window == 0 {
         crate::logf!(gndrm_obf::obf!(
             "x11 route: XID {:#x} unavailable ({})",
-            ci.window,
+            window,
             crate::x11::RouteUnavailable::NullXid.reason()
         ));
         ptr::null_mut()
     } else {
-        match unsafe { crate::x11::X11Present::new(ci.window as u32) } {
+        match unsafe { crate::x11::X11Present::new(window) } {
             Ok(p) => Box::into_raw(Box::new(p)),
             Err(e) => {
                 crate::logf!(gndrm_obf::obf!(
                     "x11 route: XID {:#x} unavailable ({})",
-                    ci.window,
+                    window,
                     e.reason()
                 ));
                 ptr::null_mut()
@@ -7725,7 +7774,7 @@ unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
         own_surface: ptr::null_mut(),
         swapchain_obj: ptr::null_mut(),
         x11,
-        window: ci.window as u32,
+        window,
         next: ptr::null_mut(),
     });
     let s = Box::into_raw(s);
@@ -7741,7 +7790,7 @@ unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
         crate::logf!(gndrm_obf::obf!(
             "proxy surface {:?} (X11 window {:#x}, DRI3+Present route)",
             s,
-            ci.window
+            window
         ));
     }
     VK_SUCCESS
@@ -7752,6 +7801,15 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceXlibPresentationSupportKHR(
     _qf: u32,
     _dpy: *mut c_void,
     _visual: usize,
+) -> VkBool32 {
+    VK_TRUE
+}
+
+unsafe extern "C" fn gn_vkGetPhysicalDeviceXcbPresentationSupportKHR(
+    _pd: VkPhysicalDevice,
+    _qf: u32,
+    _connection: *mut c_void,
+    _visual: u32,
 ) -> VkBool32 {
     VK_TRUE
 }
