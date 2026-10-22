@@ -1088,7 +1088,7 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
         let total = unsafe { (*sc).slots.len() } - guest;
         let grow = (planned as usize - free.len())
             .min(gen_destination_cap(capacity).saturating_sub(total));
-        if grow > 0 && lsfg_destinations(sc, total + grow) {
+        if !crate::lsfg::skip("grow") && grow > 0 && lsfg_destinations(sc, total + grow) {
             free.extend(guest + total..guest + total + grow);
         }
     }
@@ -1873,11 +1873,27 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             return res;
         }
     }
-    // The guest's slots are a prefix; generation destinations are appended by
-    // the present worker when the settings first ask for them, so the vector's
-    // capacity is reserved here and the guest's images never move.
+    // The guest's slots are a prefix; generation destinations follow them. Both
+    // the count and the capacity are settled here, at creation, because a slot
+    // appended while the compositor holds buffers is not just a new image: a
+    // push past the vector's capacity moves every `GnSlot`, and each buffer the
+    // compositor still holds names its slot by raw pointer (`wl_buffer` user
+    // data, `on_buffer_release`). A release arriving after that move writes
+    // through a dangling pointer and the live slot never comes back — the guest
+    // then loses an image mid-frame and takes its own window down within a
+    // frame or two. So: room for every destination the cap allows, and the
+    // destinations themselves created up front, before the first present.
     sc.guest_slots = n_slots;
-    sc.slots.reserve(3);
+    let capacity = crate::lsfg::wanted().unwrap_or(1).saturating_sub(1);
+    let dest_cap = if capacity == 0 {
+        0
+    } else {
+        gen_destination_cap(capacity)
+    };
+    sc.slots.reserve(dest_cap.max(gen_destination_cap(3)));
+    if dest_cap > 0 {
+        unsafe { lsfg_destinations(scp, dest_cap) };
+    }
 
     // What the guest was told the surface can be, next to what the slot images
     // actually are. One line, once: a disagreement here names a guest that

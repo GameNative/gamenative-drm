@@ -315,6 +315,23 @@ pub fn live() -> (bool, u32, u32) {
     )
 }
 
+/// Diagnostic bisect switches for the generation path.
+///
+/// `GNDRM_LSFG_SKIP=grow` keeps the destination ring at its first size;
+/// `GNDRM_LSFG_SKIP=commit` runs the whole chain but never publishes a
+/// generated frame; `grow,commit` does both. Empty/unset is the shipping
+/// behaviour. Read once per process.
+#[must_use]
+pub fn skip(what: &str) -> bool {
+    static SWITCHES: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let switches = SWITCHES.get_or_init(|| {
+        std::env::var("GNDRM_LSFG_SKIP")
+            .unwrap_or_default()
+            .to_lowercase()
+    });
+    switches.split(',').any(|s| s.trim() == what)
+}
+
 /// The rate the guest should be paced to while frame generation runs.
 ///
 /// `None` when generation is off or the user set no cap, in which case the
