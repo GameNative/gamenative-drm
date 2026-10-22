@@ -7131,7 +7131,6 @@ unsafe extern "C" fn gn_vkCreateInstance(
     let Some(real_create) = real_create else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
-    let mut exts: [*const c_char; 32] = [ptr::null(); 32];
     let mut n: usize = 0;
     let names = unsafe {
         slice_or_empty(
@@ -7139,6 +7138,7 @@ unsafe extern "C" fn gn_vkCreateInstance(
             ci.enabledExtensionCount as usize,
         )
     };
+    let mut exts: Vec<*const c_char> = vec![ptr::null(); names.len() + 16];
     for &name in names {
         let n_ = unsafe { CStr::from_ptr(name) };
         if n_ == c"VK_KHR_wayland_surface" || n_ == c"VK_KHR_xlib_surface" {
@@ -8526,7 +8526,6 @@ unsafe extern "C" fn gn_vkCreateDevice(
         ));
     }
     let add_exts: &[&CStr] = if import_ahb { &AHB_EXTS } else { &DMA_BUF_EXTS };
-    let mut exts: [*const c_char; 48] = [ptr::null(); 48];
     let mut n: usize = 0;
     let names = unsafe {
         slice_or_empty(
@@ -8534,6 +8533,11 @@ unsafe extern "C" fn gn_vkCreateDevice(
             ci.enabledExtensionCount as usize,
         )
     };
+    let mut exts: Vec<*const c_char> = vec![ptr::null(); names.len() + 16];
+    crate::logf!(gndrm_obf::obf!(
+        "proxy device: guest enables {} extensions",
+        names.len()
+    ));
     for &name in names {
         // The guest must never enable a WSI extension the proxy cannot honour
         // (see `unimplemented_wsi_ext`); drop it before the driver sees it.
