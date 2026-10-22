@@ -123,12 +123,14 @@ static LOG_COMMIT: AtomicUsize = AtomicUsize::new(0);
 /// handful of milliseconds of latency — is ample, and it keeps a per-frame X
 /// round trip out of the present path.
 const GAME_WINDOW_CHECK_EVERY: u32 = 120;
-/// Walks to attempt before giving up. A window that is not identifiable after
-/// this many presents (the guest never maps one, or it maps one the predicate
-/// cannot classify) will not become identifiable later, and each walk is an X11
-/// round trip on the present path.
+/// Walks to attempt before giving up: minutes of presents, so a guest that
+/// spends its first boot compiling shaders behind a loader window is still
+/// seen when its own window finally maps. A window that is not identifiable
+/// after this many walks (the guest never maps one, or it maps one the
+/// predicate cannot classify) will not become identifiable later, and each
+/// walk is an X11 round trip on the present path.
 const GAME_WINDOW_GIVE_UP: u32 = 240;
-/// Presents counted since the last game-window tree walk.
+/// Presents counted; a walk runs on every `GAME_WINDOW_CHECK_EVERY`th.
 static GAME_WINDOW_CHECK: AtomicU32 = AtomicU32::new(0);
 /// Set once the game-window notification has been sent; stops all further
 /// walks, so a signalled or idle session costs nothing.
@@ -657,7 +659,7 @@ unsafe fn maybe_report_game_window(surf: *mut GnSurface) {
         return;
     }
     let n = GAME_WINDOW_CHECK.fetch_add(1, Ordering::Relaxed);
-    if n >= GAME_WINDOW_GIVE_UP || !n.is_multiple_of(GAME_WINDOW_CHECK_EVERY) {
+    if !n.is_multiple_of(GAME_WINDOW_CHECK_EVERY) || n / GAME_WINDOW_CHECK_EVERY >= GAME_WINDOW_GIVE_UP {
         return;
     }
     let present = unsafe { (*surf).x11 };
