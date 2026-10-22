@@ -1807,7 +1807,7 @@ pub fn serve_scanout(
             );
             continue;
         }
-        let Some(req) = ScanoutAllocReq::decode(&buf[..n]) else {
+        let Some(raw_req) = ScanoutAllocReq::decode(&buf[..n]) else {
             // A frame that is neither the game-window notification (handled
             // above) nor an allocator request is logged and skipped, not fatal.
             // The shim rides in the `.tzst` payload and this daemon in
@@ -1823,6 +1823,11 @@ pub fn serve_scanout(
             );
             continue;
         };
+        // A client that imports through `VK_ANDROID_external_memory_android_hardware_buffer`
+        // flags the request; everything else sees the plain format.
+        let want_ahb = raw_req.wants_ahb_handle();
+        let req = raw_req.without_flags();
+        let mut handed_ahb: *mut ffi::AHardwareBuffer = ptr::null_mut();
         // Open the request epoch. From here the watchdog samples this request,
         // and the reply has to be on the wire before the shim's budget expires.
         d.begin_request(req.width, req.height, req.format);
@@ -1950,6 +1955,7 @@ pub fn serve_scanout(
                             if let Some(old) = replaced {
                                 release_retired(core::slice::from_ref(&retire_buf(old)));
                             }
+                            handed_ahb = payload.ahb;
                             break (
                                 ScanoutAllocResp {
                                     ret: 0,
@@ -1997,6 +2003,7 @@ pub fn serve_scanout(
                     if let Some(old) = replaced {
                         release_retired(core::slice::from_ref(&retire_buf(old)));
                     }
+                    handed_ahb = warm.ahb;
                     break (
                         ScanoutAllocResp {
                             ret: 0,
@@ -2055,6 +2062,7 @@ pub fn serve_scanout(
                             if let Some(old) = replaced {
                                 release_retired(core::slice::from_ref(&retire_buf(old)));
                             }
+                            handed_ahb = ahb;
                             break (
                                 ScanoutAllocResp {
                                     ret: 0,
@@ -2136,6 +2144,20 @@ pub fn serve_scanout(
             }
             log_warn!("{}", gndrm_obf::obf!("asc: scan-out channel send: {e}"));
             return ScanoutChannel::Closed;
+        }
+        // The handle follows its reply directly: this thread is the channel's
+        // only writer, so nothing can land between the two frames.
+        if want_ahb && resp.ret == 0 && !handed_ahb.is_null() {
+            // SAFETY: the pool holds a reference to `handed_ahb` for as long as
+            // the buffer is handed out, and `fd` is the live channel.
+            let r = unsafe { ffi::AHardwareBuffer_sendHandleToUnixSocket(handed_ahb, fd) };
+            if r != 0 {
+                log_warn!(
+                    "{}",
+                    gndrm_obf::obf!("asc: scan-out AHardwareBuffer handle send failed ({r})")
+                );
+                return ScanoutChannel::Closed;
+            }
         }
         // The spare is one short only when the request consumed it (or a cold
         // allocation was made in its place); a request answered from the reuse

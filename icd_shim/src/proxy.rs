@@ -871,6 +871,7 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
                 ino: 0,
                 floor_ns: 0,
                 release_held: false,
+                ahb: ptr::null_mut(),
             });
         }
         let res =
@@ -1860,6 +1861,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             ino: 0,
             floor_ns: 0,
             release_held: false,
+            ahb: ptr::null_mut(),
         });
     }
     for inited in 0..n_slots as usize {
@@ -5819,6 +5821,11 @@ const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT: VkStructureTy
 // lack it. Advertised to gamescope only, then stripped with its feature struct
 // before the driver sees the create.
 static FAKE_ROBUSTNESS2: AtomicBool = AtomicBool::new(false);
+/// Whether this process may import swapchain slots as `AHardwareBuffer`s (set
+/// with the driver choice; see [`device_prereqs`]).
+static AHB_IMPORT_ALLOWED: AtomicBool = AtomicBool::new(false);
+static AHB_MODE_LOGGED: AtomicBool = AtomicBool::new(false);
+
 static ROBUSTNESS2_FAKED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_fake_robustness2(on: bool) {
@@ -5970,6 +5977,10 @@ pub struct GnDevice {
     /// Whether the guest enabled float16, so a lazily opened session picks the
     /// same shader variant the device can run.
     pub fp16: bool,
+    /// Swapchain slots are imported as `AHardwareBuffer`s rather than dma-bufs:
+    /// the driver has `VK_ANDROID_external_memory_android_hardware_buffer` but
+    /// not the dma-buf/modifier pair (the Adreno system driver).
+    pub import_ahb: bool,
     /// The settings epoch the session was last attempted at.
     pub lsfg_epoch: u32,
     /// Generation batches in flight, each with its own fence and command buffer:
@@ -6064,6 +6075,9 @@ pub struct GnSlot {
     // stays in flight until the floor passes, and `acquire_take_free` is what
     // hands it back then.
     pub release_held: bool,
+    // The slot's `AHardwareBuffer` reference on a device that imports through
+    // `VK_ANDROID_external_memory_android_hardware_buffer`, null otherwise.
+    pub ahb: *mut c_void,
 }
 
 pub struct ScShared {
@@ -6959,16 +6973,41 @@ unsafe fn slice_or_empty<'a, T>(p: *const T, n: usize) -> &'a [T] {
 
 // ------------------------------------------------------- prereq probe
 
+const DMA_BUF_EXTS: [&CStr; 4] = [
+    c"VK_KHR_external_memory",
+    c"VK_KHR_external_memory_fd",
+    c"VK_EXT_external_memory_dma_buf",
+    c"VK_EXT_image_drm_format_modifier",
+];
+
+const AHB_EXTS: [&CStr; 2] = [
+    c"VK_KHR_external_memory",
+    c"VK_ANDROID_external_memory_android_hardware_buffer",
+];
+
+/// How swapchain slots reach the driver, from its device extensions: `Some(false)`
+/// for dma-buf import, `Some(true)` for `AHardwareBuffer` import (only when
+/// `allow_ahb`), `None` when neither set is complete.
+fn import_mode(has: &dyn Fn(&CStr) -> bool, allow_ahb: bool) -> Option<bool> {
+    let missing = DMA_BUF_EXTS.iter().copied().find(|e| !has(e));
+    let Some(missing) = missing else {
+        return Some(false);
+    };
+    if allow_ahb && AHB_EXTS.iter().all(|e| has(e)) {
+        return Some(true);
+    }
+    crate::logf!(gndrm_obf::obf!(
+        "proxy prereq: device lacks {}",
+        missing.to_str().unwrap()
+    ));
+    None
+}
+
 fn dev_exts_satisfied(
     enum_de: PFN_vkEnumerateDeviceExtensionProperties,
     pd: VkPhysicalDevice,
+    allow_ahb: bool,
 ) -> bool {
-    const WANT: [&CStr; 4] = [
-        c"VK_KHR_external_memory",
-        c"VK_KHR_external_memory_fd",
-        c"VK_EXT_external_memory_dma_buf",
-        c"VK_EXT_image_drm_format_modifier",
-    ];
     let mut n: u32 = 0;
     if unsafe { enum_de(pd, ptr::null(), &mut n, ptr::null_mut()) } != VK_SUCCESS {
         return false;
@@ -6983,23 +7022,27 @@ fn dev_exts_satisfied(
     if unsafe { enum_de(pd, ptr::null(), &mut n, props.as_mut_ptr()) } != VK_SUCCESS {
         return false;
     }
-    for want in WANT {
-        let found = props[..n as usize].iter().any(|p| {
+    let has = |want: &CStr| {
+        props[..n as usize].iter().any(|p| {
             let name = unsafe { CStr::from_ptr(p.extensionName.as_ptr()) };
             name == want
-        });
-        if !found {
+        })
+    };
+    match import_mode(&has, allow_ahb) {
+        Some(true) => {
             crate::logf!(gndrm_obf::obf!(
-                "proxy prereq: device lacks {}",
-                want.to_str().unwrap()
+                "proxy prereq: no dma-buf import, using AHardwareBuffer import"
             ));
-            return false;
+            true
         }
+        Some(false) => true,
+        None => false,
     }
-    true
 }
 
-pub fn device_prereqs(gipa: GipaFn) -> bool {
+/// `allow_ahb` admits a driver that can import only `AHardwareBuffer`s. Only a
+/// guest process may take that: gamescope itself imports client dma-bufs.
+pub fn device_prereqs(gipa: GipaFn, allow_ahb: bool) -> bool {
     let create_inst: Option<PFN_vkCreateInstance> =
         unsafe { std::mem::transmute(gipa(ptr::null_mut(), c"vkCreateInstance".as_ptr())) };
     let Some(create_inst) = create_inst else {
@@ -7052,7 +7095,7 @@ pub fn device_prereqs(gipa: GipaFn) -> bool {
                 let mut pd: VkPhysicalDevice = ptr::null_mut();
                 let mut one: u32 = 1;
                 if unsafe { enum_pds(inst, &mut one, &mut pd) } == VK_SUCCESS {
-                    ok = dev_exts_satisfied(enum_de, pd);
+                    ok = dev_exts_satisfied(enum_de, pd, allow_ahb);
                 }
             } else {
                 crate::logf!(gndrm_obf::obf!("proxy prereq: no physical devices"));
@@ -7064,6 +7107,9 @@ pub fn device_prereqs(gipa: GipaFn) -> bool {
     }
     if let Some(destroy_inst) = destroy_inst {
         unsafe { destroy_inst(inst, ptr::null()) };
+    }
+    if ok {
+        AHB_IMPORT_ALLOWED.store(allow_ahb, Ordering::Relaxed);
     }
     ok
 }
@@ -8468,14 +8514,18 @@ unsafe extern "C" fn gn_vkCreateDevice(
         });
         return VK_ERROR_INITIALIZATION_FAILED;
     }
-    const ADD_EXTS: [&CStr; 4] = [
-        c"VK_KHR_external_memory",
-        c"VK_KHR_external_memory_fd",
-        c"VK_EXT_external_memory_dma_buf",
-        c"VK_EXT_image_drm_format_modifier",
-    ];
     let strip_robustness2 = ROBUSTNESS2_FAKED.load(Ordering::Relaxed);
     let have = unsafe { driver_device_exts(gi, pd) };
+    // An unreadable extension list keeps the dma-buf path, as before.
+    let import_ahb = !have.is_empty()
+        && import_mode(&|e: &CStr| have.iter().any(|h| h.as_c_str() == e), AHB_IMPORT_ALLOWED.load(Ordering::Relaxed))
+            == Some(true);
+    if import_ahb && !AHB_MODE_LOGGED.swap(true, Ordering::Relaxed) {
+        crate::logf!(gndrm_obf::obf!(
+            "proxy device: importing swapchain slots as AHardwareBuffers"
+        ));
+    }
+    let add_exts: &[&CStr] = if import_ahb { &AHB_EXTS } else { &DMA_BUF_EXTS };
     let mut exts: [*const c_char; 48] = [ptr::null(); 48];
     let mut n: usize = 0;
     let names = unsafe {
@@ -8527,7 +8577,7 @@ unsafe extern "C" fn gn_vkCreateDevice(
     } else {
         &[]
     };
-    'add: for add in ADD_EXTS.iter().chain(placed_exts.iter()).copied() {
+    'add: for add in add_exts.iter().chain(placed_exts.iter()).copied() {
         for &e in &exts[..n] {
             if unsafe { CStr::from_ptr(e) } == add {
                 continue 'add;
@@ -8645,6 +8695,7 @@ unsafe extern "C" fn gn_vkCreateDevice(
         queue_family: 0,
         cmd_pool: 0,
         fp16: false,
+        import_ahb,
         lsfg_epoch: 0,
         gen_batches: Vec::new(),
         gen_next: 0,
@@ -9033,6 +9084,8 @@ unsafe fn slot_release(sc: *mut GnSwapchain, s: *mut GnSlot) {
             libc::close((*s).fd);
         }
         (*s).fd = -1;
+        crate::scanout::ahb_release((*s).ahb);
+        (*s).ahb = ptr::null_mut();
     }
 }
 
@@ -9402,6 +9455,9 @@ unsafe fn slot_init_with_usage(
     usage: VkImageUsageFlags,
 ) -> VkResult {
     let gd = (*sc).dev;
+    if unsafe { (*gd).import_ahb } {
+        return unsafe { slot_init_ahb(sc, s, usage) };
+    }
     let dev = unsafe { (*gd).real };
     let f = unsafe { (*gd).f };
     (*s).fd = -1;
@@ -9568,6 +9624,190 @@ unsafe fn slot_init_with_usage(
         return res;
     }
     slot_init_sync(sc, s)
+}
+
+const VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID:
+    VkExternalMemoryHandleTypeFlags = 0x400;
+const STYPE_AHB_PROPERTIES: VkStructureType = 1000129000;
+const STYPE_AHB_FORMAT_PROPERTIES: VkStructureType = 1000129002;
+const STYPE_IMPORT_AHB: VkStructureType = 1000129003;
+
+#[repr(C)]
+struct AhbProperties {
+    s_type: VkStructureType,
+    next: *mut c_void,
+    allocation_size: u64,
+    memory_type_bits: u32,
+}
+
+#[repr(C)]
+struct AhbFormatProperties {
+    s_type: VkStructureType,
+    next: *mut c_void,
+    format: VkFormat,
+    external_format: u64,
+    format_features: u32,
+    components: [u32; 4],
+    ycbcr: [u32; 4],
+}
+
+#[repr(C)]
+struct ImportAhb {
+    s_type: VkStructureType,
+    next: *const c_void,
+    buffer: *mut c_void,
+}
+
+/// `slot_init_with_usage` on a driver that imports only `AHardwareBuffer`s (the
+/// Adreno system driver has no dma-buf import). The daemon hands out the same
+/// pool buffer as on the dma-buf path, with its `AHardwareBuffer` handle as
+/// well: the fd still goes to the compositor, the handle to the driver. Images
+/// backed by an `AHardwareBuffer` must use OPTIMAL tiling; the layout is the
+/// one gralloc chose for the pool's usage (CPU-readable, so linear), which is
+/// what the compositor reads through the fd.
+unsafe fn slot_init_ahb(
+    sc: *mut GnSwapchain,
+    s: *mut GnSlot,
+    usage: VkImageUsageFlags,
+) -> VkResult {
+    let gd = unsafe { (*sc).dev };
+    let dev = unsafe { (*gd).real };
+    let f = unsafe { (*gd).f };
+    unsafe {
+        (*s).fd = -1;
+        (*s).offset = 0;
+        (*s).modifier = GN_DRM_MOD_LINEAR;
+        (*s).ahb = ptr::null_mut();
+    }
+    let (width, height) = unsafe { ((*sc).extent.width, (*sc).extent.height) };
+    let Some(buf) = crate::scanout::allocate_ahb(width, height) else {
+        crate::logf!(gndrm_obf::obf!(
+            "proxy slot: no AHardwareBuffer from the daemon for {width}x{height}"
+        ));
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    unsafe {
+        (*s).fd = buf.fd;
+        (*s).ino = buf.ino;
+        (*s).ahb = buf.ahb;
+        (*s).stride = if buf.stride != 0 {
+            buf.stride
+        } else {
+            (width * 4 + 255) & !255
+        };
+    }
+    type PropsPfn =
+        unsafe extern "C" fn(VkDevice, *const c_void, *mut AhbProperties) -> VkResult;
+    let get_props: Option<PropsPfn> = unsafe {
+        std::mem::transmute(gn_real_device_proc(
+            gd,
+            c"vkGetAndroidHardwareBufferPropertiesANDROID",
+        ))
+    };
+    let Some(get_props) = get_props else {
+        crate::logf!(gndrm_obf::obf!(
+            "proxy slot: driver resolves no vkGetAndroidHardwareBufferPropertiesANDROID"
+        ));
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    let mut fmt = AhbFormatProperties {
+        s_type: STYPE_AHB_FORMAT_PROPERTIES,
+        next: ptr::null_mut(),
+        format: 0,
+        external_format: 0,
+        format_features: 0,
+        components: [0; 4],
+        ycbcr: [0; 4],
+    };
+    let mut props = AhbProperties {
+        s_type: STYPE_AHB_PROPERTIES,
+        next: (&raw mut fmt).cast(),
+        allocation_size: 0,
+        memory_type_bits: 0,
+    };
+    let res = unsafe { get_props(dev, buf.ahb, &mut props) };
+    crate::logf!(gndrm_obf::obf!(
+        "proxy slot: AHB fd={} ino={} stride={} size {} memTypeBits {:#x} format {} (swapchain {}): {res}",
+        buf.fd,
+        buf.ino,
+        unsafe { (*s).stride },
+        props.allocation_size,
+        props.memory_type_bits,
+        fmt.format,
+        unsafe { (*sc).format }
+    ));
+    if res != VK_SUCCESS || props.memory_type_bits == 0 {
+        return if res != VK_SUCCESS { res } else { VK_ERROR_INITIALIZATION_FAILED };
+    }
+    let ext_img = VkExternalMemoryImageCreateInfo {
+        sType: VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        pNext: ptr::null(),
+        handleTypes: VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
+    };
+    let ici = VkImageCreateInfo {
+        sType: VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        pNext: &ext_img as *const _ as *const c_void,
+        flags: 0,
+        imageType: VK_IMAGE_TYPE_2D,
+        format: unsafe { (*sc).format },
+        extent: VkExtent3D {
+            width,
+            height,
+            depth: 1,
+        },
+        mipLevels: 1,
+        arrayLayers: 1,
+        samples: VK_SAMPLE_COUNT_1_BIT,
+        tiling: VK_IMAGE_TILING_OPTIMAL,
+        usage,
+        sharingMode: VK_SHARING_MODE_EXCLUSIVE,
+        queueFamilyIndexCount: 0,
+        pQueueFamilyIndices: ptr::null(),
+        initialLayout: VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    let res = unsafe { f.create_image.unwrap()(dev, &ici, ptr::null(), &mut (*s).image) };
+    if res != VK_SUCCESS {
+        crate::logf!(gndrm_obf::obf!("proxy import image (AHB) create failed: {res}"));
+        return res;
+    }
+    let mem_type = (0..32u32)
+        .find(|&i| {
+            props.memory_type_bits & (1 << i) != 0
+                && (i as usize) < unsafe { (*gd).mem_props.memoryTypeCount } as usize
+                && unsafe { (*gd).mem_props.memoryTypes[i as usize].propertyFlags } & 0x1 != 0
+        })
+        .or_else(|| (0..32u32).find(|&i| props.memory_type_bits & (1 << i) != 0))
+        .unwrap_or(0);
+    let ded = VkMemoryDedicatedAllocateInfo {
+        sType: VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+        pNext: ptr::null(),
+        image: unsafe { (*s).image },
+        buffer: 0,
+    };
+    let imp = ImportAhb {
+        s_type: STYPE_IMPORT_AHB,
+        next: &ded as *const _ as *const c_void,
+        buffer: buf.ahb,
+    };
+    let mai = VkMemoryAllocateInfo {
+        sType: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        pNext: &imp as *const _ as *const c_void,
+        allocationSize: props.allocation_size,
+        memoryTypeIndex: mem_type,
+    };
+    let mut res = unsafe { f.alloc_mem.unwrap()(dev, &mai, ptr::null(), &mut (*s).mem) };
+    if res == VK_SUCCESS {
+        res = unsafe { f.bind_mem.unwrap()(dev, (*s).image, (*s).mem, 0) };
+    }
+    crate::logf!(gndrm_obf::obf!(
+        "proxy slot: AHB import {width}x{height} type {} {}: {res}",
+        mem_type,
+        mem_type_desc(gd, mem_type)
+    ));
+    if res != VK_SUCCESS {
+        return res;
+    }
+    unsafe { slot_init_sync(sc, s) }
 }
 
 unsafe fn slot_make_buffer(sc: *mut GnSwapchain, s: *mut GnSlot) -> *mut wl_proxy {
