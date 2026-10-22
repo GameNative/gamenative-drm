@@ -7728,6 +7728,11 @@ unsafe extern "C" fn gn_vkCreateXcbSurfaceKHR(
     out: *mut VkSurfaceKHR,
 ) -> VkResult {
     let ci = unsafe { &*ci };
+    crate::logf!(gndrm_obf::obf!(
+        "proxy xcb surface: window {:#x} connection {:?} instance {instance:?}",
+        ci.window,
+        ci.connection
+    ));
     let gi = unsafe { find_instance(instance) };
     if gi.is_null() {
         crate::logf!(gndrm_obf::obf!(
