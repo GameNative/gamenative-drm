@@ -8539,6 +8539,8 @@ unsafe extern "C" fn gn_vkCreateDevice(
             c"VK_ANDROID_external_memory_android_hardware_buffer",
             c"VK_EXT_queue_family_foreign",
         ]
+    } else if crate::export::enabled() {
+        &[c"VK_ANDROID_external_memory_android_hardware_buffer"]
     } else {
         &[]
     };
@@ -9591,36 +9593,36 @@ unsafe fn slot_init_with_usage(
     slot_init_sync(sc, s)
 }
 
-const VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID:
+pub(crate) const VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID:
     VkExternalMemoryHandleTypeFlags = 0x400;
-const STYPE_AHB_PROPERTIES: VkStructureType = 1000129000;
-const STYPE_AHB_FORMAT_PROPERTIES: VkStructureType = 1000129002;
-const STYPE_IMPORT_AHB: VkStructureType = 1000129003;
+pub(crate) const STYPE_AHB_PROPERTIES: VkStructureType = 1000129000;
+pub(crate) const STYPE_AHB_FORMAT_PROPERTIES: VkStructureType = 1000129002;
+pub(crate) const STYPE_IMPORT_AHB: VkStructureType = 1000129003;
 
 #[repr(C)]
-struct AhbProperties {
-    s_type: VkStructureType,
-    next: *mut c_void,
-    allocation_size: u64,
-    memory_type_bits: u32,
+pub(crate) struct AhbProperties {
+    pub s_type: VkStructureType,
+    pub next: *mut c_void,
+    pub allocation_size: u64,
+    pub memory_type_bits: u32,
 }
 
 #[repr(C)]
-struct AhbFormatProperties {
-    s_type: VkStructureType,
-    next: *mut c_void,
-    format: VkFormat,
-    external_format: u64,
-    format_features: u32,
-    components: [u32; 4],
-    ycbcr: [u32; 4],
+pub(crate) struct AhbFormatProperties {
+    pub s_type: VkStructureType,
+    pub next: *mut c_void,
+    pub format: VkFormat,
+    pub external_format: u64,
+    pub format_features: u32,
+    pub components: [u32; 4],
+    pub ycbcr: [u32; 4],
 }
 
 #[repr(C)]
-struct ImportAhb {
-    s_type: VkStructureType,
-    next: *const c_void,
-    buffer: *mut c_void,
+pub(crate) struct ImportAhb {
+    pub s_type: VkStructureType,
+    pub next: *const c_void,
+    pub buffer: *mut c_void,
 }
 
 /// `slot_init_with_usage` on a driver that imports only `AHardwareBuffer`s (the

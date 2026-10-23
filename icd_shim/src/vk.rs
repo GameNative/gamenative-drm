@@ -96,9 +96,11 @@ pub const VK_TIMEOUT: VkResult = 2;
 pub const VK_SUBOPTIMAL_KHR: VkResult = 1000001003;
 pub const VK_INCOMPLETE: VkResult = 5;
 pub const VK_ERROR_OUT_OF_HOST_MEMORY: VkResult = -1;
+pub const VK_ERROR_OUT_OF_DEVICE_MEMORY: VkResult = -2;
 pub const VK_ERROR_INITIALIZATION_FAILED: VkResult = -3;
 pub const VK_ERROR_FEATURE_NOT_PRESENT: VkResult = -8;
 pub const VK_ERROR_FORMAT_NOT_SUPPORTED: VkResult = -11;
+pub const VK_ERROR_INVALID_EXTERNAL_HANDLE: VkResult = -1000072003;
 pub const VK_ERROR_SURFACE_LOST_KHR: VkResult = -1000000000;
 pub const VK_ERROR_OUT_OF_DATE_KHR: VkResult = -1000001004;
 
