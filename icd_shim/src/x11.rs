@@ -46,7 +46,6 @@
 
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 // --------------------------------------------------------------- xcb ABI
@@ -806,13 +805,6 @@ pub struct X11Present {
     /// window wine named (see `resolve_target`). Equal to the named window when
     /// that window is already a root child.
     window: u32,
-    /// The target window's `WM_CLASS` instance, read once at bring-up: the
-    /// desktop reference [`X11Present::window_present`] compares the bound
-    /// window against. Under `desktop=shell` the target is the wine desktop
-    /// window and this is its class (wine's `explorer.exe`), which the game's
-    /// own window differs from while wine's shell/taskbar children share it.
-    desktop_class: [u8; 32],
-    desktop_class_len: usize,
     /// The named window's offset within `window`; `Present` places the pixmap
     /// here, so a decorated or repositioned client window stays placed.
     x_off: i16,
@@ -833,216 +825,6 @@ unsafe fn check_err(c: *mut xcb_connection_t, cookie: cookie_t) -> Option<u8> {
     let code = unsafe { (*e).error_code };
     unsafe { libc::free(e.cast()) };
     Some(code)
-}
-
-/// The child half of the game-window predicate: whether `bound` has a child
-/// that is a real window of its own — viewable, `InputOutput`, non-degenerate,
-/// and carrying a `WM_CLASS` instance that differs from `bound`'s own
-/// (`own_class`).
-///
-/// Shared by both routes through [`window_present`]: on the override/Wayland
-/// route (the default) the bound window is the wine desktop window and this is
-/// the whole signal, while on the guest-surface route (the opt-in) it covers the
-/// case where the bound window is a container too.
-///
-/// A class read that fails (an empty class) is treated as **not** a match:
-/// wine's own shell and taskbar share the desktop's class, but an unreadable
-/// class must never let one of them clear the splash over an empty desktop.
-unsafe fn game_child_present(conn: *mut xcb_connection_t, bound: u32, own_class: &[u8]) -> bool {
-    if own_class.is_empty() {
-        return false;
-    }
-    let tree = unsafe { xcb_query_tree_reply(conn, xcb_query_tree(conn, bound), ptr::null_mut()) };
-    if tree.is_null() {
-        return false;
-    }
-    let n = unsafe { (*tree).children_len as usize };
-    let kids = unsafe { (tree as *const u8).add(32).cast::<u32>() };
-    let mut found = false;
-    for i in 0..n {
-        let c = unsafe { ptr::read_unaligned(kids.add(i)) };
-        let Some((map_state, class_, _)) = (unsafe { window_attr(conn, c) }) else {
-            continue;
-        };
-        if map_state != MAP_STATE_VIEWABLE || class_ != WINDOW_CLASS_INPUT_OUTPUT {
-            continue;
-        }
-        let (w, h) = unsafe { window_size(conn, c) };
-        if is_degenerate(w, h) {
-            continue;
-        }
-        let ccls = unsafe { window_class_instance(conn, c) };
-        let clen = ccls.iter().position(|&b| b == 0).unwrap_or(ccls.len());
-        // An unreadable class is unknown, never a match.
-        if clen == 0 {
-            continue;
-        }
-        if ccls[..clen] != own_class[..] {
-            found = true;
-            break;
-        }
-    }
-    unsafe { libc::free(tree.cast()) };
-    found
-}
-
-/// The nearest ancestor-or-self of `bound` that carries a readable `WM_CLASS`
-/// instance, with that instance (the bound window itself and length 0 when the
-/// walk finds none).
-///
-/// wine hands the guest-surface route its *client* window, which carries no
-/// `WM_CLASS` at all: the class sits on the frame one level up (`hades2.exe`),
-/// one level above that the wine desktop window (`explorer.exe`, the root
-/// child). So the predicate resolves the class through the ancestor chain
-/// rather than insisting the bound window itself be classed.
-///
-/// The walk climbs at most to the bound window's root child — under wine's
-/// `/desktop=` that is the desktop window — and stops there, so it can never
-/// cross into the desktop's siblings or the root. A window with no readable
-/// class is simply skipped; an unreadable class is "unknown", never a match.
-unsafe fn nearest_classed_ancestor(
-    conn: *mut xcb_connection_t,
-    bound: u32,
-) -> (u32, [u8; 32], usize) {
-    let mut cur = bound;
-    for _ in 0..MAX_ANCESTOR_DEPTH {
-        let cls = unsafe { window_class_instance(conn, cur) };
-        let clen = cls.iter().position(|&b| b == 0).unwrap_or(cls.len());
-        if clen > 0 {
-            return (cur, cls, clen);
-        }
-        let tree =
-            unsafe { xcb_query_tree_reply(conn, xcb_query_tree(conn, cur), ptr::null_mut()) };
-        if tree.is_null() {
-            break;
-        }
-        let (root, parent) = unsafe { ((*tree).root, (*tree).parent) };
-        unsafe { libc::free(tree.cast()) };
-        // The root child — the wine desktop window — is the boundary: read it,
-        // but never walk past it (into the root or a sibling subtree).
-        if cur == root || parent == root || parent == 0 || parent == cur {
-            break;
-        }
-        cur = parent;
-    }
-    (bound, [0u8; 32], 0)
-}
-
-/// Whether the window a present route is **bound to** is the game's own window —
-/// one predicate for both route shapes.
-///
-/// The bound window is `bound`, and the desktop window's `WM_CLASS` instance is
-/// `desktop_class` (an empty slice when it could not be read). The window shapes
-/// the two routes bind are different, which is why the rule resolves the class
-/// through the ancestor chain and then has two arms:
-///  - guest-surface (the opt-in): the bound window is the guest's *own* window,
-///    which wine leaves **classless** (its `WM_CLASS` sits on the frame one
-///    level up), so the *nearest classed ancestor-or-self* is the signal.
-///  - override/Wayland (the DEFAULT): the bound window is the wine *desktop* window,
-///    whose own class *is* the desktop's, and the game appears as a differing
-///    class child of it — nothing about the bound window itself says "game". The
-///    degenerate-ancestor case (Dishonored, with A29 parked) binds a classless
-///    window that is not the desktop and is decided here too, by the same walk.
-///
-/// So the bound window counts as present when the **nearest classed
-/// ancestor-or-self's `WM_CLASS` instance differs from the desktop's**, or when
-/// it has a **non-degenerate, viewable child whose class differs** (see
-/// [`game_child_present`]); a classless bound window is skipped by the walk, not
-/// treated as absent.
-///
-/// An unreadable class is never a match, on either side of either comparison:
-/// wine's own shell and taskbar carry the desktop's class, but an unknown class
-/// must never let one of them clear the splash over an empty desktop.
-unsafe fn window_present(conn: *mut xcb_connection_t, bound: u32, desktop_class: &[u8]) -> bool {
-    // The nearest classed ancestor-or-self (the bound window itself when it is
-    // classed). An unreadable class is unknown: the walk skips it, so it never
-    // makes the first comparison pass, and it never short-circuits the second
-    // arm either — `own` stays empty and the child scan simply declines.
-    let (ancestor, cls, clen) = unsafe { nearest_classed_ancestor(conn, bound) };
-    let own = &cls[..clen];
-    let present = if !own.is_empty() && !desktop_class.is_empty() && own != desktop_class {
-        true
-    } else {
-        unsafe { game_child_present(conn, bound, own) }
-    };
-    unsafe { log_predicate_once(conn, bound, ancestor, own, desktop_class, present) };
-    present
-}
-
-/// One-shot, ungated line naming how [`window_present`] resolved the bound
-/// window: its own `WM_CLASS` length, the nearest classed ancestor-or-self the
-/// walk found and that class, the desktop reference, and the verdict.
-///
-/// The splash-clear predicate failed on the guest-surface route because the
-/// bound window carries no `WM_CLASS` and an early guard returned before either
-/// arm ran; nothing in logcat said so, and the investigation needed an external
-/// X probe to see it. This fires once per session (the swap happens before any
-/// read or format), off the per-frame path — [`window_present`] runs at the
-/// tree-walk cadence, never per frame — and is deliberately **not** behind
-/// `GNDRM_LOG_VKSHIM`, so a real session shows it without a knob.
-unsafe fn log_predicate_once(
-    conn: *mut xcb_connection_t,
-    bound: u32,
-    ancestor: u32,
-    own: &[u8],
-    desktop_class: &[u8],
-    present: bool,
-) {
-    static LOGGED: AtomicBool = AtomicBool::new(false);
-    if LOGGED.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    let bound_cls = unsafe { window_class_instance(conn, bound) };
-    let bound_len = bound_cls.iter().position(|&b| b == 0).unwrap_or(0);
-    eprintln!(
-        "{} {}",
-        gndrm_obf::obf!("gn-vkshim:"),
-        gndrm_obf::obf!(
-            "x11 game-window predicate: bound=0x{:x} bound_class_len={} nearest_classed=0x{:x} class={} desktop_class={} present={}",
-            bound,
-            bound_len,
-            ancestor,
-            String::from_utf8_lossy(own),
-            String::from_utf8_lossy(desktop_class),
-            present
-        )
-    );
-}
-
-/// Whether the window the override/Wayland route is bound to is the game's own
-/// window (see [`window_present`]).
-///
-/// That route (the default; `proxy::xlib_override_surface`,
-/// `GN_VKSHIM_GUEST_SURFACE` unset or not exactly "1") holds no persistent X
-/// connection, so — like [`resolve_override_target`] and
-/// [`window_extent`] — the walk opens its own connection, reads the bound
-/// window's `WM_CLASS`, runs [`window_present`] and closes it. On this route the
-/// bound window is the wine desktop window, so its own class *is* the desktop's
-/// and the class comparison falls through to the child scan; the same child scan
-/// is what decides the degenerate-ancestor case, where the bound window is not
-/// the desktop. The connection is live for the walk; nothing has to be kept
-/// between walks.
-///
-/// This is an X round trip, so the caller runs it at the tree-walk cadence
-/// (every *N* presents, until the game is first reported), never per frame. The
-/// transition it detects is one-shot, so tens of milliseconds of latency — and a
-/// fresh connection per walk, which stops entirely once reported — cost nothing.
-pub unsafe fn game_window_present(window: u32) -> bool {
-    if window == 0 {
-        return false;
-    }
-    let conn = unsafe { xcb_connect(ptr::null(), ptr::null_mut()) };
-    if conn.is_null() || unsafe { xcb_connection_has_error(conn) } != 0 {
-        if !conn.is_null() {
-            unsafe { xcb_disconnect(conn) };
-        }
-        return false;
-    }
-    let cls = unsafe { window_class_instance(conn, window) };
-    let clen = cls.iter().position(|&b| b == 0).unwrap_or(cls.len());
-    let present = unsafe { window_present(conn, window, &cls[..clen]) };
-    unsafe { xcb_disconnect(conn) };
-    present
 }
 
 impl X11Present {
@@ -1121,21 +903,10 @@ impl X11Present {
             unsafe { libc::free(pv.cast()) };
             v
         };
-        // The desktop window's own `WM_CLASS`, read once: the game's window is
-        // told apart from wine's shell/taskbar by carrying a different one (see
-        // `window_present`). Length 0 means the class could not be read, which
-        // is treated as "unknown", never a match.
-        let desktop_class = unsafe { window_class_instance(conn, target_window) };
-        let desktop_class_len = desktop_class
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(desktop_class.len());
         let present = X11Present {
             lock: Mutex::new(()),
             conn,
             window: target_window,
-            desktop_class,
-            desktop_class_len,
             x_off,
             y_off,
             depth,
@@ -1154,38 +925,6 @@ impl X11Present {
 
     pub fn window(&self) -> u32 {
         self.window
-    }
-
-    /// Whether the window the guest-surface route is bound to is the game's own
-    /// window, on this present's own live connection (see [`window_present`] for
-    /// the rule).
-    ///
-    /// `bound` is the window the route bound — `GnSurface::window`, i.e. the
-    /// guest's own X window on this route — and the desktop reference is this
-    /// present's target window's class, read once at bring-up. Under
-    /// `desktop=shell` the tree is depth 3 — root -> the wine desktop window ->
-    /// the game's whole_window (override-redirect) -> the named client window
-    /// the shim was handed — and that named client window is **classless**, so
-    /// the predicate resolves the class from its nearest classed ancestor (the
-    /// game's frame) before comparing; a bound window that is a container
-    /// instead falls through to the child scan.
-    ///
-    /// This is an X round trip, so the caller runs it at the tree-walk cadence
-    /// (every *N* presents, until it first reports), never per frame. The
-    /// transition it detects is one-shot, so tens of milliseconds of latency
-    /// cost nothing.
-    pub unsafe fn window_present(&self, bound: u32) -> bool {
-        if bound == 0 {
-            return false;
-        }
-        let _g = self.lock();
-        unsafe {
-            window_present(
-                self.conn,
-                bound,
-                &self.desktop_class[..self.desktop_class_len],
-            )
-        }
     }
 
     /// One-shot dump of the named window, its parent chain up to the root, and

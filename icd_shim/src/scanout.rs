@@ -17,8 +17,8 @@
 //! pre-existing behaviour rather than a broken one.
 
 use gndrm_uapi::wire::{
-    FrameCapNote, FrameCapSubscribe, GameWindowNote, LsfgConfig, ScanoutAllocReq, ScanoutAllocResp,
-    CAP_FRAME_CAP, FPS_UNCAPPED, SCANOUT_FORMAT_BGRA_8888, SCANOUT_REQ_AHB_HANDLE,
+    FrameCapNote, FrameCapSubscribe, LsfgConfig, ScanoutAllocReq, ScanoutAllocResp, CAP_FRAME_CAP,
+    FPS_UNCAPPED, SCANOUT_FORMAT_BGRA_8888, SCANOUT_REQ_AHB_HANDLE,
 };
 use std::ffi::c_void;
 use std::os::fd::RawFd;
@@ -206,60 +206,9 @@ pub(crate) fn notes_seen() -> usize {
     NOTES_N.load(Ordering::Relaxed)
 }
 
-/// Tell the daemon the game's own window has appeared, so it can dismiss the
-/// booting splash on that event instead of on the desktop's first frame.
-///
-/// Fire-and-forget on the scan-out channel (the connection this module already
-/// holds): unlike the allocator exchange there is no reply, and a failure costs
-/// nothing — the daemon's compile-time grace clears the splash anyway. Sent
-/// once per session (the caller latches); idempotent on the daemon.
-///
-/// A few attempts, reconnecting between them, exactly like [`allocate`]: the
-/// daemon serves a **single** scan-out reader and closes whatever connection a
-/// newer one supersedes, and the other client on this same listener (the
-/// LD_PRELOAD shim in gamescope's process) reconnects on its own cadence — so
-/// the descriptor this module cached is frequently already dead when the note
-/// is sent. A single `sendmsg` on it fails with `EPIPE`, and because the caller
-/// latches `GAME_WINDOW_REPORTED` before calling this, the note would be lost
-/// for the session. Reconnecting makes this connection the newest, which is
-/// what gets the note read.
-pub fn report_game_window_present() {
-    let Ok(path) = std::env::var("GAMENATIVE_DRM_SOCKET") else {
-        return;
-    };
-    if path.is_empty() {
-        return;
-    }
-    let note = GameWindowNote {
-        present: GameWindowNote::PRESENT,
-    };
-    let mut ch = CHAN.lock().unwrap_or_else(|e| e.into_inner());
-    for _ in 0..3 {
-        if *ch < 0 {
-            *ch = connect(&path);
-            if *ch < 0 {
-                return;
-            }
-        }
-        if send_note(*ch, note) {
-            return;
-        }
-        // SAFETY: `*ch` is a descriptor this module owns.
-        unsafe { libc::close(*ch) };
-        *ch = -1;
-    }
-}
-
-/// Send one notification frame; `false` when the channel did not accept it. No
-/// reply is read: the daemon does not answer this message, so nothing is
-/// expected back on the connection.
-fn send_note(fd: RawFd, note: GameWindowNote) -> bool {
-    send_frame(fd, &note.encode())
-}
-
 /// Send one frame that expects no reply; `false` when the channel did not
-/// accept it. Shared by the two fire-and-forget frames on this channel: the
-/// game-window notification and the frame-cap subscribe.
+/// accept it: the frame-cap subscribe, the one fire-and-forget frame on this
+/// channel.
 fn send_frame(fd: RawFd, wire: &[u8]) -> bool {
     // SAFETY: `fd` is the connection this module owns, `wire` outlives the
     // call. MSG_NOSIGNAL: a displaced or closed channel must fail rather than
