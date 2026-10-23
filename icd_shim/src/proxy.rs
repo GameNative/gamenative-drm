@@ -5124,7 +5124,49 @@ pub fn serve_unlisted(
     }
 }
 
-pub static GDPA_MISSED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Names already logged, per guest device handle. A process can create
+/// several devices at different API versions and extension sets, and the same
+/// name resolves differently on each, so once per process hides the device
+/// that matters.
+pub struct PerDeviceLog(Mutex<Vec<(usize, Vec<String>)>>);
+
+const PER_DEVICE_LOG_CAP: usize = 1024;
+
+impl PerDeviceLog {
+    pub const fn new() -> Self {
+        Self(Mutex::new(Vec::new()))
+    }
+
+    /// True the first time `name` is seen for `dev`, up to the per-device cap.
+    pub fn first(&self, dev: usize, name: &str) -> bool {
+        let Ok(mut all) = self.0.lock() else {
+            return false;
+        };
+        let idx = match all.iter().position(|(d, _)| *d == dev) {
+            Some(i) => i,
+            None => {
+                all.push((dev, Vec::new()));
+                all.len() - 1
+            }
+        };
+        let seen = &mut all[idx].1;
+        if seen.len() >= PER_DEVICE_LOG_CAP || seen.iter().any(|s| s == name) {
+            return false;
+        }
+        seen.push(name.to_owned());
+        true
+    }
+
+    /// Drop a destroyed device's names, so a new device at the same address
+    /// logs afresh.
+    pub fn forget(&self, dev: usize) {
+        if let Ok(mut all) = self.0.lock() {
+            all.retain(|(d, _)| *d != dev);
+        }
+    }
+}
+
+pub static GDPA_MISSED: PerDeviceLog = PerDeviceLog::new();
 /// Entry points the *driver* has no implementation for, asked through the
 /// instance and physical-device paths. Named once each, like `GDPA_MISSED`:
 /// the loader resolves device functions through these paths too, so a name the
@@ -5148,7 +5190,7 @@ pub fn note_instance_miss(name: &CStr, driver_has_none: bool) {
         }
     }
 }
-static REAL_PROC_SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static REAL_PROC_SEEN: PerDeviceLog = PerDeviceLog::new();
 
 unsafe extern "C" fn gn_vkGetDeviceProcAddr(
     device: VkDevice,
@@ -5169,16 +5211,16 @@ unsafe extern "C" fn gn_vkGetDeviceProcAddr(
     // which always swaps.
     let target = unsafe { gn_real_device_proc(find_device(device), name) };
     if target.is_none() {
-        // Returning NULL hands the guest the loader's no-op stub: the call
-        // silently does nothing. Name every such entry point once.
-        if let Ok(mut missed) = GDPA_MISSED.lock() {
-            let n = name.to_string_lossy().into_owned();
-            if missed.len() < 64 && !missed.contains(&n) {
-                crate::logf!(gndrm_obf::obf!(
-                    "proxy: vkGetDeviceProcAddr MISS (no-op stub): {n}"
-                ));
-                missed.push(n);
-            }
+        // A NULL from here reaches the app as NULL from the loader's
+        // vkGetDeviceProcAddr. What jumps through an empty slot is a loader
+        // instance trampoline, resolved by name through the instance path
+        // instead. Name every miss once per device.
+        let n = name.to_string_lossy();
+        if GDPA_MISSED.first(device as usize, &n) {
+            crate::logf!(gndrm_obf::obf!(
+                "proxy: vkGetDeviceProcAddr MISS dev={:#x} (NULL to the app): {n}",
+                device as usize
+            ));
         }
     }
     serve_unlisted(name, target, DispatchCtx::Device)
@@ -5877,6 +5919,8 @@ pub struct RealDevFns {
 
 pub struct GnInstance {
     pub real: VkInstance,
+    /// The apiVersion the app asked for (`VkApplicationInfo`), 0 when it gave none.
+    pub api_version: u32,
     pub f: RealInstFns,
     pub pds: [VkPhysicalDevice; 8],
     pub n_pds: u32,
@@ -6821,21 +6865,20 @@ pub(crate) unsafe fn gn_real_device_proc(gd: *mut GnDevice, name: &CStr) -> PFN_
     }
     // The image/memory entry points are where the guest's calls silently do
     // nothing, so record where each one came from.
-    if let Ok(mut seen) = REAL_PROC_SEEN.lock() {
-        let n = name.to_string_lossy().into_owned();
-        if seen.len() < 128
-            && !seen.iter().any(|s| s == &n)
-            && (n.contains("Copy")
-                || n.contains("Clear")
-                || n.contains("Bind")
-                || n.contains("Allocate")
-                || n.contains("Map")
-                || n.contains("CreateImage")
-                || n.contains("SubresourceLayout"))
-        {
-            crate::logf!(gndrm_obf::obf!("proxy: real proc {n} via {via}"));
-            seen.push(n);
-        }
+    let n = name.to_string_lossy();
+    if (n.contains("Copy")
+        || n.contains("Clear")
+        || n.contains("Bind")
+        || n.contains("Allocate")
+        || n.contains("Map")
+        || n.contains("CreateImage")
+        || n.contains("SubresourceLayout"))
+        && REAL_PROC_SEEN.first(gd as usize, &n)
+    {
+        crate::logf!(gndrm_obf::obf!(
+            "proxy: real proc {n} via {via} dev={:#x}",
+            gd as usize
+        ));
     }
     fnptr
 }
@@ -7133,8 +7176,14 @@ unsafe extern "C" fn gn_vkCreateInstance(
     if res != VK_SUCCESS {
         return res;
     }
+    let api_version = if ci.pApplicationInfo.is_null() {
+        0
+    } else {
+        unsafe { (*ci.pApplicationInfo).apiVersion }
+    };
     let gi = Box::new(GnInstance {
         real: unsafe { *out },
+        api_version,
         f: RealInstFns {
             gdp: unsafe { std::mem::transmute(gn_real_inst_proc(*out, c"vkGetDeviceProcAddr")) },
             enum_pds: unsafe {
@@ -8495,9 +8544,16 @@ unsafe extern "C" fn gn_vkCreateDevice(
         )
     };
     let mut exts: Vec<*const c_char> = vec![ptr::null(); names.len() + 16];
+    // An absent or zero apiVersion means 1.0.
+    let api = match unsafe { (*gi).api_version } {
+        0 => 1 << 22,
+        v => v,
+    };
     crate::logf!(gndrm_obf::obf!(
-        "proxy device: guest enables {} extensions",
-        names.len()
+        "proxy device: guest enables {} extensions api={}.{}",
+        names.len(),
+        (api >> 22) & 0x7F,
+        (api >> 12) & 0x3FF
     ));
     for &name in names {
         // The guest must never enable a WSI extension the proxy cannot honour
@@ -8827,6 +8883,8 @@ unsafe extern "C" fn gn_vkDestroyDevice(device: VkDevice, _alloc: *const VkAlloc
             destroy_device((*gd).real, ptr::null());
         }
     }
+    GDPA_MISSED.forget(gd as usize);
+    REAL_PROC_SEEN.forget(gd as usize);
     {
         let mut g = G.lock().unwrap();
         let mut pp: *mut *mut GnDevice = &raw mut g.devices;

@@ -5,7 +5,7 @@
 //! hooks when the outer loader calls them — but the loader calls them with
 //! the shim's wrapper handles. A thunk swaps the wrapper for the real
 //! handle (stored right after the scratch prefix) and tail-branches to the
-//! hooks' function. Generated code, one 24-byte thunk per name; the RW→RX
+//! hooks' function. Generated code, one 24-byte thunk per target; the RW→RX
 //! transition matches what box64's dynarec does on-device.
 
 use crate::vk::PFN_vkVoidFunction;
@@ -22,7 +22,47 @@ struct ThunkState {
     // Only read by the aarch64 emitter; the host stub never advances it.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     used: usize,
-    thunks: HashMap<Box<str>, PFN_vkVoidFunction>,
+    cache: ThunkCache,
+}
+
+/// Thunks keyed by the address they branch to: the emitted code depends on
+/// nothing else. A name is not a key, because one name resolves to different
+/// targets on different devices of the same process (a promoted alias reached
+/// through the loader on one device and through the driver on another).
+#[derive(Default)]
+struct ThunkCache {
+    by_target: HashMap<usize, PFN_vkVoidFunction>,
+    // Diagnostic only: the last target each name was served.
+    last_target: HashMap<Box<str>, usize>,
+}
+
+impl ThunkCache {
+    fn get(&self, target: usize) -> Option<PFN_vkVoidFunction> {
+        self.by_target.get(&target).copied()
+    }
+
+    fn insert(&mut self, target: usize, thunk: PFN_vkVoidFunction) {
+        self.by_target.insert(target, thunk);
+    }
+
+    /// Record that `name` was served `target`.
+    fn note_name(&mut self, name: &str, target: usize) -> Served {
+        match self.last_target.get_mut(name) {
+            Some(prev) if *prev == target => Served::Same,
+            Some(prev) => Served::Retarget(std::mem::replace(prev, target)),
+            None => {
+                self.last_target.insert(name.into(), target);
+                Served::First
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Served {
+    First,
+    Same,
+    Retarget(usize),
 }
 
 // Raw page pointer is shared only under this mutex.
@@ -108,45 +148,113 @@ unsafe fn emit(_target: PFN_vkVoidFunction, _st: &mut ThunkState) -> PFN_vkVoidF
     None
 }
 
-static THUNKED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
-/// One thunk per name (the thunk's target is fixed at emission).
+/// One thunk per target (the thunk's code depends only on the target). `name`
+/// is only for the log.
 pub fn thunk_for(name: &str, target: PFN_vkVoidFunction) -> PFN_vkVoidFunction {
-    // Every entry point the guest resolves through the shim lands here: what
-    // is absent from this list either came from the shim's own table or was
-    // answered by someone else (the loader's stub).
-    if let Ok(mut seen) = THUNKED.lock() {
-        if seen.len() < 128 && !seen.iter().any(|s| s == name) {
-            crate::logf!(gndrm_obf::obf!("proxy: thunk -> {name}"));
-            seen.push(name.to_string());
-        }
-    }
+    let addr = target? as usize;
     let mut guard = STATE.lock().unwrap();
     let st = guard.get_or_insert_with(|| ThunkState {
         page: std::ptr::null_mut(),
         used: 0,
-        thunks: HashMap::new(),
+        cache: ThunkCache::default(),
     });
-    if let Some(&fnptr) = st.thunks.get(name) {
-        return fnptr;
-    }
-    let f = unsafe { emit(target, st) }?;
-    if !st.page.is_null() {
-        let ret =
-            unsafe { libc::mprotect(st.page.cast(), PAGE, libc::PROT_READ | libc::PROT_EXEC) };
-        if ret != 0 {
-            crate::logf!(gndrm_obf::obf!(
-                "proxy: thunk page mprotect failed: {}",
-                errno_str()
-            ));
+    let served = st.cache.note_name(name, addr);
+    let cached = st.cache.get(addr);
+    let fnptr = match cached {
+        Some(fnptr) => fnptr,
+        None => {
+            let Some(f) = (unsafe { emit(target, st) }) else {
+                drop(guard);
+                log_retarget(name, served, addr);
+                return None;
+            };
+            if !st.page.is_null() {
+                let ret = unsafe {
+                    libc::mprotect(st.page.cast(), PAGE, libc::PROT_READ | libc::PROT_EXEC)
+                };
+                if ret != 0 {
+                    crate::logf!(gndrm_obf::obf!(
+                        "proxy: thunk page mprotect failed: {}",
+                        errno_str()
+                    ));
+                }
+            }
+            let fnptr = Some(f);
+            st.cache.insert(addr, fnptr);
+            fnptr
         }
+    };
+    drop(guard);
+    log_retarget(name, served, addr);
+    if cached.is_none() || served == Served::First {
+        crate::logf!(gndrm_obf::obf!(
+            "proxy: thunk -> {name} = {addr:#x} {}",
+            describe(addr)
+        ));
     }
-    let fnptr = Some(f);
-    st.thunks.insert(name.into(), fnptr);
     fnptr
+}
+
+fn log_retarget(name: &str, served: Served, addr: usize) {
+    if let Served::Retarget(old) = served {
+        crate::logf!(gndrm_obf::obf!(
+            "proxy: thunk retarget {name}: {old:#x} -> {addr:#x}"
+        ));
+    }
+}
+
+/// Where `addr` lives, by `dladdr`: `symbol (library)`, `library+offset`, or
+/// `anon` for code no loaded object claims.
+fn describe(addr: usize) -> String {
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    let found = unsafe { libc::dladdr(addr as *const libc::c_void, &raw mut info) };
+    if found == 0 || info.dli_fname.is_null() {
+        return gndrm_obf::obf!("anon").to_string();
+    }
+    let lib = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy();
+    if info.dli_sname.is_null() {
+        let off = addr.wrapping_sub(info.dli_fbase as usize);
+        return format!("{}", gndrm_obf::obf!("{lib}+{off:#x}"));
+    }
+    let sym = unsafe { std::ffi::CStr::from_ptr(info.dli_sname) }.to_string_lossy();
+    format!("{}", gndrm_obf::obf!("{sym} ({lib})"))
 }
 
 pub fn errno_str() -> String {
     let err = std::io::Error::last_os_error();
     err.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "C" fn fake_a() {}
+    unsafe extern "C" fn fake_b() {}
+
+    #[test]
+    fn one_thunk_per_target_not_per_name() {
+        let mut c = ThunkCache::default();
+        let a: PFN_vkVoidFunction = Some(fake_a);
+        let b: PFN_vkVoidFunction = Some(fake_b);
+        c.insert(0x1000, a);
+        assert_eq!(c.get(0x1000), Some(a));
+        assert_eq!(c.get(0x2000), None);
+        c.insert(0x2000, b);
+        assert_eq!(c.get(0x1000), Some(a));
+        assert_eq!(c.get(0x2000), Some(b));
+    }
+
+    #[test]
+    fn retarget_is_reported_once_per_change() {
+        let mut c = ThunkCache::default();
+        assert_eq!(c.note_name("vkResetQueryPoolEXT", 0x1000), Served::First);
+        assert_eq!(c.note_name("vkResetQueryPoolEXT", 0x1000), Served::Same);
+        assert_eq!(
+            c.note_name("vkResetQueryPoolEXT", 0x2000),
+            Served::Retarget(0x1000)
+        );
+        assert_eq!(c.note_name("vkResetQueryPoolEXT", 0x2000), Served::Same);
+        assert_eq!(c.note_name("vkResetQueryPool", 0x1000), Served::First);
+    }
 }
