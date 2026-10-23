@@ -34,7 +34,7 @@ use crate::vk::*;
 use crate::wlproto::{self, wl_display, wl_proxy};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 // First-N diagnostics for the present pipeline handoffs (acquire ->
 // present -> worker commit -> compositor release). Bounded counters, so
@@ -118,23 +118,6 @@ fn ring_dump(reason: &str) {
 }
 static LOG_COMMIT: AtomicUsize = AtomicUsize::new(0);
 
-/// Presents between game-window tree walks (see `maybe_report_game_window`).
-/// The splash-clear transition is one-shot, so a walk every `N` presents — a
-/// handful of milliseconds of latency — is ample, and it keeps a per-frame X
-/// round trip out of the present path.
-const GAME_WINDOW_CHECK_EVERY: u32 = 120;
-/// Walks to attempt before giving up: minutes of presents, so a guest that
-/// spends its first boot compiling shaders behind a loader window is still
-/// seen when its own window finally maps. A window that is not identifiable
-/// after this many walks (the guest never maps one, or it maps one the
-/// predicate cannot classify) will not become identifiable later, and each
-/// walk is an X11 round trip on the present path.
-const GAME_WINDOW_GIVE_UP: u32 = 240;
-/// Presents counted; a walk runs on every `GAME_WINDOW_CHECK_EVERY`th.
-static GAME_WINDOW_CHECK: AtomicU32 = AtomicU32::new(0);
-/// Set once the game-window notification has been sent; stops all further
-/// walks, so a signalled or idle session costs nothing.
-static GAME_WINDOW_REPORTED: AtomicBool = AtomicBool::new(false);
 static LOG_RELEASE: AtomicUsize = AtomicUsize::new(0);
 const LOG_FIRST_N: usize = 8;
 
@@ -635,44 +618,6 @@ unsafe fn x11_present_slot(sc: *mut GnSwapchain, s: *mut GnSlot, idx: i32) -> bo
         }
     }
     true
-}
-
-/// Walk the bound window at a fraction of the present cadence and tell the
-/// daemon (once) when the game's own window appears, so it can clear the
-/// booting splash on that event instead of on the first published frame.
-/// A no-op once reported, so an idle or already-signalled session costs
-/// nothing; the walk itself is bounded and never hangs.
-///
-/// Reached from BOTH present routes, at the same N-present cadence, so the
-/// override/Wayland route (the default) runs the check too (it previously sat
-/// behind the DRI3-only X11 present and never fired on the shipping
-/// configuration):
-///  - guest-surface route (the opt-in; `surf.x11` set): the present's own live
-///    connection, with `surf.window` — the guest's own window — as the bound
-///    window (see [`crate::x11::window_present`]).
-///  - override route (the default; `surf.x11` null): `surf.window` is the window
-///    the override resolved gamescope will paint; the walk opens its own
-///    connection (see [`crate::x11::game_window_present`]). Rides the cadence,
-///    never the per-frame present path.
-unsafe fn maybe_report_game_window(surf: *mut GnSurface) {
-    if GAME_WINDOW_REPORTED.load(Ordering::Relaxed) {
-        return;
-    }
-    let n = GAME_WINDOW_CHECK.fetch_add(1, Ordering::Relaxed);
-    if !n.is_multiple_of(GAME_WINDOW_CHECK_EVERY) || n / GAME_WINDOW_CHECK_EVERY >= GAME_WINDOW_GIVE_UP {
-        return;
-    }
-    let present = unsafe { (*surf).x11 };
-    let bound = unsafe { (*surf).window };
-    let game_window_up = if present.is_null() {
-        unsafe { crate::x11::game_window_present(bound) }
-    } else {
-        unsafe { (*present).window_present(bound) }
-    };
-    if game_window_up {
-        GAME_WINDOW_REPORTED.store(true, Ordering::Relaxed);
-        crate::scanout::report_game_window_present();
-    }
 }
 
 /// Frees every X11 slot whose idle fence has triggered - the server is done
@@ -1628,7 +1573,6 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
             // and a guest waiting on a release that never comes stalls on
             // its next acquire.
             if x11_present_slot(sc, s, idx) {
-                maybe_report_game_window((*sc).surf);
                 x11_reap(sc);
             } else {
                 if !X11_DROP_LOGGED.swap(true, Ordering::Relaxed) {
@@ -1684,11 +1628,6 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
             wlproto::surface_commit(parent);
             wlproto::wl_display_flush((*(*sc).surf).dpy)
         };
-        // Override/Wayland route (the default; `GN_VKSHIM_GUEST_SURFACE`
-        // unset or not exactly "1"): same tree-walk cadence as the
-        // guest-surface arm above, so the game's own window clears the
-        // splash on this route too.
-        maybe_report_game_window((*sc).surf);
         let commit_ms = t1.elapsed().as_millis();
         let n = LOG_COMMIT.fetch_add(1, Ordering::Relaxed);
         let done = N_COMMIT_OK.fetch_add(1, Ordering::Relaxed);
@@ -2432,7 +2371,6 @@ unsafe fn present_sync_commit(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32)
         // The X11 present holds the slot until its idle fence triggers; the
         // immediate in_flight clear above is restored on success.
         if unsafe { x11_present_slot(sc, slot, idx) } {
-            maybe_report_game_window((*sc).surf);
             let g = unsafe { (*sc).shared.lock().unwrap() };
             unsafe { (*slot).in_flight = true };
             drop(g);
@@ -2463,9 +2401,6 @@ unsafe fn present_sync_commit(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32)
                 wlproto::wl_display_flush((*(*sc).surf).dpy);
             }
         }
-        // Override/Wayland route (the default; `GN_VKSHIM_GUEST_SURFACE` unset
-        // or not exactly "1"): same tree-walk cadence as the guest-surface arm above.
-        maybe_report_game_window((*sc).surf);
     }
 }
 
@@ -7571,9 +7506,7 @@ unsafe extern "C" fn gn_vkCreateWaylandSurfaceKHR(
 /// are presented to gamescope's override/Wayland surface, ignoring the guest's
 /// window content — Vulkan-only, the cheapest, and independent of Xwayland's
 /// DRI3. It is the default because it is the route that keeps presenting here:
-/// the splash-clear detection rides the tree walk that runs on BOTH routes (see
-/// `maybe_report_game_window`), so the frame path is chosen on its own merits —
-/// and the guest-surface route's commit stream stalls when the guest's Vulkan
+/// the guest-surface route's commit stream stalls when the guest's Vulkan
 /// swapchain comes up (see `docs/14-guest-surface-commit-stall.md`).
 ///
 /// Setting `GN_VKSHIM_GUEST_SURFACE=1` opts in to the guest-surface route: the

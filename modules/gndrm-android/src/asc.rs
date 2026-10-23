@@ -710,9 +710,6 @@ pub struct AscState {
     pool: Arc<TrackedMutex<ScanoutPool>>,
     last_publish: Option<LastPublish>,
     frames: u64,
-    /// The booting-splash clear has fired this session (one latch, single
-    /// condition).
-    splash_cleared: bool,
     warned_fence_timeout: bool,
     /// Inodes already reported as having no registered buffer (log once each).
     logged_unregistered: Vec<u64>,
@@ -795,7 +792,6 @@ impl AscState {
             )),
             last_publish: None,
             frames: 0,
-            splash_cleared: false,
             warned_fence_timeout: false,
             logged_unregistered: Vec::new(),
             logged_stale: Vec::new(),
@@ -1240,30 +1236,6 @@ impl AscState {
 
         self.frames += 1;
         if fb.id != 0 {
-            // Latched booting-splash clear. The trigger is the game's own
-            // window appearing, reported by the ICD shim over the scan-out
-            // channel. The desktop's first frame is deliberately not a trigger:
-            // it is exactly the blue desktop the splash exists to cover. One
-            // latch, so the clear fires once per session.
-            if !self.splash_cleared && crate::GAME_WINDOW_PRESENT.load(Ordering::Relaxed) {
-                self.splash_cleared = true;
-                // UNGATED one-shot at the latch-fired moment. Latched on the
-                // *clear*, not on the first published frame: the first frame is
-                // the desktop, ~10 s before the note, so a line there can only
-                // report the pre-latch state and never observes this event. One
-                // relaxed atomic per latch; nothing formats on a later frame.
-                {
-                    static CLEAR_FIRED: AtomicBool = AtomicBool::new(false);
-                    if !CLEAR_FIRED.swap(true, Ordering::Relaxed) {
-                        asc_log!(
-                            "{}",
-                            gndrm_obf::obf!("gndrm-daemon: splash-clear latch fired splash_cleared={} game_window_present={} clear_attempted=true",self.splash_cleared,
-                            crate::GAME_WINDOW_PRESENT.load(Ordering::Relaxed))
-                        );
-                    }
-                }
-                crate::clear_booting_splash();
-            }
             // Announce the daemon's new-frame decision to the app's frame-time
             // ring: only a changed primary FB is published (a re-commit of the
             // frame already shown is not — see `apply_commit` in `commit.rs`),
@@ -1752,7 +1724,7 @@ pub fn serve_scanout(
         // The game-window notification shares this channel. It is recognised
         // by its own magic *before* the allocator decode, so a daemon that knows
         // it never mistakes it for, or rejects it as, a scan-out request. It is
-        // fire-and-forget: no reply is sent, and the shim reads none.
+        // fire-and-forget: no reply is sent, and the sender reads none.
         if let Some(note) = GameWindowNote::decode(&buf[..n]) {
             // Latch first, report second: the line reads GAME_WINDOW_PRESENT, so
             // logged ahead of the store it could only ever print `false`,
