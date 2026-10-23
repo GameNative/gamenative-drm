@@ -68,10 +68,10 @@ const E_IO: jint = -5;
 /// `nativeRetargetSurface` with no running session; the caller starts one.
 const E_NOENT: jint = -2;
 
-/// Whether the game's own window has appeared this session, as reported by the
-/// ICD shim over the scan-out channel (a [`gndrm_uapi::wire::GameWindowNote`]).
-/// The presenter's latched booting-splash clear reads it; reset alongside the
-/// rest of the session state by `nativeStart`/`nativeStop`.
+/// Whether the game's window has appeared this session, as reported by
+/// gamescope over the scan-out channel (a [`gndrm_uapi::wire::GameWindowNote`]).
+/// Its first transition clears the booting splash; reset alongside the rest of
+/// the session state by `nativeStart`/`nativeStop`.
 pub(crate) static GAME_WINDOW_PRESENT: AtomicBool = AtomicBool::new(false);
 
 /// The session's fps cap: the target the app set, which the scan-out channel
@@ -174,14 +174,14 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetLsfgCo
 static PANEL_REFRESH_MHZ: AtomicU32 = AtomicU32::new(0);
 
 /// The app's `JavaVM`, cached from the first JNI entry point (`nativeStart`).
-/// Needed by the presenter thread, which is a Rust-spawned thread with no
-/// `JNIEnv` of its own: it attaches with [`JavaVM::attach_current_thread`] to
-/// emit the booting-splash event. Set once per process; a missing VM only means
-/// the event cannot be pushed.
+/// Needed by the presenter and scan-out threads, which are Rust-spawned threads
+/// with no `JNIEnv` of their own: they attach with
+/// [`JavaVM::attach_current_thread`] to emit the app's events. Set once per
+/// process; a missing VM only means the events cannot be pushed.
 static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
 
 /// Global ref to `GameNativeDrm`, resolved on a Java thread by
-/// [`cache_java_vm`]. A name lookup from the presenter thread cannot work: an
+/// [`cache_java_vm`]. A name lookup from a Rust-spawned thread cannot work: an
 /// attached native thread has no context class loader, so `FindClass` falls back
 /// to the system loader, which cannot see app classes.
 static CALLBACK_CLASS: OnceLock<GlobalRef> = OnceLock::new();
@@ -275,15 +275,16 @@ fn set_frame_cap_target(fps: u32) {
     }
 }
 
-/// Latch [`GAME_WINDOW_PRESENT`]. Called by the scan-out channel reader when the
-/// ICD shim reports the game's own window as present. Idempotent, so a repeat
-/// notification is free.
+/// Latch [`GAME_WINDOW_PRESENT`] and clear the booting splash on its first
+/// transition this session. Called by the scan-out channel reader when a
+/// game-window note arrives. Idempotent, so gamescope's resends are free.
 pub(crate) fn note_game_window_present() {
     if !GAME_WINDOW_PRESENT.swap(true, Ordering::Relaxed) {
         log_info!(
             "{}",
-            gndrm_obf::obf!("daemon: game window present reported by the shim")
+            gndrm_obf::obf!("daemon: game window present reported")
         );
+        clear_booting_splash();
     }
 }
 
@@ -785,8 +786,8 @@ fn start(
     // all), so the per-frame diagnostics must re-read it rather than carry the
     // previous session's verdict into this one.
     reset_verbose_logging();
-    // First JNI entry point to run: capture the VM so the presenter thread can
-    // push the booting-splash event when the game's own window is reported.
+    // First JNI entry point to run: capture the VM so the scan-out thread can
+    // push the booting-splash event when the game's window is reported.
     cache_java_vm(env);
     let name: String = match env.get_string(socket_name) {
         Ok(s) => s.to_string_lossy().into_owned(),
