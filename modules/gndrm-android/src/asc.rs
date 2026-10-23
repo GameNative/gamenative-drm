@@ -2628,8 +2628,8 @@ fn dup_scanout_fd(api: &ffi::ScApi, ahb: *mut ffi::AHardwareBuffer) -> Option<(R
     if nh.is_null() {
         return None;
     }
-    // SAFETY: `nh` is a live native handle; fd 0 is the mappable dma-buf.
-    let fd0 = unsafe { ffi::NativeHandle::fd(nh, 0) }?;
+    // SAFETY: `nh` is a live native handle for the whole scan.
+    let fd0 = unsafe { scanout_dmabuf_fd(nh) }?;
     let (ino, size) = fstat_ino_size(fd0)?;
     // The client owns the descriptor it is given, so it must be a fresh one.
     // SAFETY: dup of a descriptor this call can read; the result is owned here.
@@ -2638,6 +2638,59 @@ fn dup_scanout_fd(api: &ffi::ScApi, ahb: *mut ffi::AHardwareBuffer) -> Option<(R
         return None;
     }
     Some((fd, ino, size))
+}
+
+/// `DMA_BUF_MAGIC` (`<linux/magic.h>`), the `f_type` of every dma-buf.
+const DMA_BUF_MAGIC: u64 = 0x444d_4142;
+
+fn is_dmabuf(fd: c_int) -> Option<bool> {
+    let mut st: libc::statfs = unsafe { core::mem::zeroed() };
+    // SAFETY: fstatfs on a descriptor the caller can read; `st` is written on success.
+    if unsafe { libc::fstatfs(fd, &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_type as u64 == DMA_BUF_MAGIC)
+}
+
+/// The descriptor of `nh` that is the buffer's dma-buf. Usually the first one,
+/// but not on every gralloc: MediaTek's handles lead with a descriptor shared
+/// by every buffer, which no driver imports and whose inode collides in the
+/// pool. Falls back to the first descriptor when none is a dma-buf.
+///
+/// # Safety
+/// `nh` must be a live native handle.
+unsafe fn scanout_dmabuf_fd(nh: *const ffi::NativeHandle) -> Option<c_int> {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    // SAFETY: the caller guarantees `nh` is live.
+    let fd0 = unsafe { ffi::NativeHandle::fd(nh, 0) }?;
+    if is_dmabuf(fd0) != Some(false) {
+        return Some(fd0);
+    }
+    // SAFETY: as above; `fd` bounds the index by `num_fds`.
+    let found = (1..8)
+        .map_while(|i| unsafe { ffi::NativeHandle::fd(nh, i) }.map(|fd| (i, fd)))
+        .find(|&(_, fd)| is_dmabuf(fd) == Some(true));
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        let (ino0, size0) = fstat_ino_size(fd0).unwrap_or((0, 0));
+        match found {
+            Some((i, fd)) => {
+                let (ino, size) = fstat_ino_size(fd).unwrap_or((0, 0));
+                log_warn!(
+                    "{}",
+                    gndrm_obf::obf!(
+                        "asc: scan-out handle fd 0 is not a dma-buf (ino {ino0} size {size0}); using fd {i} (ino {ino} size {size})"
+                    )
+                );
+            }
+            None => log_warn!(
+                "{}",
+                gndrm_obf::obf!(
+                    "asc: scan-out handle has no dma-buf descriptor; fd 0 ino {ino0} size {size0}"
+                )
+            ),
+        }
+    }
+    Some(found.map_or(fd0, |(_, fd)| fd))
 }
 
 /// `(st_ino, st_size)` of `fd`, which for a dma-buf is the kernel's per-buffer
