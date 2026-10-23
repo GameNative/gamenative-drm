@@ -888,6 +888,10 @@ pub struct GenDue {
 /// dropped: a couple of source periods at the slowest cap this is used with.
 const GEN_GRACE_NS: u64 = 60_000_000;
 
+/// How long the present worker waits on a guest frame's fence between looks at
+/// the queued frames, while any are queued.
+const GEN_WAIT_SLICE_NS: u64 = 1_000_000;
+
 /// The most destinations a swapchain gets: three batches' worth plus one, which
 /// covers a compositor that returns a buffer two source periods after it was
 /// committed.
@@ -1015,9 +1019,6 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
     // The engine reports no generation until its frame history exists, and that
     // history is built by `process` — so the capture runs on every presented
     // frame and only generation and blit are gated on the plan.
-    // The requested plan, not a panel-clamped one: the session's mode advertises
-    // the output rate this produces, so the compositor paces to it rather than
-    // discarding the extra frames.
     let planned = unsafe { (*session).plan(capacity) };
     let guest = unsafe { (*sc).guest_slots as usize };
     // A destination is free once the compositor has released it and nothing
@@ -1044,6 +1045,18 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
     if planned < capacity {
         GEN_SHORT_PLAN.fetch_add(1, Ordering::Relaxed);
     }
+    // No more than the panel can show between two source frames: a frame above
+    // that is committed and never latched, and which frames those are drifts.
+    let source_hz = crate::lsfg::source_cap().unwrap_or(
+        (1_000_000_000 + period / 2)
+            .checked_div(period)
+            .unwrap_or(0) as u32,
+    );
+    let generations = generations.min(gndrm_lsfg::pacing::panel_budget(
+        crate::lsfg::panel_hz(),
+        source_hz,
+        capacity,
+    ));
 
     let (Some(alloc_cmd), Some(free_cmd), Some(submit)) = (f.alloc_cmd, f.free_cmd, f.submit)
     else {
@@ -1333,20 +1346,39 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
             (0, p) => p,
             (c, p) => c.max(p),
         };
+        // On the panel's latch grid once the daemon has reported one: the
+        // frames take consecutive latch points from the one after the previous
+        // queued frame's (or the first a commit can still reach, when that has
+        // passed), so one frame lands per panel period and none replaces
+        // another unshown. The budget above keeps a source period's frames
+        // within the periods it holds. Without a grid, the frames are spread
+        // over the source period on this clock.
+        let grid = crate::lsfg::latch_grid();
         let step = source_period / (built as u64 + 1);
         let base = now.max(unsafe { (*gd).gen_last_deadline });
+        let first_latch = grid.map(|g| g.first_latch(now, unsafe { (*gd).gen_last_latch_ns }));
+        let place = |k: u64| -> (u64, u64) {
+            match (grid, first_latch) {
+                (Some(g), Some(first)) => {
+                    let latch = first + g.period_ns * (k - 1);
+                    (g.commit_for(latch), latch)
+                }
+                _ => (base + step * k, 0),
+            }
+        };
         for (k, index) in destinations.iter().take(built).enumerate() {
+            let (deadline, _) = place(k as u64 + 1);
             unsafe {
                 (*gd).gen_due.push_back(GenDue {
-                    deadline: base + step * (k as u64 + 1),
+                    deadline,
                     slot: *index as i32,
                     batch,
-                    drop_at: base + step * (k as u64 + 1) + GEN_GRACE_NS,
+                    drop_at: deadline + GEN_GRACE_NS,
                 })
             };
         }
         GEN_QUEUED.fetch_add(built as u32, Ordering::Relaxed);
-        let real_at = base + step * (built as u64 + 1);
+        let (real_at, real_latch) = place(built as u64 + 1);
         unsafe {
             (*gd).gen_due.push_back(GenDue {
                 deadline: real_at,
@@ -1355,6 +1387,7 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
                 drop_at: u64::MAX,
             });
             (*gd).gen_last_deadline = real_at;
+            (*gd).gen_last_latch_ns = real_latch;
         }
         queued = true;
     }
@@ -1376,6 +1409,79 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
         ));
     }
     queued
+}
+
+/// Queue a source frame that got no generations of its own behind the frames
+/// already queued, on its own latch point. Returns whether it was queued; with
+/// nothing queued the caller commits it inline, which is the same order.
+///
+/// Committed inline while frames are still queued, it would show before the
+/// previous source frame and that frame's generations: time would run backwards
+/// on the panel for a few frames every time a batch is skipped.
+unsafe fn lsfg_queue_real(sc: *mut GnSwapchain, src_idx: i32) -> bool {
+    let gd = unsafe { (*sc).dev };
+    if unsafe { (*gd).gen_sc } != sc || unsafe { (*gd).gen_due.is_empty() } {
+        return false;
+    }
+    let now = monotonic_ns();
+    let grid = crate::lsfg::latch_grid();
+    // One source period on this clock: the cap's, else the measured one, else
+    // the panel's.
+    let source_period = {
+        let measured = unsafe { (*gd).gen_period_ns };
+        match crate::lsfg::source_cap() {
+            Some(cap) if cap > 0 => (1_000_000_000 / u64::from(cap)).max(measured),
+            _ if measured != 0 => measured,
+            _ => grid.map_or(16_666_667, |g| g.period_ns),
+        }
+    };
+    // A source frame already waiting that is not due for a source period yet:
+    // the guest is ahead of the output, and queueing behind it would stack a
+    // frame of latency per presented frame, up to the guest's slots. That frame
+    // has not been shown and this one is newer, so this one takes its place and
+    // its slot goes straight back to the guest.
+    if let Some(tail) = unsafe { (*gd).gen_due.back_mut() } {
+        if tail.batch == GEN_NO_BATCH && tail.deadline > now + source_period {
+            let superseded = tail.slot;
+            tail.slot = src_idx;
+            GEN_SKIPS.fetch_add(1, Ordering::Relaxed);
+            unsafe {
+                let s = (*sc).slots.as_mut_ptr().add(superseded as usize);
+                let _g = (*sc).shared.lock().unwrap();
+                (*s).in_flight = false;
+                (*sc).cv_free.notify_all();
+            }
+            return true;
+        }
+    }
+    let prev_latch = unsafe { (*gd).gen_last_latch_ns };
+    let (deadline, latch) = match grid {
+        Some(grid) => {
+            let latch = grid.first_latch(now, prev_latch);
+            (grid.commit_for(latch), latch)
+        }
+        // One output step after the last queued frame, like the frames of a
+        // batch, so the two are not composited as one.
+        None => {
+            let (_, multiplier, _) = crate::lsfg::live();
+            let step = source_period / u64::from(multiplier.max(1));
+            (
+                now.max(unsafe { (*gd).gen_last_deadline }.saturating_add(step)),
+                prev_latch,
+            )
+        }
+    };
+    unsafe {
+        (*gd).gen_due.push_back(GenDue {
+            deadline,
+            slot: src_idx,
+            batch: GEN_NO_BATCH,
+            drop_at: u64::MAX,
+        });
+        (*gd).gen_last_deadline = deadline;
+        (*gd).gen_last_latch_ns = latch;
+    }
+    true
 }
 
 /// Commit every queued frame whose slot on the output grid has arrived.
@@ -1541,13 +1647,26 @@ fn worker_main(sc: *mut GnSwapchain) {
             let s = (*sc).slots.as_mut_ptr().add(idx as usize);
             let t0 = Instant::now();
             if let Some(wait_fences) = (*(*sc).dev).f.wait_fences {
-                wait_fences((*(*sc).dev).real, 1, &(*s).fence, VK_TRUE, u64::MAX);
+                // In slices while frames are queued: a queued frame that falls
+                // due goes out on time whatever this frame's GPU time, instead
+                // of waiting behind its fence.
+                let gd = (*sc).dev;
+                loop {
+                    let queued = (*gd).gen_sc == sc && !(*gd).gen_due.is_empty();
+                    let timeout = if queued { GEN_WAIT_SLICE_NS } else { u64::MAX };
+                    if wait_fences((*gd).real, 1, &(*s).fence, VK_TRUE, timeout) != VK_TIMEOUT {
+                        break;
+                    }
+                    flush_due(sc);
+                }
             }
             let fence_ms = t0.elapsed().as_millis();
             // Before the commit, so the capture reads the frame the guest just
             // finished while the slot is still ours. When the frame's generations
-            // were queued, the frame itself is queued behind them.
-            if lsfg_generate(sc, idx) {
+            // were queued, the frame itself is queued behind them; a frame that
+            // got none still queues behind whatever is waiting, so frames go out
+            // in the order they were presented.
+            if lsfg_generate(sc, idx) || lsfg_queue_real(sc, idx) {
                 continue;
             }
             commit_real(sc, idx, fence_ms);
@@ -1974,6 +2093,7 @@ unsafe extern "C" fn gn_vkDestroySwapchainKHR(
                 (*gd).gen_due.clear();
                 (*gd).gen_last_deadline = 0;
                 (*gd).gen_last_source_ns = 0;
+                (*gd).gen_last_latch_ns = 0;
                 (*gd).gen_sc = ptr::null_mut();
             }
         }
@@ -5943,6 +6063,9 @@ pub struct GnDevice {
     // the thunks' fixed offset for `scratch`/`real` mean fields may only be
     // appended, never inserted.
     pub lsfg: *mut crate::lsfg::Session,
+    /// The panel latch point the last queued frame was placed on, so the next
+    /// one takes a later point; 0 before any frame was placed on the grid.
+    pub gen_last_latch_ns: u64,
 }
 
 #[repr(C)]
@@ -8670,6 +8793,7 @@ unsafe extern "C" fn gn_vkCreateDevice(
         gen_last_source_ns: 0,
         gen_period_ns: 0,
         lsfg: ptr::null_mut(),
+        gen_last_latch_ns: 0,
     });
     // Real-device function resolution never uses the hooks'
     // vkGetDeviceProcAddr: its answers are vulkan::driver::* trampolines

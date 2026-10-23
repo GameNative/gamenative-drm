@@ -473,6 +473,11 @@ pub const FPS_UNCAPPED: u32 = 0;
 /// [`FrameCapNote`]: it enforces the release floor the target implies.
 pub const CAP_FRAME_CAP: u32 = 1 << 0;
 
+/// The `caps` bit a [`FrameCapSubscribe`] sets once the shim reads
+/// [`VsyncNote`]. A daemon pushes the note only to a connection that set it: an
+/// older shim's reply reader treats a frame it does not know as a dead channel.
+pub const CAP_VSYNC_NOTE: u32 = 1 << 1;
+
 /// The fps target, daemon -> shim, on the scan-out channel.
 ///
 /// Encoded little-endian, 24 bytes:
@@ -523,13 +528,13 @@ impl FrameCapNote {
 /// `magic:u32, caps:u32, reserved:u64, reserved:u64`.
 /// The daemon latches the capability for the connection and answers with the
 /// current target as a [`FrameCapNote`]; it pushes the same note again whenever
-/// the target changes. `caps` is a bitmask of what the shim can honour, today
-/// only [`CAP_FRAME_CAP`]. A shim that never sends this is sent no
+/// the target changes. `caps` is a bitmask of what the shim can honour:
+/// [`CAP_FRAME_CAP`] and [`CAP_VSYNC_NOTE`]. A shim that never sends this is sent no
 /// [`FrameCapNote`] -- one frame per request, as before -- which is what keeps an
 /// older shim on the channel it expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameCapSubscribe {
-    /// Capability bits; today only [`CAP_FRAME_CAP`].
+    /// Capability bits: [`CAP_FRAME_CAP`], [`CAP_VSYNC_NOTE`].
     pub caps: u32,
 }
 
@@ -554,6 +559,59 @@ impl FrameCapSubscribe {
         }
         Some(Self {
             caps: u32::from_le_bytes(b[4..8].try_into().ok()?),
+        })
+    }
+}
+
+/// Vsync note magic: ASCII "GNVS". Daemon -> shim.
+pub const VSYNC_MAGIC: u32 = 0x474E_5653;
+
+/// The panel's latch grid, daemon -> shim, on the scan-out channel.
+///
+/// Encoded little-endian, 24 bytes:
+/// `magic:u32, reserved:u32, anchor_ns:u64, period_ns:u32, lead_ns:u32`.
+///
+/// `SurfaceFlinger` takes the newest buffer a layer holds at each of its latch
+/// points, which sit one panel period apart. `anchor_ns` is one such point in
+/// `CLOCK_MONOTONIC`, `period_ns` their spacing, and `lead_ns` how long before a
+/// latch point a frame has to be committed to the compositor to be the buffer
+/// that point takes. The daemon measures all three from its own publishes and
+/// pushes a note whenever one of them moves. The period is the panel rate the
+/// app reported; the phase and the lead are measured. A shim that never
+/// receives one paces on its own clock, as before, and beats against the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VsyncNote {
+    /// A latch point, `CLOCK_MONOTONIC` ns.
+    pub anchor_ns: u64,
+    /// The spacing of latch points, ns.
+    pub period_ns: u32,
+    /// How far ahead of a latch point a commit has to be made to land on it, ns.
+    pub lead_ns: u32,
+}
+
+impl VsyncNote {
+    pub const LEN: usize = 24;
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[0..4].copy_from_slice(&VSYNC_MAGIC.to_le_bytes());
+        b[8..16].copy_from_slice(&self.anchor_ns.to_le_bytes());
+        b[16..20].copy_from_slice(&self.period_ns.to_le_bytes());
+        b[20..24].copy_from_slice(&self.lead_ns.to_le_bytes());
+        b
+    }
+
+    /// `None` when `b` is not exactly one encoded note.
+    #[must_use]
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN || u32::from_le_bytes(b[0..4].try_into().ok()?) != VSYNC_MAGIC {
+            return None;
+        }
+        Some(Self {
+            anchor_ns: u64::from_le_bytes(b[8..16].try_into().ok()?),
+            period_ns: u32::from_le_bytes(b[16..20].try_into().ok()?),
+            lead_ns: u32::from_le_bytes(b[20..24].try_into().ok()?),
         })
     }
 }
@@ -684,6 +742,21 @@ impl LsfgConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vsync_note_round_trips_and_rejects_other_magics() {
+        let note = VsyncNote {
+            anchor_ns: 0x0123_4567_89ab_cdef,
+            period_ns: 8_333_333,
+            lead_ns: 4_000_000,
+        };
+        let b = note.encode();
+        assert_eq!(b.len(), VsyncNote::LEN);
+        assert_eq!(VsyncNote::decode(&b), Some(note));
+        assert_eq!(VsyncNote::decode(&b[..23]), None);
+        assert_eq!(VsyncNote::decode(&FrameCapNote { fps: 60 }.encode()), None);
+        assert_eq!(FrameCapNote::decode(&b), None);
+    }
 
     /// Deterministic xorshift64 — no external deps for fuzz-ish coverage.
     struct Rng(u64);

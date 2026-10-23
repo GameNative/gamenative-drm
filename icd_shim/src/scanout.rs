@@ -17,8 +17,8 @@
 //! pre-existing behaviour rather than a broken one.
 
 use gndrm_uapi::wire::{
-    FrameCapNote, FrameCapSubscribe, LsfgConfig, ScanoutAllocReq, ScanoutAllocResp, CAP_FRAME_CAP,
-    FPS_UNCAPPED, SCANOUT_FORMAT_BGRA_8888, SCANOUT_REQ_AHB_HANDLE,
+    FrameCapNote, FrameCapSubscribe, LsfgConfig, ScanoutAllocReq, ScanoutAllocResp, VsyncNote,
+    CAP_FRAME_CAP, CAP_VSYNC_NOTE, FPS_UNCAPPED, SCANOUT_FORMAT_BGRA_8888, SCANOUT_REQ_AHB_HANDLE,
 };
 use std::ffi::c_void;
 use std::os::fd::RawFd;
@@ -275,8 +275,9 @@ pub fn lsfg_config() -> Option<LsfgConfig> {
         }
         // Bounded: a channel that answers with neither our reply nor a frame we
         // recognise is not going to, and the caller has env defaults to fall back
-        // to.
-        for _ in 0..4 {
+        // to. The subscription's answer (cap note, settings, vsync note) can be
+        // ahead of the reply, so the budget covers those plus a few empty reads.
+        for _ in 0..8 {
             let mut buf = [0u8; PUSH_LEN];
             let n = libc::recv(*ch, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT);
             if n < 0 {
@@ -296,6 +297,8 @@ pub fn lsfg_config() -> Option<LsfgConfig> {
             // user changed meanwhile: a note read here is still a note.
             if let Some(note) = FrameCapNote::decode(&buf[..n as usize]) {
                 apply_note(note);
+            } else if let Some(note) = VsyncNote::decode(&buf[..n as usize]) {
+                crate::lsfg::apply_vsync(note);
             }
         }
     }
@@ -396,7 +399,7 @@ fn connect(path: &str) -> RawFd {
         if !send_frame(
             fd,
             &FrameCapSubscribe {
-                caps: CAP_FRAME_CAP,
+                caps: CAP_FRAME_CAP | CAP_VSYNC_NOTE,
             }
             .encode(),
         ) {
@@ -511,6 +514,14 @@ fn exchange_with(
                     if frames < MAX_BURST_FRAMES {
                         continue;
                     }
+                } else if let Some(note) = VsyncNote::decode(buf) {
+                    if recv_fd >= 0 {
+                        libc::close(recv_fd);
+                    }
+                    crate::lsfg::apply_vsync(note);
+                    if frames < MAX_BURST_FRAMES {
+                        continue;
+                    }
                 } else if let Some(r) = ScanoutAllocResp::decode(buf) {
                     if r.ret != 0 || recv_fd < 0 {
                         // A refusal carries no buffer; the channel stays
@@ -575,7 +586,8 @@ pub(crate) fn poll_notes() {
         return;
     }
     // One frame of the largest push. SEQPACKET preserves boundaries but truncates
-    // on a short buffer, so this must cover both `FrameCapNote` and `LsfgConfig`.
+    // on a short buffer, so this must cover every push: `FrameCapNote`,
+    // `VsyncNote` and `LsfgConfig`.
     let mut buf = [0u8; PUSH_LEN];
     // SAFETY: `*ch` is the connection this module owns and `buf` is one full
     // frame; MSG_DONTWAIT leaves a frame that has not arrived for the next
@@ -587,9 +599,11 @@ pub(crate) fn poll_notes() {
     if len == 0 {
         return;
     }
-    // Dispatch on the magic: both push types are the same socket, in either order.
+    // Dispatch on the magic: every push type shares the socket, in any order.
     if let Some(note) = FrameCapNote::decode(&buf[..len]) {
         apply_note(note);
+    } else if let Some(note) = VsyncNote::decode(&buf[..len]) {
+        crate::lsfg::apply_vsync(note);
     } else if let Some(config) = LsfgConfig::decode(&buf[..len]) {
         if !config.is_request() {
             crate::lsfg::apply(config);

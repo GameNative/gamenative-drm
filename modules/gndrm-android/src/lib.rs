@@ -40,6 +40,7 @@ mod injector;
 #[macro_use]
 mod log;
 mod log_policy;
+mod vsync;
 
 use std::io;
 use std::os::fd::RawFd;
@@ -115,6 +116,17 @@ pub(crate) fn lsfg_settings() -> Option<LsfgConfig> {
     // its own grid and only reports against this.
     settings.refresh_mhz = PANEL_REFRESH_MHZ.load(Ordering::Relaxed);
     LSFG_CONFIGURED.load(Ordering::Relaxed).then_some(settings)
+}
+
+/// Whether a presenter is placing generated frames on the panel's latch grid:
+/// frame generation is on. That is when the grid's lead can be measured.
+pub(crate) fn lsfg_pacing() -> bool {
+    lsfg_settings().is_some_and(|s| s.enabled != 0 && s.multiplier >= 2)
+}
+
+/// The panel's refresh in millihertz as the app reported it, 0 when it has not.
+pub(crate) fn panel_refresh_mhz() -> u32 {
+    PANEL_REFRESH_MHZ.load(Ordering::Relaxed)
 }
 
 /// `GameNativeDrm.nativeSetLsfgConfig(enabled, multiplier, flowPerMille, performance, fpsLimit, dllPath)`.

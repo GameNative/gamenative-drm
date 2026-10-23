@@ -46,6 +46,7 @@ fn logging() -> bool {
 }
 
 pub mod cache;
+pub mod pacing;
 pub mod pe;
 
 /// `LSFG_SHADER_COUNT` in the header.

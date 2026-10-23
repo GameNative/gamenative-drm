@@ -59,14 +59,67 @@ happens before the source buffer can return to the guest.
    `TRANSFER_SRC`.
 4. One `vkQueueSubmit` on a family-matched queue, signalled fence on
    `gd.gen_fence`, command buffer freed only after that fence retires.
-5. Commit: each generated frame is queued on the output grid
-   (`1e9 / output_rate`) and committed by `flush_due`, which waits the batch
-   fence first — the destination is a plain dma-buf, so neither gamescope nor the
-   display can wait on it, and attaching early shows an unwritten image.
+5. Commit: each generated frame is queued for a latch point of the panel (see
+   below) and committed by `flush_due`, which waits the batch fence first — the
+   destination is a plain dma-buf, so neither gamescope nor the display can wait
+   on it, and attaching early shows an unwritten image.
 
 `GEN_COMMITS` counts committed generations, `GEN_SKIPS` counts batches dropped
 for this reason; one rate-limited line (`lsfg: generated N (skips M)`, every 600
 batches) reports both.
+
+## Pacing to the panel
+
+SurfaceFlinger takes the newest buffer a layer holds at each of its latch
+points, one panel period apart, and shows it at the vsync after. Nothing between
+the shim and the panel paces to that grid — gamescope's tick is the 1200 Hz
+session grid, the daemon's `ASurfaceTransaction_apply` carries no present time —
+so a presenter that commits on its own timer beats against it: every so often
+two commits fall inside one period and the first is replaced before it is shown,
+and a rate above the panel's (60 × 3 on a 120 Hz panel) drops frames in a
+drifting pattern. Three rules keep one frame per period, in order:
+
+- **Budget.** A source period at `cap` Hz holds `panel / cap` panel periods, one
+  of which is the source frame: `pacing::panel_budget` caps the generations per
+  batch at that minus one (60 → 120 Hz: x2 whatever the multiplier; 40 → 120:
+  x3; 30 → 60: x2). The rate is the user's cap, or the measured source interval
+  without one (a source hovering at the threshold, 64 fps on 120 Hz, flips
+  between x2 and none from batch to batch). When the panel cannot hold the cap
+  twice at all (60 on 90 Hz, 60 on 60 Hz), `pacing::source_pace` lowers the
+  source rate the release floor holds the guest to, to half the panel's: 45 → 90,
+  30 → 60. The panel's rate is the one the app reported
+  (`LsfgConfig.refresh_mhz`), not a measurement: while the daemon is the only
+  thing publishing, the latch samples are spaced by its own rate, so a panel
+  SurfaceFlinger runs below that rate (an LTPO panel that dropped to 60 Hz) is
+  still paced at the reported rate and shows every other frame, as before.
+- **Grid.** The daemon reads `ASurfaceTransactionStats_getLatchTime` on every
+  completion, tracks the grid's phase (`vsync.rs`), and pushes a `VsyncNote`
+  (`anchor_ns, period_ns, lead_ns`) on the scan-out channel whenever it moves
+  by more than 300 µs, and once on subscribe — only to a shim whose
+  `FrameCapSubscribe` set `CAP_VSYNC_NOTE`, since an older shim's reply reader
+  takes an unknown frame for a dead channel. The shim gives the frames of a
+  batch consecutive latch points from the one after the previous queued
+  frame's, or the first a commit can still reach when that has passed
+  (`pacing::Grid::first_latch`), and commits `lead_ns` ahead of each. Without a
+  note the frames are spread over the source period on the shim's own clock, as
+  before; the budget and the order rules below apply either way.
+- **Lead.** The daemon stamps when its apply returned and measures how far ahead
+  of the latch it was; a loop moves the lead so that margin sits at a third of
+  a period, with the error taken modulo the period (a frame that just missed its
+  point reads as late, not as a period early). A pipeline slower than one period
+  settles one latch point later, which is still one frame per period. The loop
+  runs only while generation is on and the connection in service subscribed to
+  the note: any other frame's margin does not follow the lead.
+
+Order is kept on the skip path too: a source frame whose batch could not be
+built (`GEN_SKIPS`) is queued behind what is already waiting instead of being
+committed inline ahead of it — on the next latch point, or one output step
+later without a grid — and the present worker waits a guest frame's fence in
+1 ms slices while frames are queued, flushing the due ones between slices, so a
+slow guest frame no longer holds the queued frames of the previous one. A guest
+running ahead of the output (uncapped and faster than the panel) would stack a
+frame of latency per present this way, so a queued source frame that is not due
+for a source period is replaced by the newer one, and its slot goes back.
 
 ## Driver constraints
 
@@ -100,7 +153,9 @@ being created — the feature has to be on the device the pipelines are built on
 ## Non-goals
 
 - Making the Vulkan layer work under gamescope; it stays banned.
-- Changing the daemon's presentation model beyond pacing.
+- Changing the daemon's presentation model beyond pacing: the latch grid is
+  measured and reported, not driven (no `setDesiredPresentTime`, no frame-rate
+  vote).
 - Distributing Lossless Scaling or its DLL.
 - Frame generation for X11 sessions: `legacy` and `native` keep that path.
 - Sharing one engine copy between GameNative and this repo: the copies are
