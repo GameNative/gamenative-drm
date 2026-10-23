@@ -82,7 +82,7 @@ if [ "${1:-}" = "android" ]; then
     # here, so it is explicit, like the gamescope toolchain's flag.
     "$TC/bin/aarch64-linux-android$API-clang" $CFLAGS -shared $LDFLAGS \
         -Wl,-z,max-page-size=16384 \
-        -o "$AOUT/libgndrm_shim.so" "$CSRC" -ldl -landroid
+        -o "$AOUT/libgndrm_shim.so" "$CSRC" -ldl
     "$TC/bin/llvm-strip" --strip-unneeded "$AOUT/libgndrm_shim.so"
     echo "android: $AOUT/libgndrm_shim.so (NDK $(basename "$NDK"), API $API)"
 

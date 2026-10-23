@@ -250,7 +250,7 @@ struct AhbApi {
 fn ahb_api() -> Option<&'static AhbApi> {
     static API: std::sync::OnceLock<Option<AhbApi>> = std::sync::OnceLock::new();
     API.get_or_init(|| unsafe {
-        let h = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+        let h = libc::dlopen(c"libnativewindow.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
         if h.is_null() {
             return None;
         }
