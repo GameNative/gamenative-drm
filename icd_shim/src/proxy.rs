@@ -9440,11 +9440,11 @@ fn mem_type_desc(gd: *mut GnDevice, idx: u32) -> String {
 }
 
 /// Creates one swapchain slot image as a LINEAR, externally-exported image: the
-/// guest's `VK_IMAGE_TILING_LINEAR` is the layout contract on its own. No DRM
-/// format modifier is named or requested in the `pNext` chain — only
-/// `VkExternalMemoryImageCreateInfo{DMA_BUF}` — so the driver always produces
-/// plain scan-out pixels (LINEAR forbids UBWC outright) and DRI3 wayland
-/// present see a modifier of 0. The image is backed by a dma-buf the shim owns
+/// guest's `VK_IMAGE_TILING_LINEAR` is the layout contract when the driver's
+/// row pitch lands on the backing buffer's stride; otherwise the same LINEAR
+/// layout is restated through an explicit DRM-modifier create at that stride.
+/// Either way the driver produces plain scan-out pixels (LINEAR forbids UBWC
+/// outright) and DRI3 wayland present see a modifier of 0. The image is backed by a dma-buf the shim owns
 /// — the daemon's scan-out pool when that channel is up, a local system-heap
 /// allocation otherwise — and bound through the imported-fd path.
 unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
@@ -9538,9 +9538,42 @@ unsafe fn slot_init_with_usage(
     unsafe { query_linear_modifier_support(gd, (*sc).format, usage, VK_IMAGE_TILING_LINEAR) };
     unsafe { trace_image_create(&ici, "img-create linear", &TRACE_IMAGE_CI_LINEAR) };
     let mut res = unsafe { f.create_image.unwrap()(dev, &ici, ptr::null(), &mut (*s).image) };
+    // Plain LINEAR lets the driver pick the row pitch, and it picks width*4.
+    // The pool buffer's rows are gralloc's, padded for widths it does not like
+    // (1024 -> 1280 px, 1440 -> 1472 px on Adreno), and the compositor reads
+    // the fd at that padded stride. A pitch the driver chose differently is a
+    // frame written at one stride and scanned out at another.
+    let mut pitch = 0u64;
+    if res == VK_SUCCESS {
+        if let Some(gsl) = unsafe { gn_real_device_proc(gd, c"vkGetImageSubresourceLayout") } {
+            let gsl: PFN_vkGetImageSubresourceLayout = unsafe { std::mem::transmute(gsl) };
+            let sub = VkImageSubresource {
+                aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
+                mipLevel: 0,
+                arrayLayer: 0,
+            };
+            let mut l = VkSubresourceLayout {
+                offset: 0,
+                size: 0,
+                rowPitch: 0,
+                arrayPitch: 0,
+                depthPitch: 0,
+            };
+            unsafe { gsl(dev, (*s).image, &sub, &mut l) };
+            pitch = l.rowPitch;
+        }
+        if pitch != 0 && pitch != u64::from((*s).stride) {
+            if let Some(destroy) = f.destroy_image {
+                unsafe { destroy(dev, (*s).image, ptr::null()) };
+            }
+            (*s).image = 0;
+            res = VK_ERROR_FORMAT_NOT_SUPPORTED;
+        }
+    }
     if res != VK_SUCCESS {
-        // Drivers that import dma-bufs only through DRM-modifier tiling (Mali):
-        // the same LINEAR layout, stated explicitly at the slot's stride.
+        // The same LINEAR layout, stated explicitly at the slot's stride: for
+        // drivers that import dma-bufs only through DRM-modifier tiling (Mali),
+        // and for a LINEAR pitch that did not land on the pool's.
         let plane = VkSubresourceLayout {
             offset: 0,
             size: 0,
@@ -9562,10 +9595,17 @@ unsafe fn slot_init_with_usage(
         };
         let r1 = res;
         res = unsafe { f.create_image.unwrap()(dev, &ici2, ptr::null(), &mut (*s).image) };
-        crate::logf!(gndrm_obf::obf!(
-            "proxy import image: LINEAR tiling {r1}; explicit LINEAR modifier (pitch {}) {res}",
-            (*s).stride
-        ));
+        if pitch != 0 {
+            crate::logf!(gndrm_obf::obf!(
+                "proxy import image: LINEAR pitch {pitch} != pool stride {}; explicit LINEAR modifier {res}",
+                (*s).stride
+            ));
+        } else {
+            crate::logf!(gndrm_obf::obf!(
+                "proxy import image: LINEAR tiling {r1}; explicit LINEAR modifier (pitch {}) {res}",
+                (*s).stride
+            ));
+        }
     }
     if res != VK_SUCCESS {
         crate::logf!(gndrm_obf::obf!("proxy import image create failed: {res}"));
