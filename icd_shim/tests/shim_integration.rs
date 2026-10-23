@@ -302,6 +302,32 @@ fn xlib_surface_entry_point_is_intercepted_and_reports_route() {
     );
 }
 
+/// Mesa's zink/kopper and EGL x11 create their surfaces through
+/// `vkCreateXcbSurfaceKHR`; it must land on the same X11 window route as the
+/// Xlib entry point.
+#[test]
+fn xcb_surface_entry_point_takes_the_xlib_route() {
+    let dir = target_dir();
+    let mut env = adrenotools_env(&dir);
+    env.push(("GN_VKSHIM_GUEST_SURFACE", "1".into()));
+    let (code, out, err) = run_probe_args(&Scenario { comm: None, env }, &["--xcb-window", "0"]);
+    assert_ok(code, &out, &err);
+    assert!(out.contains("PROBE xcb_surface"), "stdout:\n{out}");
+    assert!(
+        err.contains("x11 route: XID 0x0 unavailable (null XID)"),
+        "stderr:\n{err}"
+    );
+}
+
+#[test]
+fn xcb_surface_defaults_to_override_route() {
+    let dir = target_dir();
+    let env = adrenotools_env(&dir);
+    let (_code, out, err) = run_probe_args(&Scenario { comm: None, env }, &["--xcb-window", "0"]);
+    assert!(out.contains("PROBE xcb_surface"), "stdout:\n{out}");
+    assert!(err.contains("override: XID 0x0"), "stderr:\n{err}");
+}
+
 /// A non-null XID with no reachable X server must name that check (rather than
 /// going silent), which is the case the device session could not distinguish.
 #[test]

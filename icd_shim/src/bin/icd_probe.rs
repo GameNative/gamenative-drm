@@ -43,6 +43,7 @@ fn main() {
     let mut comm: Option<String> = None;
     let mut so_path: Option<String> = None;
     let mut xlib_window: Option<u64> = None;
+    let mut xcb_window: Option<u32> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         if a == "--comm" {
@@ -57,6 +58,14 @@ fn main() {
             xlib_window = Some(
                 v.parse()
                     .unwrap_or_else(|_| fail(64, format!("--xlib-window {v} is not a number"))),
+            );
+        } else if a == "--xcb-window" {
+            let v = args
+                .next()
+                .unwrap_or_else(|| fail(64, "--xcb-window needs a value".into()));
+            xcb_window = Some(
+                v.parse()
+                    .unwrap_or_else(|_| fail(64, format!("--xcb-window {v} is not a number"))),
             );
         } else if so_path.is_none() {
             so_path = Some(a);
@@ -255,6 +264,44 @@ fn main() {
                 9,
                 format!("vkCreateXlibSurfaceKHR -> {r} surface={surf:#x}"),
             );
+        }
+        let destroy_surface: Option<
+            unsafe extern "C" fn(vk::VkInstance, vk::VkSurfaceKHR, *const c_void),
+        > = unsafe { std::mem::transmute(gipa(inst, cs(b"vkDestroySurfaceKHR\0"))) };
+        if let Some(destroy_surface) = destroy_surface {
+            unsafe { destroy_surface(inst, surf, ptr::null()) };
+        }
+    }
+
+    if let Some(window) = xcb_window {
+        let create_xcb: Option<
+            unsafe extern "C" fn(
+                vk::VkInstance,
+                *const vk::VkXcbSurfaceCreateInfoKHR,
+                *const c_void,
+                *mut vk::VkSurfaceKHR,
+            ) -> vk::VkResult,
+        > = unsafe { std::mem::transmute(gipa(inst, cs(b"vkCreateXcbSurfaceKHR\0"))) };
+        let Some(create_xcb) = create_xcb else {
+            fail(
+                9,
+                "GIPA(vkCreateXcbSurfaceKHR) returned null: the shim does not intercept the \
+                 xcb surface entry point"
+                    .into(),
+            );
+        };
+        let ci = vk::VkXcbSurfaceCreateInfoKHR {
+            sType: vk::VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR,
+            pNext: ptr::null(),
+            flags: 0,
+            connection: ptr::null_mut(),
+            window,
+        };
+        let mut surf: vk::VkSurfaceKHR = 0;
+        let r = unsafe { create_xcb(inst, &ci, ptr::null(), &mut surf) };
+        println!("PROBE xcb_surface window={window:#x} result={r} surface={surf:#x}");
+        if r != vk::VK_SUCCESS || surf == 0 {
+            fail(9, format!("vkCreateXcbSurfaceKHR -> {r} surface={surf:#x}"));
         }
         let destroy_surface: Option<
             unsafe extern "C" fn(vk::VkInstance, vk::VkSurfaceKHR, *const c_void),
