@@ -6820,6 +6820,31 @@ pub(crate) unsafe fn gn_real_device_proc(gd: *mut GnDevice, name: &CStr) -> PFN_
     // allow forcing the driver's own (GN_VKSHIM_PREFER_DRIVER_PROC=1).
     let prefer_driver = std::env::var_os("GN_VKSHIM_PREFER_DRIVER_PROC").is_some();
     let lookup = |n: &CStr| -> (PFN_vkVoidFunction, &'static str) {
+        // With a device at hand its own vkGetDeviceProcAddr decides whether a
+        // name exists: that is the one resolver the loader would have asked,
+        // and the one that knows which extensions and core version this
+        // device enabled. The instance resolver is not safe for device-level
+        // names: mesa answers them with trampolines whether or not the device
+        // has the extension (VK_ARM_tensors on turnip), and for
+        // vkCmdEndRendering2EXT its lookup dereferences NULL outright.
+        // winevulkan resolves every device entry point by name right after
+        // vkCreateDevice, which is how a 32-bit guest ended in a fault inside
+        // that call and an abort on assert(!status) (Terraria under gamescope
+        // on turnip, second device from the Steam overlay). dlsym is no
+        // better as an existence check: Android 16's libvulkan.so exports the
+        // 1.4 core names, so vkMapMemory2 resolved to a trampoline into an
+        // empty dispatch slot on a 1.3 device. The device only gates; which
+        // implementation is handed back still prefers dlsym for the hooks.
+        // The instance resolver stays for the device-less callers.
+        let mut from_device = None;
+        if !gd.is_null() {
+            if let Some(gdp) = unsafe { (*(*gd).inst).f.gdp } {
+                from_device = unsafe { gdp((*gd).real, n.as_ptr()) };
+                if from_device.is_none() {
+                    return (None, "miss");
+                }
+            }
+        }
         if !handle.is_null() && !prefer_driver {
             let sym = unsafe { libc::dlsym(handle, n.as_ptr()) };
             if !sym.is_null() {
@@ -6829,22 +6854,8 @@ pub(crate) unsafe fn gn_real_device_proc(gd: *mut GnDevice, name: &CStr) -> PFN_
                 );
             }
         }
-        // With a device at hand its own vkGetDeviceProcAddr is final: that is
-        // the one resolver the loader would have asked, and the one that knows
-        // which extensions this device enabled. The instance resolver is not
-        // safe for device-level names: mesa answers them with trampolines
-        // whether or not the device has the extension (VK_ARM_tensors on
-        // turnip), and for vkCmdEndRendering2EXT its lookup dereferences NULL
-        // outright. winevulkan resolves every device entry point by name
-        // right after vkCreateDevice, which is how a 32-bit guest ended in a
-        // fault inside that call and an abort on assert(!status)
-        // (Terraria under gamescope on turnip, second device from the Steam
-        // overlay). The instance resolver stays for the device-less callers.
-        if !gd.is_null() {
-            if let Some(gdp) = unsafe { (*(*gd).inst).f.gdp } {
-                let f = unsafe { gdp((*gd).real, n.as_ptr()) };
-                return if f.is_some() { (f, "gdpa") } else { (None, "miss") };
-            }
+        if from_device.is_some() {
+            return (from_device, "gdpa");
         }
         if !inst.is_null() {
             if let Some(gipa) = gipa {
