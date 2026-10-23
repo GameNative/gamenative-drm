@@ -104,8 +104,9 @@ drifting pattern. Three rules keep one frame per period, in order:
   note the frames are spread over the source period on the shim's own clock, as
   before; the budget and the order rules below apply either way.
 - **Lead.** The daemon stamps when its apply returned and measures how far ahead
-  of the latch it was; a loop moves the lead so that margin sits at a third of
-  a period, with the error taken modulo the period (a frame that just missed its
+  of the latch it was; a loop moves the lead so that margin sits at half a
+  period, the middle of the window between two latch points, with the error
+  taken modulo the period (a frame that just missed its
   point reads as late, not as a period early). A pipeline slower than one period
   settles one latch point later, which is still one frame per period. The loop
   runs only while generation is on and the connection in service subscribed to

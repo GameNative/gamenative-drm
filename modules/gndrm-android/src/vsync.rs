@@ -144,15 +144,17 @@ impl Tracker {
             }
         }
         // How early the frame was: the apply returned `margin` before the latch
-        // took it. Aim for a third of a period, so a commit that arrives a
-        // little early or late still makes the same latch point. The error is
-        // taken modulo the period: a frame that missed its point by a hair
-        // shows as almost a whole period early, and the wrap reads it as late,
-        // which is what it was.
+        // took it. Aim for half a period, the middle of the window between two
+        // latch points, so the pipeline's jitter either way still makes the
+        // same point (measured on an Odin 3 at 120 Hz: a third of a period left
+        // the late tail on the edge, and 8 % of the frames a period late). The
+        // error is taken modulo the period: a frame that missed its point by a
+        // hair shows as almost a whole period early, and the wrap reads it as
+        // late, which is what it was.
         if pacing && applied_ns != 0 && latch_ns > applied_ns {
             let margin = latch_ns - applied_ns;
             if margin < 4 * period {
-                let target = period / 3;
+                let target = period / 2;
                 let d = wrap(margin as i64 - target as i64, period as i64);
                 let lead = self.lead_ns as i64 - d / 8;
                 self.lead_ns = lead.clamp(MIN_LEAD_NS as i64, 2 * period as i64) as u64;
@@ -354,13 +356,13 @@ mod tests {
     }
 
     #[test]
-    fn the_lead_settles_a_third_of_a_period_ahead_of_a_latch() {
-        // The margin is a third of a period modulo the period: a pipeline
-        // longer than a period settles one latch point later, which is still
-        // one frame per period, evenly.
+    fn the_lead_settles_half_a_period_ahead_of_a_latch() {
+        // The margin is half a period modulo the period: a pipeline longer
+        // than a period settles one latch point later, which is still one
+        // frame per period, evenly.
         for pipeline in [500_000u64, 2_000_000, 4_000_000, 6_000_000, 9_000_000] {
             let lead = settle(pipeline);
-            let margin = wrap(lead as i64 - pipeline as i64 - (P / 3) as i64, P as i64);
+            let margin = wrap(lead as i64 - pipeline as i64 - (P / 2) as i64, P as i64);
             assert!(
                 margin.abs() < 400_000,
                 "pipeline {pipeline}: lead {lead} off by {margin}"
