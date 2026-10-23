@@ -53,7 +53,7 @@ struct AhbRecvApi {
 fn ahb_recv_api() -> Option<&'static AhbRecvApi> {
     static API: std::sync::OnceLock<Option<AhbRecvApi>> = std::sync::OnceLock::new();
     API.get_or_init(|| unsafe {
-        let h = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+        let h = libc::dlopen(c"libnativewindow.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
         if h.is_null() {
             return None;
         }
@@ -359,7 +359,7 @@ pub fn allocate(width: u32, height: u32) -> Option<ScanoutBuf> {
 
 /// [`allocate`], plus the buffer's `AHardwareBuffer`, for a driver that imports
 /// only through `VK_ANDROID_external_memory_android_hardware_buffer`. `None`
-/// when libandroid cannot receive a handle or the daemon does not send one.
+/// when libnativewindow cannot receive a handle or the daemon does not send one.
 pub fn allocate_ahb(width: u32, height: u32) -> Option<ScanoutBuf> {
     ahb_recv_api()?;
     allocate_with(width, height, true)
