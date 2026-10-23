@@ -8718,7 +8718,7 @@ unsafe extern "C" fn gn_vkCreateDevice(
             c"VK_ANDROID_external_memory_android_hardware_buffer",
             c"VK_EXT_queue_family_foreign",
         ]
-    } else if crate::export::enabled() {
+    } else if crate::export::enabled() || AHB_IMPORT_ALLOWED.load(Ordering::Relaxed) {
         &[c"VK_ANDROID_external_memory_android_hardware_buffer"]
     } else {
         &[]
@@ -9604,7 +9604,7 @@ unsafe fn slot_init_with_usage(
     usage: VkImageUsageFlags,
 ) -> VkResult {
     let gd = (*sc).dev;
-    if unsafe { (*gd).import_ahb } {
+    if unsafe { (*gd).import_ahb } || SLOT_DMABUF_REFUSED.load(Ordering::Relaxed) {
         return unsafe { slot_init_ahb(sc, s, usage) };
     }
     let dev = unsafe { (*gd).real };
@@ -9767,6 +9767,24 @@ unsafe fn slot_init_with_usage(
         // A failed import does not consume the descriptor (the driver keeps
         // nothing): close the dup or it leaks with the abandoned slot.
         unsafe { libc::close(import_fd) };
+        if unsafe { gn_real_device_proc(gd, c"vkGetAndroidHardwareBufferPropertiesANDROID") }
+            .is_some()
+        {
+            crate::logf!(gndrm_obf::obf!(
+                "proxy slot: dma-buf import failed ({res}), importing pool buffer as AHardwareBuffer"
+            ));
+            SLOT_DMABUF_REFUSED.store(true, Ordering::Relaxed);
+            unsafe {
+                if let Some(destroy) = f.destroy_image {
+                    destroy(dev, (*s).image, ptr::null());
+                }
+                (*s).image = 0;
+                (*s).mem = 0;
+                libc::close((*s).fd);
+                (*s).fd = -1;
+            }
+            return unsafe { slot_init_ahb(sc, s, usage) };
+        }
     }
     if res != VK_SUCCESS {
         crate::logf!(gndrm_obf::obf!("proxy import memory failed: {res}"));
@@ -9774,6 +9792,10 @@ unsafe fn slot_init_with_usage(
     }
     slot_init_sync(sc, s)
 }
+
+/// Set once the driver refuses a pool buffer's dma-buf although it advertises
+/// dma-buf import (the Mali-G720): later slots import the `AHardwareBuffer`.
+static SLOT_DMABUF_REFUSED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) const VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID:
     VkExternalMemoryHandleTypeFlags = 0x400;

@@ -546,6 +546,7 @@ fn exchange_with(
                             return Err(Failure::Dead);
                         }
                     }
+                    note_pool_fd_kind(recv_fd, r.ino);
                     return Ok(ScanoutBuf {
                         fd: recv_fd,
                         ino: r.ino,
@@ -561,6 +562,28 @@ fn exchange_with(
             return Err(Failure::Dead);
         }
     }
+}
+
+/// Log, once, what the first pool descriptor is: a buffer whose fd is not a
+/// dma-buf cannot be imported as one or scanned out by size.
+fn note_pool_fd_kind(fd: RawFd, ino: u64) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !crate::vkshim_enabled() || LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    // SAFETY: fstat/fstatfs on a descriptor this module just received; both
+    // structs are written on success.
+    let (magic, size) = unsafe {
+        let mut fs: libc::statfs = core::mem::zeroed();
+        let mut st: libc::stat = core::mem::zeroed();
+        let magic = if libc::fstatfs(fd, &mut fs) == 0 { fs.f_type as u64 } else { 0 };
+        let size = if libc::fstat(fd, &mut st) == 0 { st.st_size as u64 } else { 0 };
+        (magic, size)
+    };
+    crate::logf!(gndrm_obf::obf!(
+        "scan-out: pool fd ino={ino} size={size} fs={magic:#x} dma-buf={}",
+        magic == 0x444d_4142
+    ));
 }
 
 /// Adopt any frame-cap note the daemon has pushed on this channel, if one is
