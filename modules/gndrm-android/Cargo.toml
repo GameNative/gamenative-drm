@@ -28,3 +28,8 @@ wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-scanner = "0.31"
 wayland-backend = "0.3"
+
+# The host integration tests that include `src/*.rs` verbatim: `vsync.rs`'s
+# tracker speaks the wire type.
+[dev-dependencies]
+gndrm-uapi = { path = "../gndrm-uapi" }

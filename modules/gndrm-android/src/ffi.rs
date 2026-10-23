@@ -287,6 +287,9 @@ pub type FnStSetOnComplete = unsafe extern "C" fn(
 );
 pub type FnStStatsGetPreviousReleaseFenceFd =
     unsafe extern "C" fn(stats: *mut ASurfaceTransactionStats, sc: *mut ASurfaceControl) -> c_int;
+/// `ASurfaceTransactionStats_getLatchTime` (API 29): when SurfaceFlinger took
+/// the transaction's buffers, `CLOCK_MONOTONIC` ns.
+pub type FnStStatsGetLatchTime = unsafe extern "C" fn(stats: *mut ASurfaceTransactionStats) -> i64;
 /// `ASurfaceTransactionStats_getASurfaceControls`: the controls a completed
 /// transaction itself updated. The array it stores in `out_controls` is owned by
 /// the caller until `FnStStatsReleaseASurfaceControls` is called on it.
@@ -388,6 +391,10 @@ pub struct ScApi {
     pub st_stats_previous_release_fence_fd: FnStStatsGetPreviousReleaseFenceFd,
     pub st_stats_get_controls: FnStStatsGetASurfaceControls,
     pub st_stats_release_controls: FnStStatsReleaseASurfaceControls,
+    /// The latch time of a completed transaction, API 29. Optional: without it
+    /// the panel's latch grid is not measured and the presenter paces generated
+    /// frames on its own clock.
+    pub st_stats_latch_time: Option<FnStStatsGetLatchTime>,
     pub ahb_get_native_handle: FnAhbGetNativeHandle,
     pub looper: Option<LooperApi>,
 }
@@ -463,6 +470,7 @@ impl ScApi {
                     handle,
                     c"ASurfaceTransactionStats_releaseASurfaceControls",
                 )?,
+                st_stats_latch_time: sym(handle, c"ASurfaceTransactionStats_getLatchTime"),
                 ahb_get_native_handle: sym(handle, c"AHardwareBuffer_getNativeHandle")?,
                 looper,
             })

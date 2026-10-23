@@ -58,7 +58,7 @@ use std::collections::HashSet;
 use std::io;
 use std::os::fd::RawFd;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -68,7 +68,7 @@ use gndrm_daemon::scanout::{Geometry, Removed, Reservation as CacheReservation, 
 use gndrm_daemon::{FrameCap, Framebuffer, PlaneState, Presenter};
 use gndrm_uapi::wire::{
     FrameCapSubscribe, GameWindowNote, LsfgConfig, ScanoutAllocReq, ScanoutAllocResp,
-    CAP_FRAME_CAP, SCANOUT_FORMAT_BGRA_8888,
+    CAP_FRAME_CAP, CAP_VSYNC_NOTE, SCANOUT_FORMAT_BGRA_8888,
 };
 
 use crate::ffi;
@@ -179,6 +179,11 @@ struct ReleaseCtx {
     previous_release: ffi::FnStStatsGetPreviousReleaseFenceFd,
     /// fd of the previous release fence, `-1` when none is waiting.
     release_fd: AtomicI32,
+    /// The latch-time query, when the platform has it.
+    latch_time: Option<ffi::FnStStatsGetLatchTime>,
+    /// When the daemon's apply of the transaction this registration was last
+    /// published in returned, `CLOCK_MONOTONIC` ns; 0 before the first.
+    applied_ns: AtomicU64,
     /// Set by the completion callback: SurfaceFlinger reported the flip event
     /// for this registration, so the buffer is safe to hand back out (the
     /// reuse cache keys on it). Never cleared: the flag belongs to this
@@ -247,6 +252,15 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
     {
         // SAFETY: `fd` is a valid descriptor owned by this call.
         unsafe { libc::close(fd) };
+    }
+    // The latch time is a sample of the panel's latch grid, which the presenter
+    // places generated frames on.
+    if let Some(latch_time) = ctx.latch_time {
+        // SAFETY: `stats` belongs to this completion.
+        let latch = unsafe { latch_time(stats) };
+        if latch > 0 {
+            crate::vsync::sample(latch as u64, ctx.applied_ns.load(Ordering::Relaxed));
+        }
     }
     // The transaction completed: SurfaceFlinger has reported this publish's
     // completion. This is the frame's release signal — the return path the reuse
@@ -506,6 +520,8 @@ impl ScanoutPool {
             stats_release_controls: api.st_stats_release_controls,
             previous_release: api.st_stats_previous_release_fence_fd,
             release_fd: AtomicI32::new(-1),
+            latch_time: api.st_stats_latch_time,
+            applied_ns: AtomicU64::new(0),
             latched: Arc::clone(&latched),
         }));
         (ctx, latched)
@@ -1180,6 +1196,12 @@ impl AscState {
                     match build_show(&api, self.sc, ahb, ctx, rect, fence) {
                         Some(tx) => {
                             apply_transaction(&api, tx);
+                            // SAFETY: `ctx` is the leaked mailbox of this slot.
+                            unsafe {
+                                (*ctx)
+                                    .applied_ns
+                                    .store(crate::vsync::now_ns(), Ordering::Relaxed);
+                            }
                             // What is on the layer is what a later commit falls
                             // back to.
                             self.last_publish = Some(LastPublish {
@@ -1380,6 +1402,12 @@ impl AscState {
         };
         if let Some(tx) = build_show(&api, self.sc, ahb, ctx, rect, None) {
             apply_transaction(&api, tx);
+            // SAFETY: `ctx` is the leaked mailbox of this slot.
+            unsafe {
+                (*ctx)
+                    .applied_ns
+                    .store(crate::vsync::now_ns(), Ordering::Relaxed);
+            }
         }
         // UNGATED: a rebuilt layer has just been given the retained frame back.
         // This runs once per layer rebuild (session bring-up, a display power
@@ -1606,6 +1634,12 @@ pub fn serve_scanout(
     // frames it was sent before, so an older shim sharing this allocator is
     // never handed a frame it would refuse to frame.
     let mut cap_aware = false;
+    // Whether this connection reads the panel's latch grid, pushed whenever it
+    // moves. Only a shim that declared so is sent one: an older shim's reply
+    // reader takes a frame it does not know for a dead channel. Cleared when
+    // this connection is done, whichever way it returns.
+    let mut vsync_aware = VsyncSubscription(false);
+    let vsync_fd = crate::vsync::changed_fd();
     loop {
         // The channel is idle until a request arrives. Its state is what tells
         // a shim-side timeout apart from a request the daemon never read: if
@@ -1639,10 +1673,15 @@ pub fn serve_scanout(
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: vsync_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        // SAFETY: four pollfds waited on indefinitely; a negative `cap_fd` (no
-        // eventfd) is ignored by `poll`.
-        let ready = unsafe { libc::poll(pfds.as_mut_ptr(), 4, -1) };
+        // SAFETY: five pollfds waited on indefinitely; a negative `cap_fd` or
+        // `vsync_fd` (no eventfd) is ignored by `poll`.
+        let ready = unsafe { libc::poll(pfds.as_mut_ptr(), 5, -1) };
         if ready < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
@@ -1671,6 +1710,18 @@ pub fn serve_scanout(
                 // together because one wake cannot say which of them moved.
                 if let Some(settings) = crate::lsfg_settings() {
                     if send_resp(fd, &settings.encode(), None).is_err() {
+                        return ScanoutChannel::Closed;
+                    }
+                }
+            }
+        }
+        if pfds[4].revents != 0 {
+            // The panel's latch grid moved: its phase, or the lead the shim
+            // should commit by. Drained first, like the cap's.
+            drain_eventfd(vsync_fd);
+            if vsync_aware.0 {
+                if let Some(note) = crate::vsync::note() {
+                    if send_resp(fd, &note.encode(), None).is_err() {
                         return ScanoutChannel::Closed;
                     }
                 }
@@ -1766,6 +1817,16 @@ pub fn serve_scanout(
                 // change the user makes.
                 if let Some(settings) = crate::lsfg_settings() {
                     if send_resp(fd, &settings.encode(), None).is_err() {
+                        return ScanoutChannel::Closed;
+                    }
+                }
+            }
+            if sub.caps & CAP_VSYNC_NOTE != 0 {
+                vsync_aware.set(true);
+                // The panel's latch grid, when it has been measured: a presenter
+                // that connects mid-session starts on it.
+                if let Some(note) = crate::vsync::note() {
+                    if send_resp(fd, &note.encode(), None).is_err() {
                         return ScanoutChannel::Closed;
                     }
                 }
@@ -2601,6 +2662,26 @@ fn build_hide(
         (api.st_set_zorder)(tx, sc, 0);
         (api.st_set_visibility)(tx, sc, 0);
         Some(tx)
+    }
+}
+
+/// Whether the connection in service reads [`gndrm_uapi::wire::VsyncNote`],
+/// mirrored into `vsync` for as long as it is, so the lead is measured only
+/// while a shim places frames by it.
+struct VsyncSubscription(bool);
+
+impl VsyncSubscription {
+    fn set(&mut self, on: bool) {
+        self.0 = on;
+        crate::vsync::set_subscribed(on);
+    }
+}
+
+impl Drop for VsyncSubscription {
+    fn drop(&mut self) {
+        if self.0 {
+            crate::vsync::set_subscribed(false);
+        }
     }
 }
 

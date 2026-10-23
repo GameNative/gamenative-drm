@@ -226,6 +226,11 @@ struct Live {
     flow_per_mille: std::sync::atomic::AtomicU32,
     fps_limit: std::sync::atomic::AtomicU32,
     refresh_mhz: std::sync::atomic::AtomicU32,
+    /// The panel's latch grid as the daemon last reported it; a period of 0
+    /// means no report yet.
+    vsync_anchor_ns: std::sync::atomic::AtomicU64,
+    vsync_period_ns: std::sync::atomic::AtomicU32,
+    vsync_lead_ns: std::sync::atomic::AtomicU32,
 }
 
 static LIVE: Live = Live {
@@ -234,6 +239,9 @@ static LIVE: Live = Live {
     flow_per_mille: std::sync::atomic::AtomicU32::new(0),
     fps_limit: std::sync::atomic::AtomicU32::new(0),
     refresh_mhz: std::sync::atomic::AtomicU32::new(0),
+    vsync_anchor_ns: std::sync::atomic::AtomicU64::new(0),
+    vsync_period_ns: std::sync::atomic::AtomicU32::new(0),
+    vsync_lead_ns: std::sync::atomic::AtomicU32::new(0),
 };
 
 /// The last settings applied to this process, kept because a session opened
@@ -340,8 +348,8 @@ pub fn skip(what: &str) -> bool {
 /// comes from here, not from a `FrameCapNote`.
 #[must_use]
 pub fn source_cap() -> Option<u32> {
-    let (enabled, _, cap) = live();
-    (enabled && cap > 0).then_some(cap)
+    let (enabled, multiplier, cap) = live();
+    (enabled && cap > 0).then(|| gndrm_lsfg::pacing::source_pace(cap, panel_hz(), multiplier))
 }
 
 /// `(source, output)` rates in whole hertz while generation is on.
@@ -366,6 +374,46 @@ pub fn refresh_hz() -> u32 {
     LIVE.refresh_mhz
         .load(std::sync::atomic::Ordering::Relaxed)
         .div_euclid(1000)
+}
+
+/// Adopt the panel's latch grid from the daemon.
+pub fn apply_vsync(note: gndrm_uapi::wire::VsyncNote) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let had = LIVE.vsync_period_ns.load(Relaxed);
+    LIVE.vsync_anchor_ns.store(note.anchor_ns, Relaxed);
+    LIVE.vsync_period_ns.store(note.period_ns, Relaxed);
+    LIVE.vsync_lead_ns.store(note.lead_ns, Relaxed);
+    if had != note.period_ns {
+        crate::logf!(gndrm_obf::obf!(
+            "lsfg: panel grid period={}us lead={}us",
+            note.period_ns / 1000,
+            note.lead_ns / 1000
+        ));
+    }
+}
+
+/// The panel's latch grid, or `None` until the daemon has reported one.
+#[must_use]
+pub fn latch_grid() -> Option<gndrm_lsfg::pacing::Grid> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let period = LIVE.vsync_period_ns.load(Relaxed);
+    (period != 0).then(|| gndrm_lsfg::pacing::Grid {
+        anchor_ns: LIVE.vsync_anchor_ns.load(Relaxed),
+        period_ns: u64::from(period),
+        lead_ns: u64::from(LIVE.vsync_lead_ns.load(Relaxed)),
+    })
+}
+
+/// The panel's rate in whole hertz: from its latch grid when the daemon has
+/// reported one, else the rate the app reported, else 0.
+#[must_use]
+pub fn panel_hz() -> u32 {
+    let period = LIVE
+        .vsync_period_ns
+        .load(std::sync::atomic::Ordering::Relaxed);
+    (1_000_000_000 + period / 2)
+        .checked_div(period)
+        .unwrap_or_else(refresh_hz)
 }
 
 /// One generation's render target: the engine writes here, and the shim blits the
