@@ -830,16 +830,46 @@ int gamenative_drm_connect(void)
 }
 
 /*
- * Interception rule: a card or render-node path + configured socket ⇒ always
- * intercept (even on hosts with a real /dev/dri, e.g. the CI box). Without the
- * env var, fall through to the real open untouched.
+ * A library from the OS image: the platform and the vendor GPU stack. A
+ * Vulkan driver whose kernel interface is a DRM node (PowerVR on Tensor G5
+ * opens /dev/dri/renderD128) runs inside gamescope's own process, and handing
+ * it the daemon's node instead of the real one fails its instance creation.
  */
-static bool should_intercept(const char *path)
+static bool is_os_library(const void *caller)
+{
+    static const char *const prefixes[] = {
+        "/vendor/", "/odm/", "/system/", "/system_ext/", "/product/", "/apex/",
+    };
+    Dl_info info;
+    if (!caller || !dladdr(caller, &info) || !info.dli_fname)
+        return false;
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        if (strncmp(info.dli_fname, prefixes[i], strlen(prefixes[i])) == 0)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * Interception rule: a card or render-node path + configured socket ⇒
+ * intercept (even on hosts with a real /dev/dri, e.g. the CI box), unless the
+ * open comes from an OS library. Without the env var, fall through to the
+ * real open untouched.
+ */
+static bool should_intercept(const char *path, const void *caller)
 {
     if (!is_drm_node_path(path))
         return false;
     const char *sock = getenv("GAMENATIVE_DRM_SOCKET");
-    return sock && *sock;
+    if (!sock || !*sock)
+        return false;
+    if (is_os_library(caller)) {
+        Dl_info info;
+        LOG("passing %s through to the kernel for %s\n", path,
+            dladdr(caller, &info) && info.dli_fname ? info.dli_fname : "?");
+        return false;
+    }
+    return true;
 }
 
 /* The node kind an intercepted open() impersonates, from its path. */
@@ -967,7 +997,7 @@ int open(const char *path, int flags, ...)
         mode = va_arg(ap, mode_t);
         va_end(ap);
     }
-    if (should_intercept(path))
+    if (should_intercept(path, __builtin_return_address(0)))
         return open_common(node_kind_for_path(path));
     return memfd_reopen_fallback(path, pass_open(path, flags, mode));
 }
@@ -981,7 +1011,7 @@ int open64(const char *path, int flags, ...)
         mode = va_arg(ap, mode_t);
         va_end(ap);
     }
-    if (should_intercept(path))
+    if (should_intercept(path, __builtin_return_address(0)))
         return open_common(node_kind_for_path(path));
     return memfd_reopen_fallback(path, pass_open64(path, flags, mode));
 }
@@ -995,7 +1025,7 @@ int openat(int dirfd, const char *path, int flags, ...)
         mode = va_arg(ap, mode_t);
         va_end(ap);
     }
-    if (should_intercept(path))
+    if (should_intercept(path, __builtin_return_address(0)))
         return open_common(node_kind_for_path(path));
     return memfd_reopen_fallback(path, pass_openat(dirfd, path, flags, mode));
 }
