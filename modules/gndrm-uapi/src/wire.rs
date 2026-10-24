@@ -279,8 +279,29 @@ pub struct ScanoutAllocReq {
 /// the request, so an out-of-step pair fails fast instead of desynchronising.
 pub const SCANOUT_REQ_AHB_HANDLE: u32 = 1 << 31;
 
+/// Set in a request's `format` to look up a buffer the pool already handed
+/// out instead of allocating one: `len` carries the `stat.st_ino` of its
+/// dma-buf and `width`/`height` are zero. The reply is the same as for an
+/// allocation (a fresh descriptor of the buffer, then its `AHardwareBuffer`
+/// when [`SCANOUT_REQ_AHB_HANDLE`] is also set), or a refusal with `-ENOENT`
+/// when no handed-out buffer has that inode. Nothing is allocated or
+/// registered. A daemon that predates the flag refuses the unknown format.
+pub const SCANOUT_REQ_LOOKUP_INO: u32 = 1 << 30;
+
 impl ScanoutAllocReq {
     pub const LEN: usize = 24;
+
+    /// A lookup of the handed-out buffer whose dma-buf has inode `ino`,
+    /// asking for its `AHardwareBuffer` too.
+    #[must_use]
+    pub fn lookup_ahb(ino: u64) -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            format: SCANOUT_FORMAT_BGRA_8888 | SCANOUT_REQ_AHB_HANDLE | SCANOUT_REQ_LOOKUP_INO,
+            len: ino,
+        }
+    }
 
     /// Whether the client asked for the `AHardwareBuffer` handle as well.
     #[must_use]
@@ -288,11 +309,18 @@ impl ScanoutAllocReq {
         self.format & SCANOUT_REQ_AHB_HANDLE != 0
     }
 
+    /// Whether this is a lookup by inode ([`SCANOUT_REQ_LOOKUP_INO`]); the
+    /// inode is `len`.
+    #[must_use]
+    pub fn is_lookup(&self) -> bool {
+        self.format & SCANOUT_REQ_LOOKUP_INO != 0
+    }
+
     /// The request with its flag bits cleared, i.e. the plain format.
     #[must_use]
     pub fn without_flags(self) -> Self {
         Self {
-            format: self.format & !SCANOUT_REQ_AHB_HANDLE,
+            format: self.format & !(SCANOUT_REQ_AHB_HANDLE | SCANOUT_REQ_LOOKUP_INO),
             ..self
         }
     }
@@ -851,6 +879,30 @@ mod tests {
                 0x00, 0x00, 0x00, 0x00, // reserved
             ]
         );
+    }
+
+    #[test]
+    fn scanout_lookup_carries_the_inode_and_both_flags() {
+        let req = ScanoutAllocReq::lookup_ahb(0x1234_5678_9ABC);
+        let dec = ScanoutAllocReq::decode(&req.encode()).unwrap();
+        assert!(dec.is_lookup());
+        assert!(dec.wants_ahb_handle());
+        assert_eq!(dec.len, 0x1234_5678_9ABC);
+        assert_eq!(dec.without_flags().format, SCANOUT_FORMAT_BGRA_8888);
+        assert!(!dec.without_flags().is_lookup());
+        // A daemon that predates the lookup clears only the handle flag and
+        // sees a format it does not serve, so it refuses.
+        assert_ne!(
+            dec.format & !SCANOUT_REQ_AHB_HANDLE,
+            SCANOUT_FORMAT_BGRA_8888
+        );
+        let alloc = ScanoutAllocReq {
+            width: 64,
+            height: 64,
+            format: SCANOUT_FORMAT_BGRA_8888 | SCANOUT_REQ_AHB_HANDLE,
+            len: 64 * 64 * 4,
+        };
+        assert!(!alloc.is_lookup());
     }
 
     #[test]

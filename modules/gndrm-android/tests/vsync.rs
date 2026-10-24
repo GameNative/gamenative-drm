@@ -13,4 +13,5 @@
 #![cfg(not(target_os = "android"))]
 
 #[path = "../src/vsync.rs"]
+#[allow(dead_code)]
 mod vsync;

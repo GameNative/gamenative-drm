@@ -37,6 +37,24 @@ fn main() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     println!("cargo:rustc-env=GN_SHIM_BUILD={}", utc_stamp(secs));
+    let dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(args)
+            .output()
+            .ok()
+    };
+    let sha = git(&["rev-parse", "--short", "HEAD"])
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let dirty = git(&["diff", "--quiet", "HEAD", "--", "."]).is_some_and(|o| !o.status.success());
+    println!(
+        "cargo:rustc-env=GN_SHIM_GIT={sha}{}",
+        if dirty { "-dirty" } else { "" }
+    );
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=build.rs");
 

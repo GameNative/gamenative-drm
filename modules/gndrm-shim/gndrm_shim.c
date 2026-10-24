@@ -224,6 +224,19 @@ static uint32_t g_in_fence_prop; /* discovered at init, 0 = unsupported */
             fprintf(stderr, "[gndrm-shim] " __VA_ARGS__); \
     } while (0)
 
+/* Always printed, whatever GNDRM_LOG_SHIM says: the few one-time lines that
+ * explain a session's GPU access. The launcher does not pass a container's
+ * environment to gamescope, so a gated line can never be turned on there. */
+__attribute__((format(printf, 1, 2)))
+static void log_info(const char *fmt, ...)
+{
+    va_list ap;
+    fputs("[gndrm-shim] ", stderr);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
 /*
  * Render-channel trace: name the first occurrence of each DRM request a client
  * issues on one of our fds (GNDRM_LOG_SHIM=1). The daemon logs the same
@@ -829,17 +842,115 @@ int gamenative_drm_connect(void)
     return open_common(GNDRM_NODE_KIND_CARD);
 }
 
+/* The file of the library containing `caller`, or "?". */
+static const char *caller_file(const void *caller)
+{
+    Dl_info info;
+    if (!caller || !dladdr(caller, &info) || !info.dli_fname)
+        return "?";
+    return info.dli_fname;
+}
+
+/* A library from the OS image: the platform and the vendor GPU stack. */
+static bool is_os_library(const char *file)
+{
+    static const char *const prefixes[] = {
+        "/vendor/", "/odm/", "/system/", "/system_ext/", "/product/", "/apex/",
+    };
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        if (strncmp(file, prefixes[i], strlen(prefixes[i])) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* This process's comm, for the log lines (filled by is_xwayland_process). */
+static char g_process_name[64];
+
 /*
- * Interception rule: a card or render-node path + configured socket ⇒ always
- * intercept (even on hosts with a real /dev/dri, e.g. the CI box). Without the
- * env var, fall through to the real open untouched.
+ * Xwayland is the one client of the daemon's render node (glamor/dri3, doc
+ * 08). It runs through linker64, so its comm can read "linker64"; argv names
+ * it either way.
  */
-static bool should_intercept(const char *path)
+static bool is_xwayland_process(void)
+{
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
+    char buf[512];
+    bool hit = false;
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/comm", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        syscall(SYS_close, fd);
+        if (n > 0) {
+            buf[n] = 0;
+            if (buf[n - 1] == '\n')
+                buf[n - 1] = 0;
+            snprintf(g_process_name, sizeof(g_process_name), "%s", buf);
+            hit = strcmp(buf, "Xwayland") == 0;
+        }
+    }
+    fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        syscall(SYS_close, fd);
+        if (n > 0) {
+            buf[n] = 0;
+            const char *arg = buf;
+            for (int i = 0; i < 2 && arg < buf + n; i++) {
+                const char *base = strrchr(arg, '/');
+                base = base ? base + 1 : arg;
+                if (strcmp(base, "Xwayland") == 0)
+                    hit = true;
+                arg += strlen(arg) + 1;
+            }
+        }
+    }
+    cached = hit;
+    return hit;
+}
+
+/*
+ * Interception rule (only with GAMENATIVE_DRM_SOCKET set; without it every
+ * open reaches the kernel untouched):
+ *   - a card node is the daemon's (gamescope's KMS), unless an OS library
+ *     opens it;
+ *   - a render node is the daemon's only in Xwayland, whose glamor/dri3 runs on
+ *     it, and there only while that single connection is free and the opener
+ *     is not an OS library. Everywhere else it is the kernel's: a Vulkan driver
+ *     whose kernel interface is a render node (PowerVR on Tensor G5) runs in
+ *     gamescope's and the guests' processes, and the daemon's node is not its
+ *     GPU. The opener's file cannot tell the two apart in general: a vendor
+ *     driver's libdrm resolves through LD_LIBRARY_PATH to the payload's copy.
+ * GNDRM_RENDER_NODE_CLIENT=1 makes any process a render-node client like
+ * Xwayland (the host harness's test clients). Every /dev/dri decision is
+ * logged with the opener's library.
+ */
+static bool should_intercept(const char *path, const void *caller)
 {
     if (!is_drm_node_path(path))
         return false;
     const char *sock = getenv("GAMENATIVE_DRM_SOCKET");
-    return sock && *sock;
+    if (!sock || !*sock)
+        return false;
+    const char *file = caller_file(caller);
+    const char *rn = getenv("GNDRM_RENDER_NODE_CLIENT");
+    bool xwayland = is_xwayland_process() || (rn && strcmp(rn, "1") == 0);
+    const char *why = NULL;
+    if (is_os_library(file))
+        why = GNDRM_OBF("an OS library opened it");
+    else if (is_drm_render_path(path) && !xwayland)
+        why = GNDRM_OBF("render nodes are the kernel's outside Xwayland");
+    else if (is_drm_render_path(path) && g_opened)
+        why = GNDRM_OBF("the daemon connection is already in use");
+    if (why) {
+        log_info(GNDRM_OBF("passing %s through to the kernel for %s in %s: %s\n"), path, file,
+                 g_process_name, why);
+        return false;
+    }
+    log_info(GNDRM_OBF("intercepting %s for %s in %s\n"), path, file, g_process_name);
+    return true;
 }
 
 /* The node kind an intercepted open() impersonates, from its path. */
@@ -967,7 +1078,7 @@ int open(const char *path, int flags, ...)
         mode = va_arg(ap, mode_t);
         va_end(ap);
     }
-    if (should_intercept(path))
+    if (should_intercept(path, __builtin_return_address(0)))
         return open_common(node_kind_for_path(path));
     return memfd_reopen_fallback(path, pass_open(path, flags, mode));
 }
@@ -981,7 +1092,7 @@ int open64(const char *path, int flags, ...)
         mode = va_arg(ap, mode_t);
         va_end(ap);
     }
-    if (should_intercept(path))
+    if (should_intercept(path, __builtin_return_address(0)))
         return open_common(node_kind_for_path(path));
     return memfd_reopen_fallback(path, pass_open64(path, flags, mode));
 }
@@ -995,7 +1106,7 @@ int openat(int dirfd, const char *path, int flags, ...)
         mode = va_arg(ap, mode_t);
         va_end(ap);
     }
-    if (should_intercept(path))
+    if (should_intercept(path, __builtin_return_address(0)))
         return open_common(node_kind_for_path(path));
     return memfd_reopen_fallback(path, pass_openat(dirfd, path, flags, mode));
 }

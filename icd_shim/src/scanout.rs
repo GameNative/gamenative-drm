@@ -70,8 +70,11 @@ fn ahb_recv_api() -> Option<&'static AhbRecvApi> {
     .as_ref()
 }
 
-/// Drop a reference [`allocate_ahb`] handed out.
-pub fn ahb_release(ahb: *mut c_void) {
+/// Drop a reference [`allocate_ahb`] or [`lookup_ahb`] handed out.
+///
+/// # Safety
+/// `ahb` is null or a reference this process received and still owns.
+pub unsafe fn ahb_release(ahb: *mut c_void) {
     if ahb.is_null() {
         return;
     }
@@ -318,6 +321,24 @@ pub fn allocate_ahb(width: u32, height: u32) -> Option<ScanoutBuf> {
 }
 
 fn allocate_with(width: u32, height: u32, want_ahb: bool) -> Option<ScanoutBuf> {
+    request(ScanoutAllocReq {
+        width,
+        height,
+        format: SCANOUT_FORMAT_BGRA_8888 | if want_ahb { SCANOUT_REQ_AHB_HANDLE } else { 0 },
+        len: u64::from(width) * u64::from(height) * 4,
+    })
+}
+
+/// The pool buffer the daemon handed out under dma-buf inode `ino` (to this
+/// process or another), with a fresh descriptor and its `AHardwareBuffer`.
+/// `None` when the daemon has no such buffer, predates the lookup, or the
+/// handle cannot be received.
+pub fn lookup_ahb(ino: u64) -> Option<ScanoutBuf> {
+    ahb_recv_api()?;
+    request(ScanoutAllocReq::lookup_ahb(ino))
+}
+
+fn request(req: ScanoutAllocReq) -> Option<ScanoutBuf> {
     let path = std::env::var("GAMENATIVE_DRM_SOCKET").ok()?;
     if path.is_empty() {
         return None;
@@ -334,7 +355,7 @@ fn allocate_with(width: u32, height: u32, want_ahb: bool) -> Option<ScanoutBuf> 
                 return None;
             }
         }
-        match exchange_with(*ch, width, height, want_ahb) {
+        match exchange_req(*ch, req) {
             Ok(buf) => return Some(buf),
             Err(Failure::Refused) => return None,
             Err(Failure::Dead) => {
@@ -421,21 +442,19 @@ const MAX_BURST_FRAMES: usize = 32;
 /// and its descriptor.
 #[cfg(test)]
 fn exchange(fd: RawFd, width: u32, height: u32) -> Result<ScanoutBuf, Failure> {
-    exchange_with(fd, width, height, false)
+    exchange_req(
+        fd,
+        ScanoutAllocReq {
+            width,
+            height,
+            format: SCANOUT_FORMAT_BGRA_8888,
+            len: u64::from(width) * u64::from(height) * 4,
+        },
+    )
 }
 
-fn exchange_with(
-    fd: RawFd,
-    width: u32,
-    height: u32,
-    want_ahb: bool,
-) -> Result<ScanoutBuf, Failure> {
-    let req = ScanoutAllocReq {
-        width,
-        height,
-        format: SCANOUT_FORMAT_BGRA_8888 | if want_ahb { SCANOUT_REQ_AHB_HANDLE } else { 0 },
-        len: u64::from(width) * u64::from(height) * 4,
-    };
+fn exchange_req(fd: RawFd, req: ScanoutAllocReq) -> Result<ScanoutBuf, Failure> {
+    let want_ahb = req.wants_ahb_handle();
     let wire = req.encode();
     // SAFETY: `fd` is the connection this module owns; `wire`/`buf`/`cbuf`
     // outlive the calls, and only a reply the kernel framed is parsed.
@@ -546,6 +565,7 @@ fn exchange_with(
                             return Err(Failure::Dead);
                         }
                     }
+                    note_pool_fd_kind(recv_fd, r.ino);
                     return Ok(ScanoutBuf {
                         fd: recv_fd,
                         ino: r.ino,
@@ -561,6 +581,37 @@ fn exchange_with(
             return Err(Failure::Dead);
         }
     }
+}
+
+/// Log, once, what the first pool descriptor is: a buffer whose fd is not a
+/// dma-buf cannot be imported as one or scanned out by size.
+fn note_pool_fd_kind(fd: RawFd, ino: u64) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !crate::vkshim_enabled() || LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    // SAFETY: fstat/fstatfs on a descriptor this module just received; both
+    // structs are written on success.
+    let (magic, size) = unsafe {
+        let mut fs: libc::statfs = core::mem::zeroed();
+        let mut st: libc::stat = core::mem::zeroed();
+        let magic = if libc::fstatfs(fd, &mut fs) == 0 { fs.f_type as u64 } else { 0 };
+        let size = if libc::fstat(fd, &mut st) == 0 { st.st_size as u64 } else { 0 };
+        (magic, size)
+    };
+    crate::logf!(gndrm_obf::obf!(
+        "scan-out: pool fd ino={ino} size={size} fs={magic:#x} dma-buf={} link={}",
+        magic == 0x444d_4142,
+        fd_link(fd)
+    ));
+}
+
+/// The `/proc/self/fd` link of `fd` (`/dmabuf:…` for a dma-buf), empty when it
+/// cannot be read.
+pub(crate) fn fd_link(fd: RawFd) -> String {
+    std::fs::read_link(format!("/proc/self/fd/{fd}"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Adopt any frame-cap note the daemon has pushed on this channel, if one is
@@ -681,7 +732,7 @@ mod tests {
             let n = libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0);
             assert_eq!(n as usize, FrameCapSubscribe::LEN);
             let sub = FrameCapSubscribe::decode(&buf).expect(&gndrm_obf::obf!("subscribe frame"));
-            assert_eq!(sub.caps, CAP_FRAME_CAP);
+            assert_eq!(sub.caps & CAP_FRAME_CAP, CAP_FRAME_CAP);
         }
     }
 

@@ -3049,6 +3049,9 @@ unsafe extern "C" fn gn_vkCreateImage(
     if let Some(r) = unsafe { crate::export::try_create_image(gd, ci, alloc, out) } {
         return r;
     }
+    if let Some(r) = unsafe { crate::export::try_create_import_image(gd, ci, alloc, out) } {
+        return r;
+    }
     let res = unsafe { (*gd).f.create_image.unwrap()((*gd).real, ci, alloc, out) };
     // Gate first: when GNDRM_LOG_VKSHIM is off (the default) this is one flag
     // load and a branch — no lock, no map insert, no formatting. The detector
@@ -5252,6 +5255,12 @@ pub struct PerDeviceLog(Mutex<Vec<(usize, Vec<String>)>>);
 
 const PER_DEVICE_LOG_CAP: usize = 1024;
 
+impl Default for PerDeviceLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PerDeviceLog {
     pub const fn new() -> Self {
         Self(Mutex::new(Vec::new()))
@@ -5349,6 +5358,46 @@ unsafe extern "C" fn gn_vkGetDeviceProcAddr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_names_the_system_loader_lacks_are_dropped() {
+        let known = [CString::from(c"VK_KHR_surface"), CString::from(c"VK_EXT_debug_report")];
+        let req = [c"VK_KHR_surface", c"VK_EXT_swapchain_colorspace"];
+        let (keep, drop) = split_known(&req, Some(&known));
+        assert_eq!(keep, vec![c"VK_KHR_surface"]);
+        assert_eq!(drop, vec![c"VK_EXT_swapchain_colorspace"]);
+        let (keep, drop) = split_known(&req, None);
+        assert_eq!(keep, req.to_vec());
+        assert!(drop.is_empty());
+        let (keep, drop) = split_known(&[], Some(&known));
+        assert!(keep.is_empty() && drop.is_empty());
+    }
+
+    #[test]
+    fn api_version_is_clamped_only_for_a_1_0_loader() {
+        let v1_4 = 1 << 22 | 4 << 12;
+        assert_eq!(forward_api_version(VK_API_VERSION_1_3, v1_4), VK_API_VERSION_1_3);
+        assert_eq!(forward_api_version(VK_API_VERSION_1_3, VK_API_VERSION_1_1), VK_API_VERSION_1_3);
+        assert_eq!(forward_api_version(v1_4 | 354, VK_API_VERSION_1_3 | 280), v1_4 | 354);
+        assert_eq!(forward_api_version(VK_API_VERSION_1_3, VK_API_VERSION_1_0), VK_API_VERSION_1_0);
+        assert_eq!(forward_api_version(VK_API_VERSION_1_0 | 5, VK_API_VERSION_1_0), VK_API_VERSION_1_0 | 5);
+        assert_eq!(forward_api_version(0, VK_API_VERSION_1_0), 0);
+    }
+
+    #[test]
+    fn external_memory_counts_as_present_once_it_is_core() {
+        let listed = |e: &CStr| DMA_BUF_EXTS[1..].contains(&e);
+        assert_eq!(import_mode(&listed, false), None);
+        EXTERNAL_MEMORY_CORE.store(true, Ordering::Relaxed);
+        assert_eq!(import_mode(&listed, false), Some(false));
+        EXTERNAL_MEMORY_CORE.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn api_versions_print_as_major_minor_patch() {
+        assert_eq!(api_str(1 << 22 | 3 << 12 | 288), "1.3.288");
+        assert_eq!(api_str(1 << 22 | 4 << 12), "1.4.0");
+    }
 
     /// The device-level commands whose handles the shim wraps must stay in the
     /// interception table: resolving one of these through `device_func` is what
@@ -5924,6 +5973,16 @@ static AHB_IMPORT_ALLOWED: AtomicBool = AtomicBool::new(false);
 static AHB_MODE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 static ROBUSTNESS2_FAKED: AtomicBool = AtomicBool::new(false);
+
+/// gamescope's DRM nodes are the daemon's, so it must not see the real ones a
+/// driver reports through `VK_EXT_physical_device_drm` (PowerVR does): it
+/// would open the real render node through the preload shim, which only
+/// serves the daemon's.
+static HIDE_DEVICE_DRM: AtomicBool = AtomicBool::new(false);
+
+pub fn set_hide_device_drm(on: bool) {
+    HIDE_DEVICE_DRM.store(on, Ordering::Relaxed);
+}
 
 pub fn set_fake_robustness2(on: bool) {
     FAKE_ROBUSTNESS2.store(on, Ordering::Relaxed);
@@ -7114,10 +7173,17 @@ const AHB_EXTS: [&CStr; 2] = [
     c"VK_ANDROID_external_memory_android_hardware_buffer",
 ];
 
+/// Set when the probed device is Vulkan 1.1+ and does not list
+/// `VK_KHR_external_memory`: the extension is core there, so its absence from
+/// the list does not mean the driver lacks it.
+static EXTERNAL_MEMORY_CORE: AtomicBool = AtomicBool::new(false);
+
 /// How swapchain slots reach the driver, from its device extensions: `Some(false)`
 /// for dma-buf import, `Some(true)` for `AHardwareBuffer` import (only when
 /// `allow_ahb`), `None` when neither set is complete.
 fn import_mode(has: &dyn Fn(&CStr) -> bool, allow_ahb: bool) -> Option<bool> {
+    let core = EXTERNAL_MEMORY_CORE.load(Ordering::Relaxed);
+    let has = |e: &CStr| has(e) || (core && e == c"VK_KHR_external_memory");
     let missing = DMA_BUF_EXTS.iter().copied().find(|e| !has(e));
     let Some(missing) = missing else {
         return Some(false);
@@ -7125,7 +7191,7 @@ fn import_mode(has: &dyn Fn(&CStr) -> bool, allow_ahb: bool) -> Option<bool> {
     if allow_ahb && AHB_EXTS.iter().all(|e| has(e)) {
         return Some(true);
     }
-    crate::logf!(gndrm_obf::obf!(
+    crate::log_reason!(gndrm_obf::obf!(
         "proxy prereq: device lacks {}",
         missing.to_str().unwrap()
     ));
@@ -7135,6 +7201,7 @@ fn import_mode(has: &dyn Fn(&CStr) -> bool, allow_ahb: bool) -> Option<bool> {
 fn dev_exts_satisfied(
     enum_de: PFN_vkEnumerateDeviceExtensionProperties,
     pd: VkPhysicalDevice,
+    device_api: u32,
     allow_ahb: bool,
 ) -> bool {
     let mut n: u32 = 0;
@@ -7157,9 +7224,16 @@ fn dev_exts_satisfied(
             name == want
         })
     };
+    if device_api >= VK_API_VERSION_1_1 && !has(c"VK_KHR_external_memory") {
+        EXTERNAL_MEMORY_CORE.store(true, Ordering::Relaxed);
+        crate::logi!(gndrm_obf::obf!(
+            "proxy prereq: VK_KHR_external_memory not listed, core in device api {}",
+            api_str(device_api)
+        ));
+    }
     match import_mode(&has, allow_ahb) {
         Some(true) => {
-            crate::logf!(gndrm_obf::obf!(
+            crate::logi!(gndrm_obf::obf!(
                 "proxy prereq: no dma-buf import, using AHardwareBuffer import"
             ));
             true
@@ -7172,10 +7246,11 @@ fn dev_exts_satisfied(
 /// `allow_ahb` admits a driver that can import only `AHardwareBuffer`s. Only a
 /// guest process may take that: gamescope itself imports client dma-bufs.
 pub fn device_prereqs(gipa: GipaFn, allow_ahb: bool) -> bool {
+    log_real_instance_surface(gipa);
     let create_inst: Option<PFN_vkCreateInstance> =
         unsafe { std::mem::transmute(gipa(ptr::null_mut(), c"vkCreateInstance".as_ptr())) };
     let Some(create_inst) = create_inst else {
-        crate::logf!(gndrm_obf::obf!(
+        crate::log_reason!(gndrm_obf::obf!(
             "proxy prereq: driver exposes no vkCreateInstance"
         ));
         return false;
@@ -7201,8 +7276,12 @@ pub fn device_prereqs(gipa: GipaFn, allow_ahb: bool) -> bool {
     };
     let mut inst: VkInstance = ptr::null_mut();
     let res = unsafe { create_inst(&ci, ptr::null(), &mut inst) };
+    crate::logi!(gndrm_obf::obf!(
+        "proxy prereq: probe vkCreateInstance api={} layers=[] exts=[] -> {res}",
+        api_str(app.apiVersion)
+    ));
     if res != VK_SUCCESS {
-        crate::logf!(gndrm_obf::obf!(
+        crate::log_reason!(gndrm_obf::obf!(
             "proxy prereq: probe vkCreateInstance failed ({res})"
         ));
         return false;
@@ -7216,6 +7295,8 @@ pub fn device_prereqs(gipa: GipaFn, allow_ahb: bool) -> bool {
     };
     let destroy_inst: Option<PFN_vkDestroyInstance> =
         unsafe { std::mem::transmute(gipa(inst, c"vkDestroyInstance".as_ptr())) };
+    let get_props: Option<PFN_vkGetPhysicalDeviceProperties> =
+        unsafe { std::mem::transmute(gipa(inst, c"vkGetPhysicalDeviceProperties".as_ptr())) };
     let mut ok = false;
     match (enum_pds, enum_de, destroy_inst) {
         (Some(enum_pds), Some(enum_de), _) => {
@@ -7223,14 +7304,32 @@ pub fn device_prereqs(gipa: GipaFn, allow_ahb: bool) -> bool {
             if unsafe { enum_pds(inst, &mut n, ptr::null_mut()) } == VK_SUCCESS && n > 0 {
                 let mut pd: VkPhysicalDevice = ptr::null_mut();
                 let mut one: u32 = 1;
-                if unsafe { enum_pds(inst, &mut one, &mut pd) } == VK_SUCCESS {
-                    ok = dev_exts_satisfied(enum_de, pd, allow_ahb);
+                let r = unsafe { enum_pds(inst, &mut one, &mut pd) };
+                if r == VK_SUCCESS || r == VK_INCOMPLETE {
+                    let device_api = get_props.map_or(0, |f| unsafe {
+                        let mut p: VkPhysicalDeviceProperties = std::mem::zeroed();
+                        f(pd, &mut p);
+                        crate::logi!(gndrm_obf::obf!(
+                            "proxy prereq: device '{}' api {} vendor {:#x} device {:#x} driver {:#x} ({n} physical devices)",
+                            CStr::from_ptr(p.deviceName.as_ptr()).to_string_lossy(),
+                            api_str(p.apiVersion),
+                            p.vendorID,
+                            p.deviceID,
+                            p.driverVersion
+                        ));
+                        p.apiVersion
+                    });
+                    ok = dev_exts_satisfied(enum_de, pd, device_api, allow_ahb);
+                } else {
+                    crate::log_reason!(gndrm_obf::obf!(
+                        "proxy prereq: vkEnumeratePhysicalDevices failed ({r})"
+                    ));
                 }
             } else {
-                crate::logf!(gndrm_obf::obf!("proxy prereq: no physical devices"));
+                crate::log_reason!(gndrm_obf::obf!("proxy prereq: no physical devices"));
             }
         }
-        _ => crate::logf!(gndrm_obf::obf!(
+        _ => crate::log_reason!(gndrm_obf::obf!(
             "proxy prereq: instance-level procs unresolved"
         )),
     }
@@ -7240,7 +7339,180 @@ pub fn device_prereqs(gipa: GipaFn, allow_ahb: bool) -> bool {
     if ok {
         AHB_IMPORT_ALLOWED.store(allow_ahb, Ordering::Relaxed);
     }
+    crate::logi!(gndrm_obf::obf!(
+        "proxy prereq: {}",
+        if ok {
+            "passed".to_string()
+        } else {
+            format!("FAILED ({})", crate::reason())
+        }
+    ));
     ok
+}
+
+// ------------------------------------------- the real loader's instance surface
+
+fn api_str(v: u32) -> String {
+    format!("{}.{}.{}", (v >> 22) & 0x7F, (v >> 12) & 0x3FF, v & 0xFFF)
+}
+
+fn join_names<S: AsRef<CStr>>(names: &[S]) -> String {
+    names
+        .iter()
+        .map(|n| n.as_ref().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The real loader's instance version; 1.0 when it has no
+/// `vkEnumerateInstanceVersion`.
+fn real_instance_version(gipa: GipaFn) -> u32 {
+    let f: Option<PFN_vkEnumerateInstanceVersion> = unsafe {
+        std::mem::transmute(gipa(ptr::null_mut(), c"vkEnumerateInstanceVersion".as_ptr()))
+    };
+    let Some(f) = f else {
+        return VK_API_VERSION_1_0;
+    };
+    let mut v: u32 = 0;
+    if unsafe { f(&mut v) } == VK_SUCCESS && v != 0 {
+        v
+    } else {
+        VK_API_VERSION_1_0
+    }
+}
+
+/// The real loader's global instance extensions, `None` when it cannot list them.
+fn real_instance_exts(gipa: GipaFn) -> Option<Vec<CString>> {
+    let f: Option<PFN_vkEnumerateInstanceExtensionProperties> = unsafe {
+        std::mem::transmute(gipa(
+            ptr::null_mut(),
+            c"vkEnumerateInstanceExtensionProperties".as_ptr(),
+        ))
+    };
+    let f = f?;
+    let mut n: u32 = 0;
+    if unsafe { f(ptr::null(), &mut n, ptr::null_mut()) } != VK_SUCCESS {
+        return None;
+    }
+    let mut props = vec![
+        VkExtensionProperties {
+            extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
+            specVersion: 0,
+        };
+        n as usize
+    ];
+    let r = unsafe { f(ptr::null(), &mut n, props.as_mut_ptr()) };
+    if r != VK_SUCCESS && r != VK_INCOMPLETE {
+        return None;
+    }
+    Some(
+        props[..n as usize]
+            .iter()
+            .map(|p| unsafe { CStr::from_ptr(p.extensionName.as_ptr()) }.to_owned())
+            .collect(),
+    )
+}
+
+/// The real loader's instance layers, `None` when it cannot list them.
+fn real_instance_layers(gipa: GipaFn) -> Option<Vec<CString>> {
+    let f: Option<PFN_vkEnumerateInstanceLayerProperties> = unsafe {
+        std::mem::transmute(gipa(
+            ptr::null_mut(),
+            c"vkEnumerateInstanceLayerProperties".as_ptr(),
+        ))
+    };
+    let f = f?;
+    let mut n: u32 = 0;
+    if unsafe { f(&mut n, ptr::null_mut()) } != VK_SUCCESS {
+        return None;
+    }
+    let mut props = vec![
+        VkLayerProperties {
+            layerName: [0; VK_MAX_EXTENSION_NAME_SIZE],
+            specVersion: 0,
+            implementationVersion: 0,
+            description: [0; VK_MAX_DESCRIPTION_SIZE],
+        };
+        n as usize
+    ];
+    let r = unsafe { f(&mut n, props.as_mut_ptr()) };
+    if r != VK_SUCCESS && r != VK_INCOMPLETE {
+        return None;
+    }
+    Some(
+        props[..n as usize]
+            .iter()
+            .map(|p| unsafe { CStr::from_ptr(p.layerName.as_ptr()) }.to_owned())
+            .collect(),
+    )
+}
+
+fn log_real_instance_surface(gipa: GipaFn) {
+    crate::logi!(gndrm_obf::obf!(
+        "system loader: instance version {}",
+        api_str(real_instance_version(gipa))
+    ));
+    match real_instance_exts(gipa) {
+        Some(e) => crate::logi!(gndrm_obf::obf!(
+            "system loader: {} instance extensions: {}",
+            e.len(),
+            join_names(&e)
+        )),
+        None => crate::logi!(gndrm_obf::obf!(
+            "system loader: instance extensions unreadable"
+        )),
+    }
+    match real_instance_layers(gipa) {
+        Some(l) => crate::logi!(gndrm_obf::obf!(
+            "system loader: {} instance layers: {}",
+            l.len(),
+            join_names(&l)
+        )),
+        None => crate::logi!(gndrm_obf::obf!(
+            "system loader: instance layers unreadable"
+        )),
+    }
+}
+
+/// Splits `requested` into the names `known` lists and the ones it does not.
+/// An unreadable list (`None`) keeps every name.
+fn split_known<'a>(requested: &[&'a CStr], known: Option<&[CString]>) -> (Vec<&'a CStr>, Vec<&'a CStr>) {
+    let Some(known) = known else {
+        return (requested.to_vec(), Vec::new());
+    };
+    requested
+        .iter()
+        .partition(|r| known.iter().any(|k| k.as_c_str() == **r))
+}
+
+/// The apiVersion to hand a loader whose own instance version is `loader`. A
+/// 1.0 implementation may refuse anything above 1.0 with
+/// VK_ERROR_INCOMPATIBLE_DRIVER; from 1.1 on any value must be accepted, so it
+/// is passed through unchanged.
+fn forward_api_version(requested: u32, loader: u32) -> u32 {
+    if loader & !0xFFF < VK_API_VERSION_1_1 && requested & !0xFFF > VK_API_VERSION_1_0 {
+        VK_API_VERSION_1_0
+    } else {
+        requested
+    }
+}
+
+/// The pNext chain's sTypes (and the loader-info `function` where there is
+/// one), for the create-info log line.
+unsafe fn pnext_str(mut p: *const VkBaseOutStructure) -> String {
+    let mut out = Vec::new();
+    while !p.is_null() && out.len() < 32 {
+        unsafe {
+            if (*p).sType == VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO {
+                let lci = p.cast::<VkLayerInstanceCreateInfo>();
+                out.push(format!("{}/{}", (*p).sType, (*lci).function));
+            } else {
+                out.push(format!("{}", (*p).sType));
+            }
+            p = (*p).pNext;
+        }
+    }
+    out.join(",")
 }
 
 // ------------------------------------------------ instance-level functions
@@ -7278,9 +7550,69 @@ unsafe extern "C" fn gn_vkCreateInstance(
             n += 1;
         }
     }
+    // Forward only what the real loader lists: an extension the proxy answers
+    // itself (or a layer the outer loader knows and the system one does not)
+    // would make it refuse the whole instance.
+    let wanted: Vec<&CStr> = exts[..n].iter().map(|&e| unsafe { CStr::from_ptr(e) }).collect();
+    let real_exts = real_instance_exts(gipa);
+    let (fwd_exts, dropped_exts) = split_known(&wanted, real_exts.as_deref());
+    let layers: Vec<&CStr> = unsafe {
+        slice_or_empty(ci.ppEnabledLayerNames, ci.enabledLayerCount as usize)
+    }
+    .iter()
+    .map(|&l| unsafe { CStr::from_ptr(l) })
+    .collect();
+    let real_layers = if layers.is_empty() {
+        None
+    } else {
+        real_instance_layers(gipa)
+    };
+    let (fwd_layers, dropped_layers) = split_known(&layers, real_layers.as_deref());
+    let ext_ptrs: Vec<*const c_char> = fwd_exts.iter().map(|e| e.as_ptr()).collect();
+    let layer_ptrs: Vec<*const c_char> = fwd_layers.iter().map(|l| l.as_ptr()).collect();
     let mut ci2 = VkInstanceCreateInfo { ..*ci };
-    ci2.enabledExtensionCount = n as u32;
-    ci2.ppEnabledExtensionNames = exts.as_ptr();
+    ci2.enabledExtensionCount = ext_ptrs.len() as u32;
+    ci2.ppEnabledExtensionNames = if ext_ptrs.is_empty() { ptr::null() } else { ext_ptrs.as_ptr() };
+    ci2.enabledLayerCount = layer_ptrs.len() as u32;
+    ci2.ppEnabledLayerNames = if layer_ptrs.is_empty() { ptr::null() } else { layer_ptrs.as_ptr() };
+    let app_api = if ci.pApplicationInfo.is_null() {
+        0
+    } else {
+        unsafe { (*ci.pApplicationInfo).apiVersion }
+    };
+    let loader_api = real_instance_version(gipa);
+    let fwd_api = forward_api_version(app_api, loader_api);
+    let app2;
+    if fwd_api != app_api {
+        let a = unsafe { &*ci.pApplicationInfo };
+        app2 = VkApplicationInfo {
+            sType: a.sType,
+            pNext: a.pNext,
+            pApplicationName: a.pApplicationName,
+            applicationVersion: a.applicationVersion,
+            pEngineName: a.pEngineName,
+            engineVersion: a.engineVersion,
+            apiVersion: fwd_api,
+        };
+        ci2.pApplicationInfo = &app2;
+    }
+    if !dropped_exts.is_empty() || !dropped_layers.is_empty() {
+        crate::logi!(gndrm_obf::obf!(
+            "proxy instance create: dropping exts=[{}] layers=[{}] the system loader does not list",
+            join_names(&dropped_exts),
+            join_names(&dropped_layers)
+        ));
+    }
+    crate::logi!(gndrm_obf::obf!(
+        "proxy instance create: api={} (app {}, system loader {}) flags={:#x} layers=[{}] exts=[{}] pNext=[{}]",
+        api_str(fwd_api),
+        api_str(app_api),
+        api_str(loader_api),
+        ci.flags,
+        join_names(&fwd_layers),
+        join_names(&fwd_exts),
+        unsafe { pnext_str(ci.pNext.cast()) }
+    ));
     // Confine the loader's chain link to the hooks' namespace (see
     // G_CHAIN_INST_LINK).
     let mut p = ci2.pNext as *mut VkBaseOutStructure;
@@ -7296,14 +7628,13 @@ unsafe extern "C" fn gn_vkCreateInstance(
         }
     }
     let res = unsafe { real_create(&ci2, alloc, out) };
+    crate::logi!(gndrm_obf::obf!(
+        "proxy instance create: system loader returned {res}"
+    ));
     if res != VK_SUCCESS {
         return res;
     }
-    let api_version = if ci.pApplicationInfo.is_null() {
-        0
-    } else {
-        unsafe { (*ci.pApplicationInfo).apiVersion }
-    };
+    let api_version = app_api;
     let gi = Box::new(GnInstance {
         real: unsafe { *out },
         api_version,
@@ -7510,6 +7841,12 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
         for i in 0..got as usize {
             let name = CStr::from_ptr(buf[i].extensionName.as_ptr());
             if unimplemented_wsi_ext(name) {
+                continue;
+            }
+            if name == c"VK_EXT_physical_device_drm" && HIDE_DEVICE_DRM.load(Ordering::Relaxed) {
+                crate::logf!(gndrm_obf::obf!(
+                    "proxy: hiding VK_EXT_physical_device_drm from gamescope"
+                ));
                 continue;
             }
             if name == c"VK_EXT_hdr_metadata" {
@@ -8718,6 +9055,8 @@ unsafe extern "C" fn gn_vkCreateDevice(
             c"VK_ANDROID_external_memory_android_hardware_buffer",
             c"VK_EXT_queue_family_foreign",
         ]
+    } else if crate::export::enabled() || AHB_IMPORT_ALLOWED.load(Ordering::Relaxed) {
+        &[c"VK_ANDROID_external_memory_android_hardware_buffer"]
     } else {
         &[]
     };
@@ -9602,7 +9941,15 @@ unsafe fn slot_init_with_usage(
     usage: VkImageUsageFlags,
 ) -> VkResult {
     let gd = (*sc).dev;
-    if unsafe { (*gd).import_ahb } {
+    if SLOT_DMABUF_REFUSED.load(Ordering::Relaxed) == false
+        && std::env::var_os("GNDRM_EXPORT_AHB").is_some_and(|v| v == "1")
+    {
+        SLOT_DMABUF_REFUSED.store(true, Ordering::Relaxed);
+        crate::logf!(gndrm_obf::obf!(
+            "proxy slot: GNDRM_EXPORT_AHB=1, importing pool buffers as AHardwareBuffers from the start"
+        ));
+    }
+    if unsafe { (*gd).import_ahb } || SLOT_DMABUF_REFUSED.load(Ordering::Relaxed) {
         return unsafe { slot_init_ahb(sc, s, usage) };
     }
     let dev = unsafe { (*gd).real };
@@ -9681,7 +10028,9 @@ unsafe fn slot_init_with_usage(
     unsafe { query_linear_modifier_support(gd, (*sc).format, usage, VK_IMAGE_TILING_LINEAR) };
     unsafe { trace_image_create(&ici, "img-create linear", &TRACE_IMAGE_CI_LINEAR) };
     let mut res = unsafe { f.create_image.unwrap()(dev, &ici, ptr::null(), &mut (*s).image) };
+    let mut explicit_layout = false;
     if res != VK_SUCCESS {
+        explicit_layout = true;
         // Drivers that import dma-bufs only through DRM-modifier tiling (Mali):
         // the same LINEAR layout, stated explicitly at the slot's stride.
         let plane = VkSubresourceLayout {
@@ -9713,6 +10062,55 @@ unsafe fn slot_init_with_usage(
     if res != VK_SUCCESS {
         crate::logf!(gndrm_obf::obf!("proxy import image create failed: {res}"));
         return res;
+    }
+    // A plain LINEAR image's row pitch is the driver's choice, and the pool
+    // buffer is scanned out and sampled at its gralloc stride: a driver that
+    // packs the rows tighter (PowerVR, 632 px -> 2528 B against a 2560 B
+    // stride) shears every frame. Such a slot takes the AHardwareBuffer route,
+    // where the driver owns the layout.
+    if !explicit_layout {
+        if let Some(gsl) = unsafe { gn_real_device_proc(gd, c"vkGetImageSubresourceLayout") } {
+            let gsl: PFN_vkGetImageSubresourceLayout = unsafe { std::mem::transmute(gsl) };
+            let sub = VkImageSubresource {
+                aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
+                mipLevel: 0,
+                arrayLayer: 0,
+            };
+            let mut l = VkSubresourceLayout {
+                offset: 0,
+                size: 0,
+                rowPitch: 0,
+                arrayPitch: 0,
+                depthPitch: 0,
+            };
+            unsafe { gsl(dev, (*s).image, &sub, &mut l) };
+            if l.rowPitch != 0 && (l.rowPitch != u64::from((*s).stride) || l.offset != 0) {
+                let can_ahb = unsafe {
+                    gn_real_device_proc(gd, c"vkGetAndroidHardwareBufferPropertiesANDROID")
+                }
+                .is_some();
+                crate::logf!(gndrm_obf::obf!(
+                    "proxy slot: LINEAR pitch {} != pool stride {} for {}x{}; {}",
+                    l.rowPitch,
+                    (*s).stride,
+                    (*sc).extent.width,
+                    (*sc).extent.height,
+                    if can_ahb { "importing pool buffer as AHardwareBuffer" } else { "no AHardwareBuffer import on this driver, frames will shear" }
+                ));
+                if can_ahb {
+                    SLOT_DMABUF_REFUSED.store(true, Ordering::Relaxed);
+                    unsafe {
+                        if let Some(destroy) = f.destroy_image {
+                            destroy(dev, (*s).image, ptr::null());
+                        }
+                        (*s).image = 0;
+                        libc::close((*s).fd);
+                        (*s).fd = -1;
+                    }
+                    return unsafe { slot_init_ahb(sc, s, usage) };
+                }
+            }
+        }
     }
     let mut reqs = VkMemoryRequirements {
         size: 0,
@@ -9765,6 +10163,24 @@ unsafe fn slot_init_with_usage(
         // A failed import does not consume the descriptor (the driver keeps
         // nothing): close the dup or it leaks with the abandoned slot.
         unsafe { libc::close(import_fd) };
+        if unsafe { gn_real_device_proc(gd, c"vkGetAndroidHardwareBufferPropertiesANDROID") }
+            .is_some()
+        {
+            crate::logf!(gndrm_obf::obf!(
+                "proxy slot: dma-buf import failed ({res}), importing pool buffer as AHardwareBuffer"
+            ));
+            SLOT_DMABUF_REFUSED.store(true, Ordering::Relaxed);
+            unsafe {
+                if let Some(destroy) = f.destroy_image {
+                    destroy(dev, (*s).image, ptr::null());
+                }
+                (*s).image = 0;
+                (*s).mem = 0;
+                libc::close((*s).fd);
+                (*s).fd = -1;
+            }
+            return unsafe { slot_init_ahb(sc, s, usage) };
+        }
     }
     if res != VK_SUCCESS {
         crate::logf!(gndrm_obf::obf!("proxy import memory failed: {res}"));
@@ -9773,36 +10189,40 @@ unsafe fn slot_init_with_usage(
     slot_init_sync(sc, s)
 }
 
-const VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID:
+/// Set once the driver refuses a pool buffer's dma-buf although it advertises
+/// dma-buf import (the Mali-G720): later slots import the `AHardwareBuffer`.
+static SLOT_DMABUF_REFUSED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) const VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID:
     VkExternalMemoryHandleTypeFlags = 0x400;
-const STYPE_AHB_PROPERTIES: VkStructureType = 1000129000;
-const STYPE_AHB_FORMAT_PROPERTIES: VkStructureType = 1000129002;
-const STYPE_IMPORT_AHB: VkStructureType = 1000129003;
+pub(crate) const STYPE_AHB_PROPERTIES: VkStructureType = 1000129000;
+pub(crate) const STYPE_AHB_FORMAT_PROPERTIES: VkStructureType = 1000129002;
+pub(crate) const STYPE_IMPORT_AHB: VkStructureType = 1000129003;
 
 #[repr(C)]
-struct AhbProperties {
-    s_type: VkStructureType,
-    next: *mut c_void,
-    allocation_size: u64,
-    memory_type_bits: u32,
+pub(crate) struct AhbProperties {
+    pub s_type: VkStructureType,
+    pub next: *mut c_void,
+    pub allocation_size: u64,
+    pub memory_type_bits: u32,
 }
 
 #[repr(C)]
-struct AhbFormatProperties {
-    s_type: VkStructureType,
-    next: *mut c_void,
-    format: VkFormat,
-    external_format: u64,
-    format_features: u32,
-    components: [u32; 4],
-    ycbcr: [u32; 4],
+pub(crate) struct AhbFormatProperties {
+    pub s_type: VkStructureType,
+    pub next: *mut c_void,
+    pub format: VkFormat,
+    pub external_format: u64,
+    pub format_features: u32,
+    pub components: [u32; 4],
+    pub ycbcr: [u32; 4],
 }
 
 #[repr(C)]
-struct ImportAhb {
-    s_type: VkStructureType,
-    next: *const c_void,
-    buffer: *mut c_void,
+pub(crate) struct ImportAhb {
+    pub s_type: VkStructureType,
+    pub next: *const c_void,
+    pub buffer: *mut c_void,
 }
 
 /// `slot_init_with_usage` on a driver that imports only `AHardwareBuffer`s (the
