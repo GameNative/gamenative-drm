@@ -70,8 +70,11 @@ fn ahb_recv_api() -> Option<&'static AhbRecvApi> {
     .as_ref()
 }
 
-/// Drop a reference [`allocate_ahb`] handed out.
-pub fn ahb_release(ahb: *mut c_void) {
+/// Drop a reference [`allocate_ahb`] or [`lookup_ahb`] handed out.
+///
+/// # Safety
+/// `ahb` is null or a reference this process received and still owns.
+pub unsafe fn ahb_release(ahb: *mut c_void) {
     if ahb.is_null() {
         return;
     }
@@ -318,6 +321,24 @@ pub fn allocate_ahb(width: u32, height: u32) -> Option<ScanoutBuf> {
 }
 
 fn allocate_with(width: u32, height: u32, want_ahb: bool) -> Option<ScanoutBuf> {
+    request(ScanoutAllocReq {
+        width,
+        height,
+        format: SCANOUT_FORMAT_BGRA_8888 | if want_ahb { SCANOUT_REQ_AHB_HANDLE } else { 0 },
+        len: u64::from(width) * u64::from(height) * 4,
+    })
+}
+
+/// The pool buffer the daemon handed out under dma-buf inode `ino` (to this
+/// process or another), with a fresh descriptor and its `AHardwareBuffer`.
+/// `None` when the daemon has no such buffer, predates the lookup, or the
+/// handle cannot be received.
+pub fn lookup_ahb(ino: u64) -> Option<ScanoutBuf> {
+    ahb_recv_api()?;
+    request(ScanoutAllocReq::lookup_ahb(ino))
+}
+
+fn request(req: ScanoutAllocReq) -> Option<ScanoutBuf> {
     let path = std::env::var("GAMENATIVE_DRM_SOCKET").ok()?;
     if path.is_empty() {
         return None;
@@ -334,7 +355,7 @@ fn allocate_with(width: u32, height: u32, want_ahb: bool) -> Option<ScanoutBuf> 
                 return None;
             }
         }
-        match exchange_with(*ch, width, height, want_ahb) {
+        match exchange_req(*ch, req) {
             Ok(buf) => return Some(buf),
             Err(Failure::Refused) => return None,
             Err(Failure::Dead) => {
@@ -421,21 +442,19 @@ const MAX_BURST_FRAMES: usize = 32;
 /// and its descriptor.
 #[cfg(test)]
 fn exchange(fd: RawFd, width: u32, height: u32) -> Result<ScanoutBuf, Failure> {
-    exchange_with(fd, width, height, false)
+    exchange_req(
+        fd,
+        ScanoutAllocReq {
+            width,
+            height,
+            format: SCANOUT_FORMAT_BGRA_8888,
+            len: u64::from(width) * u64::from(height) * 4,
+        },
+    )
 }
 
-fn exchange_with(
-    fd: RawFd,
-    width: u32,
-    height: u32,
-    want_ahb: bool,
-) -> Result<ScanoutBuf, Failure> {
-    let req = ScanoutAllocReq {
-        width,
-        height,
-        format: SCANOUT_FORMAT_BGRA_8888 | if want_ahb { SCANOUT_REQ_AHB_HANDLE } else { 0 },
-        len: u64::from(width) * u64::from(height) * 4,
-    };
+fn exchange_req(fd: RawFd, req: ScanoutAllocReq) -> Result<ScanoutBuf, Failure> {
+    let want_ahb = req.wants_ahb_handle();
     let wire = req.encode();
     // SAFETY: `fd` is the connection this module owns; `wire`/`buf`/`cbuf`
     // outlive the calls, and only a reply the kernel framed is parsed.

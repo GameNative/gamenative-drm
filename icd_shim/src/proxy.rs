@@ -3049,6 +3049,9 @@ unsafe extern "C" fn gn_vkCreateImage(
     if let Some(r) = unsafe { crate::export::try_create_image(gd, ci, alloc, out) } {
         return r;
     }
+    if let Some(r) = unsafe { crate::export::try_create_import_image(gd, ci, alloc, out) } {
+        return r;
+    }
     let res = unsafe { (*gd).f.create_image.unwrap()((*gd).real, ci, alloc, out) };
     // Gate first: when GNDRM_LOG_VKSHIM is off (the default) this is one flag
     // load and a branch — no lock, no map insert, no formatting. The detector

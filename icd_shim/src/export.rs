@@ -62,6 +62,15 @@ struct EmuImage {
 static IMAGES: Mutex<Vec<EmuImage>> = Mutex::new(Vec::new());
 static MEMS: Mutex<Vec<(VkDeviceMemory, VkImage)>> = Mutex::new(Vec::new());
 
+/// gamescope's own imports of a client dma-buf (a guest frame): the image and
+/// whether it was created for the `AHardwareBuffer` route.
+static IMPORTS: Mutex<Vec<(VkImage, bool)>> = Mutex::new(Vec::new());
+
+/// Import images logged so far; gamescope imports each client buffer once, so
+/// this only caps a client that churns its buffers.
+static IMPORT_LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const IMPORT_LOG_FIRST_N: u32 = 24;
+
 #[repr(C)]
 struct BaseIn {
     sType: VkStructureType,
@@ -297,6 +306,18 @@ mod tests {
     }
 
     #[test]
+    fn an_import_entry_follows_its_image_handle() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        note_import(0x5150, false);
+        assert_eq!(import_route(0x5150), Some(false));
+        note_import(0x5150, true);
+        assert_eq!(import_route(0x5150), Some(true));
+        forget_import(0x5150);
+        assert_eq!(import_route(0x5150), None);
+        assert_eq!(import_route(0), None);
+    }
+
+    #[test]
     fn the_linear_modifier_is_the_one_gamescope_flips() {
         // DRM_FORMAT_MOD_LINEAR; the export query answers with this modifier.
         assert_eq!(MOD_LINEAR, 0);
@@ -369,6 +390,40 @@ pub fn forget_memory(mem: VkDeviceMemory) {
     if let Ok(mut m) = MEMS.lock() {
         m.retain(|(mm, _)| *mm != mem);
     }
+}
+
+fn note_import(image: VkImage, ahb: bool) {
+    if let Ok(mut v) = IMPORTS.lock() {
+        v.retain(|(i, _)| *i != image);
+        v.push((image, ahb));
+    }
+}
+
+fn import_route(image: VkImage) -> Option<bool> {
+    if image == 0 {
+        return None;
+    }
+    IMPORTS
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(i, _)| *i == image)
+        .map(|(_, ahb)| *ahb)
+}
+
+fn forget_import(image: VkImage) {
+    if let Ok(mut v) = IMPORTS.lock() {
+        v.retain(|(i, _)| *i != image);
+    }
+}
+
+fn fd_ino(fd: i32) -> u64 {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat into a zeroed struct; the call validates `fd`.
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return 0;
+    }
+    st.st_ino as u64
 }
 
 unsafe fn real_dev<T>(device: VkDevice, name: &CStr) -> Option<(VkDevice, T)> {
@@ -567,7 +622,7 @@ pub unsafe fn try_create_image(
         match unsafe { create_dmabuf_backed(gd, ci, &buf, fl_ptr, alloc) } {
             Ok((image, mem, linear_tiling)) => {
                 DMABUF_IMPORT.store(DMABUF_WORKS, Ordering::Relaxed);
-                crate::scanout::ahb_release(buf.ahb);
+                unsafe { crate::scanout::ahb_release(buf.ahb) };
                 unsafe { *out = image };
                 log_image(
                     ci,
@@ -606,7 +661,7 @@ pub unsafe fn try_create_image(
         ));
     }
     let res = unsafe { create_ahb_backed(gd, ci, &buf, fl_ptr, alloc) };
-    crate::scanout::ahb_release(buf.ahb);
+    unsafe { crate::scanout::ahb_release(buf.ahb) };
     match res {
         Ok((image, mem)) => {
             unsafe { *out = image };
@@ -626,6 +681,262 @@ pub unsafe fn try_create_image(
             Some(r)
         }
     }
+}
+
+/// Image create for gamescope's import of a client dma-buf (a guest frame
+/// arriving over linux-dmabuf): external DMA_BUF memory without a modifier
+/// list, which is the export shape [`try_create_image`] handles. `None` when
+/// the request is not one, so the caller creates normally.
+///
+/// While the driver takes pool buffers as dma-bufs the image is created as
+/// asked and only remembered, so a refusal at `vkAllocateMemory` can switch the
+/// process to the other route. Once the driver has refused one, the image is
+/// created with OPTIMAL tiling for an `AHardwareBuffer` import instead: its
+/// memory is the same pool buffer, resolved through the daemon by the inode of
+/// the fd gamescope imports.
+pub unsafe fn try_create_import_image(
+    gd: *mut crate::proxy::GnDevice,
+    ci: *const VkImageCreateInfo,
+    alloc: *const VkAllocationCallbacks,
+    out: *mut VkImage,
+) -> Option<VkResult> {
+    if !enabled() {
+        return None;
+    }
+    let ci = unsafe { &*ci };
+    if !four_bpp(ci.format) {
+        return None;
+    }
+    let ext = unsafe {
+        find_in(
+            ci.pNext,
+            VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        )
+    } as *const VkExternalMemoryImageCreateInfo;
+    if ext.is_null()
+        || unsafe { (*ext).handleTypes } & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT == 0
+    {
+        return None;
+    }
+    let list = unsafe {
+        find_in(
+            ci.pNext,
+            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+        )
+    };
+    if !list.is_null() {
+        return None;
+    }
+    let explicit = unsafe {
+        find_in(
+            ci.pNext,
+            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+        )
+    } as *const VkImageDrmFormatModifierExplicitCreateInfoEXT;
+    if !explicit.is_null()
+        && (unsafe { (*explicit).drmFormatModifier } != MOD_LINEAR
+            || unsafe { (*explicit).drmFormatModifierPlaneCount } != 1)
+    {
+        return None;
+    }
+    let create = unsafe { (*gd).f.create_image }?;
+    let dev = unsafe { (*gd).real };
+    if DMABUF_IMPORT.load(Ordering::Relaxed) != DMABUF_REFUSED {
+        let res = unsafe { create(dev, ci, alloc, out) };
+        if res == VK_SUCCESS {
+            note_import(unsafe { *out }, false);
+        }
+        return Some(res);
+    }
+    use crate::proxy::VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+    let fl = unsafe { find_in(ci.pNext, STYPE_IMAGE_FORMAT_LIST_CREATE_INFO) }
+        as *const ImageFormatListCreateInfo;
+    let fl_copy = (!fl.is_null()).then(|| ImageFormatListCreateInfo {
+        sType: STYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+        pNext: ptr::null(),
+        viewFormatCount: unsafe { (*fl).viewFormatCount },
+        pViewFormats: unsafe { (*fl).pViewFormats },
+    });
+    let ext_img = VkExternalMemoryImageCreateInfo {
+        sType: VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        pNext: fl_copy
+            .as_ref()
+            .map_or(ptr::null(), |f| f as *const _ as *const c_void),
+        handleTypes: VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
+    };
+    let ci2 = VkImageCreateInfo {
+        pNext: &ext_img as *const _ as *const c_void,
+        tiling: VK_IMAGE_TILING_OPTIMAL,
+        ..*ci
+    };
+    let res = unsafe { create(dev, &ci2, alloc, out) };
+    if res == VK_SUCCESS {
+        note_import(unsafe { *out }, true);
+    }
+    if IMPORT_LOGS.fetch_add(1, Ordering::Relaxed) < IMPORT_LOG_FIRST_N {
+        crate::logf!(gndrm_obf::obf!(
+            "export-emu: import image {:#x} {}x{} fmt={} usage={:#x} created for the AHardwareBuffer route: {res}",
+            if res == VK_SUCCESS { unsafe { *out } } else { 0 },
+            ci.extent.width,
+            ci.extent.height,
+            ci.format,
+            ci.usage
+        ));
+    }
+    Some(res)
+}
+
+/// `vkAllocateMemory` for an image [`try_create_import_image`] remembered.
+/// `None` when the allocation is not a dma-buf import into one.
+unsafe fn try_allocate_import(
+    gd: *mut crate::proxy::GnDevice,
+    real: PFN_vkAllocateMemory,
+    ai: *const VkMemoryAllocateInfo,
+    alloc: *const VkAllocationCallbacks,
+    out: *mut VkDeviceMemory,
+) -> Option<VkResult> {
+    let imp = unsafe { find_in((*ai).pNext, VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR) }
+        as *const VkImportMemoryFdInfoKHR;
+    if imp.is_null()
+        || unsafe { (*imp).handleType } != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    {
+        return None;
+    }
+    let ded = unsafe {
+        find_in(
+            (*ai).pNext,
+            VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+        )
+    } as *const VkMemoryDedicatedAllocateInfo;
+    if ded.is_null() {
+        return None;
+    }
+    let image = unsafe { (*ded).image };
+    let ahb_route = import_route(image)?;
+    let dev = unsafe { (*gd).real };
+    let fd = unsafe { (*imp).fd };
+    if !ahb_route {
+        let res = unsafe { real(dev, ai, alloc, out) };
+        if res == VK_ERROR_OUT_OF_DEVICE_MEMORY || res == VK_ERROR_INVALID_EXTERNAL_HANDLE {
+            let ino = fd_ino(fd);
+            if let Some(buf) = crate::scanout::lookup_ahb(ino) {
+                close_fd(buf.fd);
+                unsafe { crate::scanout::ahb_release(buf.ahb) };
+                DMABUF_IMPORT.store(DMABUF_REFUSED, Ordering::Relaxed);
+                crate::logf!(gndrm_obf::obf!(
+                    "export-emu: dma-buf import of pool buffer ino={ino} for image {:#x} failed ({res}); later imports take the AHardwareBuffer route",
+                    image
+                ));
+            }
+        }
+        return Some(res);
+    }
+    let ino = fd_ino(fd);
+    let Some(buf) = crate::scanout::lookup_ahb(ino) else {
+        crate::logf!(gndrm_obf::obf!(
+            "export-emu: import ino={ino} for image {:#x}: no pool AHardwareBuffer from the daemon",
+            image
+        ));
+        return Some(VK_ERROR_INVALID_EXTERNAL_HANDLE);
+    };
+    close_fd(buf.fd);
+    let res = unsafe { import_ahb_dedicated(gd, image, buf.ahb, ino, out) };
+    unsafe { crate::scanout::ahb_release(buf.ahb) };
+    if res == VK_SUCCESS {
+        // A successful import owns the descriptor it was given; the
+        // `AHardwareBuffer` import does not take it, so it is closed here.
+        close_fd(fd);
+    }
+    Some(res)
+}
+
+/// Import `ahb` as the dedicated memory of `image`, created with the
+/// `AHardwareBuffer` handle type.
+unsafe fn import_ahb_dedicated(
+    gd: *mut crate::proxy::GnDevice,
+    image: VkImage,
+    ahb: *mut c_void,
+    ino: u64,
+    out: *mut VkDeviceMemory,
+) -> VkResult {
+    use crate::proxy::{
+        AhbFormatProperties, AhbProperties, ImportAhb, STYPE_AHB_FORMAT_PROPERTIES,
+        STYPE_AHB_PROPERTIES,
+    };
+    type PropsPfn = unsafe extern "C" fn(VkDevice, *const c_void, *mut AhbProperties) -> VkResult;
+    let Some(alloc_mem) = (unsafe { (*gd).f.alloc_mem }) else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    let dev = unsafe { (*gd).real };
+    let get_props: Option<PropsPfn> = unsafe {
+        std::mem::transmute(gn_real_device_proc(
+            gd,
+            c"vkGetAndroidHardwareBufferPropertiesANDROID",
+        ))
+    };
+    let Some(get_props) = get_props else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    let mut fmt = AhbFormatProperties {
+        s_type: STYPE_AHB_FORMAT_PROPERTIES,
+        next: ptr::null_mut(),
+        format: 0,
+        external_format: 0,
+        format_features: 0,
+        components: [0; 4],
+        ycbcr: [0; 4],
+    };
+    let mut props = AhbProperties {
+        s_type: STYPE_AHB_PROPERTIES,
+        next: (&raw mut fmt).cast(),
+        allocation_size: 0,
+        memory_type_bits: 0,
+    };
+    let res = unsafe { get_props(dev, ahb, &mut props) };
+    if res != VK_SUCCESS || props.memory_type_bits == 0 {
+        crate::logf!(gndrm_obf::obf!(
+            "export-emu: import ino={ino} AHB properties {res} memTypeBits={:#x}",
+            props.memory_type_bits
+        ));
+        return if res != VK_SUCCESS {
+            res
+        } else {
+            VK_ERROR_INVALID_EXTERNAL_HANDLE
+        };
+    }
+    let img_bits = unsafe { image_requirements(gd, image) }.map_or(u32::MAX, |r| r.memoryTypeBits);
+    let types = unsafe { memory_types(gd) };
+    let mem_type = pick_memory_type(types, props.memory_type_bits & img_bits)
+        .or_else(|| pick_memory_type(types, props.memory_type_bits))
+        .unwrap_or(0);
+    let ded = VkMemoryDedicatedAllocateInfo {
+        sType: VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+        pNext: ptr::null(),
+        image,
+        buffer: 0,
+    };
+    let imp = ImportAhb {
+        s_type: STYPE_IMPORT_AHB,
+        next: &ded as *const _ as *const c_void,
+        buffer: ahb,
+    };
+    let ai = VkMemoryAllocateInfo {
+        sType: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        pNext: &imp as *const _ as *const c_void,
+        allocationSize: props.allocation_size,
+        memoryTypeIndex: mem_type,
+    };
+    let res = unsafe { alloc_mem(dev, &ai, ptr::null(), out) };
+    if IMPORT_LOGS.fetch_add(1, Ordering::Relaxed) < IMPORT_LOG_FIRST_N || res != VK_SUCCESS {
+        crate::logf!(gndrm_obf::obf!(
+            "export-emu: import ino={ino} as AHardwareBuffer for image {:#x} size={} type={} format={} -> {res}",
+            image,
+            props.allocation_size,
+            mem_type,
+            fmt.format
+        ));
+    }
+    res
 }
 
 fn log_image(ci: &VkImageCreateInfo, buf: &crate::scanout::ScanoutBuf, image: VkImage, how: &str) {
@@ -988,8 +1299,13 @@ pub unsafe extern "C" fn gn_vkAllocateMemory(
     else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
-    if !enabled()
-        || unsafe { !find_in((*ai).pNext, VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR).is_null() }
+    if !enabled() {
+        return unsafe { real(dev, ai, alloc, out) };
+    }
+    if let Some(r) = unsafe { try_allocate_import(find_device(device), real, ai, alloc, out) } {
+        return r;
+    }
+    if unsafe { !find_in((*ai).pNext, VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR).is_null() }
         || unsafe { !find_in((*ai).pNext, STYPE_IMPORT_AHB).is_null() }
     {
         return unsafe { real(dev, ai, alloc, out) };
@@ -1026,6 +1342,7 @@ pub unsafe extern "C" fn gn_vkDestroyImage(
     };
     let mut unclaimed = 0;
     if enabled() && image != 0 {
+        forget_import(image);
         if let Some((e, mems)) = forget_image(image) {
             crate::logf!(gndrm_obf::obf!(
                 "export-emu: drop image {:#x} pool fd={} mems={mems}",
