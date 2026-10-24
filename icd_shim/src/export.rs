@@ -588,6 +588,16 @@ pub unsafe fn try_create_image(
     if !mods.contains(&MOD_LINEAR) {
         return None;
     }
+    // GNDRM_EXPORT_AHB=1 skips the dma-buf route for the whole process: the
+    // A/B for a driver whose dma-buf import succeeds but scans out wrong.
+    if DMABUF_IMPORT.load(Ordering::Relaxed) == DMABUF_UNKNOWN
+        && std::env::var_os("GNDRM_EXPORT_AHB").is_some_and(|v| v == "1")
+    {
+        DMABUF_IMPORT.store(DMABUF_REFUSED, Ordering::Relaxed);
+        crate::logf!(gndrm_obf::obf!(
+            "export-emu: GNDRM_EXPORT_AHB=1, importing pool buffers as AHardwareBuffers from the start"
+        ));
+    }
     let route = DMABUF_IMPORT.load(Ordering::Relaxed);
     let (w, h) = (ci.extent.width, ci.extent.height);
     let buf = if route == DMABUF_WORKS {
