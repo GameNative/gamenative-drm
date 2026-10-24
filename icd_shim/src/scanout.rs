@@ -600,9 +600,18 @@ fn note_pool_fd_kind(fd: RawFd, ino: u64) {
         (magic, size)
     };
     crate::logf!(gndrm_obf::obf!(
-        "scan-out: pool fd ino={ino} size={size} fs={magic:#x} dma-buf={}",
-        magic == 0x444d_4142
+        "scan-out: pool fd ino={ino} size={size} fs={magic:#x} dma-buf={} link={}",
+        magic == 0x444d_4142,
+        fd_link(fd)
     ));
+}
+
+/// The `/proc/self/fd` link of `fd` (`/dmabuf:…` for a dma-buf), empty when it
+/// cannot be read.
+pub(crate) fn fd_link(fd: RawFd) -> String {
+    std::fs::read_link(format!("/proc/self/fd/{fd}"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Adopt any frame-cap note the daemon has pushed on this channel, if one is

@@ -72,7 +72,7 @@ use gndrm_uapi::wire::{
 };
 
 use crate::ffi;
-use crate::{log_info, log_warn};
+use crate::{log_always, log_info, log_warn};
 
 /// Budget for the previous release fence (a 30 Hz frame). A fence that never
 /// signals must not stall the flip loop, so the frame is published anyway and
@@ -2789,46 +2789,62 @@ fn dup_scanout_fd(api: &ffi::ScApi, ahb: *mut ffi::AHardwareBuffer) -> Option<(R
 /// `DMA_BUF_MAGIC` (`<linux/magic.h>`), the `f_type` of every dma-buf.
 const DMA_BUF_MAGIC: u64 = 0x444d_4142;
 
-fn is_dmabuf(fd: c_int) -> Option<bool> {
+/// Whether `fd` is a dma-buf: its filesystem magic, or, where `fstatfs` is
+/// refused (the app's SELinux domain on some vendor builds), the name the
+/// kernel gives a dma-buf file (`/dmabuf:…`, `anon_inode:dmabuf` before 5.x).
+fn is_dmabuf(fd: c_int) -> bool {
     let mut st: libc::statfs = unsafe { core::mem::zeroed() };
     // SAFETY: fstatfs on a descriptor the caller can read; `st` is written on success.
-    if unsafe { libc::fstatfs(fd, &mut st) } != 0 {
-        return None;
+    if unsafe { libc::fstatfs(fd, &mut st) } == 0 && st.f_type as u64 == DMA_BUF_MAGIC {
+        return true;
     }
-    Some(st.f_type as u64 == DMA_BUF_MAGIC)
+    fd_link(fd).contains("dmabuf")
+}
+
+/// The `/proc/self/fd` link of `fd`, empty when it cannot be read.
+fn fd_link(fd: c_int) -> String {
+    std::fs::read_link(format!("/proc/self/fd/{fd}"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// The descriptor of `nh` that is the buffer's dma-buf. Usually the first one,
 /// but not on every gralloc: MediaTek's handles lead with a descriptor shared
-/// by every buffer, which no driver imports and whose inode collides in the
-/// pool. When the first descriptor is not a dma-buf, the largest dma-buf in the
-/// handle is taken: a handle can also carry a small dma-buf for its metadata,
-/// and only the pixel buffer spans the image. Falls back to the first
-/// descriptor when none is a dma-buf.
+/// by every buffer, which is not a dma-buf at all — its inode is the same for
+/// every buffer, it has no length, and polling it for the compositor's
+/// implicit-sync wait never reports the frame ready. When the first descriptor
+/// is not a dma-buf, the largest dma-buf in the handle is taken (a handle can
+/// also carry a small metadata dma-buf), else the descriptor with the largest
+/// length, else the first.
 ///
 /// # Safety
 /// `nh` must be a live native handle.
 unsafe fn scanout_dmabuf_fd(nh: *const ffi::NativeHandle) -> Option<c_int> {
     static LOGGED: AtomicBool = AtomicBool::new(false);
-    // SAFETY: the caller guarantees `nh` is live.
-    let fd0 = unsafe { ffi::NativeHandle::fd(nh, 0) }?;
-    if is_dmabuf(fd0) != Some(false) {
-        return Some(fd0);
-    }
-    // SAFETY: as above; `fd` bounds the index by `num_fds`.
+    // SAFETY: the caller guarantees `nh` is live; `fd` bounds the index by
+    // `num_fds`.
     let fds: Vec<c_int> = (0..8)
         .map_while(|i| unsafe { ffi::NativeHandle::fd(nh, i) })
         .collect();
-    let found = fds
-        .iter()
-        .enumerate()
-        .skip(1)
-        .filter(|&(_, &fd)| is_dmabuf(fd) == Some(true))
-        .map(|(i, &fd)| (i, fd, dmabuf_len(fd)))
-        .fold(None, |best: Option<(usize, c_int, u64)>, cur| match best {
-            Some(b) if b.2 >= cur.2 => Some(b),
-            _ => Some(cur),
-        });
+    let fd0 = *fds.first()?;
+    let largest = |want_dmabuf: bool| {
+        fds.iter()
+            .enumerate()
+            .filter(|&(_, &fd)| !want_dmabuf || is_dmabuf(fd))
+            .map(|(i, &fd)| (i, fd, dmabuf_len(fd)))
+            .filter(|&(_, _, len)| want_dmabuf || len > 0)
+            .fold(None, |best: Option<(usize, c_int, u64)>, cur| match best {
+                Some(b) if b.2 >= cur.2 => Some(b),
+                _ => Some(cur),
+            })
+    };
+    let pick = if is_dmabuf(fd0) {
+        (0, fd0)
+    } else {
+        largest(true)
+            .or_else(|| largest(false))
+            .map_or((0, fd0), |(i, fd, _)| (i, fd))
+    };
     if !LOGGED.swap(true, Ordering::Relaxed) {
         let table = fds
             .iter()
@@ -2836,34 +2852,30 @@ unsafe fn scanout_dmabuf_fd(nh: *const ffi::NativeHandle) -> Option<c_int> {
             .map(|(i, &fd)| {
                 let (ino, size) = fstat_ino_size(fd).unwrap_or((0, 0));
                 format!(
-                    "{i}:ino={ino},size={size},len={},dmabuf={}",
+                    "{i}:ino={ino},size={size},len={},dmabuf={},link={}",
                     dmabuf_len(fd),
-                    is_dmabuf(fd) == Some(true)
+                    is_dmabuf(fd),
+                    fd_link(fd)
                 )
             })
             .collect::<Vec<_>>()
             .join(" ");
-        match found {
-            Some((i, _, len)) => log_warn!(
-                "{}",
-                gndrm_obf::obf!(
-                    "asc: scan-out handle fd 0 is not a dma-buf; using fd {i} (len {len}) of [{table}]"
-                )
-            ),
-            None => log_warn!(
-                "{}",
-                gndrm_obf::obf!("asc: scan-out handle has no dma-buf descriptor: [{table}]")
-            ),
-        }
+        log_always!(
+            "{}",
+            gndrm_obf::obf!(
+                "asc: scan-out handle descriptors [{table}]; handing out fd {}",
+                pick.0
+            )
+        );
     }
-    Some(found.map_or(fd0, |(_, fd, _)| fd))
+    Some(pick.1)
 }
 
-/// Length of the dma-buf `fd`: `st_size`, or the end offset where a kernel
+/// Length of `fd`: `st_size`, or for a dma-buf the end offset where a kernel
 /// leaves the inode size at zero. 0 when neither is known.
 fn dmabuf_len(fd: c_int) -> u64 {
     let size = fstat_ino_size(fd).map_or(0, |(_, s)| s);
-    if size != 0 {
+    if size != 0 || !is_dmabuf(fd) {
         return size;
     }
     // SAFETY: lseek on a descriptor the caller can read; a dma-buf only moves

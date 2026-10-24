@@ -840,7 +840,7 @@ unsafe fn try_allocate_import(
         return Some(VK_ERROR_INVALID_EXTERNAL_HANDLE);
     };
     close_fd(buf.fd);
-    let res = unsafe { import_ahb_dedicated(gd, image, buf.ahb, ino, out) };
+    let res = unsafe { import_ahb_dedicated(gd, image, buf.ahb, fd, ino, out) };
     unsafe { crate::scanout::ahb_release(buf.ahb) };
     if res == VK_SUCCESS {
         // A successful import owns the descriptor it was given; the
@@ -856,6 +856,7 @@ unsafe fn import_ahb_dedicated(
     gd: *mut crate::proxy::GnDevice,
     image: VkImage,
     ahb: *mut c_void,
+    fd: i32,
     ino: u64,
     out: *mut VkDeviceMemory,
 ) -> VkResult {
@@ -929,11 +930,12 @@ unsafe fn import_ahb_dedicated(
     let res = unsafe { alloc_mem(dev, &ai, ptr::null(), out) };
     if IMPORT_LOGS.fetch_add(1, Ordering::Relaxed) < IMPORT_LOG_FIRST_N || res != VK_SUCCESS {
         crate::logf!(gndrm_obf::obf!(
-            "export-emu: import ino={ino} as AHardwareBuffer for image {:#x} size={} type={} format={} -> {res}",
+            "export-emu: import ino={ino} as AHardwareBuffer for image {:#x} size={} type={} format={} fd link={} -> {res}",
             image,
             props.allocation_size,
             mem_type,
-            fmt.format
+            fmt.format,
+            crate::scanout::fd_link(fd)
         ));
     }
     res
