@@ -21,19 +21,17 @@ daemon's commit stream **stops**:
 - The guest itself keeps presenting at **~325 presents/s** with **no errors**.
 - gamescope's flip loop goes **dead** at that point: with no flip there is no
   publish, so the splash-clear latch (which requires a published framebuffer,
-  `fb.id != 0`) can never fire even though the note is decoded and the
-  game-window predicate reports `present=true`.
+  `fb.id != 0`) can never fire.
 
 The onset is the guest's **Vulkan swapchain coming up**. On the same guest and
 the same build, the override/Wayland route (the default) renders at a healthy
 frame rate with the splash cleared and the QuickMenu overlaying live content —
 so the failure is **route-specific**, not a guest or gamescope-wide fault.
 
-All three splash-clear links have **ungated, permanent probes**, so a session log
-on this route names which link is live: the shim's `x11 game-window predicate:`
-line, the daemon's `scan-out channel non-request frame … note_decoded=…`, and the
-daemon's `splash-clear latch fired …` / `splash-clear upcall clearBootingSplash
-outcome=…` lines.
+Both splash-clear links have **ungated, permanent probes**, so a session log on
+this route names which link is live: the daemon's `splash-clear upcall
+clearBootingSplash outcome=…` line, and the commit probe's `fb.id`, which says
+whether a published framebuffer ever arrived.
 
 ## The two candidate causes (with code locations)
 

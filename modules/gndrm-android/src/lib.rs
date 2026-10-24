@@ -69,11 +69,10 @@ const E_IO: jint = -5;
 /// `nativeRetargetSurface` with no running session; the caller starts one.
 const E_NOENT: jint = -2;
 
-/// Whether the game's window has appeared this session, as reported by
-/// gamescope over the scan-out channel (a [`gndrm_uapi::wire::GameWindowNote`]).
-/// Its first transition clears the booting splash; reset alongside the rest of
-/// the session state by `nativeStart`/`nativeStop`.
-pub(crate) static GAME_WINDOW_PRESENT: AtomicBool = AtomicBool::new(false);
+/// Whether the session's first frame has been committed. The booting splash
+/// clears on that transition: until a frame is on the panel there is nothing
+/// but the desktop behind it, which is what the splash covers.
+pub(crate) static FIRST_FRAME_COMMITTED: AtomicBool = AtomicBool::new(false);
 
 /// The session's fps cap: the target the app set, which the scan-out channel
 /// hands to a subscribed shim on its subscribe and pushes again whenever it
@@ -287,15 +286,10 @@ fn set_frame_cap_target(fps: u32) {
     }
 }
 
-/// Latch [`GAME_WINDOW_PRESENT`] and clear the booting splash on its first
-/// transition this session. Called by the scan-out channel reader when a
-/// game-window note arrives. Idempotent, so gamescope's resends are free.
-pub(crate) fn note_game_window_present() {
-    if !GAME_WINDOW_PRESENT.swap(true, Ordering::Relaxed) {
-        log_info!(
-            "{}",
-            gndrm_obf::obf!("daemon: game window present reported")
-        );
+/// Clear the booting splash on the session's first committed frame; later
+/// commits return without calling the app.
+pub(crate) fn clear_booting_splash_on_first_frame() {
+    if !FIRST_FRAME_COMMITTED.swap(true, Ordering::Relaxed) {
         clear_booting_splash();
     }
 }
@@ -788,7 +782,7 @@ fn start(
     width: jint,
     height: jint,
 ) -> jint {
-    GAME_WINDOW_PRESENT.store(false, Ordering::Relaxed);
+    FIRST_FRAME_COMMITTED.store(false, Ordering::Relaxed);
     // Session start: drop the cached `GNDRM_HDR` verdict so this session
     // re-reads the environment. The launcher sets the variable (via
     // `Os.setenv`) after this returns and before the guest forks, so the first
@@ -1076,7 +1070,7 @@ fn stop() {
     // again.
     // SAFETY: presenter no longer references the window.
     unsafe { ffi::ANativeWindow_release(rt.window.0) };
-    GAME_WINDOW_PRESENT.store(false, Ordering::Relaxed);
+    FIRST_FRAME_COMMITTED.store(false, Ordering::Relaxed);
     log_info!("{}", gndrm_obf::obf!("stopped"));
 }
 
