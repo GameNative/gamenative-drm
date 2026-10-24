@@ -278,6 +278,7 @@ pub const VK_FILTER_NEAREST: i32 = 0;
 
 pub type VkImageAspectFlags = u32;
 pub const VK_IMAGE_ASPECT_COLOR_BIT: VkImageAspectFlags = 0x1;
+pub const VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT: VkImageAspectFlags = 0x80;
 
 pub type VkCommandBufferLevel = i32;
 pub const VK_COMMAND_BUFFER_LEVEL_PRIMARY: VkCommandBufferLevel = 0;

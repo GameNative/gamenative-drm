@@ -1047,11 +1047,31 @@ unsafe fn create_dmabuf_backed(
     if res != VK_SUCCESS {
         return Err(res);
     }
-    if linear_tiling {
-        if let Some(gsl) = unsafe { gn_real_device_proc(gd, c"vkGetImageSubresourceLayout") } {
-            let gsl: PFN_vkGetImageSubresourceLayout = unsafe { std::mem::transmute(gsl) };
+    let fail = |r: VkResult| {
+        unsafe { destroy_real_image(gd, image, alloc) };
+        Err(r)
+    };
+    // The driver's own row pitch for the image. The explicit-modifier create
+    // asks for the pool stride, but a driver may answer with a pitch of its own
+    // (PowerVR packs the rows at the image width): the daemon scans the pool
+    // buffer out at its gralloc stride, so a different pitch shears every row
+    // and the dma-buf route is refused for the AHardwareBuffer one.
+    if let Some(gsl) = unsafe { gn_real_device_proc(gd, c"vkGetImageSubresourceLayout") } {
+        let gsl: PFN_vkGetImageSubresourceLayout = unsafe { std::mem::transmute(gsl) };
+        // DRM-modifier images are queried by memory plane; a driver that only
+        // answers the colour aspect reports a zero pitch for the plane aspect.
+        let mut pitch = 0u64;
+        let mut offset = 0u64;
+        for aspect in if linear_tiling {
+            [VK_IMAGE_ASPECT_COLOR_BIT, 0]
+        } else {
+            [VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT, VK_IMAGE_ASPECT_COLOR_BIT]
+        } {
+            if aspect == 0 {
+                break;
+            }
             let sub = VkImageSubresource {
-                aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
+                aspectMask: aspect,
                 mipLevel: 0,
                 arrayLayer: 0,
             };
@@ -1063,19 +1083,26 @@ unsafe fn create_dmabuf_backed(
                 depthPitch: 0,
             };
             unsafe { gsl(dev, image, &sub, &mut l) };
-            if l.rowPitch != u64::from(buf.stride) {
-                crate::logf!(gndrm_obf::obf!(
-                    "export-emu: LINEAR pitch {} != pool stride {}",
-                    l.rowPitch,
-                    buf.stride
-                ));
+            if l.rowPitch != 0 {
+                pitch = l.rowPitch;
+                offset = l.offset;
+                break;
             }
         }
+        crate::logf!(gndrm_obf::obf!(
+            "export-emu: {} image {:#x} layout pitch={pitch} offset={offset} (pool stride {})",
+            if linear_tiling { "LINEAR-tiling" } else { "explicit-LINEAR" },
+            image,
+            buf.stride
+        ));
+        if pitch != 0 && (pitch != u64::from(buf.stride) || offset != 0) {
+            crate::logf!(gndrm_obf::obf!(
+                "export-emu: driver pitch {pitch} != pool stride {}; the dma-buf route cannot scan out, trying AHardwareBuffer",
+                buf.stride
+            ));
+            return fail(VK_ERROR_FORMAT_NOT_SUPPORTED);
+        }
     }
-    let fail = |r: VkResult| {
-        unsafe { destroy_real_image(gd, image, alloc) };
-        Err(r)
-    };
     let Some(reqs) = (unsafe { image_requirements(gd, image) }) else {
         return fail(VK_ERROR_INITIALIZATION_FAILED);
     };
