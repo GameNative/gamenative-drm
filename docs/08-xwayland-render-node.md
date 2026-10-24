@@ -30,6 +30,15 @@ master acquisition are not. The gate is what makes "this is a render node" an
 observable property rather than a label — a render client cannot accidentally
 modeset.
 
+Only Xwayland's render-node opens go to the daemon. In every other process
+(gamescope, the guests) `/dev/dri/renderD*` reaches the kernel: a Vulkan driver
+whose kernel interface is a render node (PowerVR on Tensor G5) runs there, and
+the daemon's node is not its GPU. In Xwayland too, an open by an OS library, or
+one made while the daemon connection is already held, reaches the kernel.
+`GNDRM_RENDER_NODE_CLIENT=1` makes any process a render-node client (the host
+harness's test clients). The shim logs every `/dev/dri` decision with the
+opener's library.
+
 The node kind is per connection, not per device, because the daemon is the
 device: both clients connect to the same `Device` implementation and the wire
 protocol is identical; only the permitted request set and the object model
