@@ -7188,7 +7188,7 @@ fn import_mode(has: &dyn Fn(&CStr) -> bool, allow_ahb: bool) -> Option<bool> {
     if allow_ahb && AHB_EXTS.iter().all(|e| has(e)) {
         return Some(true);
     }
-    crate::logf!(gndrm_obf::obf!(
+    crate::log_reason!(gndrm_obf::obf!(
         "proxy prereq: device lacks {}",
         missing.to_str().unwrap()
     ));
@@ -7223,14 +7223,14 @@ fn dev_exts_satisfied(
     };
     if device_api >= VK_API_VERSION_1_1 && !has(c"VK_KHR_external_memory") {
         EXTERNAL_MEMORY_CORE.store(true, Ordering::Relaxed);
-        crate::logf!(gndrm_obf::obf!(
+        crate::logi!(gndrm_obf::obf!(
             "proxy prereq: VK_KHR_external_memory not listed, core in device api {}",
             api_str(device_api)
         ));
     }
     match import_mode(&has, allow_ahb) {
         Some(true) => {
-            crate::logf!(gndrm_obf::obf!(
+            crate::logi!(gndrm_obf::obf!(
                 "proxy prereq: no dma-buf import, using AHardwareBuffer import"
             ));
             true
@@ -7247,7 +7247,7 @@ pub fn device_prereqs(gipa: GipaFn, allow_ahb: bool) -> bool {
     let create_inst: Option<PFN_vkCreateInstance> =
         unsafe { std::mem::transmute(gipa(ptr::null_mut(), c"vkCreateInstance".as_ptr())) };
     let Some(create_inst) = create_inst else {
-        crate::logf!(gndrm_obf::obf!(
+        crate::log_reason!(gndrm_obf::obf!(
             "proxy prereq: driver exposes no vkCreateInstance"
         ));
         return false;
@@ -7273,12 +7273,12 @@ pub fn device_prereqs(gipa: GipaFn, allow_ahb: bool) -> bool {
     };
     let mut inst: VkInstance = ptr::null_mut();
     let res = unsafe { create_inst(&ci, ptr::null(), &mut inst) };
-    crate::logf!(gndrm_obf::obf!(
+    crate::logi!(gndrm_obf::obf!(
         "proxy prereq: probe vkCreateInstance api={} layers=[] exts=[] -> {res}",
         api_str(app.apiVersion)
     ));
     if res != VK_SUCCESS {
-        crate::logf!(gndrm_obf::obf!(
+        crate::log_reason!(gndrm_obf::obf!(
             "proxy prereq: probe vkCreateInstance failed ({res})"
         ));
         return false;
@@ -7306,7 +7306,7 @@ pub fn device_prereqs(gipa: GipaFn, allow_ahb: bool) -> bool {
                     let device_api = get_props.map_or(0, |f| unsafe {
                         let mut p: VkPhysicalDeviceProperties = std::mem::zeroed();
                         f(pd, &mut p);
-                        crate::logf!(gndrm_obf::obf!(
+                        crate::logi!(gndrm_obf::obf!(
                             "proxy prereq: device '{}' api {} vendor {:#x} device {:#x} driver {:#x} ({n} physical devices)",
                             CStr::from_ptr(p.deviceName.as_ptr()).to_string_lossy(),
                             api_str(p.apiVersion),
@@ -7318,15 +7318,15 @@ pub fn device_prereqs(gipa: GipaFn, allow_ahb: bool) -> bool {
                     });
                     ok = dev_exts_satisfied(enum_de, pd, device_api, allow_ahb);
                 } else {
-                    crate::logf!(gndrm_obf::obf!(
+                    crate::log_reason!(gndrm_obf::obf!(
                         "proxy prereq: vkEnumeratePhysicalDevices failed ({r})"
                     ));
                 }
             } else {
-                crate::logf!(gndrm_obf::obf!("proxy prereq: no physical devices"));
+                crate::log_reason!(gndrm_obf::obf!("proxy prereq: no physical devices"));
             }
         }
-        _ => crate::logf!(gndrm_obf::obf!(
+        _ => crate::log_reason!(gndrm_obf::obf!(
             "proxy prereq: instance-level procs unresolved"
         )),
     }
@@ -7336,9 +7336,13 @@ pub fn device_prereqs(gipa: GipaFn, allow_ahb: bool) -> bool {
     if ok {
         AHB_IMPORT_ALLOWED.store(allow_ahb, Ordering::Relaxed);
     }
-    crate::logf!(gndrm_obf::obf!(
+    crate::logi!(gndrm_obf::obf!(
         "proxy prereq: {}",
-        if ok { "passed" } else { "FAILED" }
+        if ok {
+            "passed".to_string()
+        } else {
+            format!("FAILED ({})", crate::reason())
+        }
     ));
     ok
 }
@@ -7441,30 +7445,27 @@ fn real_instance_layers(gipa: GipaFn) -> Option<Vec<CString>> {
 }
 
 fn log_real_instance_surface(gipa: GipaFn) {
-    if !crate::vkshim_enabled() {
-        return;
-    }
-    crate::logf!(gndrm_obf::obf!(
+    crate::logi!(gndrm_obf::obf!(
         "system loader: instance version {}",
         api_str(real_instance_version(gipa))
     ));
     match real_instance_exts(gipa) {
-        Some(e) => crate::logf!(gndrm_obf::obf!(
+        Some(e) => crate::logi!(gndrm_obf::obf!(
             "system loader: {} instance extensions: {}",
             e.len(),
             join_names(&e)
         )),
-        None => crate::logf!(gndrm_obf::obf!(
+        None => crate::logi!(gndrm_obf::obf!(
             "system loader: instance extensions unreadable"
         )),
     }
     match real_instance_layers(gipa) {
-        Some(l) => crate::logf!(gndrm_obf::obf!(
+        Some(l) => crate::logi!(gndrm_obf::obf!(
             "system loader: {} instance layers: {}",
             l.len(),
             join_names(&l)
         )),
-        None => crate::logf!(gndrm_obf::obf!(
+        None => crate::logi!(gndrm_obf::obf!(
             "system loader: instance layers unreadable"
         )),
     }
@@ -7593,13 +7594,13 @@ unsafe extern "C" fn gn_vkCreateInstance(
         ci2.pApplicationInfo = &app2;
     }
     if !dropped_exts.is_empty() || !dropped_layers.is_empty() {
-        crate::logf!(gndrm_obf::obf!(
+        crate::logi!(gndrm_obf::obf!(
             "proxy instance create: dropping exts=[{}] layers=[{}] the system loader does not list",
             join_names(&dropped_exts),
             join_names(&dropped_layers)
         ));
     }
-    crate::logf!(gndrm_obf::obf!(
+    crate::logi!(gndrm_obf::obf!(
         "proxy instance create: api={} (app {}, system loader {}) flags={:#x} layers=[{}] exts=[{}] pNext=[{}]",
         api_str(fwd_api),
         api_str(app_api),
@@ -7624,7 +7625,7 @@ unsafe extern "C" fn gn_vkCreateInstance(
         }
     }
     let res = unsafe { real_create(&ci2, alloc, out) };
-    crate::logf!(gndrm_obf::obf!(
+    crate::logi!(gndrm_obf::obf!(
         "proxy instance create: system loader returned {res}"
     ));
     if res != VK_SUCCESS {

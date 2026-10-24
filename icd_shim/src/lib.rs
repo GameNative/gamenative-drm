@@ -57,6 +57,43 @@ macro_rules! logf {
     };
 }
 
+/// Emit a `gn-vkshim:` line to stderr whatever `GNDRM_LOG_VKSHIM` says. Kept
+/// for the few one-time lines that say which driver a process got, or why it
+/// got none: the launcher does not pass a container's environment to
+/// gamescope, so a gated line can never be turned on there.
+#[macro_export]
+macro_rules! logi {
+    ($e:expr) => {
+        eprintln!("{} {}", ::gndrm_obf::obf!("gn-vkshim:"), $e)
+    };
+}
+
+/// [`logi!`], and the line becomes the reason reported if the shim ends up
+/// with no driver.
+#[macro_export]
+macro_rules! log_reason {
+    ($e:expr) => {{
+        let line = format!("{}", $e);
+        $crate::note_reason(&line);
+        eprintln!("{} {}", ::gndrm_obf::obf!("gn-vkshim:"), line);
+    }};
+}
+
+static REASON: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+pub fn note_reason(line: &str) {
+    if let Ok(mut r) = REASON.lock() {
+        line.clone_into(&mut r);
+    }
+}
+
+pub(crate) fn reason() -> String {
+    REASON
+        .lock()
+        .map(|r| r.clone())
+        .unwrap_or_default()
+}
+
 /// `GNDRM_LOG_VKSHIM` gate, resolved once and cached.
 pub fn vkshim_enabled() -> bool {
     // 0 = unresolved, 1 = off, 2 = on.
@@ -99,6 +136,24 @@ type IcdGipaFn = Option<unsafe extern "C" fn(VkInstance, *const c_char) -> PFN_v
 /// `build.rs` at compile time (`GN_SHIM_BUILD`); it used to be a hardcoded
 /// constant that never advanced, so every rebuild reported the same date.
 pub const SHIM_BUILD: &str = env!("GN_SHIM_BUILD");
+
+/// The commit the shim was built from (`-dirty` with uncommitted changes).
+pub const SHIM_GIT: &str = env!("GN_SHIM_GIT");
+
+fn announce(entry: &str) {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let comm = std::fs::read_to_string("/proc/self/comm").unwrap_or_default();
+        logi!(gndrm_obf::obf!(
+            "ICD loaded [shim {} {}] pid={} comm={} first entry {}",
+            SHIM_BUILD,
+            SHIM_GIT,
+            std::process::id(),
+            comm.trim_end(),
+            entry
+        ));
+    });
+}
 
 /// Signature recovered from libvulkan_wrapper.so's call site: dlopen flags,
 /// feature bitmask (bit0 always set, bit1 = file redirect dir present), temp
@@ -319,20 +374,20 @@ fn try_system_driver() {
     if opened.is_none() {
         let h = unsafe { libc::dlopen(SYSTEM_LOADER.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if h.is_null() {
-            logf!(gndrm_obf::obf!(
+            log_reason!(gndrm_obf::obf!(
                 "dlopen system vulkan loader failed: {}",
                 dlerror_str()
             ));
             return;
         }
         let Some(gipa) = (unsafe { resolve_gipa(h) }) else {
-            logf!(gndrm_obf::obf!(
+            log_reason!(gndrm_obf::obf!(
                 "system vulkan loader exports no vkGetInstanceProcAddr"
             ));
             return;
         };
         if !proxy::device_prereqs(gipa, allow_ahb) {
-            logf!(gndrm_obf::obf!("system vulkan driver fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode"));
+            logi!(gndrm_obf::obf!("system vulkan driver fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode"));
             return;
         }
         opened = Some((h, gipa, false));
@@ -357,12 +412,12 @@ fn try_system_driver() {
         DRIVER.handle = h;
     }
     if gamescope {
-        logf!(gndrm_obf::obf!(
+        logi!(gndrm_obf::obf!(
             "gamescope process: using system vulkan driver via WSI proxy [shim {}]",
             SHIM_BUILD
         ));
     } else {
-        logf!(gndrm_obf::obf!(
+        logi!(gndrm_obf::obf!(
             "guest process: using system vulkan driver via WSI proxy [shim {}]",
             SHIM_BUILD
         ));
@@ -526,11 +581,11 @@ fn init_once() {
     let kgsl = kgsl_present();
     if !kgsl || system_driver_forced() {
         if kgsl {
-            logf!(gndrm_obf::obf!(
+            logi!(gndrm_obf::obf!(
                 "GN_VKSHIM_SYSTEM_DRIVER=1: using the system vulkan loader"
             ));
         } else {
-            logf!(gndrm_obf::obf!(
+            logi!(gndrm_obf::obf!(
                 "no /dev/kgsl-3d0: using the system vulkan loader"
             ));
         }
@@ -596,9 +651,11 @@ fn init_once() {
     }
     let handle = unsafe { DRIVER.handle };
     if handle.is_null() {
-        logf!(gndrm_obf::obf!(
-            "no driver selected [shim {}]: every entry point resolves to NULL, so the loader skips this ICD and vkCreateInstance returns VK_ERROR_INCOMPATIBLE_DRIVER",
-            SHIM_BUILD
+        logi!(gndrm_obf::obf!(
+            "no driver selected [shim {} {}]: every entry point resolves to NULL, so the loader skips this ICD and vkCreateInstance returns VK_ERROR_INCOMPATIBLE_DRIVER; reason: {}",
+            SHIM_BUILD,
+            SHIM_GIT,
+            reason()
         ));
         return;
     }
@@ -639,6 +696,7 @@ pub fn proxy_active() -> bool {
 pub unsafe extern "C" fn vk_icdNegotiateLoaderICDInterfaceVersion(
     pSupportedVersion: *mut u32,
 ) -> VkResult {
+    announce("vk_icdNegotiateLoaderICDInterfaceVersion");
     ensure_init();
     unsafe {
         if *pSupportedVersion > 5 {
@@ -655,6 +713,7 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
     instance: VkInstance,
     pName: *const c_char,
 ) -> PFN_vkVoidFunction {
+    announce("vk_icdGetInstanceProcAddr");
     ensure_init();
     let name = unsafe { CStr::from_ptr(pName) };
     // The loader asks this entry point for instance- and physical-device-level
@@ -670,9 +729,39 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
     if fnptr.is_some() {
         return fnptr;
     }
-    let raw = unsafe { DRIVER.gipa?(instance, pName) };
+    let Some(gipa) = (unsafe { DRIVER.gipa }) else {
+        if name == c"vkCreateInstance" {
+            note_null_create_instance(&format!(
+                "{}",
+                gndrm_obf::obf!("no driver selected ({})", reason())
+            ));
+        }
+        return None;
+    };
+    let raw = unsafe { gipa(instance, pName) };
     proxy::note_instance_miss(name, raw.is_none());
-    proxy::serve_unlisted(name, raw, proxy::DispatchCtx::Instance)
+    let out = proxy::serve_unlisted(name, raw, proxy::DispatchCtx::Instance);
+    if out.is_none() && name == c"vkCreateInstance" {
+        note_null_create_instance(&format!(
+            "{}",
+            gndrm_obf::obf!(
+                "the driver's vkGetInstanceProcAddr returned NULL (proxy {})",
+                if proxy_active() { "active" } else { "inactive" }
+            )
+        ));
+    }
+    out
+}
+
+/// The loader drops an ICD whose vkCreateInstance resolves to NULL and, with no
+/// other ICD, fails vkCreateInstance with VK_ERROR_INCOMPATIBLE_DRIVER.
+fn note_null_create_instance(why: &str) {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        logi!(gndrm_obf::obf!(
+            "vk_icdGetInstanceProcAddr(vkCreateInstance) -> NULL: {why}; the loader will report VK_ERROR_INCOMPATIBLE_DRIVER"
+        ));
+    });
 }
 
 /// # Safety: loader-ICD v5 interface (called by the Khronos loader).

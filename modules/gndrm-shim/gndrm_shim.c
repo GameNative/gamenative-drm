@@ -224,6 +224,19 @@ static uint32_t g_in_fence_prop; /* discovered at init, 0 = unsupported */
             fprintf(stderr, "[gndrm-shim] " __VA_ARGS__); \
     } while (0)
 
+/* Always printed, whatever GNDRM_LOG_SHIM says: the few one-time lines that
+ * explain a session's GPU access. The launcher does not pass a container's
+ * environment to gamescope, so a gated line can never be turned on there. */
+__attribute__((format(printf, 1, 2)))
+static void log_info(const char *fmt, ...)
+{
+    va_list ap;
+    fputs("[gndrm-shim] ", stderr);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
 /*
  * Render-channel trace: name the first occurrence of each DRM request a client
  * issues on one of our fds (GNDRM_LOG_SHIM=1). The daemon logs the same
@@ -865,8 +878,8 @@ static bool should_intercept(const char *path, const void *caller)
         return false;
     if (is_os_library(caller)) {
         Dl_info info;
-        LOG("passing %s through to the kernel for %s\n", path,
-            dladdr(caller, &info) && info.dli_fname ? info.dli_fname : "?");
+        log_info(GNDRM_OBF("passing %s through to the kernel for %s\n"), path,
+                 dladdr(caller, &info) && info.dli_fname ? info.dli_fname : "?");
         return false;
     }
     return true;
