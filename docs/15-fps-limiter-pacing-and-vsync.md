@@ -399,8 +399,7 @@ what remains per frame is the cached-gate atomic load and its branch.
 **Per session, not per frame.** The scan-out allocator exchange — the socket
 `sendmsg`/`recvmsg` pair that carries the pool dma-buf over `SCM_RIGHTS`, with
 its three-attempt retry (`proxy.rs:7469`, `scanout.rs:124-152`) — runs once per
-swapchain slot at swapchain creation (`proxy.rs:865`). The game-window note is
-latched to one send per session (`scanout.rs:63-88`, `proxy.rs:558-579`).
+swapchain slot at swapchain creation (`proxy.rs:865`).
 `effective_present_mode` is resolved once at swapchain creation
 (`proxy.rs:6336-6349`), and `resolve_override_target` (`proxy.rs:5919`,
 `x11.rs:609-620`) and `window_extent` once at surface creation.

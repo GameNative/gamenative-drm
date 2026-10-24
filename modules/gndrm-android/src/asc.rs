@@ -67,8 +67,8 @@ use gndrm_daemon::diag::{self, Diag, Reply, Role, Stage, State, TrackedMutex, LO
 use gndrm_daemon::scanout::{Geometry, Removed, Reservation as CacheReservation, ReusePool};
 use gndrm_daemon::{FrameCap, Framebuffer, PlaneState, Presenter};
 use gndrm_uapi::wire::{
-    FrameCapSubscribe, GameWindowNote, LsfgConfig, ScanoutAllocReq, ScanoutAllocResp,
-    CAP_FRAME_CAP, CAP_VSYNC_NOTE, SCANOUT_FORMAT_BGRA_8888,
+    FrameCapSubscribe, LsfgConfig, ScanoutAllocReq, ScanoutAllocResp, CAP_FRAME_CAP,
+    CAP_VSYNC_NOTE, SCANOUT_FORMAT_BGRA_8888,
 };
 
 use crate::ffi;
@@ -1258,6 +1258,7 @@ impl AscState {
 
         self.frames += 1;
         if fb.id != 0 {
+            crate::clear_booting_splash_on_first_frame();
             // Announce the daemon's new-frame decision to the app's frame-time
             // ring: only a changed primary FB is published (a re-commit of the
             // frame already shown is not — see `apply_commit` in `commit.rs`),
@@ -1582,7 +1583,7 @@ pub enum ScanoutChannel {
 /// gated line here is invisible on device). One-shot: a static latch, flipped
 /// on the first call, returns on every later one, so nothing formats again and
 /// the allocator path never calls this at all.
-fn log_first_non_request_frame(frame: &[u8], note: Option<GameWindowNote>) {
+fn log_first_non_request_frame(frame: &[u8]) {
     static LOGGED: AtomicBool = AtomicBool::new(false);
     if LOGGED.swap(true, Ordering::Relaxed) {
         return;
@@ -1592,8 +1593,7 @@ fn log_first_non_request_frame(frame: &[u8], note: Option<GameWindowNote>) {
         .map_or(0, |m| u32::from_le_bytes([m[0], m[1], m[2], m[3]]));
     asc_log!(
         "{}",
-        gndrm_obf::obf!("gndrm-daemon: scan-out channel non-request frame magic={magic:#010x} note_decoded={} game_window_present={}",note.is_some(),
-        crate::GAME_WINDOW_PRESENT.load(Ordering::Relaxed))
+        gndrm_obf::obf!("gndrm-daemon: scan-out channel non-request frame magic={magic:#010x}")
     );
 }
 
@@ -1772,20 +1772,6 @@ pub fn serve_scanout(
             );
             return ScanoutChannel::Closed;
         }
-        // The game-window notification shares this channel. It is recognised
-        // by its own magic *before* the allocator decode, so a daemon that knows
-        // it never mistakes it for, or rejects it as, a scan-out request. It is
-        // fire-and-forget: no reply is sent, and the sender reads none.
-        if let Some(note) = GameWindowNote::decode(&buf[..n]) {
-            // Latch first, report second: the line reads GAME_WINDOW_PRESENT, so
-            // logged ahead of the store it could only ever print `false`,
-            // whatever the note actually carried.
-            if note.present == GameWindowNote::PRESENT {
-                crate::note_game_window_present();
-            }
-            log_first_non_request_frame(&buf[..n], Some(note));
-            continue;
-        }
         // The frame-cap opt-in shares this channel and is recognised the same
         // way, by its own magic before the allocator decode. A shim sends it
         // once per connection to declare it honours frame-cap notes; the daemon
@@ -1841,15 +1827,15 @@ pub fn serve_scanout(
             continue;
         }
         let Some(raw_req) = ScanoutAllocReq::decode(&buf[..n]) else {
-            // A frame that is neither the game-window notification (handled
-            // above) nor an allocator request is logged and skipped, not fatal.
+            // A frame that is not an allocator request is logged and skipped,
+            // not fatal.
             // The shim rides in the `.tzst` payload and this daemon in
             // `jniLibs`, so the two can be updated apart: a shim sending a
             // message this daemon does not know must cost at most that message,
             // never the scan-out allocator, which would strand the session's
             // buffers. A genuinely malformed allocator request is a bug the log
             // names either way.
-            log_first_non_request_frame(&buf[..n], None);
+            log_first_non_request_frame(&buf[..n]);
             log_warn!(
                 "{}",
                 gndrm_obf::obf!("asc: unrecognised scan-out channel frame ({n} bytes); ignored")
