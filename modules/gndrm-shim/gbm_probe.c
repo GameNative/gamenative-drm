@@ -15,7 +15,8 @@
  *      -I<mesa>/src/gbm/main -L<build>/src/gbm -lgbm \
  *      -Wl,-rpath,<build>/src/gbm $(pkg-config --cflags --libs egl)
  * Run:
- *   LD_PRELOAD=libgndrm_shim.so GAMENATIVE_DRM_SOCKET=/tmp/...sock ./gbm_probe
+ *   LD_PRELOAD=libgndrm_shim.so GAMENATIVE_DRM_SOCKET=/tmp/...sock \
+ *       GNDRM_RENDER_NODE_CLIENT=1 ./gbm_probe
  */
 #define _GNU_SOURCE
 #include <stdio.h>

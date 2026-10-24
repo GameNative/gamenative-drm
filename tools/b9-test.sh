@@ -62,6 +62,7 @@ echo "== phase 2: render node (render_node_client → render listener) =="
 start_hostd
 LD_PRELOAD="$OUT/libgndrm_shim.so" \
 GAMENATIVE_DRM_SOCKET="$SOCK" \
+GNDRM_RENDER_NODE_CLIENT=1 \
 GNDRM_LOG_SHIM=1 \
     "$OUT/render_node_client"
 stop_hostd
@@ -74,6 +75,7 @@ echo "== phase 2b: render-node request matrix (Mesa gbm/kopper/glamor) =="
 start_hostd
 LD_PRELOAD="$OUT/libgndrm_shim.so" \
 GAMENATIVE_DRM_SOCKET="$SOCK" \
+GNDRM_RENDER_NODE_CLIENT=1 \
 GNDRM_LOG_SHIM=1 \
     "$OUT/render_blame"
 stop_hostd
@@ -85,6 +87,7 @@ start_hostd
 # the card client runs, so both are served by the same daemon at once.
 LD_PRELOAD="$OUT/libgndrm_shim.so" \
 GAMENATIVE_DRM_SOCKET="$SOCK" \
+GNDRM_RENDER_NODE_CLIENT=1 \
 GNDRM_HARNESS_HOLD_MS=1500 \
     "$OUT/render_node_client" &
 RN_PID=$!
@@ -117,7 +120,7 @@ sleep 0.4
 T0=$(date +%s)
 set +e
 timeout 30 env LD_PRELOAD="$OUT/libgndrm_shim.so" \
-    GAMENATIVE_DRM_SOCKET="$SOCK" GNDRM_LOG_SHIM=1 \
+    GAMENATIVE_DRM_SOCKET="$SOCK" GNDRM_RENDER_NODE_CLIENT=1 GNDRM_LOG_SHIM=1 \
     "$OUT/render_blame" >/dev/null 2>&1
 RC=$?
 set -e
@@ -144,7 +147,7 @@ start_hostd
 T0=$(date +%s)
 set +e
 LD_PRELOAD="$OUT/libgndrm_shim.so" \
-GAMENATIVE_DRM_SOCKET="$SOCK" GNDRM_LOG_SHIM=1 \
+GAMENATIVE_DRM_SOCKET="$SOCK" GNDRM_RENDER_NODE_CLIENT=1 GNDRM_LOG_SHIM=1 \
     "$OUT/event_fd_read_client"
 RC=$?
 set -e

@@ -98,12 +98,16 @@ pub const VK_INCOMPLETE: VkResult = 5;
 pub const VK_ERROR_OUT_OF_HOST_MEMORY: VkResult = -1;
 pub const VK_ERROR_OUT_OF_DEVICE_MEMORY: VkResult = -2;
 pub const VK_ERROR_INITIALIZATION_FAILED: VkResult = -3;
+pub const VK_ERROR_LAYER_NOT_PRESENT: VkResult = -6;
+pub const VK_ERROR_EXTENSION_NOT_PRESENT: VkResult = -7;
 pub const VK_ERROR_FEATURE_NOT_PRESENT: VkResult = -8;
 pub const VK_ERROR_FORMAT_NOT_SUPPORTED: VkResult = -11;
 pub const VK_ERROR_INVALID_EXTERNAL_HANDLE: VkResult = -1000072003;
 pub const VK_ERROR_SURFACE_LOST_KHR: VkResult = -1000000000;
 pub const VK_ERROR_OUT_OF_DATE_KHR: VkResult = -1000001004;
 
+pub const VK_API_VERSION_1_0: u32 = 1 << 22;
+pub const VK_API_VERSION_1_1: u32 = 1 << 22 | 1 << 12;
 pub const VK_API_VERSION_1_3: u32 = 1 << 22 | 3 << 12;
 
 // ------------------------------------------------------------ enum values
@@ -349,6 +353,16 @@ pub struct VkInstanceCreateInfo {
 }
 
 pub const VK_MAX_EXTENSION_NAME_SIZE: usize = 256;
+pub const VK_MAX_DESCRIPTION_SIZE: usize = 256;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkLayerProperties {
+    pub layerName: [c_char; VK_MAX_EXTENSION_NAME_SIZE],
+    pub specVersion: u32,
+    pub implementationVersion: u32,
+    pub description: [c_char; VK_MAX_DESCRIPTION_SIZE],
+}
 pub const VK_MAX_PHYSICAL_DEVICE_NAME_SIZE: usize = 256;
 
 #[repr(C)]
@@ -960,6 +974,10 @@ pub type PFN_vkEnumeratePhysicalDevices =
 pub type PFN_vkEnumerateInstanceExtensionProperties =
     unsafe extern "C" fn(*const c_char, *mut u32, *mut VkExtensionProperties) -> VkResult;
 pub type PFN_vkEnumerateInstanceVersion = unsafe extern "C" fn(*mut u32) -> VkResult;
+pub type PFN_vkEnumerateInstanceLayerProperties =
+    unsafe extern "C" fn(*mut u32, *mut VkLayerProperties) -> VkResult;
+pub type PFN_vkGetPhysicalDeviceProperties =
+    unsafe extern "C" fn(VkPhysicalDevice, *mut VkPhysicalDeviceProperties);
 pub type PFN_vkEnumerateDeviceExtensionProperties = unsafe extern "C" fn(
     VkPhysicalDevice,
     *const c_char,
