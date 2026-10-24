@@ -157,6 +157,7 @@ unsafe extern "C" {
     /// Releases a lock taken by [`AHardwareBuffer_lock`]. `fence` is null when
     /// the caller does not want the buffer's release fence.
     pub fn AHardwareBuffer_unlock(buffer: *mut AHardwareBuffer, fence: *mut c_int);
+    pub fn AHardwareBuffer_acquire(buffer: *mut AHardwareBuffer);
     pub fn AHardwareBuffer_release(buffer: *mut AHardwareBuffer);
     /// Sends `buffer`'s handle over a connected Unix socket; the peer turns it
     /// back into its own reference with `AHardwareBuffer_recvHandleFromUnixSocket`.

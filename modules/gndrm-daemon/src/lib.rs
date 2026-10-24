@@ -472,6 +472,9 @@ pub struct Device {
     /// Id/handle spaces already reported exhausted. One line per space: a
     /// sustained leak must surface once, not flood logcat.
     logged_exhaustion: Vec<&'static str>,
+    /// Whether an `ADDFB2` refused for a buffer shorter than the image has
+    /// been reported. One line per session: gamescope retries every frame.
+    logged_addfb_short: bool,
     /// Distinct modifiers already reported by the `ADDFB2` feed, so a
     /// compressed framebuffer's geometry registration (and the modifier it
     /// carried) surfaces once per modifier rather than once per registration.
@@ -572,6 +575,7 @@ impl Device {
             emulated_fences: HashSet::new(),
             seen_ioctls: Vec::new(),
             logged_exhaustion: Vec::new(),
+            logged_addfb_short: false,
             addfb_mods: Vec::new(),
             logged_first_commit: false,
             logged_commit_state: None,
@@ -1462,6 +1466,7 @@ impl Device {
             close_fd(fd);
             return DispatchResult::err(errno::EBADF);
         };
+        let size = if size == 0 { seek_end(fd) } else { size };
         // Dedup by st_ino (doc §5): same dma-buf re-imported → same handle;
         // the wire gave us a redundant reference, so close it.
         if let Some(&handle) = self.stores.gem_by_ino.get(&ino) {
@@ -1698,8 +1703,24 @@ impl Device {
         let need = u64::from(cmd.offsets[0])
             + u64::from(cmd.pitches[0]) * u64::from(cmd.height - 1)
             + u64::from(cmd.width) * u64::from(bpp) / 8;
+        // A length of 0 is a descriptor whose size the daemon could not learn
+        // (neither `st_size` nor its end offset), not an empty buffer: the
+        // span cannot be checked, so it is not refused for it.
         let gem_size = self.stores.gems[&cmd.handles[0]].size;
-        if need > gem_size {
+        if gem_size != 0 && need > gem_size {
+            if !self.logged_addfb_short {
+                self.logged_addfb_short = true;
+                let ino = self.stores.gems[&cmd.handles[0]].ino;
+                self.diag(|| {
+                    format!(
+                        "{}",
+                        gndrm_obf::obf!(
+                            "addfb2: refused {}x{} pitch={} offset={}: buffer ino {ino} is {gem_size} bytes, the image needs {need}",
+                            cmd.width, cmd.height, cmd.pitches[0], cmd.offsets[0]
+                        )
+                    )
+                });
+            }
             return DispatchResult::err(errno::EINVAL);
         }
         for &h in &cmd.handles {
@@ -2151,6 +2172,20 @@ fn fstat_fd(fd: RawFd) -> Option<(u64, u64)> {
         st
     };
     Some((st.st_ino, st.st_size as u64))
+}
+
+/// The end offset of `fd`, i.e. a dma-buf's length on a kernel that leaves its
+/// inode size at zero; 0 when the descriptor cannot seek.
+fn seek_end(fd: RawFd) -> u64 {
+    // SAFETY: lseek on a descriptor this device owns; a dma-buf only moves its
+    // own offset, which nothing here reads through.
+    let end = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+    if end <= 0 {
+        return 0;
+    }
+    // SAFETY: as above.
+    unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+    end as u64
 }
 
 /// `dup(fd)`, honouring `DRM_CLOEXEC`/`DRM_RDWR` in `flags` (as `HANDLE_TO_FD`).

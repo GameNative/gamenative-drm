@@ -1842,6 +1842,12 @@ pub fn serve_scanout(
             );
             continue;
         };
+        if raw_req.is_lookup() {
+            if !serve_lookup(fd, raw_req, pool) {
+                return ScanoutChannel::Closed;
+            }
+            continue;
+        }
         // A client that imports through `VK_ANDROID_external_memory_android_hardware_buffer`
         // flags the request; everything else sees the plain format.
         let want_ahb = raw_req.wants_ahb_handle();
@@ -2186,6 +2192,79 @@ pub fn serve_scanout(
             doorbell.request((width, height, req.format));
         }
     }
+}
+
+/// Answer a [`gndrm_uapi::wire::SCANOUT_REQ_LOOKUP_INO`] request: a fresh descriptor of the
+/// handed-out buffer whose dma-buf has inode `req.len`, then its
+/// `AHardwareBuffer` when asked. gamescope's ICD uses it to import a guest's
+/// pool buffer as an `AHardwareBuffer` on a driver that refuses the dma-buf.
+/// Nothing in the pool changes. `false` when the channel broke.
+fn serve_lookup(
+    fd: RawFd,
+    req: ScanoutAllocReq,
+    pool: &Arc<TrackedMutex<ScanoutPool>>,
+) -> bool {
+    let ino = req.len;
+    let (found, api) = {
+        let guard = pool.lock(Role::Scanout);
+        let found = guard.get(ino);
+        if let Some(b) = found {
+            // SAFETY: the pool holds a reference while the buffer is
+            // registered; this one keeps it alive past the lock.
+            unsafe { ffi::AHardwareBuffer_acquire(b.ahb) };
+        }
+        (found, guard.api())
+    };
+    let dup = found.and_then(|b| api.and_then(|api| dup_scanout_fd(&api, b.ahb)));
+    let (resp, fd_out) = match (found, dup) {
+        (Some(b), Some((dfd, dino, _))) => (
+            ScanoutAllocResp {
+                ret: 0,
+                ino: dino,
+                stride: b.stride,
+            },
+            Some(dfd),
+        ),
+        _ => (
+            ScanoutAllocResp {
+                ret: -libc::ENOENT,
+                ino,
+                stride: 0,
+            },
+            None,
+        ),
+    };
+    log_info!(
+        "{}",
+        gndrm_obf::obf!(
+            "asc: scan-out lookup ino {ino}: {}",
+            if resp.ret == 0 { "found" } else { "not handed out" }
+        )
+    );
+    let mut ok = send_resp(fd, &resp.encode(), fd_out).is_ok();
+    if let Some(dfd) = fd_out {
+        // SAFETY: the duplicate was made for this reply and is not used again.
+        unsafe { libc::close(dfd) };
+    }
+    if ok && resp.ret == 0 && req.wants_ahb_handle() {
+        if let Some(b) = found {
+            // SAFETY: `b.ahb` holds the reference acquired above; `fd` is the
+            // live channel.
+            let r = unsafe { ffi::AHardwareBuffer_sendHandleToUnixSocket(b.ahb, fd) };
+            if r != 0 {
+                log_warn!(
+                    "{}",
+                    gndrm_obf::obf!("asc: scan-out lookup handle send failed ({r})")
+                );
+                ok = false;
+            }
+        }
+    }
+    if let Some(b) = found {
+        // SAFETY: drops the reference acquired above.
+        unsafe { ffi::AHardwareBuffer_release(b.ahb) };
+    }
+    ok
 }
 
 /// Release a payload the pool handed back, and close the release-fence
@@ -2722,7 +2801,10 @@ fn is_dmabuf(fd: c_int) -> Option<bool> {
 /// The descriptor of `nh` that is the buffer's dma-buf. Usually the first one,
 /// but not on every gralloc: MediaTek's handles lead with a descriptor shared
 /// by every buffer, which no driver imports and whose inode collides in the
-/// pool. Falls back to the first descriptor when none is a dma-buf.
+/// pool. When the first descriptor is not a dma-buf, the largest dma-buf in the
+/// handle is taken: a handle can also carry a small dma-buf for its metadata,
+/// and only the pixel buffer spans the image. Falls back to the first
+/// descriptor when none is a dma-buf.
 ///
 /// # Safety
 /// `nh` must be a live native handle.
@@ -2734,30 +2816,66 @@ unsafe fn scanout_dmabuf_fd(nh: *const ffi::NativeHandle) -> Option<c_int> {
         return Some(fd0);
     }
     // SAFETY: as above; `fd` bounds the index by `num_fds`.
-    let found = (1..8)
-        .map_while(|i| unsafe { ffi::NativeHandle::fd(nh, i) }.map(|fd| (i, fd)))
-        .find(|&(_, fd)| is_dmabuf(fd) == Some(true));
+    let fds: Vec<c_int> = (0..8)
+        .map_while(|i| unsafe { ffi::NativeHandle::fd(nh, i) })
+        .collect();
+    let found = fds
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|&(_, &fd)| is_dmabuf(fd) == Some(true))
+        .map(|(i, &fd)| (i, fd, dmabuf_len(fd)))
+        .fold(None, |best: Option<(usize, c_int, u64)>, cur| match best {
+            Some(b) if b.2 >= cur.2 => Some(b),
+            _ => Some(cur),
+        });
     if !LOGGED.swap(true, Ordering::Relaxed) {
-        let (ino0, size0) = fstat_ino_size(fd0).unwrap_or((0, 0));
-        match found {
-            Some((i, fd)) => {
+        let table = fds
+            .iter()
+            .enumerate()
+            .map(|(i, &fd)| {
                 let (ino, size) = fstat_ino_size(fd).unwrap_or((0, 0));
-                log_warn!(
-                    "{}",
-                    gndrm_obf::obf!(
-                        "asc: scan-out handle fd 0 is not a dma-buf (ino {ino0} size {size0}); using fd {i} (ino {ino} size {size})"
-                    )
-                );
-            }
-            None => log_warn!(
+                format!(
+                    "{i}:ino={ino},size={size},len={},dmabuf={}",
+                    dmabuf_len(fd),
+                    is_dmabuf(fd) == Some(true)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        match found {
+            Some((i, _, len)) => log_warn!(
                 "{}",
                 gndrm_obf::obf!(
-                    "asc: scan-out handle has no dma-buf descriptor; fd 0 ino {ino0} size {size0}"
+                    "asc: scan-out handle fd 0 is not a dma-buf; using fd {i} (len {len}) of [{table}]"
                 )
+            ),
+            None => log_warn!(
+                "{}",
+                gndrm_obf::obf!("asc: scan-out handle has no dma-buf descriptor: [{table}]")
             ),
         }
     }
-    Some(found.map_or(fd0, |(_, fd)| fd))
+    Some(found.map_or(fd0, |(_, fd, _)| fd))
+}
+
+/// Length of the dma-buf `fd`: `st_size`, or the end offset where a kernel
+/// leaves the inode size at zero. 0 when neither is known.
+fn dmabuf_len(fd: c_int) -> u64 {
+    let size = fstat_ino_size(fd).map_or(0, |(_, s)| s);
+    if size != 0 {
+        return size;
+    }
+    // SAFETY: lseek on a descriptor the caller can read; a dma-buf only moves
+    // its own offset, which no reader of this descriptor depends on.
+    let end = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+    if end > 0 {
+        // SAFETY: as above.
+        unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+        end as u64
+    } else {
+        0
+    }
 }
 
 /// `(st_ino, st_size)` of `fd`, which for a dma-buf is the kernel's per-buffer
