@@ -343,6 +343,7 @@ fn try_system_driver() {
     let gamescope = is_gamescope_binary();
     if gamescope {
         proxy::set_fake_robustness2(true);
+        proxy::set_hide_device_drm(true);
         export::set_enabled(true);
     }
     // The wrapper ICD emulates VK_EXT_map_memory_placed itself.
@@ -595,6 +596,10 @@ fn init_once() {
     }
     let handle = unsafe { DRIVER.handle };
     if handle.is_null() {
+        logf!(gndrm_obf::obf!(
+            "no driver selected [shim {}]: every entry point resolves to NULL, so the loader skips this ICD and vkCreateInstance returns VK_ERROR_INCOMPATIBLE_DRIVER",
+            SHIM_BUILD
+        ));
         return;
     }
     unsafe {
