@@ -9941,6 +9941,14 @@ unsafe fn slot_init_with_usage(
     usage: VkImageUsageFlags,
 ) -> VkResult {
     let gd = (*sc).dev;
+    if SLOT_DMABUF_REFUSED.load(Ordering::Relaxed) == false
+        && std::env::var_os("GNDRM_EXPORT_AHB").is_some_and(|v| v == "1")
+    {
+        SLOT_DMABUF_REFUSED.store(true, Ordering::Relaxed);
+        crate::logf!(gndrm_obf::obf!(
+            "proxy slot: GNDRM_EXPORT_AHB=1, importing pool buffers as AHardwareBuffers from the start"
+        ));
+    }
     if unsafe { (*gd).import_ahb } || SLOT_DMABUF_REFUSED.load(Ordering::Relaxed) {
         return unsafe { slot_init_ahb(sc, s, usage) };
     }
@@ -10020,7 +10028,9 @@ unsafe fn slot_init_with_usage(
     unsafe { query_linear_modifier_support(gd, (*sc).format, usage, VK_IMAGE_TILING_LINEAR) };
     unsafe { trace_image_create(&ici, "img-create linear", &TRACE_IMAGE_CI_LINEAR) };
     let mut res = unsafe { f.create_image.unwrap()(dev, &ici, ptr::null(), &mut (*s).image) };
+    let mut explicit_layout = false;
     if res != VK_SUCCESS {
+        explicit_layout = true;
         // Drivers that import dma-bufs only through DRM-modifier tiling (Mali):
         // the same LINEAR layout, stated explicitly at the slot's stride.
         let plane = VkSubresourceLayout {
@@ -10052,6 +10062,55 @@ unsafe fn slot_init_with_usage(
     if res != VK_SUCCESS {
         crate::logf!(gndrm_obf::obf!("proxy import image create failed: {res}"));
         return res;
+    }
+    // A plain LINEAR image's row pitch is the driver's choice, and the pool
+    // buffer is scanned out and sampled at its gralloc stride: a driver that
+    // packs the rows tighter (PowerVR, 632 px -> 2528 B against a 2560 B
+    // stride) shears every frame. Such a slot takes the AHardwareBuffer route,
+    // where the driver owns the layout.
+    if !explicit_layout {
+        if let Some(gsl) = unsafe { gn_real_device_proc(gd, c"vkGetImageSubresourceLayout") } {
+            let gsl: PFN_vkGetImageSubresourceLayout = unsafe { std::mem::transmute(gsl) };
+            let sub = VkImageSubresource {
+                aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
+                mipLevel: 0,
+                arrayLayer: 0,
+            };
+            let mut l = VkSubresourceLayout {
+                offset: 0,
+                size: 0,
+                rowPitch: 0,
+                arrayPitch: 0,
+                depthPitch: 0,
+            };
+            unsafe { gsl(dev, (*s).image, &sub, &mut l) };
+            if l.rowPitch != 0 && (l.rowPitch != u64::from((*s).stride) || l.offset != 0) {
+                let can_ahb = unsafe {
+                    gn_real_device_proc(gd, c"vkGetAndroidHardwareBufferPropertiesANDROID")
+                }
+                .is_some();
+                crate::logf!(gndrm_obf::obf!(
+                    "proxy slot: LINEAR pitch {} != pool stride {} for {}x{}; {}",
+                    l.rowPitch,
+                    (*s).stride,
+                    (*sc).extent.width,
+                    (*sc).extent.height,
+                    if can_ahb { "importing pool buffer as AHardwareBuffer" } else { "no AHardwareBuffer import on this driver, frames will shear" }
+                ));
+                if can_ahb {
+                    SLOT_DMABUF_REFUSED.store(true, Ordering::Relaxed);
+                    unsafe {
+                        if let Some(destroy) = f.destroy_image {
+                            destroy(dev, (*s).image, ptr::null());
+                        }
+                        (*s).image = 0;
+                        libc::close((*s).fd);
+                        (*s).fd = -1;
+                    }
+                    return unsafe { slot_init_ahb(sc, s, usage) };
+                }
+            }
+        }
     }
     let mut reqs = VkMemoryRequirements {
         size: 0,
