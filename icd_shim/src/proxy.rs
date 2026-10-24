@@ -5255,6 +5255,12 @@ pub struct PerDeviceLog(Mutex<Vec<(usize, Vec<String>)>>);
 
 const PER_DEVICE_LOG_CAP: usize = 1024;
 
+impl Default for PerDeviceLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PerDeviceLog {
     pub const fn new() -> Self {
         Self(Mutex::new(Vec::new()))

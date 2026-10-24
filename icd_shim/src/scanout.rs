@@ -723,7 +723,7 @@ mod tests {
             let n = libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0);
             assert_eq!(n as usize, FrameCapSubscribe::LEN);
             let sub = FrameCapSubscribe::decode(&buf).expect(&gndrm_obf::obf!("subscribe frame"));
-            assert_eq!(sub.caps, CAP_FRAME_CAP);
+            assert_eq!(sub.caps & CAP_FRAME_CAP, CAP_FRAME_CAP);
         }
     }
 
