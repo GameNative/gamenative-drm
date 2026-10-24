@@ -39,6 +39,11 @@ static DMABUF_IMPORT: AtomicU8 = AtomicU8::new(DMABUF_UNKNOWN);
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static LOGGED_QUERY: AtomicBool = AtomicBool::new(false);
+/// The driver refused a LINEAR DRM-modifier image in the format query. Such a
+/// driver (PowerVR) still accepts the explicit-layout create and then keeps
+/// the image in a layout of its own, so the pool buffer scans out sheared:
+/// the images take the AHardwareBuffer route from the first one.
+static LINEAR_MODIFIER_REFUSED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
@@ -516,6 +521,9 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceImageFormatProperties2(
         unsafe { (*extprops).externalMemoryProperties.externalMemoryFeatures }
     };
     let lres = unsafe { real(pd, &lin, &mut lp) };
+    if res != VK_SUCCESS {
+        LINEAR_MODIFIER_REFUSED.store(true, Ordering::Relaxed);
+    }
     if !LOGGED_QUERY.swap(true, Ordering::Relaxed) {
         crate::logf!(gndrm_obf::obf!(
             "export-emu: modifier query fmt={} usage={:#x} flags={:#x} driver={res} features={features:#x} linear={lres}",
@@ -596,6 +604,15 @@ pub unsafe fn try_create_image(
         DMABUF_IMPORT.store(DMABUF_REFUSED, Ordering::Relaxed);
         crate::logf!(gndrm_obf::obf!(
             "export-emu: GNDRM_EXPORT_AHB=1, importing pool buffers as AHardwareBuffers from the start"
+        ));
+    }
+    if DMABUF_IMPORT.load(Ordering::Relaxed) == DMABUF_UNKNOWN
+        && LINEAR_MODIFIER_REFUSED.load(Ordering::Relaxed)
+        && std::env::var_os("GNDRM_EXPORT_AHB").is_none_or(|v| v != "0")
+    {
+        DMABUF_IMPORT.store(DMABUF_REFUSED, Ordering::Relaxed);
+        crate::logf!(gndrm_obf::obf!(
+            "export-emu: the driver refuses LINEAR DRM-modifier images; importing pool buffers as AHardwareBuffers from the start (GNDRM_EXPORT_AHB=0 forces the dma-buf route)"
         ));
     }
     let route = DMABUF_IMPORT.load(Ordering::Relaxed);
