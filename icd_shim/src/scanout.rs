@@ -71,6 +71,7 @@ fn ahb_recv_api() -> Option<&'static AhbRecvApi> {
 }
 
 /// Drop a reference [`allocate_ahb`] handed out.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn ahb_release(ahb: *mut c_void) {
     if ahb.is_null() {
         return;
