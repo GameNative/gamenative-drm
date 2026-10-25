@@ -34,7 +34,7 @@ use crate::vk::*;
 use crate::wlproto::{self, wl_display, wl_proxy};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 // First-N diagnostics for the present pipeline handoffs (acquire ->
 // present -> worker commit -> compositor release). Bounded counters, so
@@ -995,6 +995,15 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
 
     let width = unsafe { (*sc).extent.width };
     let height = unsafe { (*sc).extent.height };
+    let (guest_w, guest_h) = unsafe {
+        (
+            (*gd).guest_peak.0.load(Ordering::Relaxed),
+            (*gd).guest_peak.1.load(Ordering::Relaxed),
+        )
+    };
+    if guest_w != 0 && guest_h != 0 {
+        unsafe { (*session).set_guest_extent(guest_w, guest_h) };
+    }
     let f = unsafe { (*gd).f };
     if !unsafe {
         (*session).prepare(
@@ -3242,6 +3251,64 @@ fn slot_note(s: Option<(*mut GnSwapchain, usize)>) -> String {
     }
 }
 
+/// Note the area the guest draws at. DXVK scales its backbuffer into a
+/// window-sized swapchain, so a present transfer's source extent is the
+/// resolution the guest actually rendered; the engine sizes its working
+/// resolution against it, so a title drawing below the window's size costs less
+/// per generated frame. A peak, because a title that once drew larger keeps the
+/// larger chain.
+fn note_guest_area(gd: *mut GnDevice, width: u32, height: u32) {
+    if gd.is_null() || width == 0 || height == 0 {
+        return;
+    }
+    let peak = unsafe { &(*gd).guest_peak };
+    peak.0.fetch_max(width, Ordering::Relaxed);
+    peak.1.fetch_max(height, Ordering::Relaxed);
+}
+
+/// Source extent of the first blit region: the size of the image scaled into a
+/// swapchain slot.
+fn blit_source(n: u32, regions: *const VkImageBlit) -> (u32, u32) {
+    if n == 0 || regions.is_null() {
+        return (0, 0);
+    }
+    let r = unsafe { &*regions };
+    (
+        r.srcOffsets[1].x.abs_diff(r.srcOffsets[0].x),
+        r.srcOffsets[1].y.abs_diff(r.srcOffsets[0].y),
+    )
+}
+
+/// Source extent of the first blit region of a v2 `VkImageBlit2` array.
+fn blit_source2(n: u32, regions: *const VkImageBlit2) -> (u32, u32) {
+    if n == 0 || regions.is_null() {
+        return (0, 0);
+    }
+    let r = unsafe { &*regions };
+    (
+        r.srcOffsets[1].x.abs_diff(r.srcOffsets[0].x),
+        r.srcOffsets[1].y.abs_diff(r.srcOffsets[0].y),
+    )
+}
+
+/// Extent of the first copy region, as a pair.
+fn copy_size(n: u32, regions: *const VkImageCopy) -> (u32, u32) {
+    if n == 0 || regions.is_null() {
+        return (0, 0);
+    }
+    let e = unsafe { (*regions).extent };
+    (e.width, e.height)
+}
+
+/// Extent of the first copy region of a v2 `VkImageCopy2` array, as a pair.
+fn copy_size2(n: u32, regions: *const VkImageCopy2) -> (u32, u32) {
+    if n == 0 || regions.is_null() {
+        return (0, 0);
+    }
+    let e = unsafe { (*regions).extent };
+    (e.width, e.height)
+}
+
 /// A transfer region's extent, as a log field.
 fn extent_note(e: VkExtent3D) -> String {
     format!("{}", gndrm_obf::obf!("r0={}x{}", e.width, e.height))
@@ -3860,6 +3927,10 @@ unsafe extern "C" fn gn_vkCmdCopyImage(
     if !gd.is_null() {
         let s = unsafe { sc_slot_of(gd, src) };
         let d = unsafe { sc_slot_of(gd, dst) };
+        if d.is_some() {
+            let (w, h) = copy_size(n, regions);
+            note_guest_area(gd, w, h);
+        }
         if s.is_some() || d.is_some() {
             trace_sc_cmd(
                 "vkCmdCopyImage",
@@ -3904,6 +3975,10 @@ unsafe extern "C" fn gn_vkCmdCopyImage2(cmd: VkCommandBuffer, info: *const VkCop
         }
         let s = unsafe { sc_slot_of(gd, ci.srcImage) };
         let d = unsafe { sc_slot_of(gd, ci.dstImage) };
+        if d.is_some() {
+            let (w, h) = copy_size2(ci.regionCount, ci.pRegions);
+            note_guest_area(gd, w, h);
+        }
         if s.is_some() || d.is_some() {
             trace_sc_cmd(
                 "vkCmdCopyImage2",
@@ -3943,6 +4018,10 @@ unsafe extern "C" fn gn_vkCmdBlitImage(
     if !gd.is_null() {
         let s = unsafe { sc_slot_of(gd, src) };
         let d = unsafe { sc_slot_of(gd, dst) };
+        if d.is_some() {
+            let (w, h) = blit_source(n, regions);
+            note_guest_area(gd, w, h);
+        }
         if s.is_some() || d.is_some() {
             trace_sc_cmd(
                 "vkCmdBlitImage",
@@ -3970,6 +4049,10 @@ unsafe extern "C" fn gn_vkCmdBlitImage2(cmd: VkCommandBuffer, info: *const VkBli
         let ci = unsafe { &*info };
         let s = unsafe { sc_slot_of(gd, ci.srcImage) };
         let d = unsafe { sc_slot_of(gd, ci.dstImage) };
+        if d.is_some() {
+            let (w, h) = blit_source2(ci.regionCount, ci.pRegions);
+            note_guest_area(gd, w, h);
+        }
         if s.is_some() || d.is_some() {
             trace_sc_cmd(
                 "vkCmdBlitImage2",
@@ -5970,6 +6053,31 @@ mod tests {
             [VK_PRESENT_MODE_FIFO_KHR]
         );
     }
+
+    /// The area the frame generator is told about is the guest's side of a
+    /// transfer into a swapchain image, whichever way the offsets run.
+    #[test]
+    fn guest_area_comes_from_the_source_side_of_a_transfer() {
+        let mut blit: VkImageBlit = unsafe { std::mem::zeroed() };
+        blit.srcOffsets[0] = VkOffset3D { x: 0, y: 0, z: 0 };
+        blit.srcOffsets[1] = VkOffset3D { x: 1280, y: 720, z: 1 };
+        assert_eq!(blit_source(1, &blit), (1280, 720));
+        blit.srcOffsets[0] = VkOffset3D { x: 640, y: 360, z: 0 };
+        blit.srcOffsets[1] = VkOffset3D { x: 0, y: 0, z: 1 };
+        assert_eq!(blit_source(1, &blit), (640, 360));
+        assert_eq!(blit_source(0, &blit), (0, 0));
+        assert_eq!(blit_source(1, std::ptr::null()), (0, 0));
+
+        let mut copy: VkImageCopy = unsafe { std::mem::zeroed() };
+        copy.extent = VkExtent3D {
+            width: 960,
+            height: 540,
+            depth: 1,
+        };
+        assert_eq!(copy_size(1, &copy), (960, 540));
+        assert_eq!(copy_size(0, &copy), (0, 0));
+        assert_eq!(copy_size(1, std::ptr::null()), (0, 0));
+    }
 }
 
 // ---- reconstructed from HEAD (items missing after the damaged edit) ----
@@ -6189,6 +6297,10 @@ pub struct GnDevice {
     pub import_ahb: bool,
     /// The settings epoch the session was last attempted at.
     pub lsfg_epoch: u32,
+    /// The largest area the guest has blitted into a swapchain image, so the
+    /// engine can size its working resolution to what the guest draws rather
+    /// than to the window it draws into. Zero until the first present blit.
+    pub guest_peak: (AtomicU32, AtomicU32),
     /// Generation batches in flight, each with its own fence and command buffer:
     /// a batch's command buffer must outlive its submission, and its fence is
     /// what the committed frames of that batch wait on. One shared fence would
@@ -9249,6 +9361,7 @@ unsafe extern "C" fn gn_vkCreateDevice(
         fp16: false,
         import_ahb,
         lsfg_epoch: 0,
+        guest_peak: (AtomicU32::new(0), AtomicU32::new(0)),
         gen_batches: Vec::new(),
         gen_next: 0,
         gen_sc: ptr::null_mut(),

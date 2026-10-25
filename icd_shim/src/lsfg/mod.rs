@@ -446,8 +446,11 @@ pub struct Session {
     refresh_rate: f32,
     /// Source frames handed to the engine; the pacer uses it to count warm-up.
     source_frames: u64,
-    /// Geometry the engine was last prepared for.
-    prepared: Option<(u32, u32, crate::vk::VkFormat)>,
+    /// Geometry the engine was last prepared for, including the guest area:
+    /// that area decides the chain's working scale, so a change to it rebuilds.
+    prepared: Option<(u32, u32, crate::vk::VkFormat, u32, u32)>,
+    /// The largest area the guest draws, as last reported.
+    guest_extent: (u32, u32),
 }
 
 // The engine handle is only touched under the shim's own serialisation (device
@@ -599,6 +602,7 @@ impl Session {
             refresh_rate: refresh,
             source_frames: 0,
             prepared: None,
+            guest_extent: (0, 0),
         })
     }
 
@@ -659,7 +663,7 @@ impl Session {
         // the images it is given must be R,G,B,A in byte order even though the
         // scan-out slots are B,G,R,A. See `engine_storage_format`.
         let format = crate::vk::engine_storage_format(format);
-        let key = (width, height, format);
+        let key = (width, height, format, self.guest_extent.0, self.guest_extent.1);
         if self.prepared != Some(key) {
             if unsafe { (self.engine.api.prepare)(self.root, width, height, format) } {
                 self.prepared = Some(key);
@@ -807,6 +811,13 @@ impl Session {
             format
         ));
         true
+    }
+
+    /// The largest area the guest draws, so the engine sizes its working
+    /// resolution to the content rather than to the window around it.
+    pub fn set_guest_extent(&mut self, width: u32, height: u32) {
+        self.guest_extent = (width, height);
+        unsafe { (self.engine.api.set_guest_extent)(self.root, width, height) }
     }
 
     /// Generations this source frame yields, and advance the frame counter.
