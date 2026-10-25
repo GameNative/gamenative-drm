@@ -169,7 +169,7 @@ static PRES_IV_MIN_US: AtomicUsize = AtomicUsize::new(usize::MAX);
 static PRES_IV_MAX_US: AtomicUsize = AtomicUsize::new(0);
 static PRES_IV_GE_16667: AtomicUsize = AtomicUsize::new(0); // >= 16.67 ms: a missed 60 Hz frame
 static PRES_IV_GE_33333: AtomicUsize = AtomicUsize::new(0); // >= 33.3 ms: two
-static PRES_IV_LAST: Mutex<Option<Instant>> = Mutex::new(None);
+static PRES_IV_LAST_NS: AtomicU64 = AtomicU64::new(0);
 // Release-floor census, in microseconds, the same shape as the acquire dwell
 // and the present interval above and reported on the same lines. A release is
 // held when it arrives sooner than one target period after this shim's own
@@ -191,24 +191,27 @@ static REL_CAPPED_N: AtomicUsize = AtomicUsize::new(0);
 /// Record the interval since the previous present. Called once per present at
 /// entry; the first present only seeds the stamp, so the delta count is
 /// presents - 1 per process.
-fn pres_iv_note(now: Instant) {
-    let Ok(mut g) = PRES_IV_LAST.lock() else {
+///
+/// The stamp is raw `CLOCK_MONOTONIC` nanoseconds in one atomic rather than a
+/// `Mutex<Option<Instant>>`: this runs on every present, and with the stamp
+/// swapped in a single instruction the census costs a clock read instead of a
+/// lock. Callers pass `monotonic_ns()`'s value.
+fn pres_iv_note(now_ns: u64) {
+    let prev = PRES_IV_LAST_NS.swap(now_ns, Ordering::Relaxed);
+    if prev == 0 {
         return;
-    };
-    if let Some(prev) = *g {
-        let us = now.duration_since(prev).as_micros() as usize;
-        PRES_IV_N.fetch_add(1, Ordering::Relaxed);
-        PRES_IV_SUM_US.fetch_add(us, Ordering::Relaxed);
-        PRES_IV_MIN_US.fetch_min(us, Ordering::Relaxed);
-        PRES_IV_MAX_US.fetch_max(us, Ordering::Relaxed);
-        if us >= 16_667 {
-            PRES_IV_GE_16667.fetch_add(1, Ordering::Relaxed);
-        }
-        if us >= 33_333 {
-            PRES_IV_GE_33333.fetch_add(1, Ordering::Relaxed);
-        }
     }
-    *g = Some(now);
+    let us = now_ns.saturating_sub(prev) as usize / 1_000;
+    PRES_IV_N.fetch_add(1, Ordering::Relaxed);
+    PRES_IV_SUM_US.fetch_add(us, Ordering::Relaxed);
+    PRES_IV_MIN_US.fetch_min(us, Ordering::Relaxed);
+    PRES_IV_MAX_US.fetch_max(us, Ordering::Relaxed);
+    if us >= 16_667 {
+        PRES_IV_GE_16667.fetch_add(1, Ordering::Relaxed);
+    }
+    if us >= 33_333 {
+        PRES_IV_GE_33333.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// The minimum interval, or 0 while no delta exists — the initialised sentinel
@@ -628,6 +631,8 @@ unsafe fn x11_reap(sc: *mut GnSwapchain) {
     if present.is_null() {
         return;
     }
+    // The release census is read under the log gate only.
+    let logging = crate::vkshim_enabled();
     for i in 0..unsafe { (*sc).slots.len() } {
         let s = unsafe { (*sc).slots.as_mut_ptr().add(i) };
         // in_flight is the app/worker handshake field: read and clear it under
@@ -665,9 +670,11 @@ unsafe fn x11_reap(sc: *mut GnSwapchain) {
                 }
             }
             drop(_g);
-            N_REL.fetch_add(1, Ordering::Relaxed);
-            if rate_ok(&RATE_REL, RATE_EVERY) {
-                crate::logf!(gndrm_obf::obf!("x11 release: slot={i} {}", slot_flags(sc)));
+            if logging {
+                N_REL.fetch_add(1, Ordering::Relaxed);
+                if rate_ok(&RATE_REL, RATE_EVERY) {
+                    crate::logf!(gndrm_obf::obf!("x11 release: slot={i} {}", slot_flags(sc)));
+                }
             }
         }
     }
@@ -2536,12 +2543,19 @@ unsafe fn present_dispatch(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
 
 // Present: the app's render completion
 unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentInfoKHR) -> VkResult {
-    HB_PRESENT.fetch_add(1, Ordering::Relaxed);
-    wsi_hb();
-    N_PRES.fetch_add(1, Ordering::Relaxed);
-    // The guest's frame period as the shim sees it: stamped at present entry,
-    // before any work, so the census is the client's own cadence, not ours.
-    pres_iv_note(Instant::now());
+    // The WSI census exists to be read under `GNDRM_LOG_VKSHIM`, and every line
+    // that prints it is gated the same way, so its accounting is skipped when
+    // the gate is off: a present would otherwise be a clock read and five
+    // read-modify-writes for numbers nobody can print.
+    if crate::vkshim_enabled() {
+        HB_PRESENT.fetch_add(1, Ordering::Relaxed);
+        wsi_hb();
+        N_PRES.fetch_add(1, Ordering::Relaxed);
+        // The guest's frame period as the shim sees it: stamped at present
+        // entry, before any work, so the census is the client's own cadence,
+        // not ours.
+        pres_iv_note(monotonic_ns());
+    }
     let pi = unsafe { &*pi };
     let gq = unsafe { find_queue(queue) };
     let mut gd = if gq.is_null() {
@@ -6503,7 +6517,8 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
     let slot = data as *mut GnSlot;
     unsafe {
         let sc = (*slot).owner;
-        if LOG_RELEASE.fetch_add(1, Ordering::Relaxed) < LOG_FIRST_N {
+        let logging = crate::vkshim_enabled();
+        if logging && LOG_RELEASE.fetch_add(1, Ordering::Relaxed) < LOG_FIRST_N {
             crate::logf!(gndrm_obf::obf!("proxy release: slot={slot:?}"));
         }
         // The target may have changed since this shim connected, and a push
@@ -6523,7 +6538,8 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
             ((slot as usize - slots as usize) / core::mem::size_of::<GnSlot>()) < guest
         };
         let floor_ns = crate::scanout::note_release(now_ns, guest_slot);
-        let capped = crate::scanout::target_fps() != 0;
+        // `capped` only divides the census; the pacing decision is the floor.
+        let capped = logging && crate::scanout::target_fps() != 0;
         // The floor paces the guest, so only a guest slot is held to it: a
         // generation destination held back is one fewer for the next batch.
         let held = guest_slot && now_ns < floor_ns;
@@ -6531,7 +6547,7 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
         if capped {
             REL_CAPPED_N.fetch_add(1, Ordering::Relaxed);
         }
-        if !guest_slot {
+        if logging && !guest_slot {
             GEN_RELEASES.fetch_add(1, Ordering::Relaxed);
         }
         if held {
@@ -6542,24 +6558,28 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
             // the connection's other events on a floor.
             (*slot).floor_ns = floor_ns;
             (*slot).release_held = true;
-            let hold_us = ((floor_ns - now_ns) / 1_000) as usize;
-            REL_HOLD_N.fetch_add(1, Ordering::Relaxed);
-            REL_HOLD_SUM_US.fetch_add(hold_us, Ordering::Relaxed);
-            REL_HOLD_MAX_US.fetch_max(hold_us, Ordering::Relaxed);
-            if hold_us >= 8_333 {
-                REL_HOLD_GE_8333.fetch_add(1, Ordering::Relaxed);
+            if logging {
+                let hold_us = ((floor_ns - now_ns) / 1_000) as usize;
+                REL_HOLD_N.fetch_add(1, Ordering::Relaxed);
+                REL_HOLD_SUM_US.fetch_add(hold_us, Ordering::Relaxed);
+                REL_HOLD_MAX_US.fetch_max(hold_us, Ordering::Relaxed);
+                if hold_us >= 8_333 {
+                    REL_HOLD_GE_8333.fetch_add(1, Ordering::Relaxed);
+                }
             }
         } else {
             (*slot).in_flight = false;
             (*sc).cv_free.notify_all();
         }
         drop(_g);
-        N_REL.fetch_add(1, Ordering::Relaxed);
-        if rate_ok(&RATE_REL, RATE_EVERY) {
-            crate::logf!(gndrm_obf::obf!(
-                "gn-vkshim release: slot={slot:?} {}",
-                slot_flags(sc)
-            ));
+        if logging {
+            N_REL.fetch_add(1, Ordering::Relaxed);
+            if rate_ok(&RATE_REL, RATE_EVERY) {
+                crate::logf!(gndrm_obf::obf!(
+                    "gn-vkshim release: slot={slot:?} {}",
+                    slot_flags(sc)
+                ));
+            }
         }
     }
 }
@@ -9941,7 +9961,7 @@ unsafe fn slot_init_with_usage(
     usage: VkImageUsageFlags,
 ) -> VkResult {
     let gd = (*sc).dev;
-    if SLOT_DMABUF_REFUSED.load(Ordering::Relaxed) == false
+    if !SLOT_DMABUF_REFUSED.load(Ordering::Relaxed)
         && std::env::var_os("GNDRM_EXPORT_AHB").is_some_and(|v| v == "1")
     {
         SLOT_DMABUF_REFUSED.store(true, Ordering::Relaxed);
