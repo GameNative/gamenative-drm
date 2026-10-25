@@ -18,11 +18,12 @@
 
 use gndrm_uapi::wire::{
     FrameCapNote, FrameCapSubscribe, LsfgConfig, ScanoutAllocReq, ScanoutAllocResp, VsyncNote,
-    CAP_FRAME_CAP, CAP_VSYNC_NOTE, FPS_UNCAPPED, SCANOUT_FORMAT_BGRA_8888, SCANOUT_REQ_AHB_HANDLE,
+    CAP_FRAME_CAP, CAP_PRESENT_ID, CAP_VSYNC_NOTE, FPS_UNCAPPED, SCANOUT_FORMAT_BGRA_8888,
+    SCANOUT_REQ_AHB_HANDLE,
 };
 use std::ffi::c_void;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Default budget for one exchange, matching the LD_PRELOAD shim's: a daemon
@@ -95,22 +96,16 @@ static CHAN: Mutex<RawFd> = Mutex::new(-1);
 // ---------------------------------------------------------------- frame cap
 //
 // The daemon decides the fps cap's target and tells this shim on this channel
-// (see `gndrm_uapi::wire::FrameCapNote`). The floor the target implies is
-// derived here, because a release is what it is measured against and this shim
-// is the only side that sees one — and it sees every one. A per-buffer deadline
-// sent with a hand-out cannot pace a title: a hand-out happens once per pool
-// buffer per session, while a release happens every frame.
+// (see `gndrm_uapi::wire::FrameCapNote`). The cap is applied in `acquire`, where
+// the guest asks for the next image: a frame that may not start yet can be held
+// there at no cost, while holding a release would delay a frame that is already
+// on its way to the panel.
 
-/// The frame cap the daemon has declared on this connection, and this shim's
-/// own release schedule: the instant the previous release freed its slot, in
-/// `CLOCK_MONOTONIC` ns, or 0 before a release has been seen.
+/// The daemon's declared target, [`FPS_UNCAPPED`] when none has.
 ///
-/// Both words are atomics, not one mutex. The target is written on the thread
-/// that reads notes and the schedule on every release, from either the Wayland
-/// dispatch thread or the X11 reaper, so the hot side must be a load and the
-/// target must not be able to serialise two reapers.
+/// An atomic, not a mutex: written on the thread that reads notes, read by every
+/// acquire, which runs on the guest's own thread.
 static CAP_FPS: AtomicU32 = AtomicU32::new(FPS_UNCAPPED);
-static CAP_FREE_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Notes adopted on this connection. Read by the census: `notes=0` means no
 /// target ever arrived, which is a different fault from a target whose floor
@@ -127,72 +122,19 @@ pub(crate) fn period_ns(target_fps: u32) -> u64 {
     NANOS_PER_SECOND / u64::from(target_fps)
 }
 
-/// The instant a release seen at `now_ns` may free its slot.
+/// The instant the next acquire may start, given the previous one and now.
 ///
-/// The floor is one target period after the previous release's own free
-/// instant, so it applies the same rule to every release rather than to the
-/// first release of each buffer. `now_ns` comes back unchanged whenever it is at
-/// or after that floor — and always when no cap is in force or no release has
-/// been seen — so a release the guest was already slow enough to produce is
-/// never delayed. The delivered interval is therefore `max(guest interval,
-/// period)`: exact at the target when the guest is faster, the guest's own rate
-/// when it is slower, and never below it.
+/// The cap is applied here rather than to a release: a frame that may not start
+/// yet is the only point where waiting costs neither rendered work nor display
+/// latency. `max(prev, now) + period` holds the interval at the target when the
+/// guest is faster and lets it be its own rate when it is slower — never two
+/// frames closer than one period, and no debt carried out of a stall.
 #[must_use]
-fn release_floor(target_fps: u32, last_release_ns: u64, now_ns: u64) -> u64 {
-    let period = period_ns(target_fps);
-    if period == 0 || last_release_ns == 0 {
-        return now_ns;
+pub(crate) fn next_acquire_after(prev_ns: u64, now_ns: u64, period_ns: u64) -> u64 {
+    if period_ns == 0 {
+        return prev_ns;
     }
-    last_release_ns.saturating_add(period).max(now_ns)
-}
-
-/// Record a release seen at `now_ns` (`CLOCK_MONOTONIC` ns) and return the
-/// instant from which its slot may be freed.
-///
-/// The recorded instant is that free instant, not the release's arrival: a held
-/// slot frees when its floor passes, so the schedule and what the guest
-/// observes are the same sequence. That is what makes consecutive frees at
-/// least one period apart, which is the cap.
-#[must_use]
-pub(crate) fn note_release(now_ns: u64, guest_slot: bool) -> u64 {
-    // Only a guest slot's release is paced. A generated frame is the thing the
-    // floor exists to make room for: holding its release to the source period
-    // throttles the output back to the source rate, which is exactly the
-    // behaviour that makes frame generation look like it does nothing.
-    if !guest_slot {
-        return now_ns;
-    }
-    // The effective rate, not the note's: while frame generation runs the source
-    // cap comes from the app through `lsfg::live()`, and the daemon's own note is
-    // 0 (the app disarms gamescope's limiter in that case).
-    let target = crate::lsfg::source_cap().unwrap_or_else(|| CAP_FPS.load(Ordering::Relaxed));
-    advance_schedule(&CAP_FREE_NS, target, now_ns)
-}
-
-/// Advance `free_ns` to the instant a release seen at `now_ns` may free its
-/// slot, and return that instant.
-///
-/// Split out from [`note_release`] so the schedule can be driven without the
-/// process-wide cell. A capped schedule advances by compare-and-swap: two
-/// threads reap releases (the Wayland dispatch thread and the X11 reaper), and
-/// a plain load/store would let the slower one overwrite a floor the faster one
-/// already raised.
-#[must_use]
-fn advance_schedule(free_ns: &AtomicU64, target_fps: u32, now_ns: u64) -> u64 {
-    // An uncapped release has no floor and no order to preserve: one store, on
-    // a path that runs once per frame.
-    if period_ns(target_fps) == 0 {
-        free_ns.store(now_ns, Ordering::Relaxed);
-        return now_ns;
-    }
-    let mut last = free_ns.load(Ordering::Relaxed);
-    loop {
-        let free_at = release_floor(target_fps, last, now_ns);
-        match free_ns.compare_exchange_weak(last, free_at, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return free_at,
-            Err(seen) => last = seen,
-        }
-    }
+    prev_ns.max(now_ns).saturating_add(period_ns)
 }
 
 /// Adopt one frame-cap note: the target it carries.
@@ -208,9 +150,8 @@ fn apply_note(note: FrameCapNote) {
     CAP_FPS.store(note.fps, Ordering::Relaxed);
 }
 
-/// The target the daemon last declared, [`FPS_UNCAPPED`] when none has: read by
-/// the shim's census, so a round can tell "no note arrived" from "a note
-/// arrived whose floor never bound".
+/// The target in force, [`FPS_UNCAPPED`] when none has: read by the shim's
+/// census and by the acquire gate.
 pub(crate) fn target_fps() -> u32 {
     // Frame generation owns the source rate while it is on: the app disarms
     // gamescope's limiter in that case, so a zero from the daemon's cap note is
@@ -230,6 +171,20 @@ pub(crate) fn notes_seen() -> usize {
 /// Send one frame that expects no reply; `false` when the channel did not
 /// accept it: the frame-cap subscribe, the one fire-and-forget frame on this
 /// channel.
+fn send_frame_nb(fd: RawFd, wire: &[u8]) -> bool {
+    // SAFETY: `fd` is the connection this module owns, `wire` outlives the call.
+    unsafe {
+        let mut iov = libc::iovec {
+            iov_base: wire.as_ptr().cast_mut().cast(),
+            iov_len: wire.len(),
+        };
+        let mut msg: libc::msghdr = core::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT) >= 0
+    }
+}
+
 fn send_frame(fd: RawFd, wire: &[u8]) -> bool {
     // SAFETY: `fd` is the connection this module owns, `wire` outlives the
     // call. MSG_NOSIGNAL: a displaced or closed channel must fail rather than
@@ -320,6 +275,11 @@ pub fn lsfg_config() -> Option<LsfgConfig> {
                 apply_note(note);
             } else if let Some(note) = VsyncNote::decode(&buf[..n as usize]) {
                 crate::lsfg::apply_vsync(note);
+            } else if let Some(done) = gndrm_uapi::wire::PresentDone::decode(&buf[..n as usize]) {
+                crate::present::record(done.id, done.latch_ns);
+            } else if gndrm_uapi::wire::FrameAcquired::decode(&buf[..n as usize]).is_some() {
+                // The shim's own counter, echoed nowhere: accepted so it is not
+                // mistaken for a frame this reader does not know.
             }
         }
     }
@@ -438,7 +398,7 @@ fn connect(path: &str) -> RawFd {
         if !send_frame(
             fd,
             &FrameCapSubscribe {
-                caps: CAP_FRAME_CAP | CAP_VSYNC_NOTE,
+                caps: CAP_FRAME_CAP | CAP_VSYNC_NOTE | CAP_PRESENT_ID,
             }
             .encode(),
         ) {
@@ -559,6 +519,26 @@ fn exchange_req(fd: RawFd, req: ScanoutAllocReq) -> Result<ScanoutBuf, Failure> 
                     if frames < MAX_BURST_FRAMES {
                         continue;
                     }
+                } else if let Some(done) = gndrm_uapi::wire::PresentDone::decode(buf) {
+                    // A completion pushed while this exchange waits for its
+                    // reply: the daemon answers in its own time, and losing the
+                    // note here would leave a wait hanging.
+                    if recv_fd >= 0 {
+                        libc::close(recv_fd);
+                    }
+                    crate::present::record(done.id, done.latch_ns);
+                    if frames < MAX_BURST_FRAMES {
+                        continue;
+                    }
+                } else if gndrm_uapi::wire::FrameAcquired::decode(buf).is_some() {
+                    // The acquire counter shares this channel and can arrive
+                    // while a reply is pending; it is not the reply.
+                    if recv_fd >= 0 {
+                        libc::close(recv_fd);
+                    }
+                    if frames < MAX_BURST_FRAMES {
+                        continue;
+                    }
                 } else if let Some(r) = ScanoutAllocResp::decode(buf) {
                     if r.ret != 0 || recv_fd < 0 {
                         // A refusal carries no buffer; the channel stays
@@ -645,6 +625,33 @@ pub(crate) fn fd_link(fd: RawFd) -> String {
 /// exists while `exchange` holds this same lock across its send and receive, so
 /// a lock that is free means no reply is in flight and any frame on the socket
 /// is a push. A push skipped then is read on the next release.
+/// Report the running acquire total to the daemon.
+///
+/// Non-blocking: this runs on the guest's present thread once per frame, and a
+/// full socket must cost a dropped message rather than a stall. Losing one is
+/// harmless — the count is cumulative and the next message carries the total.
+pub(crate) fn send_frame_acquired(count: u64) {
+    let ch = CHAN.lock().unwrap_or_else(|e| e.into_inner());
+    if *ch < 0 {
+        return;
+    }
+    send_frame_nb(*ch, &gndrm_uapi::wire::FrameAcquired { count }.encode());
+}
+
+/// Mark a frame's present id for the daemon, immediately before the commit that
+/// presents it: the daemon answers when that transaction latches. Best effort by
+/// construction — the channel is shared with the allocator, so an exchange in
+/// flight is waited for (bounded by the exchange's own timeout) rather than
+/// skipped, because a mark that never arrives leaves `vkWaitForPresentKHR`
+/// waiting for a frame the daemon cannot name.
+pub(crate) fn send_present_mark(ino: u64, id: u64) {
+    let ch = CHAN.lock().unwrap_or_else(|e| e.into_inner());
+    if *ch < 0 {
+        return;
+    }
+    send_frame(*ch, &gndrm_uapi::wire::PresentMark { ino, id }.encode());
+}
+
 pub(crate) fn poll_notes() {
     let ch = match CHAN.try_lock() {
         Ok(g) => g,
@@ -677,6 +684,13 @@ pub(crate) fn poll_notes() {
         if !config.is_request() {
             crate::lsfg::apply(config);
         }
+    } else if let Some(done) = gndrm_uapi::wire::PresentDone::decode(&buf[..len]) {
+        // The panel latched the frame this id was marked for.
+        crate::present::record(done.id, done.latch_ns);
+    } else if let Some(acq) = gndrm_uapi::wire::FrameAcquired::decode(&buf[..len]) {
+        // Sent from the acquire path; nothing to apply here. Accepted so the
+        // log does not report it as an unknown frame.
+        let _ = acq;
     }
 }
 
@@ -890,93 +904,26 @@ mod tests {
         }
     }
 
-    /// The floor is one period after the previous release's own free instant,
-    /// so it is a lower bound that holds only a release that would have come
-    /// sooner than `1 / target`.
+    /// The acquire schedule: one period after the previous start, never closer,
+    /// and never later than the guest's own next frame when it is slower.
     #[test]
-    fn the_release_floor_is_one_period_after_the_previous_release() {
+    fn the_acquire_schedule_spaces_frame_starts() {
         let period = period_ns(40);
         assert_eq!(period, 25_000_000);
-        // The first release has nothing to measure from.
-        assert_eq!(release_floor(40, 0, 1_000), 1_000);
-        // A second release inside the period is held to it.
-        assert_eq!(
-            release_floor(40, 1_000_000_000, 1_004_000_000),
-            1_025_000_000
-        );
-        // One at or after the floor is not delayed at all: a guest already at
-        // or below the target keeps its own rate.
-        assert_eq!(
-            release_floor(40, 1_000_000_000, 1_025_000_000),
-            1_025_000_000
-        );
-        assert_eq!(
-            release_floor(40, 1_000_000_000, 1_100_000_000),
-            1_100_000_000
-        );
-        // No cap: no floor, whenever the release arrives.
-        assert_eq!(release_floor(FPS_UNCAPPED, 1_000_000_000, 1_000), 1_000);
-        assert_eq!(period_ns(FPS_UNCAPPED), 0);
+        // The first acquire schedules the next one a period later.
+        let first = next_acquire_after(0, 1_000_000_000, period);
+        assert_eq!(first, 1_025_000_000);
+        // A guest faster than the target: every start is exactly one period on.
+        assert_eq!(next_acquire_after(first, 1_001_000_000, period), 1_050_000_000);
+        assert_eq!(next_acquire_after(1_050_000_000, 1_002_000_000, period), 1_075_000_000);
+        // A guest slower than the target keeps its own rate: the gate is a lower
+        // bound, not a delay.
+        assert_eq!(next_acquire_after(1_075_000_000, 1_200_000_000, period), 1_225_000_000);
+        // No cap: the schedule is left alone, so enabling one later does not
+        // inherit a stale deadline.
+        assert_eq!(next_acquire_after(1_225_000_000, 5, 0), 1_225_000_000);
         // A period is truncated, never rounded up past `1 / target`.
+        assert_eq!(period_ns(FPS_UNCAPPED), 0);
         assert_eq!(period_ns(3), 333_333_333);
-    }
-
-    /// The recorded instant is the free instant, so a run of releases inside
-    /// the period frees one per period rather than in a burst, and never later
-    /// than the guest's own next release would have been.
-    #[test]
-    fn consecutive_releases_frees_are_spaced_by_the_period() {
-        let period = period_ns(40);
-        let mut last = 0u64;
-        let mut frees = Vec::new();
-        for i in 0..5u64 {
-            // The guest presents every 4 ms, far faster than the target.
-            let now = 1_000_000_000 + i * 4_000_000;
-            let free_at = release_floor(40, last, now);
-            last = free_at;
-            frees.push(free_at);
-        }
-        assert_eq!(
-            frees,
-            vec![
-                1_000_000_000,
-                1_025_000_000,
-                1_050_000_000,
-                1_075_000_000,
-                1_100_000_000,
-            ]
-        );
-        for pair in frees.windows(2) {
-            assert_eq!(pair[1] - pair[0], period);
-        }
-    }
-
-    /// The schedule itself: the same spacing when driven through the atomic a
-    /// release advances, and a recorded instant when no cap is in force.
-    #[test]
-    fn the_schedule_spaces_releases_under_a_cap() {
-        let free_ns = AtomicU64::new(0);
-        let frees: Vec<u64> = (0..5)
-            .map(|i| advance_schedule(&free_ns, 40, 1_000_000_000 + i * 4_000_000))
-            .collect();
-        assert_eq!(
-            frees,
-            vec![
-                1_000_000_000,
-                1_025_000_000,
-                1_050_000_000,
-                1_075_000_000,
-                1_100_000_000,
-            ]
-        );
-        // Two releases that arrive at the same instant still free a period
-        // apart: the second one's floor is the first one's free instant.
-        let free_ns = AtomicU64::new(0);
-        assert_eq!(advance_schedule(&free_ns, 40, 2_000_000_000), 2_000_000_000);
-        assert_eq!(advance_schedule(&free_ns, 40, 2_000_000_000), 2_025_000_000);
-        // Uncapped: no floor, and the cell still tracks the last release so a
-        // cap enabled later paces from it.
-        assert_eq!(advance_schedule(&free_ns, FPS_UNCAPPED, 3), 3);
-        assert_eq!(free_ns.load(Ordering::Relaxed), 3);
     }
 }
