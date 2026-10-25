@@ -94,24 +94,23 @@ what produced the 49 ms holds measured on Ori).
   now has no limiter to arm. It can stay (harmless, and keeps the API stable), or
   be dropped in a follow-up once the rework has device evidence.
 
-### 3.3 Count acquisitions
+### 3.3 Count acquisitions, but keep the frame ring on publish
 
-New wire frame, shim → daemon, on the scan-out channel:
+Two different numbers, two different events:
 
-```rust
-/// Cumulative frames acquired on this connection. Magic "GNAQ", 24 bytes:
-/// magic:u32, reserved:u32, count:u64, reserved:u64.
-pub struct FrameAcquired { pub count: u64 }
-```
+- **Acquisitions** — the rate the cap controls. The shim keeps a running total and
+  sends it cumulatively (`FrameAcquired`); the daemon records it for the census.
+- **Publications** — the rate the panel shows. The daemon publishes every frame
+  that reaches SurfaceFlinger, generated frames included, and that is what the
+  app's frame ring (`onFramePublished` → `FrameRating`) must be fed: its fps is
+  computed from the *number of calls* in a second.
 
-- The shim increments a `static ACQ_COUNT: AtomicU64` on every successful acquire
-  and sends the cumulative value with `MSG_DONTWAIT`, after dropping the swapchain
-  lock. A dropped send loses nothing: the next message carries the new total.
-- The daemon keeps `last_acquired`; on each message it calls
-  `notify_frame_published()` for the delta (bounded to, say, 240 per message so a
-  long stall cannot produce an unbounded burst).
-- Remove the call from `asc.rs:1267`; keep `clear_booting_splash_on_first_frame()`
-  there, which is a first-*presented*-frame concern and must stay on that path.
+Feeding the ring from acquisitions looks correct until generation runs: at a
+×2 multiplier the panel shows 120 while the guest acquires 60, so the overlay
+drops to half. The ring therefore stays on the publish path, and the acquire
+count is a census signal only. `PowerManager.frameSampleStride` keeps its meaning
+(one ring entry per displayed frame, sampled every multiplier-th to report the
+source rate the tuner compares against).
 
 ## 4. Task list
 
@@ -132,8 +131,8 @@ pub struct FrameAcquired { pub count: u64 }
      (`x11_reap`, `on_buffer_release`).
 4. `icd_shim/src/scanout.rs`: `note_release`, `advance_schedule`, `CAP_FREE_NS`
    and the floor tests go; `CAP_FPS` and `target_fps()` stay.
-5. `modules/gndrm-android/src/asc.rs`: `FrameAcquired` handling + delta calls to
-   `notify_frame_published()`; remove the publish-path call.
+5. `modules/gndrm-android/src/asc.rs`: `FrameAcquired` recorded for the census;
+   `notify_frame_published()` stays on the publish path (see §3.3).
 6. Tests: wire codec; gate arithmetic (two acquires one period apart, uncapped
    passes straight through, a stalled gap does not bank time); existing suite
    green; both clippy targets clean.

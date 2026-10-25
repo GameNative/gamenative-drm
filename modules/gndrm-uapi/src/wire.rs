@@ -537,6 +537,147 @@ impl FrameCapSubscribe {
     }
 }
 
+/// Frame-acquired magic: ASCII "GNAQ". Shim -> daemon, on the scan-out channel.
+///
+/// One message per acquire would be a sendmsg per frame; this carries the running
+/// total instead, so a message that cannot be sent (a full socket) loses
+/// nothing — the next one carries the new total and the daemon reports the
+/// difference. It is also why the app's frame ring can follow the rate the
+/// limiter controls: a frame is counted when the guest starts it, not when the
+/// compositor shows it.
+pub const FRAME_ACQUIRED_MAGIC: u32 = 0x474E_4151;
+
+/// Cumulative frames acquired on this connection.
+///
+/// Encoded little-endian, 24 bytes:
+/// `magic:u32, reserved:u32, count:u64, reserved:u64`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameAcquired {
+    /// Frames acquired since this shim connected.
+    pub count: u64,
+}
+
+impl FrameAcquired {
+    pub const LEN: usize = 24;
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[0..4].copy_from_slice(&FRAME_ACQUIRED_MAGIC.to_le_bytes());
+        b[8..16].copy_from_slice(&self.count.to_le_bytes());
+        b
+    }
+
+    #[must_use]
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN
+            || u32::from_le_bytes(b[0..4].try_into().ok()?) != FRAME_ACQUIRED_MAGIC
+        {
+            return None;
+        }
+        Some(Self {
+            count: u64::from_le_bytes(b[8..16].try_into().ok()?),
+        })
+    }
+}
+
+/// Present-mark magic: ASCII "GNPM". Shim -> daemon, on the scan-out channel.
+///
+/// The shim tells the daemon which present id the frame it is about to commit
+/// carries, so the daemon can name that id when the transaction completes. Sent
+/// immediately before the commit reaches the compositor, so it is always ahead
+/// of the atomic commit it belongs to. A frame with no id (an app that did not
+/// chain [`VkPresentIdKHR`]) sends nothing.
+pub const PRESENT_MARK_MAGIC: u32 = 0x474E_504D;
+
+/// Present-done magic: ASCII "GNPD". Daemon -> shim, on the scan-out channel.
+///
+/// The daemon reports that the transaction carrying a marked frame completed,
+/// with the panel's latch time for it. Only a connection that declared
+/// [`CAP_PRESENT_ID`] is sent one.
+pub const PRESENT_DONE_MAGIC: u32 = 0x474E_5044;
+
+/// The `caps` bit a [`FrameCapSubscribe`] sets when the shim can send
+/// [`PresentMark`] and read [`PresentDone`]. A daemon pushes no done note to a
+/// connection that did not set it.
+pub const CAP_PRESENT_ID: u32 = 1 << 2;
+
+/// A frame's present id, shim -> daemon.
+///
+/// Encoded little-endian, 24 bytes:
+/// `magic:u32, reserved:u32, ino:u64, id:u64`. `ino` is the scan-out inode the
+/// frame's slot was allocated from; `id` is the present id the guest chained in
+/// `VkPresentIdKHR`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentMark {
+    /// The scan-out inode of the buffer being committed.
+    pub ino: u64,
+    /// The guest's present id for this frame.
+    pub id: u64,
+}
+
+impl PresentMark {
+    pub const LEN: usize = 24;
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[0..4].copy_from_slice(&PRESENT_MARK_MAGIC.to_le_bytes());
+        b[8..16].copy_from_slice(&self.ino.to_le_bytes());
+        b[16..24].copy_from_slice(&self.id.to_le_bytes());
+        b
+    }
+
+    #[must_use]
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN || u32::from_le_bytes(b[0..4].try_into().ok()?) != PRESENT_MARK_MAGIC {
+            return None;
+        }
+        Some(Self {
+            ino: u64::from_le_bytes(b[8..16].try_into().ok()?),
+            id: u64::from_le_bytes(b[16..24].try_into().ok()?),
+        })
+    }
+}
+
+/// A completed present, daemon -> shim.
+///
+/// Encoded little-endian, 24 bytes:
+/// `magic:u32, reserved:u32, id:u64, latch_ns:u64`. `latch_ns` is the panel's
+/// latch time for the transaction that carried the frame, in
+/// `CLOCK_MONOTONIC` nanoseconds, or 0 when the platform reported none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentDone {
+    /// The present id the frame was marked with.
+    pub id: u64,
+    /// The panel's latch time for it, 0 when unknown.
+    pub latch_ns: u64,
+}
+
+impl PresentDone {
+    pub const LEN: usize = 24;
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[0..4].copy_from_slice(&PRESENT_DONE_MAGIC.to_le_bytes());
+        b[8..16].copy_from_slice(&self.id.to_le_bytes());
+        b[16..24].copy_from_slice(&self.latch_ns.to_le_bytes());
+        b
+    }
+
+    #[must_use]
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN || u32::from_le_bytes(b[0..4].try_into().ok()?) != PRESENT_DONE_MAGIC {
+            return None;
+        }
+        Some(Self {
+            id: u64::from_le_bytes(b[8..16].try_into().ok()?),
+            latch_ns: u64::from_le_bytes(b[16..24].try_into().ok()?),
+        })
+    }
+}
+
 /// Vsync note magic: ASCII "GNVS". Daemon -> shim.
 pub const VSYNC_MAGIC: u32 = 0x474E_5653;
 

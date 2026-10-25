@@ -159,6 +159,11 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceFeatures2(pd: VkPhysicalDevice, f
     };
     unsafe { real(pd, f) };
     unsafe { crate::divisor::features2(f) };
+    // Present-id/wait are shim features: the driver's answer is not about the
+    // swapchain the guest will present through.
+    if !f.is_null() {
+        unsafe { crate::present::features2((*(f as *mut BaseOut)).pNext) };
+    }
     if !enabled() || f.is_null() {
         return;
     }

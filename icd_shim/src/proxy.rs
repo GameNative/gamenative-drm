@@ -128,6 +128,9 @@ const LOG_FIRST_N: usize = 8;
 // per-slot flags, so a frozen pipeline always leaves a trail.
 static N_ACQ: AtomicUsize = AtomicUsize::new(0);
 static N_PRES: AtomicUsize = AtomicUsize::new(0);
+/// Frames this shim has handed to the guest, reported to the daemon so the app's
+/// frame ring follows acquisitions rather than presentations.
+static ACQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static N_REL: AtomicUsize = AtomicUsize::new(0);
 static N_COMMIT_OK: AtomicUsize = AtomicUsize::new(0);
 static N_STARVE: AtomicUsize = AtomicUsize::new(0);
@@ -644,30 +647,13 @@ unsafe fn x11_reap(sc: *mut GnSwapchain) {
         if fence == 0 || !busy {
             continue;
         }
-        if unsafe { (*s).release_held } {
-            // Already returned; waiting for the paced floor. `acquire_take_free`
-            // frees it when the floor passes, so re-arming here would advance the
-            // schedule once per reap for the same release.
-            continue;
-        }
         if unsafe { (*present).fence_idle(fence) } {
-            // Same floor the wayland arm applies on `wl_buffer.release`: the
-            // X11 route has no release listener, so a gamescope session would
-            // otherwise see no pacing at all.
-            let now_ns = monotonic_ns();
-            // The X11 route only ever reaps guest slots.
-            let floor_ns = crate::scanout::note_release(now_ns, true);
+            // The server is done with the pixmap: the slot is free, and the cap
+            // (if any) is applied when the guest asks for it again.
             let _g = unsafe { (*sc).shared.lock().unwrap() };
-            if now_ns < floor_ns {
-                unsafe {
-                    (*s).floor_ns = floor_ns;
-                    (*s).release_held = true;
-                }
-            } else {
-                unsafe {
-                    (*s).in_flight = false;
-                    (*sc).cv_free.notify_all();
-                }
+            unsafe {
+                (*s).in_flight = false;
+                (*sc).cv_free.notify_all();
             }
             drop(_g);
             if logging {
@@ -815,14 +801,13 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
                 buf: ptr::null_mut(),
                 xpix: 0,
                 xfence: 0,
+                present_id: 0,
                 fence: 0,
                 sem: 0,
                 acquired: false,
                 in_flight: false,
                 acq_seq: 0,
                 ino: 0,
-                floor_ns: 0,
-                release_held: false,
                 ahb: ptr::null_mut(),
             });
         }
@@ -1686,6 +1671,16 @@ fn worker_main(sc: *mut GnSwapchain) {
 unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
     unsafe {
         let s = (*sc).slots.as_mut_ptr().add(idx as usize);
+        // Tell the daemon which present id this frame carries, before the commit
+        // that names its buffer in an atomic commit. The worker may wait for an
+        // allocation exchange in flight, which is bounded by that exchange's own
+        // timeout; a mark that never arrives would leave a wait hanging.
+        if (*s).present_id != 0 && (*s).ino != 0 {
+            crate::scanout::send_present_mark((*s).ino, (*s).present_id);
+            // One mark per frame: a guest that stops chaining ids must not keep
+            // marking later frames with the last one it sent.
+            (*s).present_id = 0;
+        }
         // X11 route: the window carries its own content, so the frame is
         // presented into it (DRI3 + Present) instead of committed to a
         // wl_surface. The slot stays in flight until its idle fence
@@ -1894,6 +1889,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         slots: Vec::new(),
         guest_slots: 0,
         gen_no_grow: false,
+        next_acquire_ns: 0,
         worker: None,
         shared: Mutex::new(ScShared {
             jobs: VecDeque::with_capacity(GN_JOB_CAP),
@@ -1918,14 +1914,13 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             buf: ptr::null_mut(),
             xpix: 0,
             xfence: 0,
+            present_id: 0,
             fence: 0,
             sem: 0,
             acquired: false,
             in_flight: false,
             acq_seq: 0,
             ino: 0,
-            floor_ns: 0,
-            release_held: false,
             ahb: ptr::null_mut(),
         });
     }
@@ -2159,56 +2154,22 @@ unsafe extern "C" fn gn_vkDestroySwapchainKHR(
 // imported dma-buf image directly.
 const REAP_SLICE: Duration = Duration::from_millis(4);
 
-/// Bound `slice` by the soonest floor among the slots the compositor has
-/// already returned, so such a slot is handed back the moment its floor passes
-/// rather than on the next poll of the slice: the guest is blocked in the
-/// acquire that called this, and a late free there is a late frame. Called with
-/// `shared` held; takes no other lock.
-unsafe fn slice_to_floor(sc: *mut GnSwapchain, slice: Duration) -> Duration {
-    let now_ns = monotonic_ns();
-    let mut soonest = 0u64;
-    for k in 0..unsafe { (*sc).slots.len() } {
-        let s = unsafe { (*sc).slots.as_mut_ptr().add(k) };
-        let (held, floor) = unsafe { ((*s).release_held, (*s).floor_ns) };
-        if held && (soonest == 0 || floor < soonest) {
-            soonest = floor;
-        }
-    }
-    if soonest == 0 || now_ns >= soonest {
-        return slice;
-    }
-    slice.min(Duration::from_nanos(soonest - now_ns))
-}
-
 /// Claim the first swapchain slot that is neither held by the app nor awaiting a
 /// compositor release. On success `idx` is set to the slot (marked acquired);
 /// when none is free `idx` is left unchanged.
 ///
-/// Withholding an in-flight slot is what paces the guest to gamescope's vblank
-/// grid, i.e. to the panel refresh. Letting the app acquire one instead is not a
-/// safe way to decouple the guest's rate: this scan hands out the *first* free
-/// slot, so the app takes slot 0, presents it, re-acquires slot 0 and presents it
+/// Withholding an in-flight slot is the reuse contract, not the cap: the cap is
+/// applied by the caller's schedule before a slot is taken. Letting the app
+/// acquire a slot the compositor still holds is not a safe way to decouple the
+/// guest's rate: this scan hands out the *first* free slot, so the app takes slot
+/// 0, presents it, re-acquires slot 0 and presents it
 /// again — the compositor is handed the same buffer repeatedly and starves, which
 /// measured as 8 commits against 5334 for the gated path on the same title. Any
 /// free-running scheme needs a rotating slot choice (so each commit carries a
 /// newer buffer) and its own back-pressure, not just this condition relaxed.
 unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
-    let now_ns = monotonic_ns();
     for k in 0..unsafe { (*sc).guest_slots as usize } {
         let s = unsafe { (*sc).slots.as_mut_ptr().add(k) };
-        // A slot the compositor returned while the daemon's floor for it was
-        // still ahead becomes free the instant that floor passes, and this scan
-        // is what performs that free: the guest is blocked in the acquire that
-        // called us, so nothing has to be woken and no timer is needed. The
-        // floor is at most one target period past the daemon's last release and
-        // the comparison is on a monotonic clock, so a held slot always becomes
-        // free.
-        if unsafe { (*s).release_held && now_ns >= (*s).floor_ns } {
-            unsafe {
-                (*s).release_held = false;
-                (*s).in_flight = false;
-            }
-        }
         if unsafe { !(*s).acquired && !(*s).in_flight } {
             *idx = k as i32;
             unsafe {
@@ -2245,13 +2206,48 @@ unsafe fn gn_acquire_common(
         [timeout as usize, sem as usize, fence as usize, 0, 0],
     );
     let deadline = (timeout != u64::MAX).then(|| Instant::now() + Duration::from_nanos(timeout));
+    // The cap, applied here: a frame that may not start yet waits before it is
+    // given an image, so nothing rendered is thrown away and nothing already on
+    // its way to the panel is delayed.
+    let period = crate::scanout::period_ns(crate::scanout::target_fps());
     let mut idx: i32 = -1;
     let mut timed_out = false;
     {
         let mut g = (*sc).shared.lock().unwrap();
         loop {
+            if period != 0 && !g.stopping {
+                let now_ns = monotonic_ns();
+                let next_ns = (*sc).next_acquire_ns;
+                if next_ns != 0 && now_ns < next_ns {
+                    if timeout == 0 {
+                        break;
+                    }
+                    let mut wait = Duration::from_nanos(next_ns - now_ns);
+                    if let Some(dl) = deadline {
+                        let left = dl.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            timed_out = true;
+                            break;
+                        }
+                        wait = wait.min(left);
+                    }
+                    let (guard, _res) = (*sc).cv_free.wait_timeout(g, wait).unwrap();
+                    g = guard;
+                    continue;
+                }
+            }
             unsafe { acquire_take_free(sc, &mut idx) };
-            if idx >= 0 || g.stopping {
+            if idx >= 0 {
+                if period != 0 {
+                    // One timeline for the whole swapchain: the next frame may
+                    // not start before this one plus a period.
+                    let now_ns = monotonic_ns();
+                    (*sc).next_acquire_ns =
+                        crate::scanout::next_acquire_after((*sc).next_acquire_ns, now_ns, period);
+                }
+                break;
+            }
+            if g.stopping {
                 break;
             }
             if timeout == 0 {
@@ -2287,7 +2283,6 @@ unsafe fn gn_acquire_common(
                 }
                 None => REAP_SLICE,
             };
-            let slice = unsafe { slice_to_floor(sc, slice) };
             let (guard, _res) = (*sc).cv_free.wait_timeout(g, slice).unwrap();
             g = guard;
         }
@@ -2344,6 +2339,10 @@ unsafe fn gn_acquire_common(
         }
     }
     *index = idx as u32;
+    // One line per frame for the app's frame ring: the count is cumulative, so
+    // a message the socket refuses is carried by the next one.
+    let acquired = ACQ_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::scanout::send_frame_acquired(acquired);
     let acq_ms = acq_t0.elapsed().as_millis();
     let acq_us = acq_t0.elapsed().as_micros() as usize;
     ACQ_US_N.fetch_add(1, Ordering::Relaxed);
@@ -2607,6 +2606,13 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         let slot = unsafe { (*sc).slots.as_mut_ptr().add(indices[i] as usize) };
+        // The present id the guest chained for this swapchain, if any: the
+        // frame is waited on by it, and the daemon is told at the commit.
+        let present_id = unsafe { crate::present::present_id(pi.pNext, i) };
+        if present_id != 0 {
+            unsafe { (*slot).present_id = present_id };
+            crate::present::arm(present_id, sc as usize);
+        }
         let (waits, mut n_waits) = if chain_prev == 0 {
             (pi.pWaitSemaphores, pi.waitSemaphoreCount)
         } else {
@@ -2752,6 +2758,28 @@ unsafe fn submit_impl(
 /// what it wants against the last value it asked us to signal. The line is
 /// printed BEFORE the wait, so if the wait never returns, the last line in the
 /// log *is* the block; a returned wait longer than a second is logged too.
+unsafe extern "C" fn gn_vkWaitForPresentKHR(
+    _device: VkDevice,
+    swapchain: VkSwapchainKHR,
+    present_id: u64,
+    timeout: u64,
+) -> VkResult {
+    // The guest must have enabled the extension it is calling into: the state
+    // is recorded at device creation, before the feature structs are stripped.
+    if !crate::present::enabled() {
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
+    let sc = unsafe { find_swapchain(swapchain) };
+    if sc.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if crate::present::wait(present_id, sc as usize, timeout) {
+        VK_SUCCESS
+    } else {
+        VK_TIMEOUT
+    }
+}
+
 unsafe extern "C" fn gn_vkWaitSemaphores(
     device: VkDevice,
     wi: *const VkSemaphoreWaitInfo,
@@ -4452,6 +4480,12 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
         std::mem::transmute(
             gn_vkQueueSubmit2
                 as unsafe extern "C" fn(VkQueue, u32, *const VkSubmitInfo2, VkFence) -> VkResult,
+        )
+    }),
+    (c"vkWaitForPresentKHR", HandlerScope::Always, unsafe {
+        std::mem::transmute(
+            gn_vkWaitForPresentKHR
+                as unsafe extern "C" fn(VkDevice, VkSwapchainKHR, u64, u64) -> VkResult,
         )
     }),
     (c"vkWaitSemaphoresKHR", HandlerScope::Always, unsafe {
@@ -6238,18 +6272,16 @@ pub struct GnSlot {
     // Guest-side trace: the acquire sequence that filled this slot, so a
     // present can be tied back to the acquire that handed the guest the image.
     pub acq_seq: u64,
+    // The guest's present id for the frame currently in this slot, 0 when it
+    // chained none: read at the commit to mark the frame for the daemon, which
+    // reports it back once the transaction presenting it latched.
+    pub present_id: u64,
     // The daemon's scan-out inode for this slot's buffer, or 0 when the buffer
     // was allocated locally. Identity and logging only: the release floor is
     // this shim's own, one period after the last release, and is not filed
     // against a buffer (see `crate::scanout::note_release`).
     pub ino: u64,
-    // The instant the floor for the release landing on this slot expires, in
-    // `CLOCK_MONOTONIC` ns, stamped when the release arrived.
-    pub floor_ns: u64,
-    // Set when the compositor returned the buffer before that instant: the slot
-    // stays in flight until the floor passes, and `acquire_take_free` is what
-    // hands it back then.
-    pub release_held: bool,
+
     // The slot's `AHardwareBuffer` reference on a device that imports through
     // `VK_ANDROID_external_memory_android_hardware_buffer`, null otherwise.
     pub ahb: *mut c_void,
@@ -6287,6 +6319,11 @@ pub struct GnSwapchain {
     pub next: *mut GnSwapchain,
     /// Set once a destination could not be made: the set stops growing.
     pub gen_no_grow: bool,
+    /// The instant the guest may start its next frame, in `CLOCK_MONOTONIC` ns:
+    /// 0 before the first, advanced by each acquire. One timeline per swapchain,
+    /// not per slot — a slot-local schedule would let a ring of N images run N
+    /// frames back to back.
+    pub next_acquire_ns: u64,
 }
 
 // ---------------------------------------------------------------- wayland
@@ -6523,54 +6560,22 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
         }
         // The target may have changed since this shim connected, and a push
         // from the daemon is read here because a release is the one event this
-        // shim sees on every frame. Ahead of the floor, so the release it paces
-        // is measured against the target it arrived under.
+        // shim sees on every frame.
         crate::scanout::poll_notes();
-        // The floor this release is held to, measured from this shim's own
-        // previous release (see `scanout::note_release`): the instant the slot
-        // may go back to the guest.
-        let now_ns = monotonic_ns();
-        // Destinations are appended after the guest's slots; only a release that
-        // frees a guest slot advances the cap's schedule.
+        // A release only frees the slot: the cap is applied when the guest asks
+        // for the image again, so nothing here can delay a frame that is already
+        // on its way to the panel.
         let guest_slot = {
             let guest = (*sc).guest_slots as usize;
             let slots = (*sc).slots.as_ptr();
             ((slot as usize - slots as usize) / core::mem::size_of::<GnSlot>()) < guest
         };
-        let floor_ns = crate::scanout::note_release(now_ns, guest_slot);
-        // `capped` only divides the census; the pacing decision is the floor.
-        let capped = logging && crate::scanout::target_fps() != 0;
-        // The floor paces the guest, so only a guest slot is held to it: a
-        // generation destination held back is one fewer for the next batch.
-        let held = guest_slot && now_ns < floor_ns;
         let _g = (*sc).shared.lock().unwrap();
-        if capped {
-            REL_CAPPED_N.fetch_add(1, Ordering::Relaxed);
-        }
         if logging && !guest_slot {
             GEN_RELEASES.fetch_add(1, Ordering::Relaxed);
         }
-        if held {
-            // This runs on the Wayland dispatch thread, so the hold is state,
-            // not a wait: the slot keeps `in_flight`, and the instant it may be
-            // freed is recorded for `acquire_take_free`, which is already
-            // running on the guest's blocked acquire. Nothing here can stall
-            // the connection's other events on a floor.
-            (*slot).floor_ns = floor_ns;
-            (*slot).release_held = true;
-            if logging {
-                let hold_us = ((floor_ns - now_ns) / 1_000) as usize;
-                REL_HOLD_N.fetch_add(1, Ordering::Relaxed);
-                REL_HOLD_SUM_US.fetch_add(hold_us, Ordering::Relaxed);
-                REL_HOLD_MAX_US.fetch_max(hold_us, Ordering::Relaxed);
-                if hold_us >= 8_333 {
-                    REL_HOLD_GE_8333.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        } else {
-            (*slot).in_flight = false;
-            (*sc).cv_free.notify_all();
-        }
+        (*slot).in_flight = false;
+        (*sc).cv_free.notify_all();
         drop(_g);
         if logging {
             N_REL.fetch_add(1, Ordering::Relaxed);
@@ -7845,7 +7850,7 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
                 extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
                 specVersion: 0,
             };
-            n as usize + 4
+            n as usize + 6
         ];
         let mut got = n;
         let res = real(pd, layer, &mut got, buf.as_mut_ptr());
@@ -7856,6 +7861,8 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
         let mut has_hdr_metadata = false;
         let mut has_robustness2 = false;
         let mut has_placed = false;
+        let mut has_present_id = false;
+        let mut has_present_wait = false;
         let mut has_divisor_ext = false;
         let mut has_divisor_khr = false;
         for i in 0..got as usize {
@@ -7877,6 +7884,12 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
             }
             if name == crate::placed::EXT_NAME {
                 has_placed = true;
+            }
+            if name == crate::present::EXT_PRESENT_ID {
+                has_present_id = true;
+            }
+            if name == crate::present::EXT_PRESENT_WAIT {
+                has_present_wait = true;
             }
             if name == crate::divisor::EXT_NAME {
                 has_divisor_ext = true;
@@ -7923,6 +7936,27 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
                     "proxy: advertised VK_EXT_robustness2 (driver does not list it)"
                 ));
             }
+        }
+        // Present ids and present waits are served by the shim for its own
+        // swapchain: the driver's swapchain is not the one the guest presents
+        // through, so its support says nothing. Advertised whenever the driver
+        // does not already list them.
+        for (flag, name, spec) in [
+            (has_present_id, c"VK_KHR_present_id", 1u32),
+            (has_present_wait, c"VK_KHR_present_wait", 1u32),
+        ] {
+            if flag || !layer.is_null() {
+                continue;
+            }
+            let mut prop = VkExtensionProperties {
+                extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
+                specVersion: spec,
+            };
+            for (j, b) in name.to_bytes().iter().enumerate() {
+                prop.extensionName[j] = *b as std::os::raw::c_char;
+            }
+            buf[kept] = prop;
+            kept += 1;
         }
         if !has_placed && layer.is_null() && crate::placed::enabled() {
             let mut prop = VkExtensionProperties {
@@ -9144,7 +9178,22 @@ unsafe extern "C" fn gn_vkCreateDevice(
             p = (*p).pNext;
         }
     }
-    let mut strip: Vec<VkStructureType> = Vec::new();
+    // The present-id/wait features belong to the shim's swapchain, not the
+    // driver's, so the structs are stripped from the driver's chain whatever the
+    // guest asked for. They are recorded here: the entry points answer only when
+    // the guest enabled them.
+    let guest_id = names
+        .iter()
+        .any(|&o| unsafe { CStr::from_ptr(o) } == crate::present::EXT_PRESENT_ID);
+    let guest_wait = names
+        .iter()
+        .any(|&o| unsafe { CStr::from_ptr(o) } == crate::present::EXT_PRESENT_WAIT);
+    crate::present::note_enabled(guest_id, guest_wait);
+
+    let mut strip: Vec<VkStructureType> = vec![
+        crate::present::STYPE_PRESENT_ID_FEATURES as VkStructureType,
+        crate::present::STYPE_PRESENT_WAIT_FEATURES as VkStructureType,
+    ];
     if strip_robustness2 {
         strip.push(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
     }

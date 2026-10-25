@@ -67,7 +67,8 @@ use gndrm_daemon::diag::{self, Diag, Reply, Role, Stage, State, TrackedMutex, LO
 use gndrm_daemon::scanout::{Geometry, Removed, Reservation as CacheReservation, ReusePool};
 use gndrm_daemon::{FrameCap, Framebuffer, PlaneState, Presenter};
 use gndrm_uapi::wire::{
-    FrameCapSubscribe, LsfgConfig, ScanoutAllocReq, ScanoutAllocResp, CAP_FRAME_CAP,
+    FrameAcquired, FrameCapSubscribe, LsfgConfig, PresentDone, PresentMark, ScanoutAllocReq,
+    ScanoutAllocResp, CAP_FRAME_CAP, CAP_PRESENT_ID,
     CAP_VSYNC_NOTE, SCANOUT_FORMAT_BGRA_8888,
 };
 
@@ -184,6 +185,10 @@ struct ReleaseCtx {
     /// When the daemon's apply of the transaction this registration was last
     /// published in returned, `CLOCK_MONOTONIC` ns; 0 before the first.
     applied_ns: AtomicU64,
+    /// The guest's present id for the frame currently in this registration, 0
+    /// when the app did not chain one. Written by the publish path, consumed by
+    /// the completion callback, which reports it with the latch time.
+    present_id: AtomicU64,
     /// Set by the completion callback: SurfaceFlinger reported the flip event
     /// for this registration, so the buffer is safe to hand back out (the
     /// reuse cache keys on it). Never cleared: the flag belongs to this
@@ -196,6 +201,83 @@ struct ReleaseCtx {
 // the callback thread.
 unsafe impl Send for ReleaseCtx {}
 unsafe impl Sync for ReleaseCtx {}
+
+// ---------------------------------------------------------------- present ids
+//
+// The guest can ask when a frame reached the panel: it chains `VkPresentIdKHR`
+// in its present, and waits on the id through `vkWaitForPresentKHR`. Nothing in
+// Vulkan carries that id to the display side, so the shim marks the frame on the
+// scan-out channel and this daemon answers when the transaction that carried it
+// completes — with the latch time it already samples for the vsync grid.
+
+/// Marks received from the shim, by scan-out inode, waiting for the commit that
+/// publishes them. One frame per buffer is in flight at a time, so a plain map
+/// is enough; it is bounded because a mark for a buffer that never gets
+/// committed must not accumulate.
+static PRESENT_PENDING: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// Completions not yet written to the shim: the callback runs on SurfaceFlinger's
+/// thread, the channel on the scan-out thread, and only the latter may send.
+static PRESENT_DONE: Mutex<Vec<PresentDone>> = Mutex::new(Vec::new());
+
+/// Frames acquired as last reported by the shim: the app's frame ring is fed the
+/// difference, so it follows the rate the limiter controls rather than the rate
+/// the compositor shows.
+static ACQUIRED_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// Eventfd the completion callback writes to wake the scan-out thread. -1 until
+/// the channel is served, which is before any marked frame can exist.
+static PRESENT_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Whether the connection reading this channel asked for present-done notes.
+static PRESENT_AWARE: AtomicBool = AtomicBool::new(false);
+
+/// How many marks and completions are held, oldest dropped first. A guest that
+/// marks frames and never waits cannot grow either list without bound.
+const PRESENT_QUEUE_CAP: usize = 64;
+
+/// Record a frame's present id against the buffer carrying it.
+fn note_present_mark(mark: PresentMark) {
+    if mark.id == 0 || mark.ino == 0 {
+        return;
+    }
+    let mut pending = PRESENT_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    pending.retain(|&(ino, _)| ino != mark.ino);
+    if pending.len() >= PRESENT_QUEUE_CAP {
+        pending.remove(0);
+    }
+    pending.push((mark.ino, mark.id));
+}
+
+/// Take the id marked for `ino`, if any: the commit naming that buffer is the
+/// frame the id belongs to.
+fn take_present_mark(ino: u64) -> u64 {
+    let mut pending = PRESENT_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    match pending.iter().position(|&(marked, _)| marked == ino) {
+        Some(i) => pending.remove(i).1,
+        None => 0,
+    }
+}
+
+/// Report a completed present to the shim: queued here, written by the channel.
+fn note_present_done(id: u64, latch_ns: u64) {
+    if id == 0 {
+        return;
+    }
+    {
+        let mut done = PRESENT_DONE.lock().unwrap_or_else(|e| e.into_inner());
+        if done.len() >= PRESENT_QUEUE_CAP {
+            done.remove(0);
+        }
+        done.push(PresentDone { id, latch_ns });
+    }
+    let fd = PRESENT_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        // SAFETY: `fd` is the eventfd this channel created; writing a count is
+        // the whole protocol.
+        unsafe { libc::write(fd, (&1u64 as *const u64).cast(), 8) };
+    }
+}
 
 /// `ASurfaceTransaction_setOnComplete`: capture the fence that says
 /// SurfaceFlinger has finished with the buffer published in the previous
@@ -254,14 +336,18 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
         unsafe { libc::close(fd) };
     }
     // The latch time is a sample of the panel's latch grid, which the presenter
-    // places generated frames on.
+    // places generated frames on — and the answer a guest waiting on this
+    // frame's present id is given.
+    let mut latch_ns = 0u64;
     if let Some(latch_time) = ctx.latch_time {
         // SAFETY: `stats` belongs to this completion.
         let latch = unsafe { latch_time(stats) };
         if latch > 0 {
-            crate::vsync::sample(latch as u64, ctx.applied_ns.load(Ordering::Relaxed));
+            latch_ns = latch as u64;
+            crate::vsync::sample(latch_ns, ctx.applied_ns.load(Ordering::Relaxed));
         }
     }
+    note_present_done(ctx.present_id.swap(0, Ordering::AcqRel), latch_ns);
     // The transaction completed: SurfaceFlinger has reported this publish's
     // completion. This is the frame's release signal — the return path the reuse
     // cache and the next publish's release-fence wait key on.
@@ -522,6 +608,7 @@ impl ScanoutPool {
             release_fd: AtomicI32::new(-1),
             latch_time: api.st_stats_latch_time,
             applied_ns: AtomicU64::new(0),
+            present_id: AtomicU64::new(0),
             latched: Arc::clone(&latched),
         }));
         (ctx, latched)
@@ -1020,6 +1107,15 @@ impl AscState {
                 let PoolBuf {
                     ahb, ctx, stride, ..
                 } = buf;
+                // The frame this registration is about to carry: its present id
+                // was marked against the buffer before the commit that named it.
+                // SAFETY: `ctx` is the leaked mailbox of this registered buffer.
+                unsafe {
+                    (*ctx).present_id.store(
+                        take_present_mark(published_ino),
+                        Ordering::Release,
+                    )
+                };
                 // Attach a looper to *this* thread the first time we publish.
                 // `ALooper_pollOnce` must run on the thread the looper was
                 // prepared on: polling a looper prepared elsewhere fails with
@@ -1259,11 +1355,11 @@ impl AscState {
         self.frames += 1;
         if fb.id != 0 {
             crate::clear_booting_splash_on_first_frame();
-            // Announce the daemon's new-frame decision to the app's frame-time
-            // ring: only a changed primary FB is published (a re-commit of the
-            // frame already shown is not — see `apply_commit` in `commit.rs`),
-            // so this lands one entry per new app frame, not one per present.
-            // gamescope's frames never tick the X11 present hook.
+            // One entry per frame that reaches the panel, generated frames
+            // included: the app's frame ring is a *display* rate, and only this
+            // path knows about the ones the presenter inserted. The shim's
+            // acquire count is the source rate, which is a different number
+            // whenever frame generation runs.
             crate::notify_frame_published();
         }
     }
@@ -1640,6 +1736,12 @@ pub fn serve_scanout(
     // this connection is done, whichever way it returns.
     let mut vsync_aware = VsyncSubscription(false);
     let vsync_fd = crate::vsync::changed_fd();
+    // Wake this loop when a completion lands: the callback runs on
+    // SurfaceFlinger's thread and may not write the channel itself.
+    let present_fd = eventfd_new();
+    PRESENT_FD.store(present_fd, Ordering::Relaxed);
+    PRESENT_AWARE.store(false, Ordering::Relaxed);
+    let _present_channel = PresentChannel(present_fd);
     loop {
         // The channel is idle until a request arrives. Its state is what tells
         // a shim-side timeout apart from a request the daemon never read: if
@@ -1678,10 +1780,15 @@ pub fn serve_scanout(
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: present_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        // SAFETY: five pollfds waited on indefinitely; a negative `cap_fd` or
-        // `vsync_fd` (no eventfd) is ignored by `poll`.
-        let ready = unsafe { libc::poll(pfds.as_mut_ptr(), 5, -1) };
+        // SAFETY: six pollfds waited on indefinitely; a negative descriptor
+        // (no eventfd) is ignored by `poll`.
+        let ready = unsafe { libc::poll(pfds.as_mut_ptr(), 6, -1) };
         if ready < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
@@ -1721,6 +1828,22 @@ pub fn serve_scanout(
             drain_eventfd(vsync_fd);
             if vsync_aware.0 {
                 if let Some(note) = crate::vsync::note() {
+                    if send_resp(fd, &note.encode(), None).is_err() {
+                        return ScanoutChannel::Closed;
+                    }
+                }
+            }
+        }
+        if pfds[5].revents != 0 {
+            // A publish completed. Its id and latch time were queued by the
+            // callback; written here, on the thread that owns the channel.
+            drain_eventfd(present_fd);
+            if PRESENT_AWARE.load(Ordering::Relaxed) {
+                let done: Vec<PresentDone> = {
+                    let mut q = PRESENT_DONE.lock().unwrap_or_else(|e| e.into_inner());
+                    core::mem::take(&mut *q)
+                };
+                for note in done {
                     if send_resp(fd, &note.encode(), None).is_err() {
                         return ScanoutChannel::Closed;
                     }
@@ -1807,6 +1930,10 @@ pub fn serve_scanout(
                     }
                 }
             }
+            if sub.caps & CAP_PRESENT_ID != 0 {
+                PRESENT_AWARE.store(true, Ordering::Relaxed);
+                PRESENT_FD.store(present_fd, Ordering::Relaxed);
+            }
             if sub.caps & CAP_VSYNC_NOTE != 0 {
                 vsync_aware.set(true);
                 // The panel's latch grid, when it has been measured: a presenter
@@ -1824,6 +1951,25 @@ pub fn serve_scanout(
                     sub.caps
                 )
             );
+            continue;
+        }
+        if let Some(acq) = FrameAcquired::decode(&buf[..n]) {
+            // The shim's running acquire total — the rate the cap controls, as
+            // opposed to the publish count above, which is the rate the panel
+            // shows. Recorded for the census; not fed to the app's ring, since
+            // with frame generation running the two differ by the multiplier.
+            let previous = ACQUIRED_SEEN.swap(acq.count, Ordering::Relaxed);
+            if previous == 0 && acq.count != 0 {
+                log_info!(
+                    "{}",
+                    gndrm_obf::obf!("asc: acquire counter connected (count={})", acq.count)
+                );
+            }
+            continue;
+        }
+        if let Some(mark) = PresentMark::decode(&buf[..n]) {
+            // The frame the shim is about to commit carries this present id.
+            note_present_mark(mark);
             continue;
         }
         let Some(raw_req) = ScanoutAllocReq::decode(&buf[..n]) else {
@@ -3005,6 +3151,26 @@ fn cap_now() -> FrameCap {
 
 /// Drain the cap-change eventfd, so a count left behind cannot wake the scan-out
 /// channel again on the next poll.
+/// An eventfd for a wake the callback thread can raise: non-blocking, so a
+/// burst of completions cannot park the SurfaceFlinger thread in a write.
+fn eventfd_new() -> RawFd {
+    // SAFETY: a fresh eventfd with no shared state.
+    unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) }
+}
+
+/// Owns the present eventfd for one served connection: closing it also clears
+/// the connection-scoped state, so a later connection starts unaware.
+struct PresentChannel(RawFd);
+
+impl Drop for PresentChannel {
+    fn drop(&mut self) {
+        PRESENT_FD.store(-1, Ordering::Relaxed);
+        PRESENT_AWARE.store(false, Ordering::Relaxed);
+        // SAFETY: the descriptor is this struct's and is closed once.
+        unsafe { libc::close(self.0) };
+    }
+}
+
 fn drain_eventfd(fd: RawFd) {
     let mut buf = [0u8; 8];
     // SAFETY: `fd` is the cap-change eventfd, created non-blocking; `buf` is an
