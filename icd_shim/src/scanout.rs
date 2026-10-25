@@ -22,7 +22,7 @@ use gndrm_uapi::wire::{
 };
 use std::ffi::c_void;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Default budget for one exchange, matching the LD_PRELOAD shim's: a daemon
@@ -102,19 +102,15 @@ static CHAN: Mutex<RawFd> = Mutex::new(-1);
 // buffer per session, while a release happens every frame.
 
 /// The frame cap the daemon has declared on this connection, and this shim's
-/// own release schedule.
-struct FrameCapState {
-    /// The target in fps, [`FPS_UNCAPPED`] when the limiter is off.
-    target_fps: u32,
-    /// The instant the previous release freed its slot, in `CLOCK_MONOTONIC`
-    /// ns, or 0 before a release has been seen.
-    last_release_ns: u64,
-}
-
-static CAP: Mutex<FrameCapState> = Mutex::new(FrameCapState {
-    target_fps: FPS_UNCAPPED,
-    last_release_ns: 0,
-});
+/// own release schedule: the instant the previous release freed its slot, in
+/// `CLOCK_MONOTONIC` ns, or 0 before a release has been seen.
+///
+/// Both words are atomics, not one mutex. The target is written on the thread
+/// that reads notes and the schedule on every release, from either the Wayland
+/// dispatch thread or the X11 reaper, so the hot side must be a load and the
+/// target must not be able to serialise two reapers.
+static CAP_FPS: AtomicU32 = AtomicU32::new(FPS_UNCAPPED);
+static CAP_FREE_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Notes adopted on this connection. Read by the census: `notes=0` means no
 /// target ever arrived, which is a different fault from a target whose floor
@@ -166,14 +162,37 @@ pub(crate) fn note_release(now_ns: u64, guest_slot: bool) -> u64 {
     if !guest_slot {
         return now_ns;
     }
-    let mut c = CAP.lock().unwrap_or_else(|e| e.into_inner());
     // The effective rate, not the note's: while frame generation runs the source
     // cap comes from the app through `lsfg::live()`, and the daemon's own note is
     // 0 (the app disarms gamescope's limiter in that case).
-    let target = crate::lsfg::source_cap().unwrap_or(c.target_fps);
-    let free_at = release_floor(target, c.last_release_ns, now_ns);
-    c.last_release_ns = free_at;
-    free_at
+    let target = crate::lsfg::source_cap().unwrap_or_else(|| CAP_FPS.load(Ordering::Relaxed));
+    advance_schedule(&CAP_FREE_NS, target, now_ns)
+}
+
+/// Advance `free_ns` to the instant a release seen at `now_ns` may free its
+/// slot, and return that instant.
+///
+/// Split out from [`note_release`] so the schedule can be driven without the
+/// process-wide cell. A capped schedule advances by compare-and-swap: two
+/// threads reap releases (the Wayland dispatch thread and the X11 reaper), and
+/// a plain load/store would let the slower one overwrite a floor the faster one
+/// already raised.
+#[must_use]
+fn advance_schedule(free_ns: &AtomicU64, target_fps: u32, now_ns: u64) -> u64 {
+    // An uncapped release has no floor and no order to preserve: one store, on
+    // a path that runs once per frame.
+    if period_ns(target_fps) == 0 {
+        free_ns.store(now_ns, Ordering::Relaxed);
+        return now_ns;
+    }
+    let mut last = free_ns.load(Ordering::Relaxed);
+    loop {
+        let free_at = release_floor(target_fps, last, now_ns);
+        match free_ns.compare_exchange_weak(last, free_at, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return free_at,
+            Err(seen) => last = seen,
+        }
+    }
 }
 
 /// Adopt one frame-cap note: the target it carries.
@@ -186,8 +205,7 @@ fn apply_note(note: FrameCapNote) {
         target_fps()
     ));
     NOTES_N.fetch_add(1, Ordering::Relaxed);
-    let mut c = CAP.lock().unwrap_or_else(|e| e.into_inner());
-    c.target_fps = note.fps;
+    CAP_FPS.store(note.fps, Ordering::Relaxed);
 }
 
 /// The target the daemon last declared, [`FPS_UNCAPPED`] when none has: read by
@@ -200,7 +218,7 @@ pub(crate) fn target_fps() -> u32 {
     if let Some(cap) = crate::lsfg::source_cap() {
         return cap;
     }
-    CAP.lock().unwrap_or_else(|e| e.into_inner()).target_fps
+    CAP_FPS.load(Ordering::Relaxed)
 }
 
 /// How many frame-cap notes have been adopted on this connection, for the same
@@ -931,5 +949,34 @@ mod tests {
         for pair in frees.windows(2) {
             assert_eq!(pair[1] - pair[0], period);
         }
+    }
+
+    /// The schedule itself: the same spacing when driven through the atomic a
+    /// release advances, and a recorded instant when no cap is in force.
+    #[test]
+    fn the_schedule_spaces_releases_under_a_cap() {
+        let free_ns = AtomicU64::new(0);
+        let frees: Vec<u64> = (0..5)
+            .map(|i| advance_schedule(&free_ns, 40, 1_000_000_000 + i * 4_000_000))
+            .collect();
+        assert_eq!(
+            frees,
+            vec![
+                1_000_000_000,
+                1_025_000_000,
+                1_050_000_000,
+                1_075_000_000,
+                1_100_000_000,
+            ]
+        );
+        // Two releases that arrive at the same instant still free a period
+        // apart: the second one's floor is the first one's free instant.
+        let free_ns = AtomicU64::new(0);
+        assert_eq!(advance_schedule(&free_ns, 40, 2_000_000_000), 2_000_000_000);
+        assert_eq!(advance_schedule(&free_ns, 40, 2_000_000_000), 2_025_000_000);
+        // Uncapped: no floor, and the cell still tracks the last release so a
+        // cap enabled later paces from it.
+        assert_eq!(advance_schedule(&free_ns, FPS_UNCAPPED, 3), 3);
+        assert_eq!(free_ns.load(Ordering::Relaxed), 3);
     }
 }

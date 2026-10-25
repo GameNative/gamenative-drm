@@ -887,7 +887,12 @@ static bool is_xwayland_process(void)
             buf[n] = 0;
             if (buf[n - 1] == '\n')
                 buf[n - 1] = 0;
-            snprintf(g_process_name, sizeof(g_process_name), "%s", buf);
+            /* The comm is copied, not formatted: a `%s` into the smaller array
+             * is a truncation the compiler cannot prove impossible, and the
+             * name only has to be readable in a log line. */
+            size_t keep = strnlen(buf, sizeof(g_process_name) - 1);
+            memcpy(g_process_name, buf, keep);
+            g_process_name[keep] = '\0';
             hit = strcmp(buf, "Xwayland") == 0;
         }
     }
