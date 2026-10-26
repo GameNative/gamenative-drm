@@ -10159,11 +10159,11 @@ fn mem_type_desc(gd: *mut GnDevice, idx: u32) -> String {
 }
 
 /// Creates one swapchain slot image as a LINEAR, externally-exported image: the
-/// guest's `VK_IMAGE_TILING_LINEAR` is the layout contract on its own. No DRM
-/// format modifier is named or requested in the `pNext` chain — only
-/// `VkExternalMemoryImageCreateInfo{DMA_BUF}` — so the driver always produces
-/// plain scan-out pixels (LINEAR forbids UBWC outright) and DRI3 wayland
-/// present see a modifier of 0. The image is backed by a dma-buf the shim owns
+/// guest's `VK_IMAGE_TILING_LINEAR` is the layout contract when the driver's
+/// row pitch lands on the backing buffer's stride; otherwise the same LINEAR
+/// layout is restated through an explicit DRM-modifier create at that stride.
+/// Either way the driver produces plain scan-out pixels (LINEAR forbids UBWC
+/// outright) and DRI3 wayland present see a modifier of 0. The image is backed by a dma-buf the shim owns
 /// — the daemon's scan-out pool when that channel is up, a local system-heap
 /// allocation otherwise — and bound through the imported-fd path.
 unsafe fn slot_init(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
@@ -10322,6 +10322,51 @@ unsafe fn slot_init_with_usage(
             };
             unsafe { gsl(dev, (*s).image, &sub, &mut l) };
             if l.rowPitch != 0 && (l.rowPitch != u64::from((*s).stride) || l.offset != 0) {
+                // The pool's rows are gralloc's, padded for widths it does not
+                // like (1024 px -> 5120 B on Adreno), and plain LINEAR let the
+                // driver pick width*4. The same LINEAR layout stated explicitly
+                // at the pool's stride is what a driver with DRM-modifier
+                // import (Turnip) takes; one that refuses it goes to the
+                // AHardwareBuffer route below, where the driver owns the layout.
+                let plane = VkSubresourceLayout {
+                    offset: 0,
+                    size: 0,
+                    rowPitch: u64::from((*s).stride),
+                    arrayPitch: 0,
+                    depthPitch: 0,
+                };
+                let explicit = VkImageDrmFormatModifierExplicitCreateInfoEXT {
+                    sType: VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+                    pNext: &ext_img as *const _ as *const c_void,
+                    drmFormatModifier: GN_DRM_MOD_LINEAR,
+                    drmFormatModifierPlaneCount: 1,
+                    pPlaneLayouts: &plane,
+                };
+                let ici2 = VkImageCreateInfo {
+                    pNext: &explicit as *const _ as *const c_void,
+                    tiling: VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+                    ..ici
+                };
+                let mut img2: VkImage = 0;
+                let r2 = unsafe { f.create_image.unwrap()(dev, &ici2, ptr::null(), &mut img2) };
+                crate::logf!(gndrm_obf::obf!(
+                    "proxy slot: LINEAR pitch {} != pool stride {} for {}x{}; explicit LINEAR modifier at the pool stride: {r2}",
+                    l.rowPitch,
+                    (*s).stride,
+                    (*sc).extent.width,
+                    (*sc).extent.height
+                ));
+                if r2 == VK_SUCCESS && img2 != 0 {
+                    unsafe {
+                        if let Some(destroy) = f.destroy_image {
+                            destroy(dev, (*s).image, ptr::null());
+                        }
+                        (*s).image = img2;
+                    }
+                    explicit_layout = true;
+                }
+            }
+            if !explicit_layout && l.rowPitch != 0 && (l.rowPitch != u64::from((*s).stride) || l.offset != 0) {
                 let can_ahb = unsafe {
                     gn_real_device_proc(gd, c"vkGetAndroidHardwareBufferPropertiesANDROID")
                 }
