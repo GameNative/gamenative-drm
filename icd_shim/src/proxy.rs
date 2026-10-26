@@ -6155,11 +6155,16 @@ pub fn set_fake_robustness2(on: bool) {
 /// swapchain handle the driver has never seen — vkd3d-proton asks for it
 /// whenever it resolves, which is why DX12 titles stalled in their present task
 /// while DXVK titles, which never call it, presented normally.
+///
+/// `vkWaitForPresentKHR` is no longer on the list: the shim serves it from its
+/// own swapchain (`gn_vkWaitForPresentKHR`), and the extension names stay here
+/// only so the driver's copies are hidden and the shim's are advertised instead.
+/// Refusing the command while advertising the extension handed the guest a NULL
+/// entry point; DXVK's frame thread called it and spun in exception dispatch.
 fn unimplemented_wsi_ext(name: &CStr) -> bool {
     name == c"VK_KHR_present_wait"
         || name == c"VK_KHR_present_id"
         || name == c"VK_EXT_swapchain_maintenance1"
-        || name == c"vkWaitForPresentKHR"
         || name == c"vkWaitForPresent2KHR"
         || name == c"vkReleaseSwapchainImagesEXT"
 }

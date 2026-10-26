@@ -97,6 +97,22 @@ pub(crate) fn record(id: u64, latch_ns: u64) {
     WAIT_CV.notify_all();
 }
 
+/// The first few wait outcomes, so a log shows whether present waits are being
+/// answered by the daemon, falling through as unarmed, or hitting the bound.
+fn note_outcome(id: u64, what: &str, t0: std::time::Instant) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || n % 600 == 0 {
+        crate::logf!(gndrm_obf::obf!(
+            "present wait #{}: id={} {} after {} us",
+            n,
+            id,
+            what,
+            t0.elapsed().as_micros()
+        ));
+    }
+}
+
 /// `vkWaitForPresentKHR`: block until `id` has been presented, or `timeout_ns`
 /// elapses (`u64::MAX` waits forever). An id that was never armed cannot arrive
 /// and would hang the caller, so it is answered as presented — the guest cannot
@@ -110,19 +126,23 @@ pub(crate) fn wait(id: u64, sc: usize, timeout_ns: u64) -> bool {
     const MAX_WAIT_NS: u64 = 1_000_000_000;
     let bound = if timeout_ns == u64::MAX { MAX_WAIT_NS } else { timeout_ns };
     let deadline = Some(std::time::Instant::now() + Duration::from_nanos(bound));
+    let t0 = std::time::Instant::now();
     let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         if let Some(i) = w.done.iter().position(|&(done, _)| done == id) {
             w.done.remove(i);
+            note_outcome(id, "done", t0);
             return true;
         }
         if !w.armed.iter().any(|&(armed, owner)| armed == id && owner == sc) {
+            note_outcome(id, "unarmed", t0);
             return true;
         }
         w = match deadline {
             Some(d) => {
                 let now = std::time::Instant::now();
                 if now >= d {
+                    note_outcome(id, "timeout", t0);
                     return false;
                 }
                 WAIT_CV
