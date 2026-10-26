@@ -1695,6 +1695,13 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
             // marking later frames with the last one it sent.
             (*s).present_id = 0;
         }
+        // The frame goes to the compositor now. A wait on it is answered at
+        // the latest when the refresh after this commit has passed: a frame
+        // that nothing replaces is never released, and the guest may wait on
+        // it before presenting again (vkd3d-proton does, on its first frame).
+        if (*s).wait_id != 0 {
+            crate::present::note_commit((*s).wait_id, monotonic_ns());
+        }
         // X11 route: the window carries its own content, so the frame is
         // presented into it (DRI3 + Present) instead of committed to a
         // wl_surface. The slot stays in flight until its idle fence
@@ -6716,7 +6723,7 @@ fn wl_setup(dpy: *mut wl_display) -> bool {
 
 /// `clock_gettime(CLOCK_MONOTONIC)` in nanoseconds — the domain the daemon's
 /// release floor is expressed in, so a floor is compared with no conversion.
-fn monotonic_ns() -> u64 {
+pub(crate) fn monotonic_ns() -> u64 {
     // SAFETY: clock_gettime with a valid clock id and a valid out-pointer.
     let ts = unsafe {
         let mut ts: libc::timespec = core::mem::zeroed();
