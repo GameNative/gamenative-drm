@@ -5304,6 +5304,15 @@ const PLACED_NAMES: [&CStr; 11] = [
 ];
 
 fn export_emu_gated(name: &CStr) -> bool {
+    // The features query is served on every route: besides the placed-memory
+    // bits (patched only while that emulation is on) it reports the present-id
+    // and present-wait features the shim serves for its own swapchain, which
+    // the driver underneath answers for a swapchain the guest never uses.
+    // Gated behind placed memory, a Turnip guest read the driver's zeros, so
+    // DXVK never enabled the extensions the shim had advertised.
+    if name == c"vkGetPhysicalDeviceFeatures2" || name == c"vkGetPhysicalDeviceFeatures2KHR" {
+        return false;
+    }
     (!crate::export::enabled() && EXPORT_EMU_NAMES.contains(&name))
         || (!crate::placed::enabled()
             && PLACED_NAMES.contains(&name)
