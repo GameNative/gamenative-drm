@@ -129,6 +129,20 @@ pub(crate) fn complete_on_release(id: u64, release_ns: u64) {
     }
 }
 
+/// The swapchain is going away: nothing armed on it will be released or
+/// latched, so its ids are dropped and every waiter is woken. An id no longer
+/// armed is answered as presented, which is the only answer left to give.
+pub(crate) fn forget_swapchain(sc: usize) {
+    let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    let before = w.armed.len();
+    w.armed.retain(|&(_, owner)| owner != sc);
+    let dropped = before - w.armed.len();
+    drop(w);
+    if dropped != 0 {
+        WAIT_CV.notify_all();
+    }
+}
+
 /// `vkWaitForPresentKHR`: block until `id` has been presented, or `timeout_ns`
 /// elapses (`u64::MAX` waits forever). An id that was never armed cannot arrive
 /// and would hang the caller, so it is answered as presented — the guest cannot

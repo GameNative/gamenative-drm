@@ -2124,6 +2124,10 @@ unsafe extern "C" fn gn_vkDestroySwapchainKHR(
         }
         drop(g);
     }
+    // Ids armed on this swapchain can no longer complete: its buffers are not
+    // coming back. A wait on one (vkd3d-proton waits on the last id of a chain
+    // it has just replaced) would sit at the bound instead.
+    crate::present::forget_swapchain(sc as usize);
     {
         // One line per destroyed swapchain: a swapchain that goes away while the
         // guest keeps rendering is otherwise invisible, and nothing downstream
