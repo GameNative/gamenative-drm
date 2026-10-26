@@ -17,12 +17,12 @@ use std::time::Duration;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR`
 /// (`VK_KHR_present_id`, extension 295, offset 0).
-pub const STYPE_PRESENT_ID_FEATURES: i32 = 1_000_294_000;
+pub const STYPE_PRESENT_ID_FEATURES: i32 = 1_000_294_001;
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR`
 /// (`VK_KHR_present_wait`, extension 249, offset 0).
 pub const STYPE_PRESENT_WAIT_FEATURES: i32 = 1_000_248_000;
 /// `VK_STRUCTURE_TYPE_PRESENT_ID_KHR`: chained in `VkPresentInfoKHR`.
-pub const STYPE_PRESENT_ID: i32 = 1_000_294_001;
+pub const STYPE_PRESENT_ID: i32 = 1_000_294_000;
 
 /// The name the guest sees; served here, not by the driver.
 pub const EXT_PRESENT_ID: &core::ffi::CStr = c"VK_KHR_present_id";
@@ -110,6 +110,22 @@ fn note_outcome(id: u64, what: &str, t0: std::time::Instant) {
             what,
             t0.elapsed().as_micros()
         ));
+    }
+}
+
+/// The compositor released the frame's buffer: it has been taken into the
+/// output, and the next refresh shows it. Answers the wait when no latch report
+/// came first; a daemon that did report is left as the authority.
+pub(crate) fn complete_on_release(id: u64, release_ns: u64) {
+    if id == 0 {
+        return;
+    }
+    let armed = {
+        let w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        w.armed.iter().any(|&(armed, _)| armed == id)
+    };
+    if armed {
+        record(id, release_ns);
     }
 }
 

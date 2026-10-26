@@ -651,11 +651,15 @@ unsafe fn x11_reap(sc: *mut GnSwapchain) {
             // The server is done with the pixmap: the slot is free, and the cap
             // (if any) is applied when the guest asks for it again.
             let _g = unsafe { (*sc).shared.lock().unwrap() };
-            unsafe {
+            let wait_id = unsafe {
                 (*s).in_flight = false;
                 (*sc).cv_free.notify_all();
-            }
+                core::mem::replace(&mut (*s).wait_id, 0)
+            };
             drop(_g);
+            if wait_id != 0 {
+                crate::present::complete_on_release(wait_id, monotonic_ns());
+            }
             if logging {
                 N_REL.fetch_add(1, Ordering::Relaxed);
                 if rate_ok(&RATE_REL, RATE_EVERY) {
@@ -802,6 +806,7 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
                 xpix: 0,
                 xfence: 0,
                 present_id: 0,
+            wait_id: 0,
                 fence: 0,
                 sem: 0,
                 acquired: false,
@@ -1924,6 +1929,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             xpix: 0,
             xfence: 0,
             present_id: 0,
+            wait_id: 0,
             fence: 0,
             sem: 0,
             acquired: false,
@@ -2550,6 +2556,36 @@ unsafe fn present_dispatch(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
 }
 
 // Present: the app's render completion
+/// Once per process: the sTypes chained on the first present, and the id read
+/// from them. Says whether a VkPresentIdKHR the guest chains reaches this call.
+fn log_present_chain_once(p_next: *const c_void, id: u64) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    #[repr(C)]
+    struct Head {
+        s_type: i32,
+        p_next: *const c_void,
+    }
+    let mut types = Vec::new();
+    let mut head = p_next.cast::<Head>();
+    for _ in 0..64 {
+        if head.is_null() {
+            break;
+        }
+        // SAFETY: a live VkPresentInfoKHR chain; only the two leading members are read.
+        let node = unsafe { &*head };
+        types.push(node.s_type);
+        head = node.p_next.cast::<Head>();
+    }
+    crate::logf!(gndrm_obf::obf!(
+        "proxy present: first pNext chain sTypes={:?} present_id={}",
+        types,
+        id
+    ));
+}
+
 unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentInfoKHR) -> VkResult {
     // The WSI census exists to be read under `GNDRM_LOG_VKSHIM`, and every line
     // that prints it is gated the same way, so its accounting is skipped when
@@ -2618,8 +2654,14 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
         // The present id the guest chained for this swapchain, if any: the
         // frame is waited on by it, and the daemon is told at the commit.
         let present_id = unsafe { crate::present::present_id(pi.pNext, i) };
+        if i == 0 {
+            log_present_chain_once(pi.pNext, present_id);
+        }
         if present_id != 0 {
-            unsafe { (*slot).present_id = present_id };
+            unsafe {
+                (*slot).present_id = present_id;
+                (*slot).wait_id = present_id;
+            }
             crate::present::arm(present_id, sc as usize);
         }
         let (waits, mut n_waits) = if chain_prev == 0 {
@@ -6393,6 +6435,10 @@ pub struct GnSlot {
     // chained none: read at the commit to mark the frame for the daemon, which
     // reports it back once the transaction presenting it latched.
     pub present_id: u64,
+    // The same id, kept until the slot comes back: the compositor's release is
+    // the one completion every route observes, so a wait on it is answered
+    // there when the daemon's latch report has not arrived first.
+    pub wait_id: u64,
     // The daemon's scan-out inode for this slot's buffer, or 0 when the buffer
     // was allocated locally. Identity and logging only: the release floor is
     // this shim's own, one period after the last release, and is not filed
@@ -6693,7 +6739,11 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
         }
         (*slot).in_flight = false;
         (*sc).cv_free.notify_all();
+        let wait_id = core::mem::replace(&mut (*slot).wait_id, 0);
         drop(_g);
+        if wait_id != 0 {
+            crate::present::complete_on_release(wait_id, monotonic_ns());
+        }
         if logging {
             N_REL.fetch_add(1, Ordering::Relaxed);
             if rate_ok(&RATE_REL, RATE_EVERY) {
