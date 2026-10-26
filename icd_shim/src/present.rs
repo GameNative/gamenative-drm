@@ -34,6 +34,9 @@ pub const EXT_PRESENT_WAIT: &core::ffi::CStr = c"VK_KHR_present_wait";
 struct Waits {
     armed: Vec<(u64, usize)>,
     done: Vec<(u64, u64)>,
+    /// Ids whose frame has been committed, with the commit time: the latest a
+    /// wait on them is answered is two refresh periods after that.
+    committed: Vec<(u64, u64)>,
 }
 
 /// Bound on both lists: the ids in flight are a handful of frames, so anything
@@ -43,7 +46,29 @@ const CAP: usize = 64;
 static WAITS: Mutex<Waits> = Mutex::new(Waits {
     armed: Vec::new(),
     done: Vec::new(),
+    committed: Vec::new(),
 });
+
+/// Two refresh periods after a commit, the frame has been latched whatever the
+/// compositor does with the buffer afterwards.
+fn commit_grace_ns() -> u64 {
+    let hz = crate::lsfg::refresh_hz().max(30) as u64;
+    2 * (1_000_000_000 / hz)
+}
+
+/// The frame carrying `id` has been committed to the compositor.
+pub(crate) fn note_commit(id: u64, commit_ns: u64) {
+    if id == 0 {
+        return;
+    }
+    let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    if w.committed.len() >= CAP {
+        w.committed.remove(0);
+    }
+    w.committed.push((id, commit_ns));
+    drop(w);
+    WAIT_CV.notify_all();
+}
 
 static WAIT_CV: Condvar = Condvar::new();
 
@@ -89,6 +114,7 @@ pub(crate) fn record(id: u64, latch_ns: u64) {
     if let Some(i) = w.armed.iter().position(|&(armed, _)| armed == id) {
         w.armed.remove(i);
     }
+    w.committed.retain(|&(c, _)| c != id);
     if w.done.len() >= CAP {
         w.done.remove(0);
     }
@@ -129,6 +155,20 @@ pub(crate) fn complete_on_release(id: u64, release_ns: u64) {
     }
 }
 
+/// The swapchain is going away: nothing armed on it will be released or
+/// latched, so its ids are dropped and every waiter is woken. An id no longer
+/// armed is answered as presented, which is the only answer left to give.
+pub(crate) fn forget_swapchain(sc: usize) {
+    let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    let before = w.armed.len();
+    w.armed.retain(|&(_, owner)| owner != sc);
+    let dropped = before - w.armed.len();
+    drop(w);
+    if dropped != 0 {
+        WAIT_CV.notify_all();
+    }
+}
+
 /// `vkWaitForPresentKHR`: block until `id` has been presented, or `timeout_ns`
 /// elapses (`u64::MAX` waits forever). An id that was never armed cannot arrive
 /// and would hang the caller, so it is answered as presented — the guest cannot
@@ -154,6 +194,26 @@ pub(crate) fn wait(id: u64, sc: usize, timeout_ns: u64) -> bool {
             note_outcome(id, "unarmed", t0);
             return true;
         }
+        // A committed frame counts as latched two refresh periods after its
+        // commit, whether or not its buffer ever comes back.
+        let latch_by = w
+            .committed
+            .iter()
+            .find(|&&(c, _)| c == id)
+            .map(|&(_, ns)| ns.saturating_add(commit_grace_ns()));
+        if let Some(latch_ns) = latch_by {
+            let now_ns = crate::proxy::monotonic_ns();
+            if now_ns >= latch_ns {
+                drop(w);
+                record(id, latch_ns);
+                let mut w2 = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(i) = w2.done.iter().position(|&(done, _)| done == id) {
+                    w2.done.remove(i);
+                }
+                note_outcome(id, "latched", t0);
+                return true;
+            }
+        }
         w = match deadline {
             Some(d) => {
                 let now = std::time::Instant::now();
@@ -161,8 +221,13 @@ pub(crate) fn wait(id: u64, sc: usize, timeout_ns: u64) -> bool {
                     note_outcome(id, "timeout", t0);
                     return false;
                 }
+                let mut slice = d - now;
+                if let Some(latch_ns) = latch_by {
+                    let left = latch_ns.saturating_sub(crate::proxy::monotonic_ns());
+                    slice = slice.min(Duration::from_nanos(left.max(1)));
+                }
                 WAIT_CV
-                    .wait_timeout(w, d - now)
+                    .wait_timeout(w, slice)
                     .unwrap_or_else(|e| e.into_inner())
                     .0
             }

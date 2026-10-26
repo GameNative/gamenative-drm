@@ -1695,6 +1695,13 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
             // marking later frames with the last one it sent.
             (*s).present_id = 0;
         }
+        // The frame goes to the compositor now. A wait on it is answered at
+        // the latest when the refresh after this commit has passed: a frame
+        // that nothing replaces is never released, and the guest may wait on
+        // it before presenting again (vkd3d-proton does, on its first frame).
+        if (*s).wait_id != 0 {
+            crate::present::note_commit((*s).wait_id, monotonic_ns());
+        }
         // X11 route: the window carries its own content, so the frame is
         // presented into it (DRI3 + Present) instead of committed to a
         // wl_surface. The slot stays in flight until its idle fence
@@ -2124,6 +2131,10 @@ unsafe extern "C" fn gn_vkDestroySwapchainKHR(
         }
         drop(g);
     }
+    // Ids armed on this swapchain can no longer complete: its buffers are not
+    // coming back. A wait on one (vkd3d-proton waits on the last id of a chain
+    // it has just replaced) would sit at the bound instead.
+    crate::present::forget_swapchain(sc as usize);
     {
         // One line per destroyed swapchain: a swapchain that goes away while the
         // guest keeps rendering is otherwise invisible, and nothing downstream
@@ -5304,6 +5315,15 @@ const PLACED_NAMES: [&CStr; 11] = [
 ];
 
 fn export_emu_gated(name: &CStr) -> bool {
+    // The features query is served on every route: besides the placed-memory
+    // bits (patched only while that emulation is on) it reports the present-id
+    // and present-wait features the shim serves for its own swapchain, which
+    // the driver underneath answers for a swapchain the guest never uses.
+    // Gated behind placed memory, a Turnip guest read the driver's zeros, so
+    // DXVK never enabled the extensions the shim had advertised.
+    if name == c"vkGetPhysicalDeviceFeatures2" || name == c"vkGetPhysicalDeviceFeatures2KHR" {
+        return false;
+    }
     (!crate::export::enabled() && EXPORT_EMU_NAMES.contains(&name))
         || (!crate::placed::enabled()
             && PLACED_NAMES.contains(&name)
@@ -6703,7 +6723,7 @@ fn wl_setup(dpy: *mut wl_display) -> bool {
 
 /// `clock_gettime(CLOCK_MONOTONIC)` in nanoseconds — the domain the daemon's
 /// release floor is expressed in, so a floor is compared with no conversion.
-fn monotonic_ns() -> u64 {
+pub(crate) fn monotonic_ns() -> u64 {
     // SAFETY: clock_gettime with a valid clock id and a valid out-pointer.
     let ts = unsafe {
         let mut ts: libc::timespec = core::mem::zeroed();
