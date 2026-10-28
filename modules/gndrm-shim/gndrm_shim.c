@@ -1420,7 +1420,10 @@ static int scanout_exchange(uint32_t w, uint32_t h, uint64_t len,
     /* MSG_NOSIGNAL: a daemon that has closed this channel must make the send
      * fail with EPIPE so scanout_request's retry can re-establish it, rather
      * than raising SIGPIPE and taking the client down. */
-    if (sendmsg(g_scanout_fd, &msg, MSG_NOSIGNAL) < 0)
+    ssize_t sent;
+    while ((sent = sendmsg(g_scanout_fd, &msg, MSG_NOSIGNAL)) < 0 && errno == EINTR)
+        ;
+    if (sent < 0)
         return -errno;
 
     uint8_t buf[sizeof(struct gndrm_scanout_resp)];
@@ -1432,7 +1435,14 @@ static int scanout_exchange(uint32_t w, uint32_t h, uint64_t len,
     rmsg.msg_iovlen = 1;
     rmsg.msg_control = cbuf;
     rmsg.msg_controllen = sizeof(cbuf);
-    ssize_t n = recvmsg(g_scanout_fd, &rmsg, 0);
+    ssize_t n;
+    for (;;) {
+        rmsg.msg_controllen = sizeof(cbuf);
+        rmsg.msg_flags = 0;
+        n = recvmsg(g_scanout_fd, &rmsg, 0);
+        if (n >= 0 || errno != EINTR)
+            break;
+    }
     if (n < 0)
         return -errno;
 
