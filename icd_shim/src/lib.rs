@@ -8,9 +8,8 @@
 //! wayland platform compiled in — is a fixed build the user cannot pick per
 //! game. This shim sits between the loader and the real driver:
 //!
-//!   - gamescope's own process (comm contains "gamescope") gets the payload's
-//!     libvulkan_freedreno.so, the build its renderer is verified against.
-//!   - every other process (wine/DXVK) gets the user-selected adrenotools
+//!   - every process (gamescope, Xwayland and wine/DXVK alike, whether it
+//!     runs as itself or through linker64) gets the user-selected adrenotools
 //!     driver, opened through libadrenotools with the same call flow
 //!     libvulkan_wrapper.so uses (env-driven driver/hooks paths, temp/ dir for
 //!     the patched copies). A driver advertising VK_KHR_wayland_surface is
@@ -593,7 +592,28 @@ fn init_once() {
         try_system_driver();
     }
     if kgsl && unsafe { DRIVER.handle }.is_null() {
-        if is_gamescope_process() {
+        if std::env::var_os("GN_VKSHIM_NO_ADRENOTOOLS").is_none() {
+            try_adrenotools();
+        }
+        // A wrapper container with no adrenotools driver is on the system
+        // driver: present through it (AHardwareBuffer import) before
+        // settling for the payload's own driver.
+        if unsafe { DRIVER.handle }.is_null()
+            && !system_driver_forced()
+            && !is_gamescope_binary()
+            && !is_xwayland_binary()
+            && std::env::var_os("ADRENOTOOLS_DRIVER_PATH").is_none_or(|p| p.is_empty())
+            && std::env::var_os("GNDRM_DRIVER_TYPE")
+                .as_deref()
+                .and_then(is_wrapper_driver)
+                .unwrap_or(false)
+        {
+            logf!(gndrm_obf::obf!(
+                "wrapper driver without adrenotools: trying the system vulkan driver"
+            ));
+            try_system_driver();
+        }
+        if unsafe { DRIVER.handle }.is_null() {
             let h = unsafe {
                 libc::dlopen(
                     c"libvulkan_freedreno.so".as_ptr(),
@@ -601,7 +621,7 @@ fn init_once() {
                 )
             };
             logf!(gndrm_obf::obf!(
-                "gamescope process: payload freedreno {}",
+                "falling back to payload freedreno {}",
                 if h.is_null() {
                     dlerror_str()
                 } else {
@@ -609,45 +629,6 @@ fn init_once() {
                 }
             ));
             unsafe { DRIVER.handle = h };
-        } else {
-            if std::env::var_os("GN_VKSHIM_NO_ADRENOTOOLS").is_none() {
-                try_adrenotools();
-            }
-            // A wrapper container with no adrenotools driver is on the system
-            // driver: present through it (AHardwareBuffer import) before
-            // settling for the payload's own driver.
-            if unsafe { DRIVER.handle }.is_null()
-                && !system_driver_forced()
-                && !is_gamescope_binary()
-                && !is_xwayland_binary()
-                && std::env::var_os("ADRENOTOOLS_DRIVER_PATH").is_none_or(|p| p.is_empty())
-                && std::env::var_os("GNDRM_DRIVER_TYPE")
-                    .as_deref()
-                    .and_then(is_wrapper_driver)
-                    .unwrap_or(false)
-            {
-                logf!(gndrm_obf::obf!(
-                    "wrapper driver without adrenotools: trying the system vulkan driver"
-                ));
-                try_system_driver();
-            }
-            if unsafe { DRIVER.handle }.is_null() {
-                let h = unsafe {
-                    libc::dlopen(
-                        c"libvulkan_freedreno.so".as_ptr(),
-                        libc::RTLD_NOW | libc::RTLD_LOCAL,
-                    )
-                };
-                logf!(gndrm_obf::obf!(
-                    "guest process: falling back to payload freedreno {}",
-                    if h.is_null() {
-                        dlerror_str()
-                    } else {
-                        "loaded".into()
-                    }
-                ));
-                unsafe { DRIVER.handle = h };
-            }
         }
     }
     let handle = unsafe { DRIVER.handle };

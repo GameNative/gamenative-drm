@@ -183,18 +183,28 @@ fn a_native_driver_never_drives_a_container_icd() {
 }
 
 #[test]
-fn gamescope_process_gets_payload_freedreno() {
+fn gamescope_process_takes_the_guest_route() {
+    let dir = target_dir();
+    let (code, out, err) = run_probe(&Scenario {
+        comm: Some("gamescope"),
+        env: adrenotools_env(&dir),
+    });
+    assert_ok(code, &out, &err);
+    assert!(err.contains("via WSI proxy"), "stderr:\n{err}");
+    assert!(!err.contains("payload freedreno"), "stderr:\n{err}");
+}
+
+#[test]
+fn gamescope_process_without_env_falls_back_to_freedreno() {
     let (code, out, err) = run_probe(&Scenario {
         comm: Some("gamescope"),
         env: vec![],
     });
     assert_ok(code, &out, &err);
     assert!(
-        err.contains("gamescope process: payload freedreno loaded"),
+        err.contains("falling back to payload freedreno loaded"),
         "stderr:\n{err}"
     );
-    // Must NOT take the adrenotools path even though comm is gamescope.
-    assert!(!err.contains("adrenotools"), "stderr:\n{err}");
 }
 
 #[test]
