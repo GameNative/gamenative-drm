@@ -5126,6 +5126,16 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
         },
     ),
     (
+        c"vkGetPhysicalDeviceProperties",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                crate::placed::gn_vkGetPhysicalDeviceProperties
+                    as unsafe extern "C" fn(VkPhysicalDevice, *mut VkPhysicalDeviceProperties),
+            )
+        },
+    ),
+    (
         c"vkGetPhysicalDeviceProperties2",
         HandlerScope::ProxyOnly,
         unsafe {
@@ -5321,7 +5331,11 @@ fn export_emu_gated(name: &CStr) -> bool {
     // the driver underneath answers for a swapchain the guest never uses.
     // Gated behind placed memory, a Turnip guest read the driver's zeros, so
     // DXVK never enabled the extensions the shim had advertised.
-    if name == c"vkGetPhysicalDeviceFeatures2" || name == c"vkGetPhysicalDeviceFeatures2KHR" {
+    if name == c"vkGetPhysicalDeviceFeatures2"
+        || name == c"vkGetPhysicalDeviceFeatures2KHR"
+        || name == c"vkGetPhysicalDeviceProperties2"
+        || name == c"vkGetPhysicalDeviceProperties2KHR"
+    {
         return false;
     }
     (!crate::export::enabled() && EXPORT_EMU_NAMES.contains(&name))

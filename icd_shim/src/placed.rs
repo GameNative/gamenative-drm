@@ -192,6 +192,11 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceProperties2(pd: VkPhysicalDevice,
         return;
     };
     unsafe { crate::divisor::properties2(p, &|q| real(pd, q)) };
+    if !p.is_null() {
+        unsafe {
+            spoof_identity(&mut *(p.cast::<u8>().add(16) as *mut VkPhysicalDeviceProperties))
+        };
+    }
     if !enabled() || p.is_null() {
         return;
     }
@@ -199,6 +204,58 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceProperties2(pd: VkPhysicalDevice,
         as *mut PlacedProperties;
     if !pp.is_null() {
         unsafe { (*pp).minPlacedMemoryMapAlignment = page_size() };
+    }
+}
+
+pub unsafe extern "C" fn gn_vkGetPhysicalDeviceProperties(
+    pd: VkPhysicalDevice,
+    p: *mut VkPhysicalDeviceProperties,
+) {
+    let Some(real) = (unsafe {
+        real_pd::<PFN_vkGetPhysicalDeviceProperties>(pd, &[c"vkGetPhysicalDeviceProperties"])
+    }) else {
+        return;
+    };
+    unsafe { real(pd, p) };
+    if !p.is_null() {
+        unsafe { spoof_identity(&mut *p) };
+    }
+}
+
+// The same GPU identity the X11 wrapper ICD reports, so a game (and its DRM)
+// sees one GPU on either display server. driverID stays the driver's own.
+fn spoof_identity(p: &mut VkPhysicalDeviceProperties) {
+    if !crate::is_guest_process() {
+        return;
+    }
+    if let Some(name) = std::env::var_os("WRAPPER_DEVICE_NAME").filter(|v| !v.is_empty()) {
+        let name = [b"Wrapper(", name.as_encoded_bytes(), b")"].concat();
+        let n = name.len().min(VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1);
+        p.deviceName.fill(0);
+        for (d, s) in p.deviceName.iter_mut().zip(&name[..n]) {
+            *d = *s as std::ffi::c_char;
+        }
+    }
+    let id = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&v| v > 0)
+    };
+    if let Some(v) = id("WRAPPER_DEVICE_ID") {
+        p.deviceID = v;
+    }
+    if let Some(v) = id("WRAPPER_VENDOR_ID") {
+        p.vendorID = v;
+    }
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        crate::logi!(gndrm_obf::obf!(
+            "proxy: guest sees device '{}' vendor {:#x} device {:#x}",
+            unsafe { CStr::from_ptr(p.deviceName.as_ptr()) }.to_string_lossy(),
+            p.vendorID,
+            p.deviceID
+        ));
     }
 }
 
@@ -649,5 +706,22 @@ mod tests {
         // The map-placed bit is what a caller asks for; the extension name is
         // the one advertised in place of the driver's.
         assert_eq!(EXT_NAME.to_str().unwrap(), "VK_EXT_map_memory_placed");
+    }
+
+    #[test]
+    fn identity_follows_the_wrapper_env() {
+        let mut p: VkPhysicalDeviceProperties = unsafe { std::mem::zeroed() };
+        p.vendorID = 0x1002;
+        p.deviceID = 0x163f;
+        for (d, s) in p.deviceName.iter_mut().zip(b"AMD Custom GPU 0405 (RADV VANGOGH)") {
+            *d = *s as std::ffi::c_char;
+        }
+        std::env::set_var("WRAPPER_DEVICE_NAME", "NVIDIA GeForce GTX 480");
+        std::env::set_var("WRAPPER_DEVICE_ID", "1728");
+        std::env::set_var("WRAPPER_VENDOR_ID", "4318");
+        spoof_identity(&mut p);
+        let name = unsafe { CStr::from_ptr(p.deviceName.as_ptr()) };
+        assert_eq!(name.to_str().unwrap(), "Wrapper(NVIDIA GeForce GTX 480)");
+        assert_eq!((p.vendorID, p.deviceID), (0x10de, 0x6c0));
     }
 }
