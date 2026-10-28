@@ -82,6 +82,9 @@ pub struct AHardwareBufferDesc {
 /// buffer to dump the published frame (see `asc::dump_published`); gamescope
 /// still maps the raw dma-buf to render, it does not go through the lock.
 pub const AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN: u64 = 1 << 1;
+/// `AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN`: only the foreign-buffer copy
+/// targets carry it (see `foreign`).
+pub const AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN: u64 = 3 << 4;
 pub const AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE: u64 = 1 << 8;
 pub const AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT: u64 = 1 << 9;
 pub const AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY: u64 = 1 << 11;

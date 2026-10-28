@@ -477,7 +477,7 @@ impl Device {
         };
         // Resolve the buffer identity the presenter will look up (the GEM may
         // already be orphaned-but-FB-referenced, so search both tables).
-        let ino = fb.as_ref().and_then(|fb| {
+        let gem = fb.as_ref().and_then(|fb| {
             fb.handles
                 .first()
                 .copied()
@@ -488,7 +488,13 @@ impl Device {
                         .get(&h)
                         .or_else(|| self.stores.gems_closed.get(&h))
                 })
-                .map(|gem| gem.ino)
+        });
+        let ino = gem.map(|gem| gem.ino);
+        let src_fd = gem.and_then(|gem| {
+            // SAFETY: `gem.fd` is the store's live duplicate; the new
+            // descriptor is owned by the job.
+            let fd = unsafe { libc::fcntl(gem.fd, libc::F_DUPFD_CLOEXEC, 0) };
+            (fd >= 0).then_some(fd)
         });
         // Inodes still backed by a GEM object — the presenter's retire signal
         // ("client stopped importing"). The pool reuses a retired buffer only
@@ -534,6 +540,7 @@ impl Device {
             fb,
             plane,
             ino,
+            src_fd,
             live_inos,
             fence: fence_fd,
             event,

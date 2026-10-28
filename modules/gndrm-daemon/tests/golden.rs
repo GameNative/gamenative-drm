@@ -2415,3 +2415,82 @@ fn commit_probe_is_silent_without_the_session_flag() {
     }
     let _ = handle;
 }
+
+/// Per publish: the committed inode and the inode of the source descriptor.
+type SourceSeen = Arc<Mutex<Vec<(Option<u64>, Option<u64>)>>>;
+
+/// A presenter that records which source descriptor each publish was handed.
+struct SourceSpyPresenter {
+    seen: SourceSeen,
+}
+
+impl Presenter for SourceSpyPresenter {
+    fn publish(
+        &mut self,
+        _fb: &Framebuffer,
+        _plane: &PlaneState,
+        _ino: Option<u64>,
+        _live_inos: &HashSet<u64>,
+        fence: Option<RawFd>,
+    ) {
+        if let Some(fd) = fence {
+            // SAFETY: the mock owns the fence the device handed it.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    fn publish_with_source(
+        &mut self,
+        fb: &Framebuffer,
+        plane: &PlaneState,
+        ino: Option<u64>,
+        src_fd: Option<RawFd>,
+        live_inos: &HashSet<u64>,
+        fence: Option<RawFd>,
+    ) {
+        let src_ino = src_fd.map(|fd| {
+            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+            // SAFETY: the descriptor is live for the call.
+            assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0);
+            st.st_ino as u64
+        });
+        self.seen.lock().unwrap().push((ino, src_ino));
+        self.publish(fb, plane, ino, live_inos, fence);
+    }
+}
+
+/// The presenter is handed a live descriptor for the committed buffer, even
+/// after the client closed its GEM handle, so it can copy a buffer it does
+/// not own.
+#[test]
+fn presenter_gets_the_committed_buffer_as_a_source() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut d = Device::new(
+        PanelDesc::default(),
+        Box::new(SourceSpyPresenter {
+            seen: Arc::clone(&seen),
+        }),
+    );
+    d.set_clock(Box::new(|| (1000, 500)));
+    let blob = create_mode_blob(&mut d).0;
+    let (handle, fb, fd) = import_fb(&mut d);
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_GEM_CLOSE,
+        &pod(&DrmGemClose { handle, pad: 0 }),
+    ));
+    let req = atomic_req(
+        &modeset_sets(&d, blob, fb),
+        DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_PAGE_FLIP_EVENT,
+        0xA1,
+    );
+    ok(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req));
+    let _ = wait_flip(&mut d, 2000);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let (ino, src_ino) = seen[0];
+    assert!(ino.is_some());
+    assert_eq!(ino, src_ino);
+    // SAFETY: the test's own reference.
+    unsafe { libc::close(fd) };
+}
