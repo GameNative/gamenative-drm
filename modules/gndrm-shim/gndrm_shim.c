@@ -1693,6 +1693,45 @@ static int scanout_redirect(void *arg)
     return scanout_hand_out(a, 0, 0, a->len);
 }
 
+/*
+ * Kernels without dma-buf heaps (4.12-5.4 ION kernels) have no
+ * /dev/dma_heap/system, so Turnip's kgsl backend allocates exportable memory
+ * with ION_IOC_NEW_ALLOC on /dev/ion instead. The same scan-out redirect
+ * applies; only the struct layout differs (fd at offset 16). Legacy ION
+ * (handle-based, 32-byte struct on LP64) has a different request number and is
+ * never matched. Only system-heap requests are redirected; the kernel's ION
+ * fds are always O_CLOEXEC, so the daemon fd is too.
+ */
+#define GNDRM_IOCTL_ION_ALLOC 0xc0184900u /* _IOWR('I', 0, ion_new_allocation_data) */
+#define GNDRM_ION_SYSTEM_HEAPS ((1u << 25) | 1u) /* msm ION_SYSTEM_HEAP_ID, generic ION_HEAP_SYSTEM */
+
+struct gndrm_ion_alloc {
+    uint64_t len;
+    uint32_t heap_id_mask;
+    uint32_t flags;
+    uint32_t fd;
+    uint32_t unused;
+};
+_Static_assert(sizeof(struct gndrm_ion_alloc) == 24,
+               "ion_new_allocation_data is 24 bytes on the wire");
+
+static int ion_scanout_redirect(void *arg)
+{
+    struct gndrm_ion_alloc *ia = arg;
+    if (!ia || !ia->heap_id_mask || (ia->heap_id_mask & ~GNDRM_ION_SYSTEM_HEAPS))
+        return -1;
+    struct gndrm_dmaheap_alloc a = {
+        .len = ia->len,
+        .fd = 0,
+        .fd_flags = O_RDWR | O_CLOEXEC,
+        .heap_flags = 0,
+    };
+    if (scanout_redirect(&a) != 0)
+        return -1;
+    ia->fd = a.fd;
+    return 0;
+}
+
 static int drm_ioctl(int fd, unsigned long req, void *arg)
 {
     (void)fd; /* fd validity already established by the dispatcher */
@@ -2141,6 +2180,8 @@ int ioctl(int fd, unsigned long req, ...)
 
     if (req_l == GNDRM_IOCTL_DMAHEAP_ALLOC && scanout_redirect(arg) == 0)
         return 0;
+    if (req_l == GNDRM_IOCTL_ION_ALLOC && ion_scanout_redirect(arg) == 0)
+        return 0;
 
     if (is_our_fd(fd))
         return drm_ioctl(fd, req_l, arg);
@@ -2159,6 +2200,13 @@ int ioctl(int fd, unsigned long req, ...)
             LOG("scanout: alloc len=%llu left to kernel -> fd ino=%llu\n",
                 (unsigned long long)a->len,
                 (unsigned long long)fd_ino((int)a->fd));
+    }
+    if (req_l == GNDRM_IOCTL_ION_ALLOC && ret == 0) {
+        struct gndrm_ion_alloc *ia = arg;
+        if (ia && ia->len >= GNDRM_SCANOUT_MIN_LEN && alloc_log_ok())
+            LOG("scanout: ion alloc len=%llu heaps=0x%x left to kernel -> fd ino=%llu\n",
+                (unsigned long long)ia->len, ia->heap_id_mask,
+                (unsigned long long)fd_ino((int)ia->fd));
     }
     return ret;
 }
