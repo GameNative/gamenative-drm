@@ -284,6 +284,12 @@ fn is_gamescope_binary() -> bool {
         .any(|a| a.rsplit(|&b| b == b'/').next() == Some(b"gamescope".as_slice()))
 }
 
+/// The guest's processes, as opposed to gamescope and its Xwayland.
+pub(crate) fn is_guest_process() -> bool {
+    static GUEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GUEST.get_or_init(|| !is_gamescope_binary() && !is_xwayland_binary())
+}
+
 /// gamescope's Xwayland, also run through the linker. It keeps the payload
 /// driver: it is not the guest and must not take the guest's driver route.
 fn is_xwayland_binary() -> bool {
