@@ -64,7 +64,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use gndrm_daemon::diag::{self, Diag, Reply, Role, Stage, State, TrackedMutex, LOCK_SCANOUT_POOL};
-use gndrm_daemon::scanout::{Geometry, Removed, Reservation as CacheReservation, ReusePool};
+use gndrm_daemon::scanout::{
+    serves_len, Geometry, Removed, Reservation as CacheReservation, ReusePool,
+};
 use gndrm_daemon::{FrameCap, Framebuffer, PlaneState, Presenter};
 use gndrm_uapi::wire::{
     FrameAcquired, FrameCapSubscribe, LsfgConfig, PresentDone, PresentMark, ScanoutAllocReq,
@@ -2320,7 +2322,7 @@ pub fn serve_scanout(
                             // as it asked for; this one is shorter, so it cannot
                             // satisfy the request. Hand it back for a request it
                             // does fit and allocate instead.
-                            if req.is_length_only() && size < req.len {
+                            if req.is_length_only() && !serves_len(size, req.len) {
                                 // SAFETY: `fd` is a fresh descriptor this call owns.
                                 unsafe { libc::close(fd) };
                                 let geom = Geometry {
@@ -2393,7 +2395,7 @@ pub fn serve_scanout(
                 Ok(Reservation::Warm(warm)) => {
                     // The spare must satisfy a length-only request just like a
                     // reused buffer; put it back and allocate when it does not.
-                    if req.is_length_only() && warm.buffer.size < req.len {
+                    if req.is_length_only() && !serves_len(warm.buffer.size, req.len) {
                         pool.lock(Role::Scanout).put_warm(warm);
                         next = pool.lock(Role::Scanout).begin_cold();
                         continue;
@@ -2445,7 +2447,7 @@ pub fn serve_scanout(
                             // the capacity and the buffer back so the allocation
                             // falls through to the kernel rather than describing a
                             // dma-buf larger than it is.
-                            if req.is_length_only() && buffer.size < req.len {
+                            if req.is_length_only() && !serves_len(buffer.size, req.len) {
                                 pool.lock(Role::Scanout).abort_alloc();
                                 // SAFETY: `buffer.fd` is a fresh descriptor this
                                 // call owns, and `ahb` holds the one reference the

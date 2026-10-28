@@ -39,6 +39,13 @@ const ROW_ALIGN_MIN: u64 = 64;
 const ROW_ALIGN_MAX: u64 = 4096;
 const PAGE_LEN: u64 = 4096;
 
+/// Whether a buffer whose real allocation length (`st_size`) is `buffer_len`
+/// can answer a length-only request for `requested_len` bytes.
+#[must_use]
+pub fn serves_len(buffer_len: u64, requested_len: u64) -> bool {
+    buffer_len >= requested_len
+}
+
 /// Geometry a pooled buffer can serve. A free buffer only matches a request of
 /// the exact same width, height and format.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -231,6 +238,13 @@ impl<T: Copy> ReusePool<T> {
     /// row-padded linear length is exactly `len` serves it, the least padded
     /// first, so a mode-sized buffer resolves before its real length has been
     /// registered by a framebuffer or the spare.
+    ///
+    /// The resolved geometry is a guess about the caller's layout, not a
+    /// promise about the buffer's size: two geometries can share a length
+    /// (tight 1280x960 and 1280x800 with 6144 B rows are both 4915200 B), and
+    /// the buffer allocated for the one picked may be shorter than `len`. The
+    /// caller must check the handed-out buffer's real length with
+    /// [`serves_len`] and refuse the request when it does not hold.
     #[must_use]
     pub fn resolve_len(&self, len: u64, format: u32) -> Option<Geometry> {
         if let Some(geom) = self.by_len.get(&(len, format)) {
@@ -869,12 +883,33 @@ mod tests {
     }
 
     #[test]
+    fn padded_match_shorter_than_the_request_is_refused() {
+        let mut pool = ReusePool::<Id>::new(4);
+        let window = geom(1280, 800);
+        let tall = geom(1280, 960);
+        pool.note_geometry(window, window.alloc_len());
+        let len = tall.alloc_len();
+        assert_eq!(len, 4_915_200);
+        assert_eq!(pool.resolve_len(len, window.format), Some(window));
+        assert!(!serves_len(window.alloc_len(), len));
+        assert!(serves_len(len, len));
+        pool.note_geometry(tall, len);
+        assert_eq!(pool.resolve_len(len, tall.format), Some(tall));
+    }
+
+    #[test]
     fn row_padding_never_stands_in_for_a_different_size() {
         let mut pool = ReusePool::<Id>::new(4);
         let panel = geom(2560, 1600);
         pool.note_geometry(panel, panel.alloc_len());
-        assert_eq!(pool.resolve_len(geom(1280, 800).alloc_len(), panel.format), None);
-        assert_eq!(pool.resolve_len(panel.alloc_len() + 4096, panel.format), None);
+        assert_eq!(
+            pool.resolve_len(geom(1280, 800).alloc_len(), panel.format),
+            None
+        );
+        assert_eq!(
+            pool.resolve_len(panel.alloc_len() + 4096, panel.format),
+            None
+        );
     }
 
     #[test]
@@ -883,7 +918,10 @@ mod tests {
         let wide = geom(1280, 960);
         let narrow = geom(1250, 960);
         pool.note_geometry(narrow, narrow.alloc_len());
-        assert_eq!(pool.resolve_len(wide.alloc_len(), wide.format), Some(narrow));
+        assert_eq!(
+            pool.resolve_len(wide.alloc_len(), wide.format),
+            Some(narrow)
+        );
         pool.note_geometry(wide, wide.alloc_len());
         assert_eq!(pool.resolve_len(wide.alloc_len(), wide.format), Some(wide));
     }
@@ -895,7 +933,10 @@ mod tests {
         let padded = geom(1250, 960);
         pool.note_geometry(padded, padded.alloc_len());
         pool.note_geometry(exact, 4_947_968);
-        assert_eq!(pool.resolve_len(exact.alloc_len(), exact.format), Some(exact));
+        assert_eq!(
+            pool.resolve_len(exact.alloc_len(), exact.format),
+            Some(exact)
+        );
     }
 
     /// A commit teaches the pool its geometry, so a window size first seen as a
