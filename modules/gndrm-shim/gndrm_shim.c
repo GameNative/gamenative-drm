@@ -1560,15 +1560,73 @@ static void scanout_note_mode(uint32_t w, uint32_t h)
  * publish - so the intended geometry is available up front instead. */
 static bool g_scan_env_done;
 
+static void scanout_seed_spec(const char *v)
+{
+    unsigned w = 0, h = 0;
+    if (v && sscanf(v, "%ux%u", &w, &h) == 2)
+        scanout_note_mode(w, h);
+}
+
 static void scanout_seed_from_env(void)
 {
     if (g_scan_env_done)
         return;
     g_scan_env_done = true;
-    const char *v = getenv("GNDRM_SCANOUT");
+    scanout_seed_spec(getenv("GNDRM_SCANOUT"));
+    scanout_seed_spec(getenv("GNDRM_SCANOUT_NESTED"));
+}
+
+static const char *scanout_option(const char *const *args, int argc, int *i,
+                                  const char *shrt, const char *lng)
+{
+    size_t n = strlen(lng);
+    if (strcmp(args[*i], shrt) == 0 || strcmp(args[*i], lng) == 0)
+        return *i + 1 < argc ? args[++*i] : NULL;
+    if (strncmp(args[*i], lng, n) == 0 && args[*i][n] == '=')
+        return args[*i] + n + 1;
+    return NULL;
+}
+
+__attribute__((constructor))
+static void scanout_export_nested(void)
+{
+    if (!getenv("GAMENATIVE_DRM_SOCKET") || getenv("GNDRM_SCANOUT_NESTED"))
+        return;
+    static char buf[8192];
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return;
+    size_t n = 0;
+    ssize_t r;
+    while (n < sizeof(buf) - 1 && (r = read(fd, buf + n, sizeof(buf) - 1 - n)) > 0)
+        n += (size_t)r;
+    syscall(SYS_close, fd);
+    buf[n] = 0;
+    const char *args[128];
+    int argc = 0;
+    for (const char *p = buf; p < buf + n && argc < 128; p += strlen(p) + 1)
+        args[argc++] = p;
+    int i = 0;
+    for (; i < argc && i < 2; i++) {
+        const char *base = strrchr(args[i], '/');
+        if (strcmp(base ? base + 1 : args[i], "gamescope") == 0)
+            break;
+    }
+    if (i >= argc || i >= 2)
+        return;
     unsigned w = 0, h = 0;
-    if (v && sscanf(v, "%ux%u", &w, &h) == 2)
-        scanout_note_mode(w, h);
+    for (i++; i < argc && strcmp(args[i], "--") != 0; i++) {
+        const char *v;
+        if ((v = scanout_option(args, argc, &i, "-w", "--nested-width")))
+            w = (unsigned)strtoul(v, NULL, 10);
+        else if ((v = scanout_option(args, argc, &i, "-h", "--nested-height")))
+            h = (unsigned)strtoul(v, NULL, 10);
+    }
+    if (!w || !h)
+        return;
+    char spec[32];
+    snprintf(spec, sizeof(spec), "%ux%u", w, h);
+    setenv("GNDRM_SCANOUT_NESTED", spec, 0);
 }
 
 /*
