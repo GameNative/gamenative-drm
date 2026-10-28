@@ -15,6 +15,7 @@
 mod commit;
 pub mod diag;
 mod edid;
+pub mod foreign;
 pub mod frame_cap;
 mod objects;
 #[doc(hidden)] // exposed for integration tests; not public API
@@ -353,6 +354,22 @@ pub trait Presenter: Send {
         live_inos: &HashSet<u64>,
         fence: Option<RawFd>,
     );
+
+    /// [`Self::publish`] with the committed buffer's dma-buf, so a presenter
+    /// that cannot show `ino` directly can copy it. `src_fd` is borrowed for
+    /// the call: the worker closes it afterwards.
+    fn publish_with_source(
+        &mut self,
+        fb: &Framebuffer,
+        plane: &PlaneState,
+        ino: Option<u64>,
+        src_fd: Option<RawFd>,
+        live_inos: &HashSet<u64>,
+        fence: Option<RawFd>,
+    ) {
+        let _ = src_fd;
+        self.publish(fb, plane, ino, live_inos, fence);
+    }
 }
 
 /// Default presenter: drops frames and completes them immediately. Phase-1
@@ -1911,6 +1928,10 @@ struct CommitJob {
     plane: PlaneState,
     /// Buffer identity resolved from the GEM store at commit time.
     ino: Option<u64>,
+    /// A duplicate of that GEM's dma-buf, owned by the job, so the presenter
+    /// can read a buffer it does not own even if the client closes the GEM
+    /// while the commit is queued.
+    src_fd: Option<RawFd>,
     /// Inodes still backed by a GEM object at commit time (the presenter's
     /// retire signal).
     live_inos: HashSet<u64>,
@@ -1926,6 +1947,9 @@ impl Drop for CommitJob {
         // A job dropped without being processed (teardown, or a worker that
         // already exited) still owns its fence.
         if let Some(fd) = self.fence.take() {
+            close_fd(fd);
+        }
+        if let Some(fd) = self.src_fd.take() {
             close_fd(fd);
         }
     }
@@ -2057,7 +2081,14 @@ fn commit_worker_loop(
         match job.fb.take() {
             Some(fb) => {
                 let fence = job.fence.take();
-                presenter.publish(&fb, &job.plane, job.ino, &job.live_inos, fence);
+                presenter.publish_with_source(
+                    &fb,
+                    &job.plane,
+                    job.ino,
+                    job.src_fd,
+                    &job.live_inos,
+                    fence,
+                );
             }
             None => {
                 if let Some(fd) = job.fence.take() {

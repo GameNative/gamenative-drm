@@ -54,7 +54,7 @@
 //! [`AscState::publish`] waits on it before reusing the same buffer.
 
 use core::ffi::{c_int, c_void};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::RawFd;
 use std::ptr;
@@ -73,12 +73,22 @@ use gndrm_uapi::wire::{
 };
 
 use crate::ffi;
+use crate::foreign::{ForeignCopy, Layout};
 use crate::{log_always, log_info, log_warn};
 
 /// Budget for the previous release fence (a 30 Hz frame). A fence that never
 /// signals must not stall the flip loop, so the frame is published anyway and
 /// the timeout is logged once.
 const RELEASE_FENCE_TIMEOUT_MS: c_int = 33;
+
+/// Budget for a foreign frame's acquire fence before its pixels are read on
+/// the CPU. A fence that never signals copies whatever is there rather than
+/// stall the flip loop.
+const ACQUIRE_FENCE_TIMEOUT_MS: c_int = 100;
+
+/// Always-on foreign-buffer lines per session (first copy or failure per
+/// inode), so a client that churns buffers cannot flood logcat.
+const FOREIGN_LOG_BUDGET: u32 = 32;
 
 /// How long the spare worker waits before retrying a failed refill. A gralloc
 /// failure is transient (another process holding the mapper), so the retry
@@ -600,18 +610,7 @@ impl ScanoutPool {
         let api = self.api.expect(&gndrm_obf::obf!(
             "a slot is only committed when the presenter is enabled"
         ));
-        let latched = Arc::new(AtomicBool::new(false));
-        let ctx = Box::into_raw(Box::new(ReleaseCtx {
-            stats_get_controls: api.st_stats_get_controls,
-            stats_release_controls: api.st_stats_release_controls,
-            previous_release: api.st_stats_previous_release_fence_fd,
-            release_fd: AtomicI32::new(-1),
-            latch_time: api.st_stats_latch_time,
-            applied_ns: AtomicU64::new(0),
-            present_id: AtomicU64::new(0),
-            latched: Arc::clone(&latched),
-        }));
-        (ctx, latched)
+        new_release_ctx(&api)
     }
 
     /// Register a handed-out buffer as `ino`'s slot, logging how it was
@@ -762,6 +761,55 @@ fn ctx_release_fd(buf: &PoolBuf) -> RawFd {
     unsafe { (*buf.ctx).release_fd.swap(-1, Ordering::AcqRel) }
 }
 
+/// A fresh completion mailbox for one registration, with the reuse gate the
+/// completion callback publishes into. Leaked (see [`ReleaseCtx`]).
+fn new_release_ctx(api: &ffi::ScApi) -> (*mut ReleaseCtx, Arc<AtomicBool>) {
+    let latched = Arc::new(AtomicBool::new(false));
+    let ctx = Box::into_raw(Box::new(ReleaseCtx {
+        stats_get_controls: api.st_stats_get_controls,
+        stats_release_controls: api.st_stats_release_controls,
+        previous_release: api.st_stats_previous_release_fence_fd,
+        release_fd: AtomicI32::new(-1),
+        latch_time: api.st_stats_latch_time,
+        applied_ns: AtomicU64::new(0),
+        present_id: AtomicU64::new(0),
+        latched: Arc::clone(&latched),
+    }));
+    (ctx, latched)
+}
+
+/// A committed dma-buf the pool does not own, and the copy target its frames
+/// are published through. `copy` is `None` when the copy is not possible: the
+/// failure was logged and the inode's frames are dropped as before.
+struct ForeignSlot {
+    layout: Layout,
+    copy: Option<ForeignCopy>,
+    ctx: *mut ReleaseCtx,
+}
+
+impl ForeignSlot {
+    fn buf(&self) -> Option<PoolBuf> {
+        self.copy.as_ref().map(|c| PoolBuf {
+            ahb: c.ahb,
+            ctx: self.ctx,
+            stride: c.stride,
+        })
+    }
+}
+
+impl Drop for ForeignSlot {
+    fn drop(&mut self) {
+        if !self.ctx.is_null() {
+            // SAFETY: `ctx` is this slot's leaked mailbox.
+            let fd = unsafe { (*self.ctx).release_fd.swap(-1, Ordering::AcqRel) };
+            if fd >= 0 {
+                // SAFETY: the mailbox owned this release fence.
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
+}
+
 /// The layer-rect probe's change key: the published source and destination
 /// rects plus the panel the destination is bounded by. A plain tuple, so the
 /// probe has a `Copy + PartialEq` value to compare against the last one and
@@ -833,6 +881,16 @@ pub struct AscState {
     /// (see [`AscState::dump_published`]).
     dump_n: u64,
     dump_geom: Option<(u32, u32)>,
+    /// Committed dma-bufs the pool does not own, by inode, with the buffer
+    /// their frames are copied into (see [`AscState::foreign_target`]).
+    foreign: HashMap<u64, ForeignSlot>,
+    /// Always-on foreign-buffer lines printed (bounded by
+    /// [`FOREIGN_LOG_BUDGET`]).
+    foreign_logged: u32,
+    /// Session totals for the teardown summary.
+    foreign_frames: u64,
+    foreign_buffers: u64,
+    foreign_failures: u64,
 }
 
 // SAFETY: the state is only ever reached through the `Arc<Mutex<_>>` shared by
@@ -903,6 +961,11 @@ impl AscState {
             hidden: false,
             dump_n: 0,
             dump_geom: None,
+            foreign: HashMap::new(),
+            foreign_logged: 0,
+            foreign_frames: 0,
+            foreign_buffers: 0,
+            foreign_failures: 0,
         };
         // A layer is created empty, and an empty layer makes SurfaceFlinger
         // composite nothing. Everything this session knows lives in the
@@ -943,12 +1006,14 @@ impl AscState {
     ///
     /// `ino` is the buffer identity the device resolved from the object store;
     /// `live_inos` is the set of still-imported identities the pool retire keys
-    /// on.
+    /// on. `src_fd` is that buffer's dma-buf (borrowed), read when the pool does
+    /// not own it.
     pub fn publish(
         &mut self,
         fb: &Framebuffer,
         plane: &PlaneState,
         ino: Option<u64>,
+        src_fd: Option<RawFd>,
         live_inos: &HashSet<u64>,
         fence: Option<RawFd>,
     ) {
@@ -1058,18 +1123,20 @@ impl AscState {
         // service and the transaction build/apply run after it is dropped, so a
         // commit — including a retirement burst — can never queue a scan-out
         // reply behind slow work.
-        let (resolved, removed, misses) = {
+        let (pooled, stale, removed, misses) = {
             let mut pool = self.pool.lock(Role::Commit);
             let removed = pool.retire(live_inos, keep);
             // Resolve the buffer this commit publishes. Both lookups copy out
             // the payload, so neither borrow outlives its statement and the
             // fallback path can consult the cache again.
-            let resolved = pool.resolve(ino).map(|buf| (buf, ino, false));
-            let resolved = resolved.or_else(|| {
+            let pooled = pool.resolve(ino);
+            let stale = if pooled.is_none() {
                 self.last_publish
                     .and_then(|lp| pool.get(lp.ino).map(|buf| (buf, lp.ino, true)))
-            });
-            (resolved, removed, pool.pool_misses())
+            } else {
+                None
+            };
+            (pooled, stale, removed, pool.pool_misses())
         };
 
         // Retain the retired buffers whose flip event has been reported for
@@ -1077,6 +1144,29 @@ impl AscState {
         // explicitly outside the pool lock.
         let released = retire_to_release(&removed);
         release_retired(&released);
+        self.retire_foreign(live_inos, keep);
+
+        // A buffer the pool does not own is copied into one the presenter
+        // does, rather than dropped. Only a pool miss reaches this, so the
+        // zero-copy path is unchanged.
+        let mut copy_foreign = false;
+        let resolved = match pooled {
+            Some(buf) => Some((buf, ino, false)),
+            None => match self.foreign_target(ino, fb, src_fd) {
+                Some(buf) => {
+                    copy_foreign = true;
+                    Some((buf, ino, false))
+                }
+                None => stale.or_else(|| {
+                    self.last_publish.and_then(|lp| {
+                        self.foreign
+                            .get(&lp.ino)
+                            .and_then(ForeignSlot::buf)
+                            .map(|buf| (buf, lp.ino, true))
+                    })
+                }),
+            },
+        };
 
         match resolved {
             None => {
@@ -1162,7 +1252,16 @@ impl AscState {
                     // SAFETY: `pending` is a valid descriptor owned by this call.
                     unsafe { libc::close(pending) };
                 }
-                if drawable {
+                let mut fence = fence;
+                let copy_failed =
+                    copy_foreign && drawable && !self.copy_foreign(ino, fb, &mut fence);
+                if copy_failed {
+                    asc_log!(
+                        "{}",
+                        gndrm_obf::obf!("gndrm-daemon: asc DROPPED frame: foreign dma-buf ino {ino} could not be copied (misses={misses})")
+                    );
+                    close_fence(fence);
+                } else if drawable {
                     // No buffer for this inode: re-publish the last buffer rather
                     // than leave the layer empty (SurfaceFlinger compositing
                     // nothing shows the app's background through as a blank
@@ -1364,6 +1463,114 @@ impl AscState {
         }
     }
 
+    /// The copy target for `ino`, a dma-buf the pool does not own, set up on
+    /// first sight (map the source, allocate the target) and reused for every
+    /// later frame of the same layout. `None` when there is no source to read
+    /// or the copy is not possible (logged once per inode).
+    fn foreign_target(
+        &mut self,
+        ino: u64,
+        fb: &Framebuffer,
+        src_fd: Option<RawFd>,
+    ) -> Option<PoolBuf> {
+        let layout = Layout::of(fb);
+        if let Some(slot) = self.foreign.get(&ino) {
+            if slot.layout == layout {
+                return slot.buf();
+            }
+        }
+        let src_fd = src_fd?;
+        let api = self.api?;
+        self.foreign.remove(&ino);
+        let slot = match ForeignCopy::new(fb, src_fd) {
+            Ok(copy) => {
+                self.foreign_buffers += 1;
+                let (ctx, _latched) = new_release_ctx(&api);
+                ForeignSlot {
+                    layout,
+                    copy: Some(copy),
+                    ctx,
+                }
+            }
+            Err(reason) => {
+                self.note_foreign_failure(ino, layout, &reason);
+                ForeignSlot {
+                    layout,
+                    copy: None,
+                    ctx: ptr::null_mut(),
+                }
+            }
+        };
+        let buf = slot.buf();
+        self.foreign.insert(ino, slot);
+        buf
+    }
+
+    /// Copy the current frame of foreign `ino` into its target. Waits for the
+    /// frame's acquire fence first (consuming it): the CPU reads the pixels,
+    /// so the composer must not be handed the fence afterwards. `false` when
+    /// the copy failed; the target is then dropped and the failure logged.
+    fn copy_foreign(&mut self, ino: u64, fb: &Framebuffer, fence: &mut Option<RawFd>) -> bool {
+        if let Some(fd) = fence.take() {
+            wait_fence_for(fd, ACQUIRE_FENCE_TIMEOUT_MS);
+            close_fence(Some(fd));
+        }
+        let Some(copy) = self.foreign.get_mut(&ino).and_then(|s| s.copy.as_mut()) else {
+            return false;
+        };
+        match copy.copy() {
+            Ok(()) => {
+                let first = copy.copies == 1;
+                self.foreign_frames += 1;
+                if first && self.foreign_logged < FOREIGN_LOG_BUDGET {
+                    self.foreign_logged += 1;
+                    log_always!(
+                        "{}",
+                        gndrm_obf::obf!(
+                            "gndrm-daemon: foreign dma-buf ino={ino} {}x{} fourcc={} pitch={} -> copied into pool (reason: not pool-backed)",
+                            fb.width,
+                            fb.height,
+                            gndrm_daemon::foreign::fourcc_name(fb.pixel_format),
+                            fb.pitches[0]
+                        )
+                    );
+                }
+                true
+            }
+            Err(reason) => {
+                if let Some(slot) = self.foreign.get_mut(&ino) {
+                    slot.copy = None;
+                }
+                self.note_foreign_failure(ino, Layout::of(fb), &reason);
+                false
+            }
+        }
+    }
+
+    /// The always-on failure line for a foreign buffer, within the budget.
+    fn note_foreign_failure(&mut self, ino: u64, layout: Layout, reason: &str) {
+        self.foreign_failures += 1;
+        if self.foreign_logged < FOREIGN_LOG_BUDGET {
+            self.foreign_logged += 1;
+            log_always!(
+                "{}",
+                gndrm_obf::obf!(
+                    "gndrm-daemon: foreign dma-buf ino={ino} {layout} copy FAILED ({reason}); frames dropped"
+                )
+            );
+        }
+    }
+
+    /// Drop the copy targets of inodes the client no longer imports, keeping
+    /// the one the layer may still fall back to.
+    fn retire_foreign(&mut self, live_inos: &HashSet<u64>, keep: Option<u64>) {
+        if self.foreign.is_empty() {
+            return;
+        }
+        self.foreign
+            .retain(|ino, _| live_inos.contains(ino) || Some(*ino) == keep);
+    }
+
     /// Two reference words from a published buffer — the centre pixel and one at
     /// (400,300) — read under the same lock pattern as
     /// [`AscState::dump_published`]. The word's alpha field plus the word itself
@@ -1488,7 +1695,11 @@ impl AscState {
         if self.sc.is_null() {
             return;
         }
-        let handles = self.pool.lock(Role::Serve).get(lp.ino);
+        let handles = self
+            .pool
+            .lock(Role::Serve)
+            .get(lp.ino)
+            .or_else(|| self.foreign.get(&lp.ino).and_then(ForeignSlot::buf));
         let Some(PoolBuf { ahb, ctx, .. }) = handles else {
             return;
         };
@@ -1612,6 +1823,18 @@ impl Drop for AscState {
         // outside it.
         let retired = self.pool.lock(Role::Serve).take_all();
         release_retired(&retired);
+        if self.foreign_buffers > 0 || self.foreign_failures > 0 {
+            log_always!(
+                "{}",
+                gndrm_obf::obf!(
+                    "gndrm-daemon: foreign dma-buf summary: copied_frames={} buffers={} failures={}",
+                    self.foreign_frames,
+                    self.foreign_buffers,
+                    self.foreign_failures
+                )
+            );
+        }
+        self.foreign.clear();
         if !self.sc.is_null() {
             if let Some(api) = self.api {
                 // SAFETY: the layer was created by this API and is released
@@ -1651,7 +1874,20 @@ impl Presenter for AscPresenter {
         live_inos: &HashSet<u64>,
         fence: Option<RawFd>,
     ) {
-        self.lock().publish(fb, plane, ino, live_inos, fence);
+        self.lock().publish(fb, plane, ino, None, live_inos, fence);
+    }
+
+    fn publish_with_source(
+        &mut self,
+        fb: &Framebuffer,
+        plane: &PlaneState,
+        ino: Option<u64>,
+        src_fd: Option<RawFd>,
+        live_inos: &HashSet<u64>,
+        fence: Option<RawFd>,
+    ) {
+        self.lock()
+            .publish(fb, plane, ino, src_fd, live_inos, fence);
     }
 }
 
@@ -3182,12 +3418,17 @@ fn drain_eventfd(fd: RawFd) {
 
 /// Poll `fd` until it signals; `true` when the frame budget expired first.
 fn wait_fence(fd: RawFd) -> bool {
+    wait_fence_for(fd, RELEASE_FENCE_TIMEOUT_MS)
+}
+
+/// Poll `fd` for up to `timeout_ms`; `true` when the budget expired first.
+fn wait_fence_for(fd: RawFd, timeout_ms: c_int) -> bool {
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
     };
     // SAFETY: one valid pollfd for a duration.
-    let n = unsafe { libc::poll(&mut pfd, 1, RELEASE_FENCE_TIMEOUT_MS) };
+    let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
     n == 0
 }

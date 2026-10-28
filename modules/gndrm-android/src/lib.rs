@@ -36,6 +36,7 @@
 mod asc;
 mod dump;
 pub mod ffi;
+mod foreign;
 mod injector;
 #[macro_use]
 mod log;
