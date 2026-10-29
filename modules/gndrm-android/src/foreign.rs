@@ -12,7 +12,7 @@ use std::ptr;
 
 use gndrm_daemon::foreign::{fourcc_name, plan_copy, CopyPlan};
 use gndrm_daemon::Framebuffer;
-use gndrm_uapi::wire::SCANOUT_FORMAT_BGRA_8888;
+use gndrm_uapi::wire::SCANOUT_FORMAT_RGBA_8888;
 
 use crate::ffi;
 
@@ -112,7 +112,7 @@ impl ForeignCopy {
         let format = if plan.ten_bit {
             ffi::AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM
         } else {
-            SCANOUT_FORMAT_BGRA_8888
+            SCANOUT_FORMAT_RGBA_8888
         };
         let desc = ffi::AHardwareBufferDesc {
             width: fb.width,

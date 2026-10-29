@@ -1829,12 +1829,12 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
     // Only the scan-out pool's own layout can be served end to end (see
-    // `advertises_rgba`): the guest often renders straight into a daemon-owned
-    // BGRA buffer, so a swapchain in any other channel order would publish
+    // `advertises_bgra`): the guest often renders straight into a daemon-owned
+    // RGBA buffer, so a swapchain in any other channel order would publish
     // R/B-exchanged pixels. Refuse it loudly rather than render wrong colours.
-    if !swapchain_format_allowed(ci.imageFormat, advertises_rgba()) {
+    if !swapchain_format_allowed(ci.imageFormat, advertises_bgra()) {
         crate::logf!(gndrm_obf::obf!(
-            "proxy: refusing swapchain format {} cs={} (scan-out pool is B8G8R8A8; set GN_VKSHIM_ALLOW_RGBA to opt in)",
+            "proxy: refusing swapchain format {} cs={} (scan-out pool is R8G8B8A8; set GN_VKSHIM_ALLOW_BGRA to opt in)",
             ci.imageFormat,
             ci.imageColorSpace
         ));
@@ -5998,17 +5998,16 @@ mod tests {
         );
     }
 
-    /// Regression for the Nidhogg B/R swap: only the scan-out pool's layout is
-    /// accepted by default, so a guest cannot render RGBA into a buffer the
-    /// daemon publishes as BGRA. RGBA is reachable only under the explicit A/B
-    /// opt-in.
+    /// Only the scan-out pool's layout is accepted by default, so a guest cannot
+    /// render BGRA into a buffer the daemon publishes as RGBA. BGRA is reachable
+    /// only under the explicit debug opt-in.
     #[test]
     fn only_the_scanout_layout_is_accepted_by_default() {
-        assert!(swapchain_format_allowed(VK_FORMAT_B8G8R8A8_UNORM, false));
-        assert!(swapchain_format_allowed(VK_FORMAT_B8G8R8A8_UNORM, true));
-        assert!(!swapchain_format_allowed(VK_FORMAT_R8G8B8A8_UNORM, false));
+        assert!(swapchain_format_allowed(VK_FORMAT_R8G8B8A8_UNORM, false));
         assert!(swapchain_format_allowed(VK_FORMAT_R8G8B8A8_UNORM, true));
-        assert_eq!(SCANOUT_SWAPCHAIN_FORMAT, VK_FORMAT_B8G8R8A8_UNORM);
+        assert!(!swapchain_format_allowed(VK_FORMAT_B8G8R8A8_UNORM, false));
+        assert!(swapchain_format_allowed(VK_FORMAT_B8G8R8A8_UNORM, true));
+        assert_eq!(SCANOUT_SWAPCHAIN_FORMAT, VK_FORMAT_R8G8B8A8_UNORM);
     }
 
     /// The override parser mirrors mesa's `MESA_VK_WSI_PRESENT_MODE`: exactly
@@ -8659,13 +8658,13 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     VK_SUCCESS
 }
 
-/// The surface formats the proxy serves: `B8G8R8A8_UNORM` in the scan-out
-/// pool's own layout, plus `R8G8B8A8_UNORM` only under the RGBA opt-in (see
-/// `advertises_rgba`). Shared by the plain and `2` query forms so both forms
+/// The surface formats the proxy serves: `R8G8B8A8_UNORM` in the scan-out
+/// pool's own layout, plus `B8G8R8A8_UNORM` only under the BGRA opt-in (see
+/// `advertises_bgra`). Shared by the plain and `2` query forms so both forms
 /// advertise exactly the same set.
 fn served_surface_formats() -> &'static [VkSurfaceFormatKHR] {
     // The HDR set contains exactly what the create path can present: the
-    // scan-out pool's BGRA layout and the 10-bit layout, each with both colour
+    // scan-out pool's RGBA layout and the 10-bit layout, each with both colour
     // spaces. Two rules fix that shape.
     //
     // Every format is paired with both colours because vkd3d's
@@ -8673,14 +8672,14 @@ fn served_surface_formats() -> &'static [VkSurfaceFormatKHR] {
     // colour space match the request, and its only wildcard fallback exists on
     // the sRGB path: a title that switches to PQ while keeping an 8-bit
     // backbuffer stops creating swapchains entirely without the
-    // `(B8G8R8A8_UNORM, HDR10_ST2084)` pair. Order matters to a client that
+    // `(R8G8B8A8_UNORM, HDR10_ST2084)` pair. Order matters to a client that
     // takes the first entry carrying a colour space (DXVK): the 10-bit pair
     // comes first, because 8-bit PQ shreds the tone range.
     //
     // Nothing else may appear. An entry the create path refuses is worse than a
     // missing one — the client takes the offer, the create fails, and it
-    // retries forever: measured, advertising `R8G8B8A8_UNORM` without the RGBA
-    // opt-in made DXVK loop on an in-game HDR toggle, and advertising FP16 made
+    // retries forever: measured, advertising an 8-bit format the create path
+    // refused made DXVK loop on an in-game HDR toggle, and advertising FP16 made
     // it take `fmt=97 cs=1000104008` and loop against a refusal, because the
     // scan-out pool cannot serve 16 bits.
     const K_HDR: [VkSurfaceFormatKHR; 9] = [
@@ -8693,7 +8692,7 @@ fn served_surface_formats() -> &'static [VkSurfaceFormatKHR] {
             colorSpace: VK_COLOR_SPACE_HDR10_ST2084_EXT,
         },
         VkSurfaceFormatKHR {
-            format: VK_FORMAT_B8G8R8A8_UNORM,
+            format: VK_FORMAT_R8G8B8A8_UNORM,
             colorSpace: VK_COLOR_SPACE_HDR10_ST2084_EXT,
         },
         VkSurfaceFormatKHR {
@@ -8705,7 +8704,7 @@ fn served_surface_formats() -> &'static [VkSurfaceFormatKHR] {
             colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
         },
         VkSurfaceFormatKHR {
-            format: VK_FORMAT_B8G8R8A8_UNORM,
+            format: VK_FORMAT_R8G8B8A8_UNORM,
             colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
         },
         VkSurfaceFormatKHR {
@@ -8717,14 +8716,14 @@ fn served_surface_formats() -> &'static [VkSurfaceFormatKHR] {
             colorSpace: VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT,
         },
         VkSurfaceFormatKHR {
-            format: VK_FORMAT_B8G8R8A8_UNORM,
+            format: VK_FORMAT_R8G8B8A8_UNORM,
             colorSpace: VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT,
         },
     ];
 
-    // The RGBA opt-in is the only case where the create path serves
-    // `R8G8B8A8_UNORM`, so it is the only case that may advertise it.
-    const K_HDR_RGBA: [VkSurfaceFormatKHR; 8] = [
+    // The BGRA opt-in is the only case where the create path serves
+    // `B8G8R8A8_UNORM`, so it is the only case that may advertise it.
+    const K_HDR_BGRA: [VkSurfaceFormatKHR; 8] = [
         K_HDR[0],
         K_HDR[1],
         K_HDR[2],
@@ -8732,36 +8731,36 @@ fn served_surface_formats() -> &'static [VkSurfaceFormatKHR] {
         K_HDR[4],
         K_HDR[5],
         VkSurfaceFormatKHR {
-            format: VK_FORMAT_R8G8B8A8_UNORM,
+            format: VK_FORMAT_B8G8R8A8_UNORM,
             colorSpace: VK_COLOR_SPACE_HDR10_ST2084_EXT,
         },
         VkSurfaceFormatKHR {
-            format: VK_FORMAT_R8G8B8A8_UNORM,
+            format: VK_FORMAT_B8G8R8A8_UNORM,
             colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
         },
     ];
     if hdr_session() {
-        return if advertises_rgba() {
-            &K_HDR_RGBA
+        return if advertises_bgra() {
+            &K_HDR_BGRA
         } else {
             &K_HDR
         };
     }
     const K_FMTS: [VkSurfaceFormatKHR; 2] = [
         VkSurfaceFormatKHR {
-            format: VK_FORMAT_B8G8R8A8_UNORM,
-            colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
-        },
-        VkSurfaceFormatKHR {
             format: VK_FORMAT_R8G8B8A8_UNORM,
             colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
         },
+        VkSurfaceFormatKHR {
+            format: VK_FORMAT_B8G8R8A8_UNORM,
+            colorSpace: VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+        },
     ];
-    // BGRA_8888 only by default, so the guest renders in the scan-out pool's
-    // own layout (see `advertises_rgba` — offering RGBA let Nidhogg render
-    // R/B-exchanged into a daemon BGRA buffer, which reached the panel as
-    // cyan). RGBA is offered only under `GN_VKSHIM_ALLOW_RGBA`.
-    if advertises_rgba() {
+    // RGBA_8888 only by default, so the guest renders in the scan-out pool's
+    // own layout (see `advertises_bgra` — a second 8-bit layout lets a guest
+    // render R/B-exchanged into a daemon buffer). BGRA is offered only under
+    // `GN_VKSHIM_ALLOW_BGRA`.
+    if advertises_bgra() {
         &K_FMTS
     } else {
         &K_FMTS[..1]
@@ -9749,34 +9748,32 @@ fn vk_format_to_fourcc(format: VkFormat) -> u32 {
         // these Vulkan formats carry a real alpha channel, so they map to the
         // alpha-bearing A-formats, not XRGB8888/XBGR8888: the X byte is
         // *ignored* by the compositor, which is what forced a guest's frame
-        // opaque. The daemon already reports the same buffer as AR24
+        // opaque. The daemon already reports the same buffer as AB24
         // (`PRIMARY_FORMATS`), so this keeps the two descriptions in agreement.
         VK_FORMAT_B8G8R8A8_UNORM => GN_DRM_FORMAT_ARGB8888,
         VK_FORMAT_R8G8B8A8_UNORM => GN_DRM_FORMAT_ABGR8888,
         // The two 10-bit layouts differ only in which channel sits in the high
         // ten bits, and the fourcc must say which one the buffer actually is:
-        // `A2R10G10B10` (58, red high) is the pool's own layout and gamescope
-        // reads it back as `ARGB2101010`; `A2B10G10R10` (64, blue high) is the
-        // canonical Vulkan layout vkd3d asks for and reads back as
-        // `ABGR2101010`. Declaring the wrong one exchanges red and blue —
-        // measured on Ori: an HDR frame that should read warm (114,42,28) came
-        // out blue (2,51,89).
+        // `A2R10G10B10` (58, red high) is read back by gamescope as
+        // `ARGB2101010`; `A2B10G10R10` (64, blue high) is the canonical Vulkan
+        // layout vkd3d asks for and reads back as `ABGR2101010`. Declaring the
+        // wrong one exchanges red and blue — measured on Ori: an HDR frame that
+        // should read warm (114,42,28) came out blue (2,51,89).
         VK_FORMAT_A2R10G10B10_UNORM_PACK32 => GN_DRM_FORMAT_ARGB2101010,
         VK_FORMAT_A2B10G10R10_UNORM_PACK32 => GN_DRM_FORMAT_ABGR2101010,
         _ => 0,
     }
 }
 
-const SCANOUT_SWAPCHAIN_FORMAT: VkFormat = VK_FORMAT_B8G8R8A8_UNORM;
+const SCANOUT_SWAPCHAIN_FORMAT: VkFormat = VK_FORMAT_R8G8B8A8_UNORM;
 
-fn advertises_rgba() -> bool {
-    std::env::var_os("GN_VKSHIM_FORCE_BGRA").is_none()
-        && std::env::var_os("GN_VKSHIM_ALLOW_RGBA").is_some()
+fn advertises_bgra() -> bool {
+    std::env::var_os("GN_VKSHIM_ALLOW_BGRA").is_some_and(|v| v == "1")
 }
 
-fn swapchain_format_allowed(format: VkFormat, allow_rgba: bool) -> bool {
+fn swapchain_format_allowed(format: VkFormat, allow_bgra: bool) -> bool {
     format == SCANOUT_SWAPCHAIN_FORMAT
-        || (allow_rgba && format == VK_FORMAT_R8G8B8A8_UNORM)
+        || (allow_bgra && format == VK_FORMAT_B8G8R8A8_UNORM)
         || (hdr_session()
             && (format == VK_FORMAT_A2B10G10R10_UNORM_PACK32
                 || format == VK_FORMAT_A2R10G10B10_UNORM_PACK32))

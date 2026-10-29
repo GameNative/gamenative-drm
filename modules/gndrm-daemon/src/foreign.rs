@@ -8,6 +8,9 @@
 //! copies such a buffer into a pool-format buffer of its own instead; this
 //! module decides whether the copy is possible and moves the rows, so the
 //! layout rules are host-testable.
+//!
+//! The targets are R-low (`RGBA_8888`, `R10G10B10A2_UNORM`), so a B-low source
+//! has red and blue exchanged during the copy.
 
 use gndrm_uapi::mode::{
     DRM_FORMAT_ABGR2101010, DRM_FORMAT_ABGR8888, DRM_FORMAT_ARGB2101010, DRM_FORMAT_ARGB8888,
@@ -35,6 +38,9 @@ pub struct CopyPlan {
     /// The pixels are a 2:10:10:10 layout, so the target must be the 10-bit
     /// buffer format; otherwise the 8-bit one.
     pub ten_bit: bool,
+    /// The source is B-low (`XR24`/`AR24`, `XR30`/`AR30`), so red and blue are
+    /// exchanged on the way into the R-low target.
+    pub swap_rb: bool,
 }
 
 /// Why a foreign framebuffer cannot be copied.
@@ -81,14 +87,11 @@ pub fn plan_copy(fb: &Framebuffer, src_len: u64) -> Result<CopyPlan, CopyRefusal
             return Err(CopyRefusal::Modifier(m));
         }
     }
-    let ten_bit = match fb.pixel_format {
-        DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 | DRM_FORMAT_XBGR8888 | DRM_FORMAT_ABGR8888 => {
-            false
-        }
-        DRM_FORMAT_XRGB2101010
-        | DRM_FORMAT_XBGR2101010
-        | DRM_FORMAT_ARGB2101010
-        | DRM_FORMAT_ABGR2101010 => true,
+    let (ten_bit, swap_rb) = match fb.pixel_format {
+        DRM_FORMAT_XBGR8888 | DRM_FORMAT_ABGR8888 => (false, false),
+        DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 => (false, true),
+        DRM_FORMAT_XBGR2101010 | DRM_FORMAT_ABGR2101010 => (true, false),
+        DRM_FORMAT_XRGB2101010 | DRM_FORMAT_ARGB2101010 => (true, true),
         other => return Err(CopyRefusal::Format(other)),
     };
     if fb.width == 0 || fb.height == 0 || fb.handles[1] != 0 {
@@ -113,6 +116,7 @@ pub fn plan_copy(fb: &Framebuffer, src_len: u64) -> Result<CopyPlan, CopyRefusal
         src_offset: fb.offsets[0] as usize,
         src_pitch: pitch as usize,
         ten_bit,
+        swap_rb,
     })
 }
 
@@ -125,12 +129,21 @@ impl CopyPlan {
 
     /// Copy the rows from `src` (the whole mapped dma-buf) into `dst` (the
     /// locked target, row pitch `dst_pitch`). Both pitches are honoured; a run
-    /// with equal, unpadded pitches is one copy.
+    /// with equal, unpadded pitches is one copy. A B-low source has red and
+    /// blue exchanged per pixel.
     ///
     /// # Panics
     /// When either slice is shorter than the plan requires; the caller checks
     /// both against [`plan_copy`] and [`Self::dst_len`].
     pub fn copy_rows(&self, src: &[u8], dst: &mut [u8], dst_pitch: usize) {
+        match (self.swap_rb, self.ten_bit) {
+            (false, _) => self.copy_plain(src, dst, dst_pitch),
+            (true, false) => self.copy_swapped(src, dst, dst_pitch, swap_rb_8),
+            (true, true) => self.copy_swapped(src, dst, dst_pitch, swap_rb_10),
+        }
+    }
+
+    fn copy_plain(&self, src: &[u8], dst: &mut [u8], dst_pitch: usize) {
         let rows = self.height as usize;
         if self.src_pitch == dst_pitch && dst_pitch == self.row_bytes {
             let n = self.row_bytes * rows;
@@ -143,6 +156,33 @@ impl CopyPlan {
             dst[d..d + self.row_bytes].copy_from_slice(&src[s..s + self.row_bytes]);
         }
     }
+
+    #[inline]
+    fn copy_swapped(&self, src: &[u8], dst: &mut [u8], dst_pitch: usize, swap: fn(u32) -> u32) {
+        for y in 0..self.height as usize {
+            let s = self.src_offset + y * self.src_pitch;
+            let d = y * dst_pitch;
+            let src_row = &src[s..s + self.row_bytes];
+            let dst_row = &mut dst[d..d + self.row_bytes];
+            let (dst_px, _) = dst_row.as_chunks_mut::<4>();
+            let (src_px, _) = src_row.as_chunks::<4>();
+            for (o, i) in dst_px.iter_mut().zip(src_px) {
+                *o = swap(u32::from_le_bytes(*i)).to_le_bytes();
+            }
+        }
+    }
+}
+
+/// Exchange the 8-bit channels in bytes 0 and 2 of a 32-bit pixel.
+#[inline(always)]
+fn swap_rb_8(v: u32) -> u32 {
+    (v & 0xff00_ff00) | ((v >> 16) & 0xff) | ((v & 0xff) << 16)
+}
+
+/// Exchange the 10-bit channels at bits 0-9 and 20-29 of a 2:10:10:10 pixel.
+#[inline(always)]
+fn swap_rb_10(v: u32) -> u32 {
+    (v & 0xc00f_fc00) | ((v >> 20) & 0x3ff) | ((v & 0x3ff) << 20)
 }
 
 /// A fourcc as its four characters, for log lines.
@@ -179,6 +219,12 @@ mod tests {
         assert_eq!(p.row_bytes, 16);
         assert_eq!(p.src_pitch, 32);
         assert!(!p.ten_bit);
+        assert!(p.swap_rb);
+        assert!(
+            !plan_copy(&fb(4, 3, DRM_FORMAT_XBGR8888, 16, 0), 48)
+                .unwrap()
+                .swap_rb
+        );
         assert!(
             plan_copy(&fb(4, 3, DRM_FORMAT_XBGR2101010, 16, 0), 48)
                 .unwrap()
@@ -216,7 +262,7 @@ mod tests {
 
     #[test]
     fn copy_honours_both_pitches() {
-        let plan = plan_copy(&fb(2, 3, DRM_FORMAT_XRGB8888, 12, 4), 64).unwrap();
+        let plan = plan_copy(&fb(2, 3, DRM_FORMAT_XBGR8888, 12, 4), 64).unwrap();
         let src: Vec<u8> = (0..64u8).collect();
         let mut dst = vec![0xaa; plan.dst_len(16)];
         plan.copy_rows(&src, &mut dst, 16);
@@ -236,6 +282,50 @@ mod tests {
         let mut dst = vec![0; 16];
         plan.copy_rows(&src, &mut dst, 8);
         assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn b_low_eight_bit_swaps_red_and_blue() {
+        for fourcc in [DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888] {
+            let plan = plan_copy(&fb(2, 2, fourcc, 12, 4), 64).unwrap();
+            let src: Vec<u8> = (0..64u8).collect();
+            let mut dst = vec![0xaa; plan.dst_len(8)];
+            plan.copy_rows(&src, &mut dst, 8);
+            for y in 0..2 {
+                for x in 0..2 {
+                    let s = &src[4 + y * 12 + x * 4..][..4];
+                    let d = &dst[y * 8 + x * 4..][..4];
+                    assert_eq!(d, [s[2], s[1], s[0], s[3]]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn b_low_ten_bit_swaps_red_and_blue() {
+        let pack = |a: u32, hi: u32, g: u32, lo: u32| (a << 30) | (hi << 20) | (g << 10) | lo;
+        let px = [(0x2, 0x0a5, 0x155, 0x3ff), (0x1, 0x200, 0x3ff, 0x001)];
+        for fourcc in [DRM_FORMAT_XRGB2101010, DRM_FORMAT_ARGB2101010] {
+            let plan = plan_copy(&fb(2, 1, fourcc, 8, 0), 8).unwrap();
+            assert!(plan.ten_bit && plan.swap_rb);
+            let src: Vec<u8> = px
+                .iter()
+                .flat_map(|&(a, r, g, b)| pack(a, r, g, b).to_le_bytes())
+                .collect();
+            let want: Vec<u8> = px
+                .iter()
+                .flat_map(|&(a, r, g, b)| pack(a, b, g, r).to_le_bytes())
+                .collect();
+            let mut dst = vec![0; 8];
+            plan.copy_rows(&src, &mut dst, 8);
+            assert_eq!(dst, want);
+        }
+        let xb30 = pack(0x2, 0x3ff, 0x155, 0x0a5);
+        let plan = plan_copy(&fb(1, 1, DRM_FORMAT_XBGR2101010, 4, 0), 4).unwrap();
+        assert!(!plan.swap_rb);
+        let mut dst = vec![0; 4];
+        plan.copy_rows(&xb30.to_le_bytes(), &mut dst, 4);
+        assert_eq!(dst, xb30.to_le_bytes());
     }
 
     #[test]

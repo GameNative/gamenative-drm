@@ -10,7 +10,7 @@
 │                                        │                                     │
 │   gamenative-drm (Rust, JNI cdylib)    │                                     │
 │     • DRM UAPI server on unix socket   │                                     │
-│     • scan-out AHardwareBuffer pool ───┘ (daemon-owned, BGRA)                │
+│     • scan-out AHardwareBuffer pool ───┘ (daemon-owned, RGBA)                │
 │     • SurfaceControl/Transaction publish ──► Android Surface                 │
 │     • async commit worker + flip-event queue                                 │
 │     • input injector (wayland virtual input)                                 │
@@ -135,8 +135,8 @@ resp := { u32 len; i32 ret; i32 errno_; u8 payload[len] } + SCM_RIGHTS fds?
 
 The daemon owns the scan-out AHardwareBuffer pool and publishes committed frames
 with `ASurfaceControl`/`ASurfaceTransaction` (dlopen'd from `libandroid.so`).
-Gamescope renders directly into the pool buffer (BGRA, byte-for-byte
-`XRGB8888`/`ARGB8888`), and the same buffer is what SurfaceFlinger scans out —
+Gamescope renders directly into the pool buffer (RGBA, byte-for-byte
+`XBGR8888`/`ABGR8888`), and the same buffer is what SurfaceFlinger scans out —
 no copy, no conversion. Back-pressure comes from
 `ASurfaceTransactionStats_getPreviousReleaseFenceFd`; a warm spare keeps one
 pre-allocated buffer ready. Full details in 06-presenter-latency.md.

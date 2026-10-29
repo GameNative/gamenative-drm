@@ -95,11 +95,11 @@ struct gndrm_resp {
  * pair in gndrm-uapi/src/wire.rs.
  */
 #define GNDRM_SCANOUT_MAGIC 0x474E5331u /* "GNS1" */
-/* HAL AHardwareBuffer format BGRA_8888 (value 5): B,G,R,A in memory, which is
- * the DRM XR24 (0x34325258, fourth byte ignored) scan-out layout gamescope
+/* HAL AHardwareBuffer format RGBA_8888 (value 1): R,G,B,A in memory, which is
+ * the DRM XB24 (0x34324258, fourth byte ignored) scan-out layout gamescope
  * renders. A pool in any other format would reach SurfaceFlinger with swapped
- * channels; value 2 (R8G8B8X8_UNORM) is R,G,B,X and exchanges red and blue. */
-#define GNDRM_SCANOUT_FORMAT_BGRA_8888 5u
+ * channels; value 5 (BGRA_8888) is B,G,R,A and exchanges red and blue. */
+#define GNDRM_SCANOUT_FORMAT_RGBA_8888 1u
 /* Reply budget and attempt count for one scan-out request. A request that is
  * not answered inside the budget has either been lost or is being served
  * slowly; see scanout_request for why neither re-establishes the channel. */
@@ -143,8 +143,8 @@ struct gndrm_scanout_resp {
 } __attribute__((packed));
 _Static_assert(sizeof(struct gndrm_scanout_resp) == 24,
                "ScanoutAllocResp is 24 bytes on the wire");
-_Static_assert(GNDRM_SCANOUT_FORMAT_BGRA_8888 == 5u,
-               "scan-out pool AHB format is BGRA_8888 (HAL 5)");
+_Static_assert(GNDRM_SCANOUT_FORMAT_RGBA_8888 == 1u,
+               "scan-out pool AHB format is RGBA_8888 (HAL 1)");
 
 /* ------------------------------------------------------------------ */
 /* shim state                                                          */
@@ -1410,7 +1410,7 @@ static int scanout_exchange(uint32_t w, uint32_t h, uint64_t len,
         .magic = GNDRM_SCANOUT_MAGIC,
         .width = w,
         .height = h,
-        .format = GNDRM_SCANOUT_FORMAT_BGRA_8888,
+        .format = GNDRM_SCANOUT_FORMAT_RGBA_8888,
         .len = len,
     };
     struct iovec iov = { .iov_base = &req, .iov_len = sizeof(req) };

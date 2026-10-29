@@ -18,7 +18,7 @@
 
 use gndrm_uapi::wire::{
     FrameCapNote, FrameCapSubscribe, LsfgConfig, ScanoutAllocReq, ScanoutAllocResp, VsyncNote,
-    CAP_FRAME_CAP, CAP_PRESENT_ID, CAP_VSYNC_NOTE, FPS_UNCAPPED, SCANOUT_FORMAT_BGRA_8888,
+    CAP_FRAME_CAP, CAP_PRESENT_ID, CAP_VSYNC_NOTE, FPS_UNCAPPED, SCANOUT_FORMAT_RGBA_8888,
     SCANOUT_REQ_AHB_HANDLE,
 };
 use std::ffi::c_void;
@@ -212,7 +212,7 @@ enum Failure {
 }
 
 /// Ask the daemon named by `GAMENATIVE_DRM_SOCKET` for a `width`x`height`
-/// buffer in the pool's BGRA layout. `None` when the channel is unset,
+/// buffer in the pool's RGBA layout. `None` when the channel is unset,
 /// unreachable, or refuses; the caller then allocates locally.
 #[must_use]
 /// Ask the daemon for the app's frame-generation settings.
@@ -302,7 +302,7 @@ fn allocate_with(width: u32, height: u32, want_ahb: bool) -> Option<ScanoutBuf> 
     request(ScanoutAllocReq {
         width,
         height,
-        format: SCANOUT_FORMAT_BGRA_8888 | if want_ahb { SCANOUT_REQ_AHB_HANDLE } else { 0 },
+        format: SCANOUT_FORMAT_RGBA_8888 | if want_ahb { SCANOUT_REQ_AHB_HANDLE } else { 0 },
         len: u64::from(width) * u64::from(height) * 4,
     })
 }
@@ -425,7 +425,7 @@ fn exchange(fd: RawFd, width: u32, height: u32) -> Result<ScanoutBuf, Failure> {
         ScanoutAllocReq {
             width,
             height,
-            format: SCANOUT_FORMAT_BGRA_8888,
+            format: SCANOUT_FORMAT_RGBA_8888,
             len: u64::from(width) * u64::from(height) * 4,
         },
     )
@@ -803,7 +803,7 @@ mod tests {
                 assert_eq!(n as usize, ScanoutAllocReq::LEN);
                 let req = ScanoutAllocReq::decode(&buf).expect(&gndrm_obf::obf!("request frame"));
                 assert_eq!((req.width, req.height), (1280, 960));
-                assert_eq!(req.format, SCANOUT_FORMAT_BGRA_8888);
+                assert_eq!(req.format, SCANOUT_FORMAT_RGBA_8888);
                 assert_eq!(req.len, 1280 * 960 * 4);
 
                 let payload = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);

@@ -454,7 +454,7 @@ fn swapchain_init() -> i32 {
         vkGetPhysicalDeviceSurfaceFormatsKHR((*vk).pd, (*vk).surface, &mut nfmt, fmts.as_mut_ptr());
         let mut pick = fmts[0];
         for f in &fmts[..nfmt as usize] {
-            if f.format == VK_FORMAT_B8G8R8A8_UNORM {
+            if f.format == VK_FORMAT_R8G8B8A8_UNORM {
                 pick = *f;
                 break;
             }

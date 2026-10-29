@@ -71,7 +71,7 @@ use gndrm_daemon::{FrameCap, Framebuffer, PlaneState, Presenter};
 use gndrm_uapi::wire::{
     FrameAcquired, FrameCapSubscribe, LsfgConfig, PresentDone, PresentMark, ScanoutAllocReq,
     ScanoutAllocResp, CAP_FRAME_CAP, CAP_PRESENT_ID,
-    CAP_VSYNC_NOTE, SCANOUT_FORMAT_BGRA_8888,
+    CAP_VSYNC_NOTE, SCANOUT_FORMAT_RGBA_8888,
 };
 
 use crate::ffi;
@@ -496,9 +496,9 @@ impl ScanoutPool {
     /// when publishing is disabled (there is no point owning a buffer nothing
     /// can publish), and `ENOSPC` when the cap is reached.
     fn begin_alloc(&mut self, width: u32, height: u32, format: u32) -> io::Result<Reservation> {
-        if format != SCANOUT_FORMAT_BGRA_8888 {
+        if format != SCANOUT_FORMAT_RGBA_8888 {
             // The pool layout is a contract with gamescope's rendering format
-            // (B,G,R,X); another format would publish channel-swapped pixels.
+            // (R,G,B,X); another format would publish channel-swapped pixels.
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
         if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
@@ -571,7 +571,7 @@ impl ScanoutPool {
     /// `EINVAL` for an unknown length or a format the pool does not serve,
     /// `ENOSYS`/`ENOSPC` as [`Self::begin_alloc`].
     fn begin_alloc_len(&mut self, len: u64, format: u32) -> io::Result<(u32, u32, Reservation)> {
-        if format != SCANOUT_FORMAT_BGRA_8888 {
+        if format != SCANOUT_FORMAT_RGBA_8888 {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
         let Some(geom) = self.cache.resolve_len(len, format) else {
@@ -593,7 +593,7 @@ impl ScanoutPool {
             Geometry {
                 width,
                 height,
-                format: SCANOUT_FORMAT_BGRA_8888,
+                format: SCANOUT_FORMAT_RGBA_8888,
             },
             alloc_len,
         );
@@ -635,7 +635,7 @@ impl ScanoutPool {
         let geom = Geometry {
             width,
             height,
-            format: SCANOUT_FORMAT_BGRA_8888,
+            format: SCANOUT_FORMAT_RGBA_8888,
         };
         let (ctx, latched) = self.new_ctx();
         let replaced = self.cache.commit(
@@ -1312,7 +1312,7 @@ impl AscState {
                     // until then the dataspace keeps its existing rule and only the
                     // log is added, so a working HDR case cannot be altered.
                     let hdr_buffer = ffi::is_ten_bit_drm_format(fb.pixel_format)
-                        || served_ahb_format(SCANOUT_FORMAT_BGRA_8888)
+                        || served_ahb_format(SCANOUT_FORMAT_RGBA_8888)
                             == ffi::AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM;
                     let hdr_content = gndrm_daemon::hdr_output_active();
                     // The dataspace describes the encoding the pixels are in,
@@ -1617,8 +1617,8 @@ impl AscState {
     /// `$GNDRM_DUMP_DIR/gn-fb-latest.ppm`, so what gamescope rendered here can
     /// be compared with the client's own submitted buffer (the ICD shim's
     /// `GAMENATIVE_DUMP_DIR` dump). The pool buffer is locked for CPU read and
-    /// its BGRA rows converted to a P6 PPM (byte 2 is red — see
-    /// [`crate::dump::ppm_bgra`]).
+    /// its RGBA rows converted to a P6 PPM (byte 0 is red — see
+    /// [`crate::dump::ppm_rgba`]).
     ///
     /// Runs after the transaction is applied, on the commit worker, so it holds
     /// no pool lock and never touches the serve loop. Rate-limited to the first
@@ -1664,7 +1664,7 @@ impl AscState {
         // SAFETY: the lock above maps `stride * height` readable bytes at
         // `base`; the slice is not used after the unlock below.
         let src = unsafe { core::slice::from_raw_parts(base.cast::<u8>(), len) };
-        let ppm = crate::dump::ppm_bgra(src, width as usize, height as usize, stride as usize);
+        let ppm = crate::dump::ppm_rgba(src, width as usize, height as usize, stride as usize);
         // SAFETY: `ahb` is locked by this call and nothing reads `base` after.
         unsafe { ffi::AHardwareBuffer_unlock(ahb, ptr::null_mut()) };
         let path = std::path::Path::new(dir).join("gn-fb-latest.ppm");
@@ -2862,14 +2862,14 @@ pub fn warm_worker(pool: Arc<TrackedMutex<ScanoutPool>>, doorbell: Arc<WarmDoorb
 
 /// The `AHardwareBuffer` format the pool allocates for an incoming wire format.
 ///
-/// The shim requests one fixed format (`SCANOUT_FORMAT_BGRA_8888`, the 8-bit
-/// `XR24` layout gamescope renders in the SDR path). When HDR output is on,
+/// The shim requests one fixed format (`SCANOUT_FORMAT_RGBA_8888`, the 8-bit
+/// `XB24` layout gamescope renders in the SDR path). When HDR output is on,
 /// gamescope scans out in a 2:10:10:10 format instead, so that request is
 /// served as `R10G10B10A2_UNORM`: the pixels gamescope writes are then described
 /// to SurfaceFlinger by the format they actually are. Both are 32 bpp, so the
 /// stride and the pool's length/geometry keys are unchanged.
 fn served_ahb_format(wire_format: u32) -> u32 {
-    if wire_format == SCANOUT_FORMAT_BGRA_8888 && gndrm_daemon::hdr_output_enabled() {
+    if wire_format == SCANOUT_FORMAT_RGBA_8888 && gndrm_daemon::hdr_output_enabled() {
         ffi::AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM
     } else {
         wire_format
@@ -3013,7 +3013,7 @@ fn build_show(
         // frame, composited opaque, and gamescope's composite shaders are
         // written for a DRM plane whose X-prefixed fourcc ignores alpha (a pass
         // may store alpha 0 — cs_composite_rcas.comp does — without blanking
-        // the frame). The pool's AHardwareBuffer is BGRA_8888, whose alpha SF
+        // the frame). The pool's AHardwareBuffer is RGBA_8888, whose alpha SF
         // would otherwise honour, so assert opacity here. See ffi.rs.
         (api.st_set_buffer_transparency)(tx, sc, ffi::ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE);
         (api.st_set_geometry)(tx, sc, &src, &dst, 0);

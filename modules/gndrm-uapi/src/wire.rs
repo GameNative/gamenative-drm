@@ -213,26 +213,21 @@ pub const SCANOUT_MAGIC: u32 = 0x474E_5331;
 /// across the wire, the C shim and the presenter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanoutLayout {
-    /// 8-bit B,G,R,A. The pool's only layout today.
+    /// 8-bit R,G,B,A. The pool's only layout today.
     EightBit,
 }
 
 /// HAL `AHardwareBuffer` format for `layout`.
 ///
-/// `EightBit` is **`AHARDWAREBUFFER_FORMAT_BGRA_8888`** (HAL value 5): B,G,R,A
-/// in memory. That is the byte order of the `XR24` (`0x34325258`) the
-/// compositor commits for scan-out, whose fourth byte is ignored. It is *not*
-/// `R8G8B8X8_UNORM` (value 2), which is R,G,B,X: the two share a stride and
-/// nothing else, so allocating the pool as value 2 exchanges red and blue
-/// between the guest's frame and the panel.
+/// `EightBit` is **`AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM`** (HAL value 1,
+/// `RGBA_8888`): R,G,B,A in memory. That is the byte order of the `XB24`
+/// (`0x34324258`) / `AB24` the compositor commits for scan-out, whose fourth
+/// byte the presenter declares opaque. The primary plane offers only those
+/// R-low formats, so the compositor never places a B,G,R buffer on it.
 ///
-/// There is no alpha-less B,G,R entry in the HAL enum — value 5 is the only
-/// B,G,R form — so "declare the fourth byte as X" is not a route the platform
-/// offers. The alpha hypothesis for the presented-content defect is falsified
-/// by measurement: the guest writes a don't-care fourth byte (Nidhogg's frames
-/// are ~92.9% alpha-zero, the rest alpha-1), yet the panel is ~94% dark with
-/// either declaration, so that zero-alpha statistic is not the cause of the
-/// missing background.
+/// The pool was `BGRA_8888` (HAL value 5) matching `XR24`, but the Skia render
+/// engine in `SurfaceFlinger` cannot wrap value 5 (Android 16 aborts the whole
+/// UI on it) and Qualcomm gralloc has no display constraints for it.
 ///
 /// The 10-bit/HDR entry (`R10G10B10A2_UNORM`-class) belongs here as a
 /// `TenBit` arm once the DRM side carries what it needs — 10-bit plane
@@ -241,13 +236,13 @@ pub enum ScanoutLayout {
 #[must_use]
 pub const fn scanout_ahb_format(layout: ScanoutLayout) -> u32 {
     match layout {
-        ScanoutLayout::EightBit => 5, // AHARDWAREBUFFER_FORMAT_BGRA_8888
+        ScanoutLayout::EightBit => 1, // AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
     }
 }
 
 /// The format the scan-out path requires today, i.e.
 /// [`scanout_ahb_format`]`(ScanoutLayout::EightBit)`.
-pub const SCANOUT_FORMAT_BGRA_8888: u32 = scanout_ahb_format(ScanoutLayout::EightBit);
+pub const SCANOUT_FORMAT_RGBA_8888: u32 = scanout_ahb_format(ScanoutLayout::EightBit);
 
 /// Allocation request.
 ///
@@ -298,7 +293,7 @@ impl ScanoutAllocReq {
         Self {
             width: 0,
             height: 0,
-            format: SCANOUT_FORMAT_BGRA_8888 | SCANOUT_REQ_AHB_HANDLE | SCANOUT_REQ_LOOKUP_INO,
+            format: SCANOUT_FORMAT_RGBA_8888 | SCANOUT_REQ_AHB_HANDLE | SCANOUT_REQ_LOOKUP_INO,
             len: ino,
         }
     }
@@ -948,7 +943,7 @@ mod tests {
         let req = ScanoutAllocReq {
             width: 1280,
             height: 960,
-            format: SCANOUT_FORMAT_BGRA_8888,
+            format: SCANOUT_FORMAT_RGBA_8888,
             len: 1280 * 960 * 4,
         };
         let enc = req.encode();
@@ -962,7 +957,7 @@ mod tests {
         let by_len = ScanoutAllocReq {
             width: 0,
             height: 0,
-            format: SCANOUT_FORMAT_BGRA_8888,
+            format: SCANOUT_FORMAT_RGBA_8888,
             len: 800 * 600 * 4,
         };
         assert_eq!(ScanoutAllocReq::decode(&by_len.encode()), Some(by_len));
@@ -992,7 +987,7 @@ mod tests {
         let req = ScanoutAllocReq {
             width: 1280,
             height: 960,
-            format: SCANOUT_FORMAT_BGRA_8888,
+            format: SCANOUT_FORMAT_RGBA_8888,
             len: 1280 * 960 * 4,
         };
         assert_eq!(
@@ -1001,7 +996,7 @@ mod tests {
                 0x31, 0x53, 0x4E, 0x47, // "GNS1"
                 0x00, 0x05, 0x00, 0x00, // 1280
                 0xC0, 0x03, 0x00, 0x00, // 960
-                0x05, 0x00, 0x00, 0x00, // BGRA_8888
+                0x01, 0x00, 0x00, 0x00, // RGBA_8888
                 0x00, 0x00, 0x4B, 0x00, 0x00, 0x00, 0x00, 0x00, // 4915200
             ]
         );
@@ -1029,18 +1024,18 @@ mod tests {
         assert!(dec.is_lookup());
         assert!(dec.wants_ahb_handle());
         assert_eq!(dec.len, 0x1234_5678_9ABC);
-        assert_eq!(dec.without_flags().format, SCANOUT_FORMAT_BGRA_8888);
+        assert_eq!(dec.without_flags().format, SCANOUT_FORMAT_RGBA_8888);
         assert!(!dec.without_flags().is_lookup());
         // A daemon that predates the lookup clears only the handle flag and
         // sees a format it does not serve, so it refuses.
         assert_ne!(
             dec.format & !SCANOUT_REQ_AHB_HANDLE,
-            SCANOUT_FORMAT_BGRA_8888
+            SCANOUT_FORMAT_RGBA_8888
         );
         let alloc = ScanoutAllocReq {
             width: 64,
             height: 64,
-            format: SCANOUT_FORMAT_BGRA_8888 | SCANOUT_REQ_AHB_HANDLE,
+            format: SCANOUT_FORMAT_RGBA_8888 | SCANOUT_REQ_AHB_HANDLE,
             len: 64 * 64 * 4,
         };
         assert!(!alloc.is_lookup());
@@ -1054,7 +1049,7 @@ mod tests {
         let mut extra = ScanoutAllocReq {
             width: 1,
             height: 1,
-            format: SCANOUT_FORMAT_BGRA_8888,
+            format: SCANOUT_FORMAT_RGBA_8888,
             len: 4,
         }
         .encode()
@@ -1065,7 +1060,7 @@ mod tests {
         let mut short = ScanoutAllocReq {
             width: 1,
             height: 1,
-            format: SCANOUT_FORMAT_BGRA_8888,
+            format: SCANOUT_FORMAT_RGBA_8888,
             len: 4,
         }
         .encode()
@@ -1080,12 +1075,12 @@ mod tests {
     }
 
     #[test]
-    fn scanout_ahb_format_is_bgra_8888() {
-        // HAL value 5 is `BGRA_8888` (B,G,R,A), the byte order the compositor's
-        // `XR24` scan-out expects. Value 2 is `R8G8B8X8_UNORM` (R,G,B,X), which
+    fn scanout_ahb_format_is_rgba_8888() {
+        // HAL value 1 is `RGBA_8888` (R,G,B,A), the byte order the compositor's
+        // `XB24` scan-out expects. Value 5 is `BGRA_8888` (B,G,R,A), which
         // would exchange red and blue on the panel.
-        assert_eq!(scanout_ahb_format(ScanoutLayout::EightBit), 5);
-        assert_eq!(SCANOUT_FORMAT_BGRA_8888, 5);
+        assert_eq!(scanout_ahb_format(ScanoutLayout::EightBit), 1);
+        assert_eq!(SCANOUT_FORMAT_RGBA_8888, 1);
     }
 
     #[test]

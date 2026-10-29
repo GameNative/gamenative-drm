@@ -423,7 +423,7 @@ fn pick_modifier() -> u64 {
             pNext: &mut modlist as *mut _ as *mut c_void,
             formatProperties: [0; 12],
         };
-        vkGetPhysicalDeviceFormatProperties2((*vk).pd, VK_FORMAT_B8G8R8A8_UNORM, &mut fp2);
+        vkGetPhysicalDeviceFormatProperties2((*vk).pd, VK_FORMAT_R8G8B8A8_UNORM, &mut fp2);
         let count = modlist.drmFormatModifierCount;
         if count == 0 {
             logf!("no drm format modifiers reported; assuming LINEAR");
@@ -438,7 +438,7 @@ fn pick_modifier() -> u64 {
             count as usize
         ];
         modlist.pDrmFormatModifierProperties = mods.as_mut_ptr();
-        vkGetPhysicalDeviceFormatProperties2((*vk).pd, VK_FORMAT_B8G8R8A8_UNORM, &mut fp2);
+        vkGetPhysicalDeviceFormatProperties2((*vk).pd, VK_FORMAT_R8G8B8A8_UNORM, &mut fp2);
         let count = modlist.drmFormatModifierCount as usize;
         let mut chosen = u64::MAX;
         for m in &mods[..count] {
@@ -488,7 +488,7 @@ unsafe fn buffer_create(b: *mut TestBuf, modifier: u64) -> i32 {
             pNext: &extimg as *const _ as *const c_void,
             flags: 0,
             imageType: VK_IMAGE_TYPE_2D,
-            format: VK_FORMAT_B8G8R8A8_UNORM,
+            format: VK_FORMAT_R8G8B8A8_UNORM,
             extent: VkExtent3D {
                 width: TEST_WIDTH,
                 height: TEST_HEIGHT,

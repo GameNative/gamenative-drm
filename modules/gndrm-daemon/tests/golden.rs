@@ -539,13 +539,37 @@ fn connector_encoder_plane_queries() {
     );
     ok(&r);
     let p: DrmModeGetPlane = pod_read(&r.body).unwrap();
-    assert_eq!(p.count_format_types, 5);
+    assert_eq!(p.count_format_types, 3);
     assert_eq!(p.possible_crtcs, 1);
     let off = core::mem::size_of::<DrmModeGetPlane>();
-    let fmts = &r.body[off..off + 20];
-    assert!(fmts
+    let fmts: Vec<u32> = r.body[off..off + 12]
         .chunks(4)
-        .any(|f| u32::from_le_bytes(f.try_into().unwrap()) == DRM_FORMAT_XRGB8888));
+        .map(|f| u32::from_le_bytes(f.try_into().unwrap()))
+        .collect();
+    assert_eq!(
+        fmts,
+        [DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_RGB565]
+    );
+
+    // Cursor plane: the B-low pair the primary plane leaves out.
+    let r = call(
+        &mut d,
+        DRM_IOCTL_MODE_GETPLANE,
+        &pod(&DrmModeGetPlane {
+            plane_id: PLANE_CURSOR_ID,
+            format_type_ptr: 1,
+            count_format_types: 16,
+            ..Default::default()
+        }),
+    );
+    ok(&r);
+    let p: DrmModeGetPlane = pod_read(&r.body).unwrap();
+    assert_eq!(p.count_format_types, 2);
+    let fmts: Vec<u32> = r.body[off..off + 8]
+        .chunks(4)
+        .map(|f| u32::from_le_bytes(f.try_into().unwrap()))
+        .collect();
+    assert_eq!(fmts, [DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888]);
 }
 
 #[test]
@@ -742,7 +766,16 @@ fn blob_lifecycle() {
 #[test]
 fn in_formats_blob_on_both_planes() {
     let mut d = dev();
-    for plane in [PLANE_PRIMARY_ID, PLANE_CURSOR_ID] {
+    for (plane, want) in [
+        (
+            PLANE_PRIMARY_ID,
+            &[DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_RGB565][..],
+        ),
+        (
+            PLANE_CURSOR_ID,
+            &[DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888][..],
+        ),
+    ] {
         let r = call(
             &mut d,
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES,
@@ -795,15 +828,18 @@ fn in_formats_blob_on_both_planes() {
         let blob = &r.body[off..];
         let u32at = |i: usize| u32::from_le_bytes(blob[4 * i..4 * i + 4].try_into().unwrap());
         assert_eq!(u32at(0), 1, "drm_format_modifier_blob version");
-        assert_eq!(u32at(2), 5, "count_formats");
+        let n = want.len();
+        assert_eq!(u32at(2) as usize, n, "count_formats");
         assert_eq!(u32at(3), 24, "formats_offset");
         assert_eq!(u32at(4), 1, "count_modifiers");
-        assert_eq!(u32at(5), 24 + 4 * 5, "modifiers_offset");
-        // Modifier entry: all 5 formats at DRM_FORMAT_MOD_LINEAR (0).
-        let m = 24 + 4 * 5;
+        assert_eq!(u32at(5) as usize, 24 + 4 * n, "modifiers_offset");
+        let fmts: Vec<u32> = (0..n).map(|i| u32at(6 + i)).collect();
+        assert_eq!(fmts, want, "plane {plane}: IN_FORMATS formats");
+        // Modifier entry: every format at DRM_FORMAT_MOD_LINEAR (0).
+        let m = 24 + 4 * n;
         assert_eq!(
             u64::from_le_bytes(blob[m..m + 8].try_into().unwrap()),
-            0b11111
+            (1u64 << n) - 1
         );
         assert_eq!(
             u64::from_le_bytes(blob[m + 16..m + 24].try_into().unwrap()),
@@ -911,7 +947,7 @@ fn addfb2_validation_and_rmfb() {
     let base = DrmModeFbCmd2 {
         width: 1280,
         height: 720,
-        pixel_format: DRM_FORMAT_XRGB8888,
+        pixel_format: DRM_FORMAT_XBGR8888,
         handles: [handle, 0, 0, 0],
         pitches: [1280 * 4, 0, 0, 0],
         offsets: [0; 4],
@@ -1252,7 +1288,7 @@ fn fb_space_exhaustion_returns_enospc_not_abort() {
     let cmd = DrmModeFbCmd2 {
         width: 1280,
         height: 720,
-        pixel_format: DRM_FORMAT_XRGB8888,
+        pixel_format: DRM_FORMAT_XBGR8888,
         handles: [handle, 0, 0, 0],
         pitches: [1280 * 4, 0, 0, 0],
         offsets: [0; 4],
@@ -1388,7 +1424,7 @@ fn import_fb(d: &mut Device) -> (u32, u32, RawFd) {
         &pod(&DrmModeFbCmd2 {
             width: 1280,
             height: 720,
-            pixel_format: DRM_FORMAT_XRGB8888,
+            pixel_format: DRM_FORMAT_XBGR8888,
             handles: [handle, 0, 0, 0],
             pitches: [1280 * 4, 0, 0, 0],
             offsets: [0; 4],
@@ -2073,7 +2109,7 @@ fn full_gamescope_chain_discovery_to_syncobj_async() {
         .take(plane.count_format_types as usize)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    assert!(fmts.contains(&DRM_FORMAT_XRGB8888));
+    assert!(fmts.contains(&DRM_FORMAT_XBGR8888));
 
     // 2. Buffer: import a memfd, ADDFB2, GETFB2 echoes pitch/format.
     let fd = memfd(1280 * 720 * 4);
@@ -2091,7 +2127,7 @@ fn full_gamescope_chain_discovery_to_syncobj_async() {
         &pod(&DrmModeFbCmd2 {
             width: 1280,
             height: 720,
-            pixel_format: DRM_FORMAT_XRGB8888,
+            pixel_format: DRM_FORMAT_XBGR8888,
             handles: [handle, 0, 0, 0],
             pitches: [1280 * 4, 0, 0, 0],
             ..Default::default()

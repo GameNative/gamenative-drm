@@ -60,10 +60,13 @@ const MIN_HEIGHT: u32 = 1;
 const MAX_WIDTH: u32 = 8192;
 const MAX_HEIGHT: u32 = 8192;
 
-/// Formats on the primary plane (the SDR set). `XRGB8888` stays first.
+/// Formats on the primary plane (the SDR set). `XBGR8888` stays first.
+///
+/// Only R-low 8-bit formats: the pool's AHB is `RGBA_8888` (R,G,B,A in
+/// memory), which is `XBGR8888`/`ABGR8888`. `XRGB8888`/`ARGB8888` are B-low and
+/// would reach the panel with red and blue exchanged; gamescope falls back to
+/// `XBGR8888` for its output when the primary plane offers no `XRGB8888`.
 const PRIMARY_FORMATS_SDR: &[u32] = &[
-    DRM_FORMAT_XRGB8888,
-    DRM_FORMAT_ARGB8888,
     DRM_FORMAT_XBGR8888,
     DRM_FORMAT_ABGR8888,
     DRM_FORMAT_RGB565,
@@ -77,7 +80,7 @@ const PRIMARY_FORMATS_SDR: &[u32] = &[
 ///
 /// * the 10-bit entry cannot be appended to a flat list — that moves the SDR
 ///   path onto a 10-bit buffer too, which the presenter/pool describe as
-///   `BGRA_8888`. So the set is gated on [`hdr_output_enabled`].
+///   `RGBA_8888`. So the set is gated on [`hdr_output_enabled`].
 /// * only `XBGR2101010` is offered, never `XRGB2101010`. The pool's AHB is
 ///   `R10G10B10A2_UNORM` (`RGBA_1010102`), whose channels are R-low/B-high;
 ///   gamescope's `XBGR2101010` (`xB:G:R`, R-low) matches it, while
@@ -85,8 +88,6 @@ const PRIMARY_FORMATS_SDR: &[u32] = &[
 ///   panel with red and blue exchanged. Offering both would let gamescope pick
 ///   the mismatched one.
 const PRIMARY_FORMATS_HDR: &[u32] = &[
-    DRM_FORMAT_XRGB8888,
-    DRM_FORMAT_ARGB8888,
     DRM_FORMAT_XBGR8888,
     DRM_FORMAT_ABGR8888,
     DRM_FORMAT_RGB565,
@@ -296,7 +297,13 @@ fn hdr_output_active_for(colorspace: u64) -> bool {
 }
 
 /// Cursor plane formats (doc §3.2: ARGB8888, 64×64).
-const CURSOR_FORMATS: &[u32] = &[DRM_FORMAT_ARGB8888];
+///
+/// `ARGB8888`/`XRGB8888` live here because the primary plane does not offer
+/// them, yet gamescope needs them in the union of all plane formats: it builds
+/// the client dmabuf sampling list from that union (Xwayland allocates depth-24
+/// pixmaps as `XR24`), and its blank texture is `ARGB8888`. The cursor plane is
+/// never published, so its formats never meet the pool.
+const CURSOR_FORMATS: &[u32] = &[DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888];
 
 /// What the socket layer does with one dispatch call.
 #[derive(Debug)]
@@ -409,7 +416,7 @@ pub type LogFn = Box<dyn Fn(&str) + Send>;
 /// with `(width, height, alloc_len)`, where `alloc_len` is the backing GEM's
 /// real allocation length (`st_size`) — row-padded and page-rounded, the exact
 /// length a length-only request carries. The presentation layer notes it in its
-/// pool under the pool's own BGRA layout, never the DRM fourcc.
+/// pool under the pool's own RGBA layout, never the DRM fourcc.
 pub type AddFbGeometryFn = Box<dyn Fn(u32, u32, u64) + Send>;
 
 /// The emulated device (one per connected client / open file description).
@@ -443,6 +450,9 @@ pub struct Device {
     /// Primary-plane `IN_FORMATS` blob id (created at init: every
     /// `PRIMARY_FORMATS` fourcc × `DRM_FORMAT_MOD_LINEAR`).
     in_formats_blob: u32,
+    /// Cursor-plane `IN_FORMATS` blob id (every `CURSOR_FORMATS` fourcc ×
+    /// `DRM_FORMAT_MOD_LINEAR`).
+    cursor_in_formats_blob: u32,
     /// Connector `EDID` blob id, built at session start from the display
     /// capability (no HDR static metadata block on an SDR panel).
     edid_blob: u32,
@@ -521,7 +531,17 @@ impl Device {
             in_formats_blob,
             Blob {
                 id: in_formats_blob,
-                data: in_formats_blob_data(),
+                data: in_formats_blob_data(primary_formats()),
+            },
+        );
+        let cursor_in_formats_blob = stores
+            .alloc_blob()
+            .expect(&gndrm_obf::obf!("in_formats blob id"));
+        stores.blobs.insert(
+            cursor_in_formats_blob,
+            Blob {
+                id: cursor_in_formats_blob,
+                data: in_formats_blob_data(CURSOR_FORMATS),
             },
         );
         // The EDID tells gamescope whether this display is HDR10. Built once
@@ -577,6 +597,7 @@ impl Device {
             primary: PlaneState::default(),
             cursor: PlaneState::default(),
             in_formats_blob,
+            cursor_in_formats_blob,
             edid_blob,
             clock,
             flip_sequence: 0,
@@ -1216,10 +1237,10 @@ impl Device {
             (PLANE_CURSOR_ID, P_PLANE_CRTC_H) => self.cursor.crtc_h as u32 as u64,
             (_, P_PLANE_IN_FENCE_FD) => u64::MAX, // -1: no fence
             (PLANE_PRIMARY_ID, P_PLANE_IN_FORMATS) => u64::from(self.in_formats_blob),
-            // Kernel exposes IN_FORMATS on every plane; the shared blob's
-            // format set covers the cursor's AR24. A zero value here makes
+            // Kernel exposes IN_FORMATS on every plane, and gamescope reads
+            // each plane's formats from it. A zero value here makes
             // libliftoff's plane init fail the whole DRM backend.
-            (PLANE_CURSOR_ID, P_PLANE_IN_FORMATS) => u64::from(self.in_formats_blob),
+            (PLANE_CURSOR_ID, P_PLANE_IN_FORMATS) => u64::from(self.cursor_in_formats_blob),
             _ => 0,
         }
     }
@@ -1767,9 +1788,9 @@ impl Device {
         // Teach the presentation layer this geometry, so a length-only scan-out
         // request of the same pixel size resolves to it. Only a 32-bpp
         // framebuffer is a buffer of the pixel size the pool serves; the pool's
-        // own BGRA layout is noted, never the DRM fourcc (the length index is
-        // keyed by `(alloc_len, format)`, so a fourcc entry would poison a BGRA
-        // lookup).
+        // own RGBA layout is noted, never the DRM fourcc (the length index is
+        // keyed by `(alloc_len, format)`, so a fourcc entry would poison an
+        // RGBA lookup).
         if bpp == 32 {
             if let Some(note) = &self.addfb_geometry {
                 note(cmd.width, cmd.height, gem_size);
@@ -2136,11 +2157,10 @@ fn commit_worker_loop(
     }
 }
 
-/// `drm_format_modifier_blob` for the primary plane's `IN_FORMATS`: every
-/// advertised primary format (SDR, or the HDR set when HDR output is on)
-/// scanned out with `DRM_FORMAT_MOD_LINEAR`.
-fn in_formats_blob_data() -> Vec<u8> {
-    let formats = primary_formats();
+/// `drm_format_modifier_blob` for a plane's `IN_FORMATS`: every format in
+/// `formats` (for the primary plane the SDR set, or the HDR set when HDR output
+/// is on) scanned out with `DRM_FORMAT_MOD_LINEAR`.
+fn in_formats_blob_data(formats: &[u32]) -> Vec<u8> {
     const HEADER: u32 = 24; // drm_format_modifier_blob header size
     let count_formats = formats.len() as u32;
     let formats_offset = HEADER;
@@ -2352,18 +2372,21 @@ mod tests {
         Device::new(PanelDesc::default(), Box::<NullPresenter>::default())
     }
 
-    /// The HDR flag gates exactly the two 10-bit fourccs, keeping XRGB8888 first
+    /// The HDR flag gates exactly the 10-bit fourcc, keeping XBGR8888 first
     /// and the SDR set untouched.
     #[test]
     fn primary_formats_are_hdr_gated() {
         let sdr = primary_formats_for(false);
-        assert_eq!(sdr.len(), 5);
-        assert_eq!(sdr[0], DRM_FORMAT_XRGB8888);
+        assert_eq!(sdr.len(), 3);
+        assert_eq!(sdr[0], DRM_FORMAT_XBGR8888);
+        assert!(!sdr.contains(&DRM_FORMAT_XRGB8888));
+        assert!(!sdr.contains(&DRM_FORMAT_ARGB8888));
         assert!(!sdr.contains(&DRM_FORMAT_XRGB2101010));
 
         let hdr = primary_formats_for(true);
-        assert_eq!(hdr.len(), 6);
-        assert_eq!(hdr[0], DRM_FORMAT_XRGB8888);
+        assert_eq!(hdr.len(), 4);
+        assert_eq!(hdr[0], DRM_FORMAT_XBGR8888);
+        assert!(!hdr.contains(&DRM_FORMAT_XRGB8888));
         assert!(hdr.contains(&DRM_FORMAT_XBGR2101010));
         // XRGB2101010 is deliberately absent: its channel order does not match
         // the R10G10B10A2 pool layout, and gamescope would prefer it.
