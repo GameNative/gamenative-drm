@@ -95,10 +95,11 @@ struct gndrm_resp {
  * pair in gndrm-uapi/src/wire.rs.
  */
 #define GNDRM_SCANOUT_MAGIC 0x474E5331u /* "GNS1" */
-/* HAL AHardwareBuffer format RGBA_8888 (value 1): R,G,B,A in memory, which is
- * the DRM XB24 (0x34324258, fourth byte ignored) scan-out layout gamescope
- * renders. A pool in any other format would reach SurfaceFlinger with swapped
- * channels; value 5 (BGRA_8888) is B,G,R,A and exchanges red and blue. */
+/* HAL AHardwareBuffer formats of the two scan-out pool layouts: BGRA_8888
+ * (value 5) is B,G,R,A in memory, the DRM XR24 layout; RGBA_8888 (value 1) is
+ * R,G,B,A, the DRM XB24 layout. GNDRM_SCANOUT_LAYOUT names the session's
+ * layout ("rgba", else BGRA); the daemon refuses a request in the other one. */
+#define GNDRM_SCANOUT_FORMAT_BGRA_8888 5u
 #define GNDRM_SCANOUT_FORMAT_RGBA_8888 1u
 /* Reply budget and attempt count for one scan-out request. A request that is
  * not answered inside the budget has either been lost or is being served
@@ -143,8 +144,10 @@ struct gndrm_scanout_resp {
 } __attribute__((packed));
 _Static_assert(sizeof(struct gndrm_scanout_resp) == 24,
                "ScanoutAllocResp is 24 bytes on the wire");
+_Static_assert(GNDRM_SCANOUT_FORMAT_BGRA_8888 == 5u,
+               "BGRA scan-out pool AHB format is BGRA_8888 (HAL 5)");
 _Static_assert(GNDRM_SCANOUT_FORMAT_RGBA_8888 == 1u,
-               "scan-out pool AHB format is RGBA_8888 (HAL 1)");
+               "RGBA scan-out pool AHB format is RGBA_8888 (HAL 1)");
 
 /* ------------------------------------------------------------------ */
 /* shim state                                                          */
@@ -1398,6 +1401,19 @@ static void scanout_chan_drop(void)
     g_scanout_fd = -1;
 }
 
+/* The session's scan-out request format, read once. Called with
+ * g_scanout_lock held. */
+static uint32_t scanout_format(void)
+{
+    static uint32_t format;
+    if (!format) {
+        const char *layout = getenv("GNDRM_SCANOUT_LAYOUT");
+        format = layout && strcmp(layout, "rgba") == 0 ? GNDRM_SCANOUT_FORMAT_RGBA_8888
+                                                       : GNDRM_SCANOUT_FORMAT_BGRA_8888;
+    }
+    return format;
+}
+
 /*
  * One request/response exchange on a connected channel. Returns 0 or -errno;
  * on success *resp holds the reply and *fd_out the received descriptor.
@@ -1410,7 +1426,7 @@ static int scanout_exchange(uint32_t w, uint32_t h, uint64_t len,
         .magic = GNDRM_SCANOUT_MAGIC,
         .width = w,
         .height = h,
-        .format = GNDRM_SCANOUT_FORMAT_RGBA_8888,
+        .format = scanout_format(),
         .len = len,
     };
     struct iovec iov = { .iov_base = &req, .iov_len = sizeof(req) };

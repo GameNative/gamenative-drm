@@ -220,7 +220,7 @@ pub const ADATASPACE_BT2020_PQ: c_int = 163971072;
 /// HAL `0x2b`): the 10-bit 2:10:10:10 layout with red in bits 0-9 that matches
 /// gamescope's `XBGR2101010` scan-out fourcc. This is the format a published
 /// HDR scan-out buffer must be declared with; publishing 10-bit pixels under
-/// the 8-bit `RGBA_8888` label misdescribes them to SurfaceFlinger.
+/// an 8-bit label misdescribes them to SurfaceFlinger.
 pub const AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM: u32 = 0x2b;
 
 /// Whether a scan-out framebuffer's DRM fourcc is a 10-bit 2:10:10:10 layout
@@ -234,10 +234,10 @@ pub const fn is_ten_bit_drm_format(fourcc: u32) -> bool {
 /// `ASurfaceTransactionTransparency` (`<android/surface_control.h>`, API 29).
 /// `OPAQUE` tells SurfaceFlinger the buffer's alpha channel is not meaningful,
 /// so the scan-out layer is composited opaque — the DRM convention an
-/// X-prefixed fourcc (`XB24`) carries, and the one gamescope's composite
+/// X-prefixed fourcc (`XR24`/`XB24`) carries, and the one gamescope's composite
 /// shaders are written to (a pass may store alpha 0 without blanking the
-/// frame). The pool's `AHardwareBuffer` is `RGBA_8888`, whose alpha is
-/// honoured by default, so this must be asserted explicitly.
+/// frame). The pool's `AHardwareBuffer` is `BGRA_8888` or `RGBA_8888`, whose
+/// alpha is honoured by default, so this must be asserted explicitly.
 pub const ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE: i8 = 2;
 
 pub type FnScCreateFromWindow = unsafe extern "C" fn(

@@ -5,17 +5,18 @@
 use std::collections::HashSet;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use gndrm_daemon::pod::{pod_read, pod_write};
 use gndrm_daemon::{
-    find_prop_id, Device, DispatchResult, Framebuffer, NullPresenter, PanelDesc, PlaneState,
-    Presenter, CONNECTOR_ID, CRTC_ID, ENCODER_ID, PLANE_CURSOR_ID, PLANE_PRIMARY_ID,
+    find_prop_id, select_scanout_layout, Device, DispatchResult, Framebuffer, NullPresenter,
+    PanelDesc, PlaneState, Presenter, CONNECTOR_ID, CRTC_ID, ENCODER_ID, PLANE_CURSOR_ID,
+    PLANE_PRIMARY_ID,
 };
 use gndrm_uapi::drm::*;
 use gndrm_uapi::mode::*;
-use gndrm_uapi::wire::errno;
+use gndrm_uapi::wire::{errno, ScanoutLayout};
 
 // ---------------------------------------------------------------------------
 // harness
@@ -26,6 +27,32 @@ fn dev() -> Device {
     d.set_clock(Box::new(|| (1000, 500))); // deterministic event timestamps
     d
 }
+
+/// Serialises the tests that depend on the process-wide scan-out layout.
+static LAYOUT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Select `layout` for the devices built while the guard is held.
+fn with_layout(layout: ScanoutLayout) -> MutexGuard<'static, ()> {
+    let guard = LAYOUT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    select_scanout_layout(layout);
+    guard
+}
+
+/// The primary plane's formats per layout, without HDR.
+fn primary_formats(layout: ScanoutLayout) -> &'static [u32] {
+    match layout {
+        ScanoutLayout::Bgra8888 => &[
+            DRM_FORMAT_XRGB8888,
+            DRM_FORMAT_ARGB8888,
+            DRM_FORMAT_XBGR8888,
+            DRM_FORMAT_ABGR8888,
+            DRM_FORMAT_RGB565,
+        ],
+        ScanoutLayout::Rgba8888 => &[DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_RGB565],
+    }
+}
+
+const LAYOUTS: [ScanoutLayout; 2] = [ScanoutLayout::Bgra8888, ScanoutLayout::Rgba8888];
 
 /// A presenter whose only job is to count the frames it is handed. The device
 /// never waits on a presenter completion, so the mocks need only accept the
@@ -430,6 +457,7 @@ fn get_resources_golden() {
 
 #[test]
 fn connector_encoder_plane_queries() {
+    let _layout = with_layout(ScanoutLayout::Bgra8888);
     let mut d = dev();
 
     // Connector, two-call.
@@ -539,19 +567,16 @@ fn connector_encoder_plane_queries() {
     );
     ok(&r);
     let p: DrmModeGetPlane = pod_read(&r.body).unwrap();
-    assert_eq!(p.count_format_types, 3);
+    assert_eq!(p.count_format_types, 5);
     assert_eq!(p.possible_crtcs, 1);
     let off = core::mem::size_of::<DrmModeGetPlane>();
-    let fmts: Vec<u32> = r.body[off..off + 12]
+    let fmts: Vec<u32> = r.body[off..off + 20]
         .chunks(4)
         .map(|f| u32::from_le_bytes(f.try_into().unwrap()))
         .collect();
-    assert_eq!(
-        fmts,
-        [DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_RGB565]
-    );
+    assert_eq!(fmts, primary_formats(ScanoutLayout::Bgra8888));
 
-    // Cursor plane: the B-low pair the primary plane leaves out.
+    // Cursor plane: the B-low pair, in both layouts.
     let r = call(
         &mut d,
         DRM_IOCTL_MODE_GETPLANE,
@@ -570,6 +595,46 @@ fn connector_encoder_plane_queries() {
         .map(|f| u32::from_le_bytes(f.try_into().unwrap()))
         .collect();
     assert_eq!(fmts, [DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888]);
+}
+
+/// GETPLANE answers each layout's primary list and the same cursor list.
+#[test]
+fn plane_formats_follow_the_layout() {
+    for layout in LAYOUTS {
+        let _layout = with_layout(layout);
+        let mut d = dev();
+        for (plane, want) in [
+            (PLANE_PRIMARY_ID, primary_formats(layout)),
+            (
+                PLANE_CURSOR_ID,
+                &[DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888][..],
+            ),
+        ] {
+            let r = call(
+                &mut d,
+                DRM_IOCTL_MODE_GETPLANE,
+                &pod(&DrmModeGetPlane {
+                    plane_id: plane,
+                    format_type_ptr: 1,
+                    count_format_types: 16,
+                    ..Default::default()
+                }),
+            );
+            ok(&r);
+            let p: DrmModeGetPlane = pod_read(&r.body).unwrap();
+            assert_eq!(
+                p.count_format_types as usize,
+                want.len(),
+                "{layout:?} plane {plane}"
+            );
+            let off = core::mem::size_of::<DrmModeGetPlane>();
+            let fmts: Vec<u32> = r.body[off..off + 4 * want.len()]
+                .chunks(4)
+                .map(|f| u32::from_le_bytes(f.try_into().unwrap()))
+                .collect();
+            assert_eq!(fmts, want, "{layout:?} plane {plane}");
+        }
+    }
 }
 
 #[test]
@@ -765,12 +830,16 @@ fn blob_lifecycle() {
 /// blob lookup fails (a zero/garbage value yields ENOENT).
 #[test]
 fn in_formats_blob_on_both_planes() {
+    for layout in LAYOUTS {
+        let _layout = with_layout(layout);
+        in_formats_blobs(layout);
+    }
+}
+
+fn in_formats_blobs(layout: ScanoutLayout) {
     let mut d = dev();
     for (plane, want) in [
-        (
-            PLANE_PRIMARY_ID,
-            &[DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_RGB565][..],
-        ),
+        (PLANE_PRIMARY_ID, primary_formats(layout)),
         (
             PLANE_CURSOR_ID,
             &[DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888][..],

@@ -207,27 +207,60 @@ pub mod errno {
 /// Scan-out allocator message magic: ASCII "GNS1".
 pub const SCANOUT_MAGIC: u32 = 0x474E_5331;
 
-/// The scan-out pool's colour layout. Allocation sites pick a layout through
-/// this key and [`scanout_ahb_format`] rather than naming a HAL constant, so a
-/// future capability adds one arm below instead of a hardcoded value chasing
-/// across the wire, the C shim and the presenter.
+/// The scan-out pool's colour layout, chosen per session. Allocation sites pick
+/// a layout through this key and [`scanout_ahb_format`] rather than naming a HAL
+/// constant.
+///
+/// [`ScanoutLayout::Bgra8888`] is the default. The daemon selects
+/// [`ScanoutLayout::Rgba8888`] at session start on Android 16+ when
+/// `SurfaceFlinger` composes with the Skia GLES render engine, which tags a
+/// `BGRA_8888` buffer in a way GLES cannot pair with the RGBA8 texture it wraps
+/// the buffer in, and aborts the whole UI as soon as it has to draw the layer.
+/// [`SCANOUT_LAYOUT_ENV`] overrides the choice; every process of a session must
+/// see the same value, because the client's request format must match the pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanoutLayout {
-    /// 8-bit R,G,B,A. The pool's only layout today.
-    EightBit,
+    /// 8-bit B,G,R,A (`XR24`/`AR24` on the primary plane).
+    Bgra8888,
+    /// 8-bit R,G,B,A (`XB24`/`AB24` on the primary plane).
+    Rgba8888,
+}
+
+/// Environment variable naming the session's [`ScanoutLayout`]: `bgra` or
+/// `rgba`.
+pub const SCANOUT_LAYOUT_ENV: &str = "GNDRM_SCANOUT_LAYOUT";
+
+impl ScanoutLayout {
+    /// Parse a [`SCANOUT_LAYOUT_ENV`] value; `None` for anything else.
+    #[must_use]
+    pub fn from_env_value(value: &str) -> Option<Self> {
+        match value {
+            "bgra" => Some(Self::Bgra8888),
+            "rgba" => Some(Self::Rgba8888),
+            _ => None,
+        }
+    }
+
+    /// The [`SCANOUT_LAYOUT_ENV`] value naming this layout.
+    #[must_use]
+    pub const fn as_env_value(self) -> &'static str {
+        match self {
+            Self::Bgra8888 => "bgra",
+            Self::Rgba8888 => "rgba",
+        }
+    }
 }
 
 /// HAL `AHardwareBuffer` format for `layout`.
 ///
-/// `EightBit` is **`AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM`** (HAL value 1,
-/// `RGBA_8888`): R,G,B,A in memory. That is the byte order of the `XB24`
-/// (`0x34324258`) / `AB24` the compositor commits for scan-out, whose fourth
-/// byte the presenter declares opaque. The primary plane offers only those
-/// R-low formats, so the compositor never places a B,G,R buffer on it.
-///
-/// The pool was `BGRA_8888` (HAL value 5) matching `XR24`, but the Skia render
-/// engine in `SurfaceFlinger` cannot wrap value 5 (Android 16 aborts the whole
-/// UI on it) and Qualcomm gralloc has no display constraints for it.
+/// `Bgra8888` is **`AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM`** (HAL value 5,
+/// `BGRA_8888`): B,G,R,A in memory, the byte order of `XR24` (`0x34325258`).
+/// `Rgba8888` is **`AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM`** (HAL value 1,
+/// `RGBA_8888`): R,G,B,A in memory, the byte order of `XB24` (`0x34324258`).
+/// The fourth byte is declared opaque by the presenter. The primary plane
+/// offers only the fourccs in the session layout's channel order, so the
+/// compositor never places a buffer of the other order on it. Value 2
+/// (`R8G8B8X8_UNORM`) shares a stride with both and is neither.
 ///
 /// The 10-bit/HDR entry (`R10G10B10A2_UNORM`-class) belongs here as a
 /// `TenBit` arm once the DRM side carries what it needs — 10-bit plane
@@ -236,13 +269,16 @@ pub enum ScanoutLayout {
 #[must_use]
 pub const fn scanout_ahb_format(layout: ScanoutLayout) -> u32 {
     match layout {
-        ScanoutLayout::EightBit => 1, // AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
+        ScanoutLayout::Bgra8888 => 5, // AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM
+        ScanoutLayout::Rgba8888 => 1, // AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
     }
 }
 
-/// The format the scan-out path requires today, i.e.
-/// [`scanout_ahb_format`]`(ScanoutLayout::EightBit)`.
-pub const SCANOUT_FORMAT_RGBA_8888: u32 = scanout_ahb_format(ScanoutLayout::EightBit);
+/// [`scanout_ahb_format`]`(ScanoutLayout::Bgra8888)`.
+pub const SCANOUT_FORMAT_BGRA_8888: u32 = scanout_ahb_format(ScanoutLayout::Bgra8888);
+
+/// [`scanout_ahb_format`]`(ScanoutLayout::Rgba8888)`.
+pub const SCANOUT_FORMAT_RGBA_8888: u32 = scanout_ahb_format(ScanoutLayout::Rgba8888);
 
 /// Allocation request.
 ///
@@ -289,11 +325,11 @@ impl ScanoutAllocReq {
     /// A lookup of the handed-out buffer whose dma-buf has inode `ino`,
     /// asking for its `AHardwareBuffer` too.
     #[must_use]
-    pub fn lookup_ahb(ino: u64) -> Self {
+    pub fn lookup_ahb(ino: u64, layout: ScanoutLayout) -> Self {
         Self {
             width: 0,
             height: 0,
-            format: SCANOUT_FORMAT_RGBA_8888 | SCANOUT_REQ_AHB_HANDLE | SCANOUT_REQ_LOOKUP_INO,
+            format: scanout_ahb_format(layout) | SCANOUT_REQ_AHB_HANDLE | SCANOUT_REQ_LOOKUP_INO,
             len: ino,
         }
     }
@@ -1019,7 +1055,7 @@ mod tests {
 
     #[test]
     fn scanout_lookup_carries_the_inode_and_both_flags() {
-        let req = ScanoutAllocReq::lookup_ahb(0x1234_5678_9ABC);
+        let req = ScanoutAllocReq::lookup_ahb(0x1234_5678_9ABC, ScanoutLayout::Rgba8888);
         let dec = ScanoutAllocReq::decode(&req.encode()).unwrap();
         assert!(dec.is_lookup());
         assert!(dec.wants_ahb_handle());
@@ -1075,12 +1111,36 @@ mod tests {
     }
 
     #[test]
-    fn scanout_ahb_format_is_rgba_8888() {
-        // HAL value 1 is `RGBA_8888` (R,G,B,A), the byte order the compositor's
-        // `XB24` scan-out expects. Value 5 is `BGRA_8888` (B,G,R,A), which
-        // would exchange red and blue on the panel.
-        assert_eq!(scanout_ahb_format(ScanoutLayout::EightBit), 1);
+    fn scanout_ahb_format_per_layout() {
+        // HAL value 5 is `BGRA_8888` (B,G,R,A, `XR24`) and value 1 is
+        // `RGBA_8888` (R,G,B,A, `XB24`). Value 2 is `R8G8B8X8_UNORM`, which
+        // neither layout may use.
+        assert_eq!(scanout_ahb_format(ScanoutLayout::Bgra8888), 5);
+        assert_eq!(scanout_ahb_format(ScanoutLayout::Rgba8888), 1);
+        assert_eq!(SCANOUT_FORMAT_BGRA_8888, 5);
         assert_eq!(SCANOUT_FORMAT_RGBA_8888, 1);
+    }
+
+    #[test]
+    fn scanout_layout_env_values() {
+        assert_eq!(SCANOUT_LAYOUT_ENV, "GNDRM_SCANOUT_LAYOUT");
+        for layout in [ScanoutLayout::Bgra8888, ScanoutLayout::Rgba8888] {
+            assert_eq!(
+                ScanoutLayout::from_env_value(layout.as_env_value()),
+                Some(layout)
+            );
+        }
+        assert_eq!(
+            ScanoutLayout::from_env_value("rgba"),
+            Some(ScanoutLayout::Rgba8888)
+        );
+        assert_eq!(
+            ScanoutLayout::from_env_value("bgra"),
+            Some(ScanoutLayout::Bgra8888)
+        );
+        for other in ["", "RGBA", "1", "5", "rgba "] {
+            assert_eq!(ScanoutLayout::from_env_value(other), None);
+        }
     }
 
     #[test]

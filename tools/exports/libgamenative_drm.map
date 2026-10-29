@@ -16,6 +16,7 @@
     Java_app_gamenative_display_GameNativeDrm_nativeInjectorSetSuspended;
     Java_app_gamenative_display_GameNativeDrm_nativeDisplayInfo;
     Java_app_gamenative_display_GameNativeDrm_nativeRetargetSurface;
+    Java_app_gamenative_display_GameNativeDrm_nativeScanoutLayout;
     Java_app_gamenative_display_GameNativeDrm_nativeGamescopeCommand;
     Java_app_gamenative_display_GameNativeDrm_nativeSetFpsLimit;
     Java_app_gamenative_display_GameNativeDrm_nativeReshadeSetEffect;

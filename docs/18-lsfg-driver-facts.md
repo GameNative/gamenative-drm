@@ -26,7 +26,7 @@ embedder copies the result into the caller's target, which consequently needs on
 
 ## The capture is a blit
 
-The guest's presented frame is BGRA under the BGRA opt-in and the chain is RGBA8,
+The guest's presented frame can be BGRA and the chain is RGBA8,
 and a copy performs no conversion — a capture by `vkCmdCopyImage` yields
 generated frames with red and blue exchanged. `CopyPresentedFrame` blits with `VK_FILTER_NEAREST`.
 

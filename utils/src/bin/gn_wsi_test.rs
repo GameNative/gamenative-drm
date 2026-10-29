@@ -22,6 +22,7 @@
 
 use gn_utils::vk::*;
 use gn_utils::wlproto::{self, wl_display, wl_proxy};
+use gndrm_uapi::wire::{ScanoutLayout, SCANOUT_LAYOUT_ENV};
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
 
@@ -452,9 +453,16 @@ fn swapchain_init() -> i32 {
             nfmt as usize
         ];
         vkGetPhysicalDeviceSurfaceFormatsKHR((*vk).pd, (*vk).surface, &mut nfmt, fmts.as_mut_ptr());
+        let want = match std::env::var(SCANOUT_LAYOUT_ENV)
+            .ok()
+            .and_then(|v| ScanoutLayout::from_env_value(&v))
+        {
+            Some(ScanoutLayout::Rgba8888) => VK_FORMAT_R8G8B8A8_UNORM,
+            _ => VK_FORMAT_B8G8R8A8_UNORM,
+        };
         let mut pick = fmts[0];
         for f in &fmts[..nfmt as usize] {
-            if f.format == VK_FORMAT_R8G8B8A8_UNORM {
+            if f.format == want {
                 pick = *f;
                 break;
             }

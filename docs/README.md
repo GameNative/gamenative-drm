@@ -60,7 +60,7 @@ process redirects the DRM device open and all DRM ioctls to that socket. The
 daemon implements the kernel DRM UAPI atomic-KMS subset (resources/connector/
 CRTC/plane discovery, properties/blobs, PRIME import/export, AddFB2/GetFB2,
 atomic commit, flip events, sync objects). It owns the scan-out
-`AHardwareBuffer` pool (RGBA, HAL value 1) and publishes each committed frame
+`AHardwareBuffer` pool (BGRA, HAL value 5, or RGBA, HAL value 1) and publishes each committed frame
 with `ASurfaceControl`/`ASurfaceTransaction`, so gamescope renders directly into
 the buffer SurfaceFlinger scans out. Commits validate and queue and return
 immediately; a per-CRTC commit worker presents and emits the flip event with the
