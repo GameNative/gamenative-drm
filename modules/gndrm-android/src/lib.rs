@@ -38,6 +38,7 @@ mod dump;
 pub mod ffi;
 mod foreign;
 mod injector;
+mod layout;
 #[macro_use]
 mod log;
 mod log_policy;
@@ -58,7 +59,8 @@ use jni::{JNIEnv, JavaVM};
 use gndrm_daemon::diag;
 use gndrm_daemon::server;
 use gndrm_daemon::{
-    reset_hdr_output_cache, reset_verbose_logging, Device, FrameCap, NullPresenter, PanelDesc,
+    reset_hdr_output_cache, reset_scanout_layout, reset_verbose_logging, select_scanout_layout,
+    Device, FrameCap, NullPresenter, PanelDesc,
 };
 use gndrm_uapi::wire::LsfgConfig;
 
@@ -793,6 +795,9 @@ fn start(
     // all), so the per-frame diagnostics must re-read it rather than carry the
     // previous session's verdict into this one.
     reset_verbose_logging();
+    layout::reset();
+    reset_scanout_layout();
+    select_scanout_layout(layout::session_layout());
     // First JNI entry point to run: capture the VM so the scan-out thread can
     // push the booting-splash event when the game's window is reported.
     cache_java_vm(env);
@@ -1188,6 +1193,23 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeStart(
         start(&mut env, &socket_name, &surface, width, height)
     }))
     .unwrap_or(E_FAULT)
+}
+
+/// `GameNativeDrm.nativeScanoutLayout()` — the session's scan-out layout as the
+/// `GNDRM_SCANOUT_LAYOUT` value (`"bgra"` or `"rgba"`) the guest must be given.
+/// Valid before `nativeStart`; the same answer unless the environment changed.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeScanoutLayout(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match env.new_string(layout::session_layout().as_env_value()) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(std::ptr::null_mut())
 }
 
 /// `GameNativeDrm.nativeStop`.

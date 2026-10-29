@@ -207,32 +207,60 @@ pub mod errno {
 /// Scan-out allocator message magic: ASCII "GNS1".
 pub const SCANOUT_MAGIC: u32 = 0x474E_5331;
 
-/// The scan-out pool's colour layout. Allocation sites pick a layout through
-/// this key and [`scanout_ahb_format`] rather than naming a HAL constant, so a
-/// future capability adds one arm below instead of a hardcoded value chasing
-/// across the wire, the C shim and the presenter.
+/// The scan-out pool's colour layout, chosen per session. Allocation sites pick
+/// a layout through this key and [`scanout_ahb_format`] rather than naming a HAL
+/// constant.
+///
+/// [`ScanoutLayout::Bgra8888`] is the default. The daemon selects
+/// [`ScanoutLayout::Rgba8888`] at session start on Android 16+ when
+/// `SurfaceFlinger` composes with the Skia GLES render engine, which tags a
+/// `BGRA_8888` buffer in a way GLES cannot pair with the RGBA8 texture it wraps
+/// the buffer in, and aborts the whole UI as soon as it has to draw the layer.
+/// [`SCANOUT_LAYOUT_ENV`] overrides the choice; every process of a session must
+/// see the same value, because the client's request format must match the pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanoutLayout {
-    /// 8-bit B,G,R,A. The pool's only layout today.
-    EightBit,
+    /// 8-bit B,G,R,A (`XR24`/`AR24` on the primary plane).
+    Bgra8888,
+    /// 8-bit R,G,B,A (`XB24`/`AB24` on the primary plane).
+    Rgba8888,
+}
+
+/// Environment variable naming the session's [`ScanoutLayout`]: `bgra` or
+/// `rgba`.
+pub const SCANOUT_LAYOUT_ENV: &str = "GNDRM_SCANOUT_LAYOUT";
+
+impl ScanoutLayout {
+    /// Parse a [`SCANOUT_LAYOUT_ENV`] value; `None` for anything else.
+    #[must_use]
+    pub fn from_env_value(value: &str) -> Option<Self> {
+        match value {
+            "bgra" => Some(Self::Bgra8888),
+            "rgba" => Some(Self::Rgba8888),
+            _ => None,
+        }
+    }
+
+    /// The [`SCANOUT_LAYOUT_ENV`] value naming this layout.
+    #[must_use]
+    pub const fn as_env_value(self) -> &'static str {
+        match self {
+            Self::Bgra8888 => "bgra",
+            Self::Rgba8888 => "rgba",
+        }
+    }
 }
 
 /// HAL `AHardwareBuffer` format for `layout`.
 ///
-/// `EightBit` is **`AHARDWAREBUFFER_FORMAT_BGRA_8888`** (HAL value 5): B,G,R,A
-/// in memory. That is the byte order of the `XR24` (`0x34325258`) the
-/// compositor commits for scan-out, whose fourth byte is ignored. It is *not*
-/// `R8G8B8X8_UNORM` (value 2), which is R,G,B,X: the two share a stride and
-/// nothing else, so allocating the pool as value 2 exchanges red and blue
-/// between the guest's frame and the panel.
-///
-/// There is no alpha-less B,G,R entry in the HAL enum — value 5 is the only
-/// B,G,R form — so "declare the fourth byte as X" is not a route the platform
-/// offers. The alpha hypothesis for the presented-content defect is falsified
-/// by measurement: the guest writes a don't-care fourth byte (Nidhogg's frames
-/// are ~92.9% alpha-zero, the rest alpha-1), yet the panel is ~94% dark with
-/// either declaration, so that zero-alpha statistic is not the cause of the
-/// missing background.
+/// `Bgra8888` is **`AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM`** (HAL value 5,
+/// `BGRA_8888`): B,G,R,A in memory, the byte order of `XR24` (`0x34325258`).
+/// `Rgba8888` is **`AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM`** (HAL value 1,
+/// `RGBA_8888`): R,G,B,A in memory, the byte order of `XB24` (`0x34324258`).
+/// The fourth byte is declared opaque by the presenter. The primary plane
+/// offers only the fourccs in the session layout's channel order, so the
+/// compositor never places a buffer of the other order on it. Value 2
+/// (`R8G8B8X8_UNORM`) shares a stride with both and is neither.
 ///
 /// The 10-bit/HDR entry (`R10G10B10A2_UNORM`-class) belongs here as a
 /// `TenBit` arm once the DRM side carries what it needs — 10-bit plane
@@ -241,13 +269,16 @@ pub enum ScanoutLayout {
 #[must_use]
 pub const fn scanout_ahb_format(layout: ScanoutLayout) -> u32 {
     match layout {
-        ScanoutLayout::EightBit => 5, // AHARDWAREBUFFER_FORMAT_BGRA_8888
+        ScanoutLayout::Bgra8888 => 5, // AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM
+        ScanoutLayout::Rgba8888 => 1, // AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
     }
 }
 
-/// The format the scan-out path requires today, i.e.
-/// [`scanout_ahb_format`]`(ScanoutLayout::EightBit)`.
-pub const SCANOUT_FORMAT_BGRA_8888: u32 = scanout_ahb_format(ScanoutLayout::EightBit);
+/// [`scanout_ahb_format`]`(ScanoutLayout::Bgra8888)`.
+pub const SCANOUT_FORMAT_BGRA_8888: u32 = scanout_ahb_format(ScanoutLayout::Bgra8888);
+
+/// [`scanout_ahb_format`]`(ScanoutLayout::Rgba8888)`.
+pub const SCANOUT_FORMAT_RGBA_8888: u32 = scanout_ahb_format(ScanoutLayout::Rgba8888);
 
 /// Allocation request.
 ///
@@ -294,11 +325,11 @@ impl ScanoutAllocReq {
     /// A lookup of the handed-out buffer whose dma-buf has inode `ino`,
     /// asking for its `AHardwareBuffer` too.
     #[must_use]
-    pub fn lookup_ahb(ino: u64) -> Self {
+    pub fn lookup_ahb(ino: u64, layout: ScanoutLayout) -> Self {
         Self {
             width: 0,
             height: 0,
-            format: SCANOUT_FORMAT_BGRA_8888 | SCANOUT_REQ_AHB_HANDLE | SCANOUT_REQ_LOOKUP_INO,
+            format: scanout_ahb_format(layout) | SCANOUT_REQ_AHB_HANDLE | SCANOUT_REQ_LOOKUP_INO,
             len: ino,
         }
     }
@@ -948,7 +979,7 @@ mod tests {
         let req = ScanoutAllocReq {
             width: 1280,
             height: 960,
-            format: SCANOUT_FORMAT_BGRA_8888,
+            format: SCANOUT_FORMAT_RGBA_8888,
             len: 1280 * 960 * 4,
         };
         let enc = req.encode();
@@ -962,7 +993,7 @@ mod tests {
         let by_len = ScanoutAllocReq {
             width: 0,
             height: 0,
-            format: SCANOUT_FORMAT_BGRA_8888,
+            format: SCANOUT_FORMAT_RGBA_8888,
             len: 800 * 600 * 4,
         };
         assert_eq!(ScanoutAllocReq::decode(&by_len.encode()), Some(by_len));
@@ -992,7 +1023,7 @@ mod tests {
         let req = ScanoutAllocReq {
             width: 1280,
             height: 960,
-            format: SCANOUT_FORMAT_BGRA_8888,
+            format: SCANOUT_FORMAT_RGBA_8888,
             len: 1280 * 960 * 4,
         };
         assert_eq!(
@@ -1001,7 +1032,7 @@ mod tests {
                 0x31, 0x53, 0x4E, 0x47, // "GNS1"
                 0x00, 0x05, 0x00, 0x00, // 1280
                 0xC0, 0x03, 0x00, 0x00, // 960
-                0x05, 0x00, 0x00, 0x00, // BGRA_8888
+                0x01, 0x00, 0x00, 0x00, // RGBA_8888
                 0x00, 0x00, 0x4B, 0x00, 0x00, 0x00, 0x00, 0x00, // 4915200
             ]
         );
@@ -1024,23 +1055,23 @@ mod tests {
 
     #[test]
     fn scanout_lookup_carries_the_inode_and_both_flags() {
-        let req = ScanoutAllocReq::lookup_ahb(0x1234_5678_9ABC);
+        let req = ScanoutAllocReq::lookup_ahb(0x1234_5678_9ABC, ScanoutLayout::Rgba8888);
         let dec = ScanoutAllocReq::decode(&req.encode()).unwrap();
         assert!(dec.is_lookup());
         assert!(dec.wants_ahb_handle());
         assert_eq!(dec.len, 0x1234_5678_9ABC);
-        assert_eq!(dec.without_flags().format, SCANOUT_FORMAT_BGRA_8888);
+        assert_eq!(dec.without_flags().format, SCANOUT_FORMAT_RGBA_8888);
         assert!(!dec.without_flags().is_lookup());
         // A daemon that predates the lookup clears only the handle flag and
         // sees a format it does not serve, so it refuses.
         assert_ne!(
             dec.format & !SCANOUT_REQ_AHB_HANDLE,
-            SCANOUT_FORMAT_BGRA_8888
+            SCANOUT_FORMAT_RGBA_8888
         );
         let alloc = ScanoutAllocReq {
             width: 64,
             height: 64,
-            format: SCANOUT_FORMAT_BGRA_8888 | SCANOUT_REQ_AHB_HANDLE,
+            format: SCANOUT_FORMAT_RGBA_8888 | SCANOUT_REQ_AHB_HANDLE,
             len: 64 * 64 * 4,
         };
         assert!(!alloc.is_lookup());
@@ -1054,7 +1085,7 @@ mod tests {
         let mut extra = ScanoutAllocReq {
             width: 1,
             height: 1,
-            format: SCANOUT_FORMAT_BGRA_8888,
+            format: SCANOUT_FORMAT_RGBA_8888,
             len: 4,
         }
         .encode()
@@ -1065,7 +1096,7 @@ mod tests {
         let mut short = ScanoutAllocReq {
             width: 1,
             height: 1,
-            format: SCANOUT_FORMAT_BGRA_8888,
+            format: SCANOUT_FORMAT_RGBA_8888,
             len: 4,
         }
         .encode()
@@ -1080,12 +1111,36 @@ mod tests {
     }
 
     #[test]
-    fn scanout_ahb_format_is_bgra_8888() {
-        // HAL value 5 is `BGRA_8888` (B,G,R,A), the byte order the compositor's
-        // `XR24` scan-out expects. Value 2 is `R8G8B8X8_UNORM` (R,G,B,X), which
-        // would exchange red and blue on the panel.
-        assert_eq!(scanout_ahb_format(ScanoutLayout::EightBit), 5);
+    fn scanout_ahb_format_per_layout() {
+        // HAL value 5 is `BGRA_8888` (B,G,R,A, `XR24`) and value 1 is
+        // `RGBA_8888` (R,G,B,A, `XB24`). Value 2 is `R8G8B8X8_UNORM`, which
+        // neither layout may use.
+        assert_eq!(scanout_ahb_format(ScanoutLayout::Bgra8888), 5);
+        assert_eq!(scanout_ahb_format(ScanoutLayout::Rgba8888), 1);
         assert_eq!(SCANOUT_FORMAT_BGRA_8888, 5);
+        assert_eq!(SCANOUT_FORMAT_RGBA_8888, 1);
+    }
+
+    #[test]
+    fn scanout_layout_env_values() {
+        assert_eq!(SCANOUT_LAYOUT_ENV, "GNDRM_SCANOUT_LAYOUT");
+        for layout in [ScanoutLayout::Bgra8888, ScanoutLayout::Rgba8888] {
+            assert_eq!(
+                ScanoutLayout::from_env_value(layout.as_env_value()),
+                Some(layout)
+            );
+        }
+        assert_eq!(
+            ScanoutLayout::from_env_value("rgba"),
+            Some(ScanoutLayout::Rgba8888)
+        );
+        assert_eq!(
+            ScanoutLayout::from_env_value("bgra"),
+            Some(ScanoutLayout::Bgra8888)
+        );
+        for other in ["", "RGBA", "1", "5", "rgba "] {
+            assert_eq!(ScanoutLayout::from_env_value(other), None);
+        }
     }
 
     #[test]

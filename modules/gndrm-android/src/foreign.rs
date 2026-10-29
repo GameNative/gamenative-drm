@@ -12,7 +12,7 @@ use std::ptr;
 
 use gndrm_daemon::foreign::{fourcc_name, plan_copy, CopyPlan};
 use gndrm_daemon::Framebuffer;
-use gndrm_uapi::wire::SCANOUT_FORMAT_BGRA_8888;
+use gndrm_uapi::wire::scanout_ahb_format;
 
 use crate::ffi;
 
@@ -86,7 +86,8 @@ impl ForeignCopy {
         if len == 0 {
             return Err(gndrm_obf::obf!("dma-buf length unknown").to_string());
         }
-        let plan = plan_copy(fb, len).map_err(|r| r.to_string())?;
+        let layout = gndrm_daemon::scanout_layout();
+        let plan = plan_copy(fb, len, layout).map_err(|r| r.to_string())?;
         // SAFETY: fcntl on a descriptor the caller keeps open for this call.
         let fd = unsafe { libc::fcntl(src_fd, libc::F_DUPFD_CLOEXEC, 0) };
         if fd < 0 {
@@ -112,7 +113,7 @@ impl ForeignCopy {
         let format = if plan.ten_bit {
             ffi::AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM
         } else {
-            SCANOUT_FORMAT_BGRA_8888
+            scanout_ahb_format(layout)
         };
         let desc = ffi::AHardwareBufferDesc {
             width: fb.width,

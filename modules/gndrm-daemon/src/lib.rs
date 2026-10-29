@@ -33,7 +33,7 @@ use std::thread;
 
 use gndrm_uapi::drm::*;
 use gndrm_uapi::mode::*;
-use gndrm_uapi::wire::errno;
+use gndrm_uapi::wire::{errno, ScanoutLayout, SCANOUT_LAYOUT_ENV};
 
 pub use frame_cap::FrameCap;
 pub use objects::{CrtcState, Framebuffer, GemObject, PanelDesc, PlaneState, Stores};
@@ -59,16 +59,33 @@ const MIN_WIDTH: u32 = 1;
 const MIN_HEIGHT: u32 = 1;
 const MAX_WIDTH: u32 = 8192;
 const MAX_HEIGHT: u32 = 8192;
+/// Cursor plane size cap (`DRM_CAP_CURSOR_WIDTH`/`_HEIGHT`): the largest
+/// source and destination rectangle a cursor-plane commit may carry, as a
+/// kernel driver enforces. Without the limit libliftoff can park a full-size
+/// game buffer on the cursor plane whenever its format is listed there, and
+/// the presenter publishes only the primary plane.
+pub(crate) const CURSOR_SIZE: u32 = 64;
 
-/// Formats on the primary plane (the SDR set). `XRGB8888` stays first.
-const PRIMARY_FORMATS_SDR: &[u32] = &[
+/// Formats on the primary plane for a [`ScanoutLayout::Bgra8888`] pool (the SDR
+/// set). `XRGB8888` stays first: gamescope renders its output in the first
+/// 8-bit format it prefers, and `XRGB8888` is B,G,R,X in memory like the pool.
+const PRIMARY_FORMATS_BGRA_SDR: &[u32] = &[
     DRM_FORMAT_XRGB8888,
     DRM_FORMAT_ARGB8888,
     DRM_FORMAT_XBGR8888,
     DRM_FORMAT_ABGR8888,
     DRM_FORMAT_RGB565,
 ];
-/// The SDR set plus the 2:10:10:10 HDR scan-out format, advertised only when the
+/// Formats on the primary plane for a [`ScanoutLayout::Rgba8888`] pool (the SDR
+/// set). `XBGR8888` stays first.
+///
+/// Only R-low 8-bit formats: the pool's AHB is `RGBA_8888` (R,G,B,A in
+/// memory), which is `XBGR8888`/`ABGR8888`. `XRGB8888`/`ARGB8888` are B-low and
+/// would reach the panel with red and blue exchanged; gamescope falls back to
+/// `XBGR8888` for its output when the primary plane offers no `XRGB8888`.
+const PRIMARY_FORMATS_RGBA_SDR: &[u32] =
+    &[DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_RGB565];
+/// An SDR set plus the 2:10:10:10 HDR scan-out format, advertised only when the
 /// container asked for HDR output.
 ///
 /// gamescope's plane-format pick prefers `XRGB2101010` over `XBGR2101010` and
@@ -77,16 +94,24 @@ const PRIMARY_FORMATS_SDR: &[u32] = &[
 ///
 /// * the 10-bit entry cannot be appended to a flat list — that moves the SDR
 ///   path onto a 10-bit buffer too, which the presenter/pool describe as
-///   `BGRA_8888`. So the set is gated on [`hdr_output_enabled`].
+///   the 8-bit layout. So the set is gated on [`hdr_output_enabled`].
 /// * only `XBGR2101010` is offered, never `XRGB2101010`. The pool's AHB is
 ///   `R10G10B10A2_UNORM` (`RGBA_1010102`), whose channels are R-low/B-high;
 ///   gamescope's `XBGR2101010` (`xB:G:R`, R-low) matches it, while
 ///   `XRGB2101010` (`x:R:G:B`, B-low) is the opposite order and reaches the
 ///   panel with red and blue exchanged. Offering both would let gamescope pick
 ///   the mismatched one.
-const PRIMARY_FORMATS_HDR: &[u32] = &[
+const PRIMARY_FORMATS_BGRA_HDR: &[u32] = &[
     DRM_FORMAT_XRGB8888,
     DRM_FORMAT_ARGB8888,
+    DRM_FORMAT_XBGR8888,
+    DRM_FORMAT_ABGR8888,
+    DRM_FORMAT_RGB565,
+    DRM_FORMAT_XBGR2101010,
+];
+/// [`PRIMARY_FORMATS_RGBA_SDR`] plus `XBGR2101010`; see
+/// [`PRIMARY_FORMATS_BGRA_HDR`].
+const PRIMARY_FORMATS_RGBA_HDR: &[u32] = &[
     DRM_FORMAT_XBGR8888,
     DRM_FORMAT_ABGR8888,
     DRM_FORMAT_RGB565,
@@ -101,17 +126,80 @@ const VERBOSE_ON: u8 = 2;
 
 /// The primary plane's format list for the current session.
 fn primary_formats() -> &'static [u32] {
-    primary_formats_for(hdr_output_enabled())
+    primary_formats_for(hdr_output_enabled(), scanout_layout())
 }
 
-/// Pure core of [`primary_formats`], so the HDR branch is testable without
-/// mutating the process environment.
-fn primary_formats_for(hdr: bool) -> &'static [u32] {
-    if hdr {
-        PRIMARY_FORMATS_HDR
-    } else {
-        PRIMARY_FORMATS_SDR
+/// Pure core of [`primary_formats`], so the HDR and layout branches are
+/// testable without mutating the process environment.
+fn primary_formats_for(hdr: bool, layout: ScanoutLayout) -> &'static [u32] {
+    match (layout, hdr) {
+        (ScanoutLayout::Bgra8888, false) => PRIMARY_FORMATS_BGRA_SDR,
+        (ScanoutLayout::Bgra8888, true) => PRIMARY_FORMATS_BGRA_HDR,
+        (ScanoutLayout::Rgba8888, false) => PRIMARY_FORMATS_RGBA_SDR,
+        (ScanoutLayout::Rgba8888, true) => PRIMARY_FORMATS_RGBA_HDR,
     }
+}
+
+/// Cached session [`ScanoutLayout`] (see [`scanout_layout`]).
+static LAYOUT_GATE: AtomicU8 = AtomicU8::new(LAYOUT_UNRESOLVED);
+/// The layout the presentation layer selected for this session
+/// ([`select_scanout_layout`]), used when the environment names none.
+static LAYOUT_SELECTED: AtomicU8 = AtomicU8::new(LAYOUT_UNRESOLVED);
+const LAYOUT_UNRESOLVED: u8 = 0;
+const LAYOUT_BGRA: u8 = 1;
+const LAYOUT_RGBA: u8 = 2;
+
+const fn layout_code(layout: ScanoutLayout) -> u8 {
+    match layout {
+        ScanoutLayout::Bgra8888 => LAYOUT_BGRA,
+        ScanoutLayout::Rgba8888 => LAYOUT_RGBA,
+    }
+}
+
+const fn layout_from_code(code: u8) -> Option<ScanoutLayout> {
+    match code {
+        LAYOUT_BGRA => Some(ScanoutLayout::Bgra8888),
+        LAYOUT_RGBA => Some(ScanoutLayout::Rgba8888),
+        _ => None,
+    }
+}
+
+/// The layout `GNDRM_SCANOUT_LAYOUT` names in this process, if any.
+#[must_use]
+pub fn scanout_layout_from_env() -> Option<ScanoutLayout> {
+    std::env::var(SCANOUT_LAYOUT_ENV)
+        .ok()
+        .and_then(|v| ScanoutLayout::from_env_value(&v))
+}
+
+/// The scan-out pool's layout for this session: `GNDRM_SCANOUT_LAYOUT` when it
+/// names one, else the layout the presentation layer selected at session start
+/// ([`select_scanout_layout`]), else [`ScanoutLayout::Bgra8888`]. Resolved
+/// lazily and cached like [`hdr_output_enabled`]; [`reset_scanout_layout`]
+/// drops both slots at session start.
+#[must_use]
+pub fn scanout_layout() -> ScanoutLayout {
+    if let Some(layout) = layout_from_code(LAYOUT_GATE.load(Ordering::Relaxed)) {
+        return layout;
+    }
+    let layout = scanout_layout_from_env()
+        .or_else(|| layout_from_code(LAYOUT_SELECTED.load(Ordering::Relaxed)))
+        .unwrap_or(ScanoutLayout::Bgra8888);
+    LAYOUT_GATE.store(layout_code(layout), Ordering::Relaxed);
+    layout
+}
+
+/// Record the layout the presentation layer chose for this session. Takes
+/// effect unless `GNDRM_SCANOUT_LAYOUT` names one.
+pub fn select_scanout_layout(layout: ScanoutLayout) {
+    LAYOUT_SELECTED.store(layout_code(layout), Ordering::Relaxed);
+    LAYOUT_GATE.store(LAYOUT_UNRESOLVED, Ordering::Relaxed);
+}
+
+/// Drop the cached [`scanout_layout`] and the selected layout at session start.
+pub fn reset_scanout_layout() {
+    LAYOUT_SELECTED.store(LAYOUT_UNRESOLVED, Ordering::Relaxed);
+    LAYOUT_GATE.store(LAYOUT_UNRESOLVED, Ordering::Relaxed);
 }
 
 /// Whether the session asked for HDR output, so the plane may offer the 10-bit
@@ -296,7 +384,14 @@ fn hdr_output_active_for(colorspace: u64) -> bool {
 }
 
 /// Cursor plane formats (doc §3.2: ARGB8888, 64×64).
-const CURSOR_FORMATS: &[u32] = &[DRM_FORMAT_ARGB8888];
+///
+/// `ARGB8888`/`XRGB8888` live here because the [`ScanoutLayout::Rgba8888`]
+/// primary plane does not offer them, yet gamescope needs them in the union of
+/// all plane formats: it builds
+/// the client dmabuf sampling list from that union (Xwayland allocates depth-24
+/// pixmaps as `XR24`), and its blank texture is `ARGB8888`. The cursor plane is
+/// never published, so its formats never meet the pool.
+const CURSOR_FORMATS: &[u32] = &[DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888];
 
 /// What the socket layer does with one dispatch call.
 #[derive(Debug)]
@@ -409,7 +504,7 @@ pub type LogFn = Box<dyn Fn(&str) + Send>;
 /// with `(width, height, alloc_len)`, where `alloc_len` is the backing GEM's
 /// real allocation length (`st_size`) — row-padded and page-rounded, the exact
 /// length a length-only request carries. The presentation layer notes it in its
-/// pool under the pool's own BGRA layout, never the DRM fourcc.
+/// pool under the pool's own layout, never the DRM fourcc.
 pub type AddFbGeometryFn = Box<dyn Fn(u32, u32, u64) + Send>;
 
 /// The emulated device (one per connected client / open file description).
@@ -443,6 +538,9 @@ pub struct Device {
     /// Primary-plane `IN_FORMATS` blob id (created at init: every
     /// `PRIMARY_FORMATS` fourcc × `DRM_FORMAT_MOD_LINEAR`).
     in_formats_blob: u32,
+    /// Cursor-plane `IN_FORMATS` blob id (every `CURSOR_FORMATS` fourcc ×
+    /// `DRM_FORMAT_MOD_LINEAR`).
+    cursor_in_formats_blob: u32,
     /// Connector `EDID` blob id, built at session start from the display
     /// capability (no HDR static metadata block on an SDR panel).
     edid_blob: u32,
@@ -521,7 +619,17 @@ impl Device {
             in_formats_blob,
             Blob {
                 id: in_formats_blob,
-                data: in_formats_blob_data(),
+                data: in_formats_blob_data(primary_formats()),
+            },
+        );
+        let cursor_in_formats_blob = stores
+            .alloc_blob()
+            .expect(&gndrm_obf::obf!("in_formats blob id"));
+        stores.blobs.insert(
+            cursor_in_formats_blob,
+            Blob {
+                id: cursor_in_formats_blob,
+                data: in_formats_blob_data(CURSOR_FORMATS),
             },
         );
         // The EDID tells gamescope whether this display is HDR10. Built once
@@ -577,6 +685,7 @@ impl Device {
             primary: PlaneState::default(),
             cursor: PlaneState::default(),
             in_formats_blob,
+            cursor_in_formats_blob,
             edid_blob,
             clock,
             flip_sequence: 0,
@@ -954,7 +1063,7 @@ impl Device {
             // glamor's device probe read this cap before allocating.
             DRM_CAP_PRIME => DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT,
             DRM_CAP_TIMESTAMP_MONOTONIC => 1,
-            DRM_CAP_CURSOR_WIDTH | DRM_CAP_CURSOR_HEIGHT => 64,
+            DRM_CAP_CURSOR_WIDTH | DRM_CAP_CURSOR_HEIGHT => u64::from(CURSOR_SIZE),
             // Advertised: gamescope's DRM backend creates an always-signalled
             // sync object here and exports it as the in-fence it rides on every
             // atomic commit. With this 0 it logs "Syncobjs are not supported"
@@ -1216,10 +1325,10 @@ impl Device {
             (PLANE_CURSOR_ID, P_PLANE_CRTC_H) => self.cursor.crtc_h as u32 as u64,
             (_, P_PLANE_IN_FENCE_FD) => u64::MAX, // -1: no fence
             (PLANE_PRIMARY_ID, P_PLANE_IN_FORMATS) => u64::from(self.in_formats_blob),
-            // Kernel exposes IN_FORMATS on every plane; the shared blob's
-            // format set covers the cursor's AR24. A zero value here makes
+            // Kernel exposes IN_FORMATS on every plane, and gamescope reads
+            // each plane's formats from it. A zero value here makes
             // libliftoff's plane init fail the whole DRM backend.
-            (PLANE_CURSOR_ID, P_PLANE_IN_FORMATS) => u64::from(self.in_formats_blob),
+            (PLANE_CURSOR_ID, P_PLANE_IN_FORMATS) => u64::from(self.cursor_in_formats_blob),
             _ => 0,
         }
     }
@@ -1767,9 +1876,9 @@ impl Device {
         // Teach the presentation layer this geometry, so a length-only scan-out
         // request of the same pixel size resolves to it. Only a 32-bpp
         // framebuffer is a buffer of the pixel size the pool serves; the pool's
-        // own BGRA layout is noted, never the DRM fourcc (the length index is
-        // keyed by `(alloc_len, format)`, so a fourcc entry would poison a BGRA
-        // lookup).
+        // own layout is noted, never the DRM fourcc (the length index is
+        // keyed by `(alloc_len, format)`, so a fourcc entry would poison a
+        // pool lookup).
         if bpp == 32 {
             if let Some(note) = &self.addfb_geometry {
                 note(cmd.width, cmd.height, gem_size);
@@ -2136,11 +2245,10 @@ fn commit_worker_loop(
     }
 }
 
-/// `drm_format_modifier_blob` for the primary plane's `IN_FORMATS`: every
-/// advertised primary format (SDR, or the HDR set when HDR output is on)
-/// scanned out with `DRM_FORMAT_MOD_LINEAR`.
-fn in_formats_blob_data() -> Vec<u8> {
-    let formats = primary_formats();
+/// `drm_format_modifier_blob` for a plane's `IN_FORMATS`: every format in
+/// `formats` (for the primary plane the SDR set, or the HDR set when HDR output
+/// is on) scanned out with `DRM_FORMAT_MOD_LINEAR`.
+fn in_formats_blob_data(formats: &[u32]) -> Vec<u8> {
     const HEADER: u32 = 24; // drm_format_modifier_blob header size
     let count_formats = formats.len() as u32;
     let formats_offset = HEADER;
@@ -2352,24 +2460,59 @@ mod tests {
         Device::new(PanelDesc::default(), Box::<NullPresenter>::default())
     }
 
-    /// The HDR flag gates exactly the two 10-bit fourccs, keeping XRGB8888 first
-    /// and the SDR set untouched.
+    /// The HDR flag gates exactly the 10-bit fourcc, keeping each layout's
+    /// first format and its SDR set untouched.
     #[test]
     fn primary_formats_are_hdr_gated() {
-        let sdr = primary_formats_for(false);
-        assert_eq!(sdr.len(), 5);
-        assert_eq!(sdr[0], DRM_FORMAT_XRGB8888);
-        assert!(!sdr.contains(&DRM_FORMAT_XRGB2101010));
+        for layout in [ScanoutLayout::Bgra8888, ScanoutLayout::Rgba8888] {
+            let sdr = primary_formats_for(false, layout);
+            assert!(!sdr.contains(&DRM_FORMAT_XRGB2101010));
+            let hdr = primary_formats_for(true, layout);
+            assert_eq!(hdr.len(), sdr.len() + 1);
+            assert!(hdr.contains(&DRM_FORMAT_XBGR2101010));
+            // XRGB2101010 is deliberately absent: its channel order does not
+            // match the R10G10B10A2 pool layout, and gamescope would prefer it.
+            assert!(!hdr.contains(&DRM_FORMAT_XRGB2101010));
+            // The SDR set is a prefix: enabling HDR only appends.
+            assert_eq!(&hdr[..sdr.len()], sdr);
+        }
+    }
 
-        let hdr = primary_formats_for(true);
-        assert_eq!(hdr.len(), 6);
-        assert_eq!(hdr[0], DRM_FORMAT_XRGB8888);
-        assert!(hdr.contains(&DRM_FORMAT_XBGR2101010));
-        // XRGB2101010 is deliberately absent: its channel order does not match
-        // the R10G10B10A2 pool layout, and gamescope would prefer it.
-        assert!(!hdr.contains(&DRM_FORMAT_XRGB2101010));
-        // The SDR set is a prefix: enabling HDR only appends.
-        assert_eq!(&hdr[..sdr.len()], sdr);
+    /// The BGRA layout offers the list shipped before the RGBA layout existed;
+    /// the RGBA layout offers only the R-low 8-bit formats.
+    #[test]
+    fn primary_formats_follow_the_layout() {
+        assert_eq!(
+            primary_formats_for(false, ScanoutLayout::Bgra8888),
+            &[
+                DRM_FORMAT_XRGB8888,
+                DRM_FORMAT_ARGB8888,
+                DRM_FORMAT_XBGR8888,
+                DRM_FORMAT_ABGR8888,
+                DRM_FORMAT_RGB565,
+            ]
+        );
+        assert_eq!(
+            primary_formats_for(false, ScanoutLayout::Rgba8888),
+            &[DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_RGB565]
+        );
+        assert_eq!(primary_formats_for(true, ScanoutLayout::Bgra8888).len(), 6);
+        assert_eq!(primary_formats_for(true, ScanoutLayout::Rgba8888).len(), 4);
+    }
+
+    /// The selected layout applies until the next reset, and an unselected
+    /// session is BGRA.
+    #[test]
+    fn scanout_layout_selection_and_reset() {
+        if scanout_layout_from_env().is_some() {
+            return;
+        }
+        reset_scanout_layout();
+        assert_eq!(scanout_layout(), ScanoutLayout::Bgra8888);
+        select_scanout_layout(ScanoutLayout::Rgba8888);
+        assert_eq!(scanout_layout(), ScanoutLayout::Rgba8888);
+        reset_scanout_layout();
+        assert_eq!(scanout_layout(), ScanoutLayout::Bgra8888);
     }
 
     /// The connector's HDR-output signal is its colorspace alone. A metadata

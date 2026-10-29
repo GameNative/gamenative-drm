@@ -5,17 +5,18 @@
 use std::collections::HashSet;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use gndrm_daemon::pod::{pod_read, pod_write};
 use gndrm_daemon::{
-    find_prop_id, Device, DispatchResult, Framebuffer, NullPresenter, PanelDesc, PlaneState,
-    Presenter, CONNECTOR_ID, CRTC_ID, ENCODER_ID, PLANE_CURSOR_ID, PLANE_PRIMARY_ID,
+    find_prop_id, select_scanout_layout, Device, DispatchResult, Framebuffer, NullPresenter,
+    PanelDesc, PlaneState, Presenter, CONNECTOR_ID, CRTC_ID, ENCODER_ID, PLANE_CURSOR_ID,
+    PLANE_PRIMARY_ID,
 };
 use gndrm_uapi::drm::*;
 use gndrm_uapi::mode::*;
-use gndrm_uapi::wire::errno;
+use gndrm_uapi::wire::{errno, ScanoutLayout};
 
 // ---------------------------------------------------------------------------
 // harness
@@ -26,6 +27,32 @@ fn dev() -> Device {
     d.set_clock(Box::new(|| (1000, 500))); // deterministic event timestamps
     d
 }
+
+/// Serialises the tests that depend on the process-wide scan-out layout.
+static LAYOUT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Select `layout` for the devices built while the guard is held.
+fn with_layout(layout: ScanoutLayout) -> MutexGuard<'static, ()> {
+    let guard = LAYOUT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    select_scanout_layout(layout);
+    guard
+}
+
+/// The primary plane's formats per layout, without HDR.
+fn primary_formats(layout: ScanoutLayout) -> &'static [u32] {
+    match layout {
+        ScanoutLayout::Bgra8888 => &[
+            DRM_FORMAT_XRGB8888,
+            DRM_FORMAT_ARGB8888,
+            DRM_FORMAT_XBGR8888,
+            DRM_FORMAT_ABGR8888,
+            DRM_FORMAT_RGB565,
+        ],
+        ScanoutLayout::Rgba8888 => &[DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_RGB565],
+    }
+}
+
+const LAYOUTS: [ScanoutLayout; 2] = [ScanoutLayout::Bgra8888, ScanoutLayout::Rgba8888];
 
 /// A presenter whose only job is to count the frames it is handed. The device
 /// never waits on a presenter completion, so the mocks need only accept the
@@ -430,6 +457,7 @@ fn get_resources_golden() {
 
 #[test]
 fn connector_encoder_plane_queries() {
+    let _layout = with_layout(ScanoutLayout::Bgra8888);
     let mut d = dev();
 
     // Connector, two-call.
@@ -542,10 +570,71 @@ fn connector_encoder_plane_queries() {
     assert_eq!(p.count_format_types, 5);
     assert_eq!(p.possible_crtcs, 1);
     let off = core::mem::size_of::<DrmModeGetPlane>();
-    let fmts = &r.body[off..off + 20];
-    assert!(fmts
+    let fmts: Vec<u32> = r.body[off..off + 20]
         .chunks(4)
-        .any(|f| u32::from_le_bytes(f.try_into().unwrap()) == DRM_FORMAT_XRGB8888));
+        .map(|f| u32::from_le_bytes(f.try_into().unwrap()))
+        .collect();
+    assert_eq!(fmts, primary_formats(ScanoutLayout::Bgra8888));
+
+    // Cursor plane: the B-low pair, in both layouts.
+    let r = call(
+        &mut d,
+        DRM_IOCTL_MODE_GETPLANE,
+        &pod(&DrmModeGetPlane {
+            plane_id: PLANE_CURSOR_ID,
+            format_type_ptr: 1,
+            count_format_types: 16,
+            ..Default::default()
+        }),
+    );
+    ok(&r);
+    let p: DrmModeGetPlane = pod_read(&r.body).unwrap();
+    assert_eq!(p.count_format_types, 2);
+    let fmts: Vec<u32> = r.body[off..off + 8]
+        .chunks(4)
+        .map(|f| u32::from_le_bytes(f.try_into().unwrap()))
+        .collect();
+    assert_eq!(fmts, [DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888]);
+}
+
+/// GETPLANE answers each layout's primary list and the same cursor list.
+#[test]
+fn plane_formats_follow_the_layout() {
+    for layout in LAYOUTS {
+        let _layout = with_layout(layout);
+        let mut d = dev();
+        for (plane, want) in [
+            (PLANE_PRIMARY_ID, primary_formats(layout)),
+            (
+                PLANE_CURSOR_ID,
+                &[DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888][..],
+            ),
+        ] {
+            let r = call(
+                &mut d,
+                DRM_IOCTL_MODE_GETPLANE,
+                &pod(&DrmModeGetPlane {
+                    plane_id: plane,
+                    format_type_ptr: 1,
+                    count_format_types: 16,
+                    ..Default::default()
+                }),
+            );
+            ok(&r);
+            let p: DrmModeGetPlane = pod_read(&r.body).unwrap();
+            assert_eq!(
+                p.count_format_types as usize,
+                want.len(),
+                "{layout:?} plane {plane}"
+            );
+            let off = core::mem::size_of::<DrmModeGetPlane>();
+            let fmts: Vec<u32> = r.body[off..off + 4 * want.len()]
+                .chunks(4)
+                .map(|f| u32::from_le_bytes(f.try_into().unwrap()))
+                .collect();
+            assert_eq!(fmts, want, "{layout:?} plane {plane}");
+        }
+    }
 }
 
 #[test]
@@ -741,8 +830,21 @@ fn blob_lifecycle() {
 /// blob lookup fails (a zero/garbage value yields ENOENT).
 #[test]
 fn in_formats_blob_on_both_planes() {
+    for layout in LAYOUTS {
+        let _layout = with_layout(layout);
+        in_formats_blobs(layout);
+    }
+}
+
+fn in_formats_blobs(layout: ScanoutLayout) {
     let mut d = dev();
-    for plane in [PLANE_PRIMARY_ID, PLANE_CURSOR_ID] {
+    for (plane, want) in [
+        (PLANE_PRIMARY_ID, primary_formats(layout)),
+        (
+            PLANE_CURSOR_ID,
+            &[DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888][..],
+        ),
+    ] {
         let r = call(
             &mut d,
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES,
@@ -795,15 +897,18 @@ fn in_formats_blob_on_both_planes() {
         let blob = &r.body[off..];
         let u32at = |i: usize| u32::from_le_bytes(blob[4 * i..4 * i + 4].try_into().unwrap());
         assert_eq!(u32at(0), 1, "drm_format_modifier_blob version");
-        assert_eq!(u32at(2), 5, "count_formats");
+        let n = want.len();
+        assert_eq!(u32at(2) as usize, n, "count_formats");
         assert_eq!(u32at(3), 24, "formats_offset");
         assert_eq!(u32at(4), 1, "count_modifiers");
-        assert_eq!(u32at(5), 24 + 4 * 5, "modifiers_offset");
-        // Modifier entry: all 5 formats at DRM_FORMAT_MOD_LINEAR (0).
-        let m = 24 + 4 * 5;
+        assert_eq!(u32at(5) as usize, 24 + 4 * n, "modifiers_offset");
+        let fmts: Vec<u32> = (0..n).map(|i| u32at(6 + i)).collect();
+        assert_eq!(fmts, want, "plane {plane}: IN_FORMATS formats");
+        // Modifier entry: every format at DRM_FORMAT_MOD_LINEAR (0).
+        let m = 24 + 4 * n;
         assert_eq!(
             u64::from_le_bytes(blob[m..m + 8].try_into().unwrap()),
-            0b11111
+            (1u64 << n) - 1
         );
         assert_eq!(
             u64::from_le_bytes(blob[m + 16..m + 24].try_into().unwrap()),
@@ -911,7 +1016,7 @@ fn addfb2_validation_and_rmfb() {
     let base = DrmModeFbCmd2 {
         width: 1280,
         height: 720,
-        pixel_format: DRM_FORMAT_XRGB8888,
+        pixel_format: DRM_FORMAT_XBGR8888,
         handles: [handle, 0, 0, 0],
         pitches: [1280 * 4, 0, 0, 0],
         offsets: [0; 4],
@@ -1252,7 +1357,7 @@ fn fb_space_exhaustion_returns_enospc_not_abort() {
     let cmd = DrmModeFbCmd2 {
         width: 1280,
         height: 720,
-        pixel_format: DRM_FORMAT_XRGB8888,
+        pixel_format: DRM_FORMAT_XBGR8888,
         handles: [handle, 0, 0, 0],
         pitches: [1280 * 4, 0, 0, 0],
         offsets: [0; 4],
@@ -1388,7 +1493,7 @@ fn import_fb(d: &mut Device) -> (u32, u32, RawFd) {
         &pod(&DrmModeFbCmd2 {
             width: 1280,
             height: 720,
-            pixel_format: DRM_FORMAT_XRGB8888,
+            pixel_format: DRM_FORMAT_XBGR8888,
             handles: [handle, 0, 0, 0],
             pitches: [1280 * 4, 0, 0, 0],
             offsets: [0; 4],
@@ -1569,6 +1674,78 @@ fn atomic_test_only_then_modeset_then_flip() {
 
     // SAFETY: caller's fd.
     unsafe { libc::close(fd) };
+}
+
+#[test]
+fn cursor_plane_rejects_a_full_size_rectangle() {
+    let mut d = dev();
+    let blob = create_mode_blob(&mut d).0;
+    let (_h1, primary_fb, fd1) = import_fb(&mut d);
+    let (_h2, cursor_fb, fd2) = import_fb(&mut d);
+
+    let base = modeset_sets(&d, blob, primary_fb);
+    let cursor_sets = |src_w: u64, src_h: u64, crtc_w: u64, crtc_h: u64| {
+        let mut sets = base.clone();
+        sets.extend([
+            (
+                PLANE_CURSOR_ID,
+                find_prop_id(PLANE_CURSOR_ID, "FB_ID").unwrap(),
+                u64::from(cursor_fb),
+            ),
+            (
+                PLANE_CURSOR_ID,
+                find_prop_id(PLANE_CURSOR_ID, "CRTC_ID").unwrap(),
+                u64::from(CRTC_ID),
+            ),
+            (
+                PLANE_CURSOR_ID,
+                find_prop_id(PLANE_CURSOR_ID, "SRC_W").unwrap(),
+                src_w << 16,
+            ),
+            (
+                PLANE_CURSOR_ID,
+                find_prop_id(PLANE_CURSOR_ID, "SRC_H").unwrap(),
+                src_h << 16,
+            ),
+            (
+                PLANE_CURSOR_ID,
+                find_prop_id(PLANE_CURSOR_ID, "CRTC_W").unwrap(),
+                crtc_w,
+            ),
+            (
+                PLANE_CURSOR_ID,
+                find_prop_id(PLANE_CURSOR_ID, "CRTC_H").unwrap(),
+                crtc_h,
+            ),
+        ]);
+        sets
+    };
+
+    // A game-sized layer on the cursor plane (what libliftoff tries when the
+    // plane lists the layer's format) is refused, in TEST_ONLY and for real.
+    for flags in [
+        DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_TEST_ONLY,
+        DRM_MODE_ATOMIC_ALLOW_MODESET,
+    ] {
+        let req = atomic_req(&cursor_sets(1280, 720, 1280, 720), flags, 0);
+        is_err(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req), errno::EINVAL);
+    }
+    let req = atomic_req(
+        &cursor_sets(64, 64, 65, 64),
+        DRM_MODE_ATOMIC_ALLOW_MODESET,
+        0,
+    );
+    is_err(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req), errno::EINVAL);
+
+    // A cursor-sized rectangle goes through.
+    let req = atomic_req(&cursor_sets(64, 64, 64, 64), DRM_MODE_ATOMIC_ALLOW_MODESET, 0);
+    ok(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req));
+
+    // SAFETY: caller's fds.
+    unsafe {
+        libc::close(fd1);
+        libc::close(fd2);
+    }
 }
 
 #[test]
@@ -2073,7 +2250,7 @@ fn full_gamescope_chain_discovery_to_syncobj_async() {
         .take(plane.count_format_types as usize)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    assert!(fmts.contains(&DRM_FORMAT_XRGB8888));
+    assert!(fmts.contains(&DRM_FORMAT_XBGR8888));
 
     // 2. Buffer: import a memfd, ADDFB2, GETFB2 echoes pitch/format.
     let fd = memfd(1280 * 720 * 4);
@@ -2091,7 +2268,7 @@ fn full_gamescope_chain_discovery_to_syncobj_async() {
         &pod(&DrmModeFbCmd2 {
             width: 1280,
             height: 720,
-            pixel_format: DRM_FORMAT_XRGB8888,
+            pixel_format: DRM_FORMAT_XBGR8888,
             handles: [handle, 0, 0, 0],
             pitches: [1280 * 4, 0, 0, 0],
             ..Default::default()

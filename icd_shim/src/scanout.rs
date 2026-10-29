@@ -17,9 +17,9 @@
 //! pre-existing behaviour rather than a broken one.
 
 use gndrm_uapi::wire::{
-    FrameCapNote, FrameCapSubscribe, LsfgConfig, ScanoutAllocReq, ScanoutAllocResp, VsyncNote,
-    CAP_FRAME_CAP, CAP_PRESENT_ID, CAP_VSYNC_NOTE, FPS_UNCAPPED, SCANOUT_FORMAT_BGRA_8888,
-    SCANOUT_REQ_AHB_HANDLE,
+    scanout_ahb_format, FrameCapNote, FrameCapSubscribe, LsfgConfig, ScanoutAllocReq,
+    ScanoutAllocResp, ScanoutLayout, VsyncNote, CAP_FRAME_CAP, CAP_PRESENT_ID, CAP_VSYNC_NOTE,
+    FPS_UNCAPPED, SCANOUT_LAYOUT_ENV, SCANOUT_REQ_AHB_HANDLE,
 };
 use std::ffi::c_void;
 use std::os::fd::RawFd;
@@ -211,8 +211,18 @@ enum Failure {
     Dead,
 }
 
+/// The session's scan-out pool layout: `GNDRM_SCANOUT_LAYOUT=rgba` selects
+/// [`ScanoutLayout::Rgba8888`], anything else [`ScanoutLayout::Bgra8888`].
+#[must_use]
+pub fn layout() -> ScanoutLayout {
+    std::env::var(SCANOUT_LAYOUT_ENV)
+        .ok()
+        .and_then(|v| ScanoutLayout::from_env_value(&v))
+        .unwrap_or(ScanoutLayout::Bgra8888)
+}
+
 /// Ask the daemon named by `GAMENATIVE_DRM_SOCKET` for a `width`x`height`
-/// buffer in the pool's BGRA layout. `None` when the channel is unset,
+/// buffer in the session's [`layout`]. `None` when the channel is unset,
 /// unreachable, or refuses; the caller then allocates locally.
 #[must_use]
 /// Ask the daemon for the app's frame-generation settings.
@@ -302,7 +312,7 @@ fn allocate_with(width: u32, height: u32, want_ahb: bool) -> Option<ScanoutBuf> 
     request(ScanoutAllocReq {
         width,
         height,
-        format: SCANOUT_FORMAT_BGRA_8888 | if want_ahb { SCANOUT_REQ_AHB_HANDLE } else { 0 },
+        format: scanout_ahb_format(layout()) | if want_ahb { SCANOUT_REQ_AHB_HANDLE } else { 0 },
         len: u64::from(width) * u64::from(height) * 4,
     })
 }
@@ -313,7 +323,7 @@ fn allocate_with(width: u32, height: u32, want_ahb: bool) -> Option<ScanoutBuf> 
 /// handle cannot be received.
 pub fn lookup_ahb(ino: u64) -> Option<ScanoutBuf> {
     ahb_recv_api()?;
-    request(ScanoutAllocReq::lookup_ahb(ino))
+    request(ScanoutAllocReq::lookup_ahb(ino, layout()))
 }
 
 fn request(req: ScanoutAllocReq) -> Option<ScanoutBuf> {
@@ -425,7 +435,7 @@ fn exchange(fd: RawFd, width: u32, height: u32) -> Result<ScanoutBuf, Failure> {
         ScanoutAllocReq {
             width,
             height,
-            format: SCANOUT_FORMAT_BGRA_8888,
+            format: scanout_ahb_format(ScanoutLayout::Bgra8888),
             len: u64::from(width) * u64::from(height) * 4,
         },
     )
@@ -803,7 +813,7 @@ mod tests {
                 assert_eq!(n as usize, ScanoutAllocReq::LEN);
                 let req = ScanoutAllocReq::decode(&buf).expect(&gndrm_obf::obf!("request frame"));
                 assert_eq!((req.width, req.height), (1280, 960));
-                assert_eq!(req.format, SCANOUT_FORMAT_BGRA_8888);
+                assert_eq!(req.format, scanout_ahb_format(ScanoutLayout::Bgra8888));
                 assert_eq!(req.len, 1280 * 960 * 4);
 
                 let payload = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);

@@ -84,7 +84,7 @@ EINVAL (probing clients treat that as unsupported).
 | `DRM_IOCTL_MODE_GETCRTC` | current mode = panel mode |
 | `DRM_IOCTL_MODE_SETCRTC` | never called on the atomic path; EINVAL (gamescope is atomic-only) |
 | `DRM_IOCTL_MODE_GETPLANERESOURCES` | 2 planes: primary + cursor |
-| `DRM_IOCTL_MODE_GETPLANE` | formats: primary `XR24`, `AR24` (BGRA-backed); cursor `AR24`; `possible_crtcs=0x1` |
+| `DRM_IOCTL_MODE_GETPLANE` | formats: primary `XR24`, `AR24`, `XB24`, `AB24`, `RG16` (BGRA pool) or `XB24`, `AB24`, `RG16` (RGBA pool); cursor `AR24`, `XR24`; `possible_crtcs=0x1` |
 | `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` | per-object-type property list with current values |
 | `DRM_IOCTL_MODE_GETPROPERTY` | property metadata: name, flags (range/enum/bitmask/blob), values |
 | `DRM_IOCTL_MODE_OBJ_SETPROPERTY` | EINVAL — the only props gamescope sets directly at init are optional ones the daemon deliberately does not expose, so this never fires |
@@ -257,13 +257,23 @@ The presenter publishes committed buffers to Android. Its whole surface is
 documented in 06-presenter-latency.md; the shape is:
 
 - **Scan-out allocation is daemon-owned.** The daemon allocates the
-  `AHardwareBuffer` pool (HAL format `BGRA_8888`, value 5, usage
-  `GPU_SAMPLED_IMAGE | GPU_COLOR_OUTPUT | COMPOSER_OVERLAY`). The shim requests
-  a pool buffer by geometry and receives a dup'd dma-buf fd; gamescope renders
-  into it; the same `AHardwareBuffer` is published. No import, no copy.
-- **Format identity.** BGRA is byte-for-byte `XRGB8888`/`ARGB8888`
-  (`XR24`/`AR24`), so no conversion and no shader. The daemon advertises
-  exactly these formats.
+  `AHardwareBuffer` pool (HAL format `BGRA_8888`, value 5, or `RGBA_8888`,
+  value 1; usage `GPU_SAMPLED_IMAGE | GPU_COLOR_OUTPUT | COMPOSER_OVERLAY`).
+  The shim requests a pool buffer by geometry and receives a dup'd dma-buf fd;
+  gamescope renders into it; the same `AHardwareBuffer` is published. No
+  import, no copy.
+- **Layout per session.** BGRA (`XR24`/`AR24` byte order) is the default.
+  RGBA (`XB24`/`AB24`) is chosen at `nativeStart` on SDK 36+ when
+  SurfaceFlinger's render engine is Skia GLES (`debug.renderengine.backend`,
+  else the `vulkan_renderengine`/`graphite_renderengine` aconfig flags):
+  that engine aborts on a `BGRA_8888` layer it has to draw. `GNDRM_SCANOUT_LAYOUT`
+  (`bgra`/`rgba`) overrides the rule; the app passes the result
+  (`nativeScanoutLayout()`) to the guest in the same variable, and the shim's
+  request format must match it.
+- **Format identity.** The primary plane advertises only formats in the pool's
+  byte order (plus `RG16`, and `XR24`/`AR24` under BGRA), so no conversion and
+  no shader; under RGBA `XR24`/`AR24` are on the cursor plane only, so gamescope
+  samples them but never scans them out.
 - **Publish tail.** `ASurfaceControl`/`ASurfaceTransaction`, resolved by
   `dlopen("libandroid.so")` (the NDK gates these symbols at API 29; the build
   targets API 28). One child `SurfaceControl` from the window, one layer per

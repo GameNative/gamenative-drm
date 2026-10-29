@@ -8,8 +8,8 @@ hardware — zero-copy, no intermediate buffer queue, and no format conversion.
 ## Scan-out allocation
 
 The daemon allocates and owns the scan-out `AHardwareBuffer` pool (HAL format
-`BGRA_8888`, value 5, usage `GPU_SAMPLED_IMAGE | GPU_COLOR_OUTPUT |
-COMPOSER_OVERLAY`). When gamescope's renderer asks for a scan-out buffer, the
+`BGRA_8888`, value 5, or `RGBA_8888`, value 1, per session; usage
+`GPU_SAMPLED_IMAGE | GPU_COLOR_OUTPUT | COMPOSER_OVERLAY`). When gamescope's renderer asks for a scan-out buffer, the
 shim requests a pool buffer by geometry over the DRM socket and receives a
 dup'd dma-buf fd via `SCM_RIGHTS`; gamescope renders into that fd, and the
 *same* `AHardwareBuffer` is published. The daemon owns the buffer end to end —
@@ -18,16 +18,23 @@ from a bare fd.
 
 ## Format identity
 
-The pool is BGRA (`BGRA_8888`), which is byte-for-byte identical to DRM
-`XRGB8888`/`ARGB8888` (`XR24`/`AR24`), so the frames gamescope renders need no
-conversion and no shader. The daemon advertises exactly the formats the pool is
-laid out in, so gamescope cannot elect a layout the pool does not have.
+The pool is BGRA (`BGRA_8888`, byte-for-byte DRM `XRGB8888`/`ARGB8888`) by
+default and RGBA (`RGBA_8888`, byte-for-byte `XBGR8888`/`ABGR8888`) on SDK 36+
+devices whose SurfaceFlinger render engine is Skia GLES, which aborts on a
+`BGRA_8888` layer it has to draw; `GNDRM_SCANOUT_LAYOUT=bgra|rgba` overrides
+the choice (doc 02 §7). Either way the frames gamescope renders need no
+conversion and no shader: gamescope renders in the first format the primary
+plane offers, `XRGB8888` under BGRA and `XBGR8888` under RGBA. Under RGBA the
+primary plane offers no B-low format, and `XRGB8888`/`ARGB8888` are on the
+cursor plane only, so they stay sampleable client formats that gamescope
+composites rather than scans out.
 
 ## Alpha semantics (scan-out alpha is not meaningful)
 
-The pool's `AHardwareBuffer` is `BGRA_8888`, whose alpha channel SurfaceFlinger
-**honours** by default. The frame gamescope renders is written for a DRM primary
-plane, whose X-prefixed fourcc (`XRGB8888`/`XR24`) carries no alpha: a shader
+The pool's `AHardwareBuffer` is `BGRA_8888` or `RGBA_8888`, whose alpha channel
+SurfaceFlinger **honours** by default. The frame gamescope renders is written
+for a DRM primary plane, whose X-prefixed fourcc (`XR24`/`XB24`) carries no
+alpha: a shader
 pass may store alpha **0** without blanking the plane. gamescope's RCAS composite
 shaders do exactly that — `imageStore(dst, …, vec4(outputValue, 0))` in
 `cs_composite_rcas.comp` / `cs_composite_rcas_1px.comp:94`. Storing 0 is
@@ -40,8 +47,8 @@ presenter asserts `ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE` on every show
 transaction (`modules/gndrm-android/src/asc.rs` `build_show`; constant and
 rationale in `ffi.rs`), so the layer composites opaque no matter what alpha the
 scan-out pass left behind. The scan-out format table is not the fix and needs no
-change: the daemon's `PRIMARY_FORMATS` already lists `XRGB8888` first (an
-X-prefixed fourcc, alpha ignored).
+change: each of the daemon's primary format lists starts with an X-prefixed
+fourcc (alpha ignored).
 
 Without the assertion the primary layer is composited with the buffer's alpha,
 and a full-frame `alpha = 0` renders the whole frame transparent — black. The

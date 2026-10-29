@@ -195,10 +195,10 @@ pub const VK_FORMAT_R8G8B8A8_SRGB: VkFormat = 43;
 ///
 /// The engine's shaders declare their storage image as `rgba8`, and their
 /// history images are sampled as `rgba8` too, so the images handed to the engine
-/// must be **R,G,B,A in byte order**. The scan-out pool is B8G8R8A8 (or
-/// A2B10G10R10), so passing the swapchain format straight through gives the
-/// engine a BGRA view of an `rgba8` storage image — undefined behaviour, and on
-/// this driver the generate dispatch then writes nothing at all (every generated
+/// must be **R,G,B,A in byte order**. A swapchain can be B8G8R8A8 (the BGRA
+/// scan-out layout) or A2B10G10R10, so passing its format straight
+/// through gives the engine a BGRA view of an `rgba8` storage image —
+/// undefined behaviour, and on this driver the generate dispatch then writes nothing at all (every generated
 /// destination buffer reads back as all-zero). Map the channel order and keep
 /// `vkCmdBlitImage` to do the swap back into the scan-out slot.
 #[must_use]

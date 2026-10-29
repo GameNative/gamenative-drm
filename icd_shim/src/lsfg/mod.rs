@@ -660,8 +660,8 @@ impl Session {
             return false;
         }
         // The engine writes into its target through an `rgba8` storage image, so
-        // the images it is given must be R,G,B,A in byte order even though the
-        // scan-out slots are B,G,R,A. See `engine_storage_format`.
+        // the images it is given must be R,G,B,A in byte order, whatever order
+        // the scan-out slots are in. See `engine_storage_format`.
         let format = crate::vk::engine_storage_format(format);
         let key = (width, height, format, self.guest_extent.0, self.guest_extent.1);
         if self.prepared != Some(key) {

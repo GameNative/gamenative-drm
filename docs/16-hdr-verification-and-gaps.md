@@ -59,7 +59,8 @@ SDR path the same line writes the connector's SDR static-metadata blob — that 
 why the connector's metalspace cannot be used as an "HDR is on" test (§5).
 
 **Plane formats** (`gndrm-daemon/src/lib.rs:62-108`): the SDR set with
-`XRGB8888` first, plus `XBGR2101010` only when `hdr_output_enabled()`.
+the layout's X-prefixed 8-bit format first, plus `XBGR2101010` only when
+`hdr_output_enabled()`.
 `XRGB2101010` must stay absent — its channel order is the reverse of the pool's
 `R10G10B10A2` layout. The 10-bit entry cannot sit in a flat list, or an SDR
 session moves onto a 10-bit buffer; `pick_plane_format` runs once at backend

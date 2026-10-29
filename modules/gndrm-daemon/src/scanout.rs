@@ -54,7 +54,7 @@ pub struct Geometry {
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
-    /// Gralloc format (the presenter's single BGRA layout).
+    /// Gralloc format (the presenter's single RGBA layout).
     pub format: u32,
 }
 
@@ -458,13 +458,13 @@ impl<T: Copy> ReusePool<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gndrm_uapi::wire::SCANOUT_FORMAT_BGRA_8888;
+    use gndrm_uapi::wire::SCANOUT_FORMAT_RGBA_8888;
 
     fn geom(width: u32, height: u32) -> Geometry {
         Geometry {
             width,
             height,
-            format: SCANOUT_FORMAT_BGRA_8888,
+            format: SCANOUT_FORMAT_RGBA_8888,
         }
     }
 
@@ -491,23 +491,23 @@ mod tests {
         let mut pool: ReusePool<()> = ReusePool::new(4);
         // Two layouts of one resolution share a byte length, so a length-only
         // key would answer both requests with whichever was noted first.
-        let bgra = Geometry {
+        let rgba = Geometry {
             width: 1280,
             height: 960,
-            format: SCANOUT_FORMAT_BGRA_8888,
+            format: SCANOUT_FORMAT_RGBA_8888,
         };
         let xbgr = Geometry {
             width: 1280,
             height: 960,
             format: 0x3432_4258,
         };
-        assert_eq!(bgra.alloc_len(), xbgr.alloc_len());
-        pool.note_geometry(bgra, bgra.alloc_len());
+        assert_eq!(rgba.alloc_len(), xbgr.alloc_len());
+        pool.note_geometry(rgba, rgba.alloc_len());
         pool.note_geometry(xbgr, xbgr.alloc_len());
-        assert_eq!(pool.resolve_len(bgra.alloc_len(), bgra.format), Some(bgra));
+        assert_eq!(pool.resolve_len(rgba.alloc_len(), rgba.format), Some(rgba));
         assert_eq!(pool.resolve_len(xbgr.alloc_len(), xbgr.format), Some(xbgr));
         // An unrelated format at the same length resolves to nothing.
-        assert_eq!(pool.resolve_len(bgra.alloc_len(), 0xdead_beef), None);
+        assert_eq!(pool.resolve_len(rgba.alloc_len(), 0xdead_beef), None);
     }
 
     #[test]

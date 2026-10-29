@@ -130,11 +130,11 @@ int main(void)
     CHECK(plane != NULL, "drmModeGetPlane");
     uint32_t plane_id = plane->plane_id;
     CHECK(plane->possible_crtcs == 1, "plane possible_crtcs");
-    int have_xrgb = 0;
+    int have_xbgr = 0;
     for (uint32_t i = 0; i < plane->count_formats; i++)
-        if (plane->formats[i] == DRM_FORMAT_XRGB8888)
-            have_xrgb = 1;
-    CHECK(have_xrgb, "primary supports XRGB8888");
+        if (plane->formats[i] == DRM_FORMAT_XBGR8888)
+            have_xbgr = 1;
+    CHECK(have_xbgr, "primary supports XBGR8888");
     drmModeFreePlane(plane);
     drmModeFreePlaneResources(pres);
 
@@ -194,7 +194,7 @@ int main(void)
     uint32_t pitches[4] = { 1280 * 4, 0, 0, 0 };
     uint32_t offsets[4] = { 0, 0, 0, 0 };
     uint32_t handles[4] = { handle, 0, 0, 0 };
-    CHECK(drmModeAddFB2(fd, 1280, 720, DRM_FORMAT_XRGB8888,
+    CHECK(drmModeAddFB2(fd, 1280, 720, DRM_FORMAT_XBGR8888,
                         handles, pitches, offsets, &fb_id, 0) == 0 && fb_id != 0,
           "drmModeAddFB2");
     printf("addfb2: fb=%u\n", fb_id);
@@ -249,7 +249,7 @@ int main(void)
 
     /* page flip: second FB on the same buffer, flip again */
     uint32_t fb2 = 0;
-    CHECK(drmModeAddFB2(fd, 1280, 720, DRM_FORMAT_XRGB8888,
+    CHECK(drmModeAddFB2(fd, 1280, 720, DRM_FORMAT_XBGR8888,
                         handles, pitches, offsets, &fb2, 0) == 0,
           "addfb2 #2");
     req = drmModeAtomicAlloc();

@@ -24,6 +24,7 @@
 
 use gn_utils::vk::*;
 use gn_utils::wlproto::{self, wl_display, wl_proxy};
+use gndrm_uapi::wire::{ScanoutLayout, SCANOUT_LAYOUT_ENV};
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
 
@@ -33,6 +34,7 @@ macro_rules! logf {
     };
 }
 
+const DRM_FORMAT_XRGB8888: u32 = 0x34325258; // 'XR24'
 const DRM_FORMAT_XBGR8888: u32 = 0x34324258; // 'XB24'
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const TEST_WIDTH: u32 = 1280;
@@ -407,7 +409,19 @@ fn vulkan_init() -> i32 {
     0
 }
 
-/// Pick the modifier for XBGR8888: prefer LINEAR, else the first with
+/// The DRM fourcc and Vulkan format of the test buffers: the scan-out layout
+/// `GNDRM_SCANOUT_LAYOUT` names, BGRA unless it says `rgba`.
+fn test_formats() -> (u32, VkFormat) {
+    match std::env::var(SCANOUT_LAYOUT_ENV)
+        .ok()
+        .and_then(|v| ScanoutLayout::from_env_value(&v))
+    {
+        Some(ScanoutLayout::Rgba8888) => (DRM_FORMAT_XBGR8888, VK_FORMAT_R8G8B8A8_UNORM),
+        _ => (DRM_FORMAT_XRGB8888, VK_FORMAT_B8G8R8A8_UNORM),
+    }
+}
+
+/// Pick the modifier for the test format: prefer LINEAR, else the first with
 /// COLOR_ATTACHMENT in its tiling features.
 fn pick_modifier() -> u64 {
     unsafe {
@@ -423,7 +437,7 @@ fn pick_modifier() -> u64 {
             pNext: &mut modlist as *mut _ as *mut c_void,
             formatProperties: [0; 12],
         };
-        vkGetPhysicalDeviceFormatProperties2((*vk).pd, VK_FORMAT_B8G8R8A8_UNORM, &mut fp2);
+        vkGetPhysicalDeviceFormatProperties2((*vk).pd, test_formats().1, &mut fp2);
         let count = modlist.drmFormatModifierCount;
         if count == 0 {
             logf!("no drm format modifiers reported; assuming LINEAR");
@@ -438,7 +452,7 @@ fn pick_modifier() -> u64 {
             count as usize
         ];
         modlist.pDrmFormatModifierProperties = mods.as_mut_ptr();
-        vkGetPhysicalDeviceFormatProperties2((*vk).pd, VK_FORMAT_B8G8R8A8_UNORM, &mut fp2);
+        vkGetPhysicalDeviceFormatProperties2((*vk).pd, test_formats().1, &mut fp2);
         let count = modlist.drmFormatModifierCount as usize;
         let mut chosen = u64::MAX;
         for m in &mods[..count] {
@@ -488,7 +502,7 @@ unsafe fn buffer_create(b: *mut TestBuf, modifier: u64) -> i32 {
             pNext: &extimg as *const _ as *const c_void,
             flags: 0,
             imageType: VK_IMAGE_TYPE_2D,
-            format: VK_FORMAT_B8G8R8A8_UNORM,
+            format: test_formats().1,
             extent: VkExtent3D {
                 width: TEST_WIDTH,
                 height: TEST_HEIGHT,
@@ -591,7 +605,7 @@ unsafe fn buffer_create(b: *mut TestBuf, modifier: u64) -> i32 {
             params,
             TEST_WIDTH as i32,
             TEST_HEIGHT as i32,
-            DRM_FORMAT_XBGR8888,
+            test_formats().0,
             0,
         );
         wlproto::wl_proxy_destroy(params);

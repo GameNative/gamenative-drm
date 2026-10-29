@@ -65,9 +65,9 @@ void CopyPresentedFrame(VkCommandBuffer cmd, VkImage source, lsfg::LsfgImage& de
     region.dstSubresource.layerCount = 1;
     region.extent = {extent.width, extent.height, 1};
     // A copy does not convert formats, a blit does. The presented frame is in the
-    // scan-out order (B,G,R,A) and every chain image is R,G,B,A, so a copy would
-    // carry B into R and the whole chain — and the generated frame — would come
-    // out with red and blue exchanged.
+    // swapchain's order (B,G,R,A under the BGRA opt-in) and every chain image is
+    // R,G,B,A, so a copy would carry B into R and the whole chain — and the
+    // generated frame — would come out with red and blue exchanged.
     VkImageBlit blit{};
     blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     blit.srcSubresource.layerCount = 1;
