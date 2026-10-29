@@ -26,7 +26,7 @@ winlator X11 path (which remains the default for normal launches).
 | GameNative | `/data/workspace/Projects/GameNative` | `feat/gamescope-display` | App: Display Server setting, launch integration, JNI host for gamenative-drm |
 | proton-wine | `/data/workspace/Projects/proton-wine` | `proton_11.0-2` | Wine: `winex11.drv` client driver + DXVK; the X11 client that talks to XWayland |
 | gamenative-xwayland | `/data/workspace/Projects/gamenative-xwayland` | `gamenative` | XWayland: the X server the payload ships, built for the bionic prefix |
-| mesa | `/data/workspace/Projects/mesa` | `build-xwayland` | The staged minimal Mesa the payload ships (zink + softpipe, LLVM off), built into `build-android-glamor/stage` |
+| mesa | `gamescope/android/mesa-glamor` | — | The Mesa the payload ships (zink + softpipe, LLVM off, pinned 26.2.6), fetched and built **in-tree** into `gamescope/build-android-mesa-glamor/stage`, which `package-gamescope.sh` itself builds when the stage is missing or older than that source, then reads |
 
 ## Documents
 
