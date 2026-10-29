@@ -1608,6 +1608,78 @@ fn atomic_test_only_then_modeset_then_flip() {
 }
 
 #[test]
+fn cursor_plane_rejects_a_full_size_rectangle() {
+    let mut d = dev();
+    let blob = create_mode_blob(&mut d).0;
+    let (_h1, primary_fb, fd1) = import_fb(&mut d);
+    let (_h2, cursor_fb, fd2) = import_fb(&mut d);
+
+    let base = modeset_sets(&d, blob, primary_fb);
+    let cursor_sets = |src_w: u64, src_h: u64, crtc_w: u64, crtc_h: u64| {
+        let mut sets = base.clone();
+        sets.extend([
+            (
+                PLANE_CURSOR_ID,
+                find_prop_id(PLANE_CURSOR_ID, "FB_ID").unwrap(),
+                u64::from(cursor_fb),
+            ),
+            (
+                PLANE_CURSOR_ID,
+                find_prop_id(PLANE_CURSOR_ID, "CRTC_ID").unwrap(),
+                u64::from(CRTC_ID),
+            ),
+            (
+                PLANE_CURSOR_ID,
+                find_prop_id(PLANE_CURSOR_ID, "SRC_W").unwrap(),
+                src_w << 16,
+            ),
+            (
+                PLANE_CURSOR_ID,
+                find_prop_id(PLANE_CURSOR_ID, "SRC_H").unwrap(),
+                src_h << 16,
+            ),
+            (
+                PLANE_CURSOR_ID,
+                find_prop_id(PLANE_CURSOR_ID, "CRTC_W").unwrap(),
+                crtc_w,
+            ),
+            (
+                PLANE_CURSOR_ID,
+                find_prop_id(PLANE_CURSOR_ID, "CRTC_H").unwrap(),
+                crtc_h,
+            ),
+        ]);
+        sets
+    };
+
+    // A game-sized layer on the cursor plane (what libliftoff tries when the
+    // plane lists the layer's format) is refused, in TEST_ONLY and for real.
+    for flags in [
+        DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_TEST_ONLY,
+        DRM_MODE_ATOMIC_ALLOW_MODESET,
+    ] {
+        let req = atomic_req(&cursor_sets(1280, 720, 1280, 720), flags, 0);
+        is_err(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req), errno::EINVAL);
+    }
+    let req = atomic_req(
+        &cursor_sets(64, 64, 65, 64),
+        DRM_MODE_ATOMIC_ALLOW_MODESET,
+        0,
+    );
+    is_err(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req), errno::EINVAL);
+
+    // A cursor-sized rectangle goes through.
+    let req = atomic_req(&cursor_sets(64, 64, 64, 64), DRM_MODE_ATOMIC_ALLOW_MODESET, 0);
+    ok(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req));
+
+    // SAFETY: caller's fds.
+    unsafe {
+        libc::close(fd1);
+        libc::close(fd2);
+    }
+}
+
+#[test]
 fn atomic_rejections() {
     let mut d = dev();
     let blob = create_mode_blob(&mut d).0;

@@ -24,7 +24,7 @@ use gndrm_uapi::wire::errno;
 
 use crate::objects::{PlaneState, CONNECTOR_ID, CRTC_ID, PLANE_CURSOR_ID, PLANE_PRIMARY_ID};
 use crate::pod::*;
-use crate::{props, CommitJob, Device, DispatchResult};
+use crate::{props, CommitJob, Device, DispatchResult, CURSOR_SIZE};
 
 /// One parsed `(obj, prop, value)` triple.
 #[derive(Debug, Clone, Copy)]
@@ -453,6 +453,30 @@ impl Device {
                 });
                 return Err(errno::EINVAL);
             }
+        }
+        // The cursor plane takes a cursor-sized rectangle and nothing larger.
+        if cursor.fb_id != 0
+            && (cursor.src_w >> 16 > CURSOR_SIZE
+                || cursor.src_h >> 16 > CURSOR_SIZE
+                || cursor.crtc_w > CURSOR_SIZE as i32
+                || cursor.crtc_h > CURSOR_SIZE as i32)
+        {
+            self.diag(|| {
+                format!(
+                    "{}",
+                    gndrm_obf::obf!(
+                        "atomic: reject EINVAL cursor fb={} src={}x{} crtc={}x{} exceeds {}x{}",
+                        cursor.fb_id,
+                        cursor.src_w >> 16,
+                        cursor.src_h >> 16,
+                        cursor.crtc_w,
+                        cursor.crtc_h,
+                        CURSOR_SIZE,
+                        CURSOR_SIZE
+                    )
+                )
+            });
+            return Err(errno::EINVAL);
         }
         Ok(())
     }

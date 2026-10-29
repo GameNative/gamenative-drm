@@ -59,6 +59,12 @@ const MIN_WIDTH: u32 = 1;
 const MIN_HEIGHT: u32 = 1;
 const MAX_WIDTH: u32 = 8192;
 const MAX_HEIGHT: u32 = 8192;
+/// Cursor plane size cap (`DRM_CAP_CURSOR_WIDTH`/`_HEIGHT`): the largest
+/// source and destination rectangle a cursor-plane commit may carry, as a
+/// kernel driver enforces. Without the limit libliftoff can park a full-size
+/// game buffer on the cursor plane whenever its format is listed there, and
+/// the presenter publishes only the primary plane.
+pub(crate) const CURSOR_SIZE: u32 = 64;
 
 /// Formats on the primary plane (the SDR set). `XBGR8888` stays first.
 ///
@@ -975,7 +981,7 @@ impl Device {
             // glamor's device probe read this cap before allocating.
             DRM_CAP_PRIME => DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT,
             DRM_CAP_TIMESTAMP_MONOTONIC => 1,
-            DRM_CAP_CURSOR_WIDTH | DRM_CAP_CURSOR_HEIGHT => 64,
+            DRM_CAP_CURSOR_WIDTH | DRM_CAP_CURSOR_HEIGHT => u64::from(CURSOR_SIZE),
             // Advertised: gamescope's DRM backend creates an always-signalled
             // sync object here and exports it as the in-fence it rides on every
             // atomic commit. With this 0 it logs "Syncobjs are not supported"
