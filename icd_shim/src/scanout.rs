@@ -146,15 +146,15 @@ pub(crate) fn next_acquire_after(prev_ns: u64, now_ns: u64, period_ns: u64) -> u
 
 /// Adopt one frame-cap note: the target it carries.
 fn apply_note(note: FrameCapNote) {
-    // 0 while frame generation paces the session: log what is actually in force,
-    // not what the note carried.
+    NOTES_N.fetch_add(1, Ordering::Relaxed);
+    CAP_FPS.store(note.fps, Ordering::Relaxed);
+    // 0 while frame generation paces the session: log what is actually in force
+    // now that the note is adopted, not what it carried.
     crate::logf!(gndrm_obf::obf!(
         "scanout frame cap: fps={} effective={}",
         note.fps,
         target_fps()
     ));
-    NOTES_N.fetch_add(1, Ordering::Relaxed);
-    CAP_FPS.store(note.fps, Ordering::Relaxed);
 }
 
 /// The target in force, [`FPS_UNCAPPED`] when none has: read by the shim's
