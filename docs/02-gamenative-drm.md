@@ -79,7 +79,7 @@ EINVAL (probing clients treat that as unsupported).
 
 | ioctl | notes |
 |---|---|
-| `DRM_IOCTL_MODE_GETCONNECTOR` | 1 connector, `DRM_MODE_CONNECTED`, type `DRM_MODE_CONNECTOR_DSI`; modes: panel mode from the SurfaceView size; two-call count/array semantics; `count_props` exposes the connector props |
+| `DRM_IOCTL_MODE_GETCONNECTOR` | 1 connector, `DRM_MODE_CONNECTED`, type `DRM_MODE_CONNECTOR_DSI`; one mode: the session's scan-out size (`nativeSetScanoutGeometry`, the app's Upscaling Resolution), or the window's size when the app named none or the size does not fit the window; two-call count/array semantics; `count_props` exposes the connector props |
 | `DRM_IOCTL_MODE_GETENCODER` | 1 encoder, `possible_crtcs=0x1`, `possible_clones=0` |
 | `DRM_IOCTL_MODE_GETCRTC` | current mode = panel mode |
 | `DRM_IOCTL_MODE_SETCRTC` | never called on the atomic path; EINVAL (gamescope is atomic-only) |
@@ -299,6 +299,9 @@ in the app's `jniLibs/arm64-v8a/` and is loaded via
 
 - `nativeStart(socketName: String, surface: Surface, width: Int, height: Int): Int`
 - `nativeStop()`, `nativeRetargetSurface(surface, w, h)`
+- session inputs, before `nativeStart`: `nativeSetPanelRefreshHz(hz)` (the mode's
+  rate) and `nativeSetScanoutGeometry(w, h)` (the mode's size — the app's
+  Upscaling Resolution; `0, 0` clears it).
 - injector calls: `nativePointerAbsolute(x, y)`, `nativePointerMotion(dx, dy)`,
   `nativePointerButton(btn, pressed)`, `nativePointerAxis(axis, value)`,
   `nativeKey(evdevCode, pressed)`.

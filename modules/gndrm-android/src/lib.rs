@@ -26,6 +26,13 @@
 //! mode's rate — the refresh advertised to clients — while the grid stays the
 //! daemon's constant.
 //!
+//! The mode's *size* is the other session-level input. `nativeStart` takes it
+//! from the window unless the app named one through `nativeSetScanoutGeometry`
+//! first, and a size below the window's is what keeps a session off the panel's
+//! pixel count: gamescope composites at the mode, the presenter scales the layer
+//! up into the window, and the display's compositor does the upscale. A size
+//! that does not fit the window is refused and the window's is the mode.
+//!
 //! On non-Android targets this crate is an empty stub so host-side
 //! workspace gates (fmt/clippy/test) stay green; the real gates for this
 //! module are `tools/build-android.sh` and on-device runs.
@@ -186,6 +193,48 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetLsfgCo
 /// process-lifetime (not reset per session) so an app that supplies it once
 /// still gets it for every later session.
 static PANEL_REFRESH_MHZ: AtomicU32 = AtomicU32::new(0);
+
+/// The scan-out size the app asked the session to present at, supplied through
+/// [`Java_app_gamenative_display_GameNativeDrm_nativeSetScanoutGeometry`] before
+/// the session starts; `None` until then, and then the window's size is the mode.
+///
+/// It is the emulated connector's mode — what gamescope composites at, and what
+/// the scan-out pool allocates — not the window's size. Below the window's it is
+/// what keeps a session off the panel's pixel count: gamescope composites at this
+/// size and the presenter scales the layer up into the window, so the display's
+/// own compositor does the upscale. A size that does not fit the window is
+/// refused at `nativeStart`, whose window is then the mode (see
+/// [`scanout_geometry`]).
+///
+/// Session-level and read once, like the panel rate: the mode is built when
+/// `nativeStart` assembles the [`PanelDesc`], so a value set afterwards does not
+/// reach the running session. Process-lifetime, not reset per session.
+static SCANOUT_GEOMETRY: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+
+/// The mode geometry for a window of `win_w`x`win_h`: the size the app asked for
+/// when it fits, else the window's own.
+///
+/// A mode larger than the window would composite more pixels than the display
+/// can show and then have them scaled back down, so it is refused rather than
+/// clamped to an aspect nobody asked for: the connector then advertises the
+/// window's size, which is the pre-setting behaviour, and gamescope's `-W/-H`
+/// (the requested size) matches no mode and falls back to it.
+fn scanout_geometry(win_w: u16, win_h: u16) -> (u16, u16) {
+    let Some((want_w, want_h)) = *SCANOUT_GEOMETRY.lock().unwrap_or_else(|e| e.into_inner()) else {
+        return (win_w, win_h);
+    };
+    if want_w >= 64 && want_h >= 64 && want_w <= u32::from(win_w) && want_h <= u32::from(win_h) {
+        (want_w as u16, want_h as u16)
+    } else {
+        log_info!(
+            "{}",
+            gndrm_obf::obf!(
+                "scan-out geometry {want_w}x{want_h} does not fit the {win_w}x{win_h} window; the mode is the window"
+            )
+        );
+        (win_w, win_h)
+    }
+}
 
 /// The app's `JavaVM`, cached from the first JNI entry point (`nativeStart`).
 /// Needed by the presenter and scan-out threads, which are Rust-spawned threads
@@ -436,11 +485,12 @@ fn server_thread(
     listener: RawFd,
     window: WindowPtr,
     panel: PanelDesc,
+    window_size: (u16, u16),
     fds: Arc<Mutex<AcceptedFds>>,
     ready: mpsc::Sender<Result<Arc<Mutex<asc::AscState>>, String>>,
 ) {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        server_thread_inner(listener, window, panel, fds, ready);
+        server_thread_inner(listener, window, panel, window_size, fds, ready);
     }));
     if let Err(e) = caught {
         report_panic("gndrm server", e.as_ref());
@@ -451,6 +501,7 @@ fn server_thread_inner(
     listener: RawFd,
     window: WindowPtr,
     panel: PanelDesc,
+    window_size: (u16, u16),
     fds: Arc<Mutex<AcceptedFds>>,
     ready: mpsc::Sender<Result<Arc<Mutex<asc::AscState>>, String>>,
 ) {
@@ -461,6 +512,8 @@ fn server_thread_inner(
         window.0,
         i32::from(panel.width),
         i32::from(panel.height),
+        i32::from(window_size.0),
+        i32::from(window_size.1),
     )));
     let presenter: Box<dyn gndrm_daemon::Presenter> =
         Box::new(asc::AscPresenter::new(Arc::clone(&asc_state)));
@@ -881,11 +934,15 @@ fn start(
             ffi::ANativeWindow_getHeight(window.0),
         )
     };
-    let (panel_w, panel_h) = if win_w > 0 && win_h > 0 {
+    let (win_w, win_h) = if win_w > 0 && win_h > 0 {
         (win_w as u16, win_h as u16)
     } else {
         (width as u16, height as u16)
     };
+    // The mode is the scan-out size, which the app may have asked to be below the
+    // window's so the display's compositor upscales instead of the session
+    // compositing at the panel's pixels (see `SCANOUT_GEOMETRY`).
+    let (panel_w, panel_h) = scanout_geometry(win_w, win_h);
     let panel = PanelDesc {
         width: panel_w,
         height: panel_h,
@@ -945,9 +1002,10 @@ fn start(
     };
     let (tx, rx) = mpsc::channel::<Result<Arc<Mutex<asc::AscState>>, String>>();
     let thread_fds = Arc::clone(&fds);
+    let window_size = (win_w, win_h);
     let handle = thread::Builder::new()
         .name("gndrm".into())
-        .spawn(move || server_thread(listener, window, panel, thread_fds, tx));
+        .spawn(move || server_thread(listener, window, panel, window_size, thread_fds, tx));
     let handle = match handle {
         Ok(h) => h,
         Err(e) => {
@@ -996,7 +1054,7 @@ fn start(
 
     log_info!(
         "{}",
-        gndrm_obf::obf!("started: socket={name} {panel_w}x{panel_h}")
+        gndrm_obf::obf!("started: socket={name} {panel_w}x{panel_h} into {win_w}x{win_h}")
     );
     log_info!(
         "{}",
@@ -1129,7 +1187,9 @@ fn retarget(env: &mut JNIEnv, surface: &JObject, width: jint, height: jint) -> j
             ffi::ANativeWindow_getHeight(raw),
         )
     };
-    let (panel_w, panel_h) = if win_w > 0 && win_h > 0 {
+    // The window's size, not the session's mode: retargeting rebuilds the publish
+    // layer around a new window and never re-modes what gamescope is compositing at.
+    let (win_w, win_h) = if win_w > 0 && win_h > 0 {
         (win_w, win_h)
     } else {
         (width, height)
@@ -1142,7 +1202,7 @@ fn retarget(env: &mut JNIEnv, surface: &JObject, width: jint, height: jint) -> j
         state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .set_panel(panel_w, panel_h);
+            .set_window(win_w, win_h);
         // SAFETY: `raw` is the extra reference this call acquired.
         unsafe { ffi::ANativeWindow_release(raw) };
         return 0;
@@ -1150,7 +1210,7 @@ fn retarget(env: &mut JNIEnv, surface: &JObject, width: jint, height: jint) -> j
     let rebuilt = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .retarget(raw, panel_w, panel_h);
+        .retarget(raw, win_w, win_h);
     if !rebuilt {
         log_error!(
             "{}",
@@ -1173,7 +1233,7 @@ fn retarget(env: &mut JNIEnv, surface: &JObject, width: jint, height: jint) -> j
     let _ = injector::gamescope_command("debug_force_repaint");
     log_info!(
         "{}",
-        gndrm_obf::obf!("retarget: adopted the new window {panel_w}x{panel_h}")
+        gndrm_obf::obf!("retarget: adopted the new window {win_w}x{win_h}")
     );
     0
 }
@@ -1283,6 +1343,57 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetPanelR
     if let Err(e) = std::panic::catch_unwind(|| set_panel_refresh_hz(refresh_hz)) {
         report_panic("gndrm-refresh", e.as_ref());
     }
+}
+
+/// `GameNativeDrm.nativeSetScanoutGeometry(width, height)` — tell the daemon the
+/// scan-out size the session's mode is emulated at, before `nativeStart`.
+///
+/// It is the size gamescope composites at and the connector advertises, so it is
+/// also the size the scan-out pool allocates and the size the guest's X screen
+/// and windows see. Given a size below the window's, the session stays off the
+/// panel's pixel count and the presenter scales the layer up into the window.
+/// A size that does not fit the window, or one below `64x64`, is refused at
+/// `nativeStart` (the window's size is then the mode) — see [`scanout_geometry`].
+/// Safe to call with no session running; a value set after `nativeStart` does not
+/// reach that session.
+#[no_mangle]
+pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetScanoutGeometry(
+    _env: JNIEnv,
+    _class: JClass,
+    width: jint,
+    height: jint,
+) {
+    if let Err(e) = std::panic::catch_unwind(|| set_scanout_geometry(width, height)) {
+        report_panic("gndrm-mode", e.as_ref());
+    }
+}
+
+/// Store the scan-out geometry from
+/// [`Java_app_gamenative_display_GameNativeDrm_nativeSetScanoutGeometry`], or
+/// clear it for a zero axis.
+///
+/// Only the obviously-unusable is dropped here — a negative or sub-`64` axis on
+/// its own, which would make the mode's timings nonsense. Whether the size fits
+/// the window is [`scanout_geometry`]'s question, because only `nativeStart`
+/// knows the window. Clearing matters because the value is process-lifetime: a
+/// session whose resolution cannot be read must not inherit the previous
+/// session's size.
+fn set_scanout_geometry(width: jint, height: jint) {
+    if width == 0 || height == 0 {
+        eprintln!("gndrm-daemon: scan-out geometry cleared");
+        *SCANOUT_GEOMETRY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        return;
+    }
+    if width < 64 || height < 64 {
+        log_warn!(
+            "{}",
+            gndrm_obf::obf!("scan-out geometry {width}x{height} below 64x64; ignored")
+        );
+        return;
+    }
+    eprintln!("gndrm-daemon: scan-out geometry {}x{}", width, height);
+    *SCANOUT_GEOMETRY.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((width as u32, height as u32));
 }
 
 /// Validate and store the panel refresh rate from

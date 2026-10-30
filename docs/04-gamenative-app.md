@@ -78,11 +78,19 @@ because those run without the gamescope lib env):
 
 ```
 filesDir/gamescope/bin/gamescope --backend drm --expose-wayland --xwayland-count 1 \
-    -W <surfaceW> -H <surfaceH> -- <wine>/bin/wine explorer /desktop=gamescope,<WxH> <start command>
+    -W <scanoutW> -H <scanoutH> -w <desktopW> -h <desktopH> -- <wine>/bin/wine explorer /desktop=gamescope,<WxH> <start command>
 ```
 
-- `-W/-H` = **output** res = the Surface/mode size (03 §7); game res stays wine's
-  window size.
+- `-W/-H` = **the session's scan-out size**: the container's Upscaling Resolution
+  (Graphics tab; `GamescopeSettings.outputResolution`), passed to the daemon as
+  `nativeSetScanoutGeometry` so the emulated connector advertises exactly that
+  mode. The composite, the scan-out pool and the KMS output are that size, and
+  the presenter fits them into the app's window, so a resolution below the panel
+  is upscaled by the display's compositor, not by gamescope's composite. A size
+  that does not fit the window is refused and the window's size is the mode —
+  gamescope's `-W/-H` then matches no mode and falls back to it.
+- `-w/-h` = the container's screen size, i.e. the guest desktop; the game res
+  stays wine's window size.
 - `--expose-wayland`: gamescope serves xdg-shell clients and sets
   `WAYLAND_DISPLAY=gamescope-0` + `XDG_SESSION_TYPE=wayland` for its children
   itself.
@@ -300,7 +308,11 @@ anyway).
   4. `surfaceDestroyed` / screen exit → `nativeStop()` before the guest is
      killed.
 - The daemon presents per KMS semantics: black outside the plane's CRTC rect, the
-  FB's SRC rect (16.16 fixed point) scaled into it (02 §7).
+  FB's SRC rect (16.16 fixed point) scaled into it (02 §7). The CRTC rect is in
+  the session's mode pixels, so it is fitted into the window before the
+  transaction: a mode below the window's is scaled up uniformly and centred there
+  (another aspect is letterboxed, never stretched), which is where the Upscaling
+  Resolution's upscale happens.
 - Logging: `GN_DRM` logtag (native side; Kotlin uses Timber), plus a build-stamp
   line at daemon start — the only stale-.so detector on device (no root/run-as).
 

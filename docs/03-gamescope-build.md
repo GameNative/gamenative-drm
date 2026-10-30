@@ -316,7 +316,9 @@ WLR_XWAYLAND=<pkg>/bin/Xwayland
 # guest so winex11 dials XWayland.
 ```
 
-Launch: `gamescope --backend drm --expose-wayland --xwayland-count 1 -W <panelW> -H <panelH> -- <wine>/bin/wine explorer /desktop=gamescope,<WxH> <start command>`
-(width/height = *output* res = Surface size; game res stays wine's window size).
+Launch: `gamescope --backend drm --expose-wayland --xwayland-count 1 -W <scanoutW> -H <scanoutH> -w <desktopW> -h <desktopH> -- <wine>/bin/wine explorer /desktop=gamescope,<WxH> <start command>`
+(`-W/-H` = the session's scan-out size, i.e. the container's Upscaling Resolution,
+which the daemon emulates its connector mode at; `-w/-h` = the container's screen
+size, the guest desktop. Game res stays wine's window size.)
 `--backend drm` explicit: auto-select would also land on DRM when no parent
 wayland/X11 exists, but never rely on detection.

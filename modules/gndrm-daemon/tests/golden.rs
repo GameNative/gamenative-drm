@@ -2671,3 +2671,58 @@ fn presenter_gets_the_committed_buffer_as_a_source() {
     // SAFETY: the test's own reference.
     unsafe { libc::close(fd) };
 }
+
+// ---------------------------------------------------------------------------
+// A50: the mode is the session's scan-out size, not the window's
+// ---------------------------------------------------------------------------
+
+/// The connector advertises the size the app asked the session to present at,
+/// so gamescope's `-W/-H` finds a mode and composites at it. This is what makes
+/// an Upscaling Resolution below the panel a scan-out size rather than only a
+/// scaling hint.
+#[test]
+fn connector_advertises_the_session_scanout_size() {
+    let _layout = with_layout(ScanoutLayout::Bgra8888);
+    let mut d = Device::new(
+        PanelDesc {
+            width: 1920,
+            height: 1080,
+            ..PanelDesc::default()
+        },
+        Box::<NullPresenter>::default(),
+    );
+    d.set_clock(Box::new(|| (1000, 500)));
+
+    let r = call(
+        &mut d,
+        DRM_IOCTL_MODE_GETCONNECTOR,
+        &pod(&DrmModeGetConnector {
+            connector_id: CONNECTOR_ID,
+            modes_ptr: 1,
+            count_modes: 1,
+            ..Default::default()
+        }),
+    );
+    ok(&r);
+    let off = core::mem::size_of::<DrmModeGetConnector>();
+    let m: DrmModeModeinfo = pod_read(&r.body[off..]).unwrap();
+    assert_eq!(
+        (m.hdisplay, m.vdisplay),
+        (1920, 1080),
+        "the mode is the scan-out size the panel was built with"
+    );
+
+    // GETCRTC carries the same mode (its `mode_valid` follows a committed
+    // MODE_ID, so it is 0 on a fresh device and says nothing here).
+    let r = call(
+        &mut d,
+        DRM_IOCTL_MODE_GETCRTC,
+        &pod(&DrmModeCrtc {
+            crtc_id: CRTC_ID,
+            ..Default::default()
+        }),
+    );
+    ok(&r);
+    let c: DrmModeCrtc = pod_read(&r.body).unwrap();
+    assert_eq!((c.mode.hdisplay, c.mode.vdisplay), (1920, 1080));
+}
