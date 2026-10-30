@@ -1430,7 +1430,17 @@ int gamenative_drm_latch_grid(uint64_t *anchor_ns, uint32_t *period_ns, uint32_t
     typedef int (*latch_grid_fn)(uint64_t *, uint32_t *, uint32_t *);
     static latch_grid_fn fn;
     static int looked_up;
+    static uint64_t last_try_ns;
     if (!looked_up) {
+        /* The Vulkan loader opens the ICD on the first instance, so the lookup
+         * may run before it is there: ask again, at most once a second, since
+         * the caller asks on every vblank. */
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        if (last_try_ns && now_ns - last_try_ns < 1000000000ull)
+            return 0;
+        last_try_ns = now_ns;
         /* The ICD carries no DT_SONAME, so it is found by the path it was
          * loaded from, read off this process's maps; RTLD_NOLOAD never loads. */
         char path[512] = "";
@@ -1451,16 +1461,19 @@ int gamenative_drm_latch_grid(uint64_t *anchor_ns, uint32_t *period_ns, uint32_t
         if (!h)
             h = dlopen("libadrenotools_gamescope.so", RTLD_NOLOAD | RTLD_LAZY);
         if (!h) {
-            /* Not loaded yet (the Vulkan loader opens it on the first instance):
-             * ask again next time. */
+            static int said;
+            if (!said++)
+                log_info("latch grid: ICD %s (%s)\n",
+                         path[0] ? "mapped but dlopen(RTLD_NOLOAD) refused it" : "not mapped yet",
+                         path[0] ? path : "-");
             return 0;
         }
         fn = (latch_grid_fn)dlsym(h, "gamenative_drm_icd_latch_grid");
         looked_up = 1;
         if (fn)
-            LOG("latch grid: answered from %s\n", path[0] ? path : "the loaded ICD");
+            log_info("latch grid: answered from %s\n", path[0] ? path : "the loaded ICD");
         else
-            LOG("latch grid: the loaded ICD has no gamenative_drm_icd_latch_grid\n");
+            log_info("latch grid: the loaded ICD has no gamenative_drm_icd_latch_grid\n");
     }
     if (!fn)
         return 0;
