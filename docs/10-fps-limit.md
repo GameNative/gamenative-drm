@@ -35,23 +35,25 @@ gamescope, so our pacer would be pacing a path the frames no longer take.
    (interned `steamcompmgr.cpp:9003`, read at `:7371`). Equivalent effect, but it
    needs a client of *gamescope's* Xwayland — writable by the ICD shim (which
    already has that connection) or by wine, not by the app process.
-3. **`-r <N>` / `--nested-refresh`** — the launch knob GameNative uses to carry
-   the FPS limit value directly. `main.cpp:748` stores it as
-   `g_nNestedRefresh` in **mHz**; `0` is the unset sentinel (only negatives are
-   rejected) and every consumer falls back to `g_nOutputRefresh`. Verified
-   consumers:
-   - `vblankmanager.cpp:77` `GetVBlankInterval()` — the vblank grid itself.
-   - `vblankmanager.cpp:405` — a sleep computed from the same value.
-   - `steamcompmgr.cpp:10492-10494` — `nRealRefreshmHz` →
-     `g_SteamCompMgrAppRefreshCycle`, consumed at `:8252-8253` as the window's
-     refresh cycle (this is what paces the app's frame callbacks).
-   - `steamcompmgr.cpp:6911` — the limiter's divisor base `nRefreshHz` (only
-     used when a target FPS is also set; with `-r` alone `g_nSteamCompMgrTargetFPS`
-     stays 0, so the cap comes from the app refresh cycle, not the divisor).
-   - `Backends/DRMBackend.cpp:3910` — passed into `init_drm(..., g_nNestedRefresh)`
-     → `drm->preferred_refresh` → mode selection (`find_mode`, exact `vrefresh`
-     match `:1029`) and the declared output refresh (`drm_unset_mode`, `:3646`
-     `if (bPreferredRefresh) g_nOutputRefresh = drm->preferred_refresh`).
+3. **`-r <N>` / `--nested-refresh`** — the session's vblank grid.
+   `main.cpp:740-741` stores it as `g_nNestedRefresh` in **mHz**; `0` is the
+   unset sentinel (only negatives are rejected) and every consumer falls back to
+   `g_nOutputRefresh`. GameNative launches with a constant 1200 Hz
+   (`GamescopeState.SESSION_GRID_HZ` → `gridArg()`), high enough that the grid
+   never binds the session. Verified consumers:
+   - `vblankmanager.cpp:75-77` `GetRefresh()` — the vblank grid itself, and
+     `:405` a sleep computed from the same value.
+   - `steamcompmgr.cpp:10606-10607` — `nRealRefreshmHz` →
+     `g_SteamCompMgrAppRefreshCycle`, the window's refresh cycle (what paces the
+     app's frame callbacks).
+   - `steamcompmgr.cpp:7013` — the limiter's divisor base `nRefreshHz`, used only
+     when a target FPS reached gamescope through
+     `set_app_target_refresh_cycle`.
+   - `Backends/DRMBackend.cpp:3943` — passed into
+     `init_drm(..., g_nNestedRefresh)` → `drm->preferred_refresh`, which A47
+     makes a size-only mode lookup because the grid matches no `vrefresh`;
+     `drm_set_mode` (`:3728`) then makes the mode's own rate the declared
+     output refresh.
 
    `--framerate-limit` is a dead option in this tree — declared at
    `main.cpp:97`/documented at `:221`, absent from main.cpp's long-option chain —
@@ -63,23 +65,22 @@ Method: deltas of gamescope's unconditional 1/s `drm: A23 flip commit <N>` over 
 ≥23 s window after ~95 s settle, same scene each run. Device 97c32e85, container
 `xuser-STEAM_1868140`.
 
-gndrm exposes **one** mode only: `1280x960@1200` (gndrm-daemon `objects.rs`
-`PanelDesc::modeinfo` builds a single `DrmModeModeinfo`; `vrefresh` comes from
-`SESSION_REFRESH_MHZ`, the daemon's own 1200 Hz constant — not the panel's rate).
+gndrm exposes **one** mode: the session's scan-out size at the panel's real rate
+(`PanelDesc::modeinfo` in `gndrm-daemon/src/objects.rs`; the rate comes from
+`nativeSetPanelRefreshHz`, or from the frame-generation output rate when that is
+higher). The vblank grid is a separate value — the daemon's own
+`SESSION_REFRESH_MHZ`, 1200 Hz — so `-r` matches no `vrefresh` by design: A47
+re-runs the lookup by size, and `drm_set_mode` makes the mode's rate the
+declared output refresh. `-r` is the grid (paint tick, app-refresh cycle) and
+never the client-visible rate.
 
-The selected DRM mode is `1280x960@1200` for **every** `-r` value: the connector
-exposes only that one mode, `find_mode(N)` finds no exact `vrefresh` match and
-the single mode is kept. What `-r N` changes is the declared output refresh
-`g_nOutputRefresh = N` and the vblank grid / app-refresh cycle = N — the grid is
-re-timed while the mode stays 1200 Hz.
+A divisor cap on the grid lands on its target exactly, and the uncapped ceiling
+is the client↔gamescope lap — the grid itself never binds.
 
 | `-r` | presents/s |
 |---|---|
 | `0` (unset→output refresh; uncapped) | ~259 |
 | `60` | 60.0 |
-
-The 1200 Hz grid never binds: the uncapped ceiling is the client↔gamescope lap,
-and a divisor cap lands on its target exactly (`-r 60` reads 60.0 presents/s).
 
 ### Pacing cost
 
@@ -87,30 +88,29 @@ The flip event is emitted with the publish (see 12), so a paced frame's present
 does not carry the SurfaceFlinger round trip: `interval ≈ 1 / target`, and a
 divisor cap reads its target exactly.
 
-## Recommended wiring
+## How the cap is applied
 
-- **Runtime (mid-session) changes** stay on the existing request path: a
-  `nativeSetFpsLimit(fps)` JNI call on the `GameNativeDrm` surface issues
+- **`nativeSetFpsLimit(fps)`** (`gndrm-android/src/lib.rs:1454`, `0` = uncapped)
+  fans out to both routes. `injector::set_fps_limit` issues
   `gamescope_control.set_app_target_refresh_cycle(fps, internal_display)` and
-  re-issues it when the setting changes (`fps = 0` = uncapped). This is the only
-  route that can change the limit mid-session, because `-r` is a launch-time
-  argument.
-- **Launch contract**: pass `-r <value>` where value = the QuickMenu fps limit —
-  `0` when the limiter is off (gamescope falls back to the output refresh =
-  uncapped) and the user's target when it is on. Sourced from the same container
-  extra (`fpsLimiterTarget`, off ⇒ 0) the runtime request reads, so the launch
-  value and a mid-session change cannot drift. The launch command builds no
-  `--framerate-limit`.
+  re-issues it when the value or the panel's screen type changes
+  (`injector.rs:717-722`); `set_frame_cap_target` (`lib.rs:322`) holds the target
+  so the scan-out channel pushes a `FrameCapNote` to a subscribed shim.
+- **The shim enforces it** (`icd_shim/src/scanout.rs:118-140`): the next acquire
+  may start no sooner than one `1/target` period after the previous one, so the
+  guest blocks in `vkAcquireNextImageKHR` — the one point where waiting costs
+  neither rendered work nor display latency.
+- **`-r` is not part of it**: the grid is the constant 1200 Hz, and no launch
+  argument carries the limit. `--framerate-limit` is never built.
 
 Open points:
-- **Divisor rounding only bites the request path.** With `-r` alone the cap comes
-  from the grid rate, not from `nVblankDivisor`, so the `nearest divisor`
-  behaviour applies to runtime changes made while `g_nSteamCompMgrTargetFPS != 0`.
-- **`-r` also sets the declared output refresh `g_nOutputRefresh`** (and, since
-  the connector has a single mode, keeps the 1200 Hz DRM mode). Consequences of a
-  low `-r` on the client-visible refresh (`_GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK`,
-  `active_display_info` rates) were not measured directly on device — the rates
-  `active_display_info` carries are the connector's mode list, not
-  `g_nOutputRefresh`, in this configuration.
-- **Engagement feedback**: `gamescope_limiter.state` is the honest source for
-  "is a limit actually in force".
+- **Divisor rounding bites the gamescope route only.** `nVblankDivisor =
+  nRefreshHz / nTargetFPS` (`steamcompmgr.cpp:7040`, and `:10621` for the window's
+  limited cycle) lands on the nearest divisor of the grid; the shim's floor is
+  exact.
+- **The client-visible refresh is the mode's.** `-r` reaches `g_nOutputRefresh`
+  only transiently (`drm_unset_mode`, `:3680`), before `drm_set_mode` (`:3728`)
+  overwrites it with the mode's rate — `_GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK`
+  and `active_display_info` therefore carry the panel's rate, never the grid.
+- **Engagement feedback**: `gamescope_limiter.state` covers the gamescope route;
+  the shim logs `scanout frame cap: fps=… effective=…` (`scanout.rs:141-149`).
