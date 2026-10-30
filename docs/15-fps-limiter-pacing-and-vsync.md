@@ -5,11 +5,11 @@ Scope: an audit of where frame pacing and the fps cap are decided in
 SurfaceFlinger`, and a design for a correct cap with correct pacing and an
 honest refresh model.
 
-Nothing in this document is implemented. The pacing-arithmetic patch remains in
-`gamescope/android/patches/disabled/0032-A32-fps-cap-lower-bound-delay.patch`
-and is **not** applied to `gamescope/src/`. Line references are against
-`gamescope` HEAD `f3c3b96`, `gamenative-drm` `master`, and GameNative
-`feat/gamescope-display`.
+The refresh split described in §1 is implemented: the mode advertises the
+panel's rate and the 1200 Hz constant is the grid alone. The pacing arithmetic
+below is not — `steamcompmgr.cpp:10621` still applies the cap as a refresh
+divisor, whose patch sits in `gamescope/android/patches/disabled/`. Line
+references are against the working trees at the A51 patch train.
 
 ## 1. One variable does two jobs
 
@@ -23,39 +23,43 @@ g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh
 - the grid — `CVBlankTimer::GetRefresh()`, `gamescope/src/vblankmanager.cpp:75-78`,
   consumed at `:87` (`GetNextVBlank`) and `:127` (`CalcNextWakeupTime`);
 - app pacing — `g_SteamCompMgrAppRefreshCycle = mHzToRefreshCycle(nRealRefreshmHz)`,
-  `gamescope/src/steamcompmgr.cpp:10528-10529`;
-- the limiter's divisor base — `nRefreshHz`, `gamescope/src/steamcompmgr.cpp:6938`.
+  `gamescope/src/steamcompmgr.cpp:10606-10607`;
+- the limiter's divisor base — `nRefreshHz`, `gamescope/src/steamcompmgr.cpp:7013`.
 
-The launcher passes no `-r`
-(`GameNative/app/src/main/java/com/winlator/xenvironment/components/BionicProgramLauncherComponent.java:591-594`),
-so `g_nNestedRefresh` is 0 and all three read `g_nOutputRefresh`.
+The launcher passes the constant `-r 1200`
+(`GameNative/.../GamescopeState.kt:44`, `:64` → `gridArg()`, appended at
+`BionicProgramLauncherComponent.java:640`), so `g_nNestedRefresh` wins for all
+three and the grid is 1200 Hz — the app-refresh cycle and the divisor base
+included.
 
 The DRM backend sets `g_nOutputRefresh` from the mode it selected, recomputed
 rather than read from the label: `drm_set_mode` →
 `g_nOutputRefresh = gamescope::GetModeRefresh( mode )`
-(`gamescope/src/Backends/DRMBackend.cpp:3674-3685`), and `GetModeRefresh` is
-`(clock*1e6/htotal + vtotal/2)/vtotal` (`:229-243`). The daemon exposes one
-synthetic mode whose `clock`/`htotal`/`vtotal` encode
-`SESSION_REFRESH_MHZ = 1_200_000`
-(`gamenative-drm/modules/gndrm-daemon/src/objects.rs:63`, `:91-125`), so the
-recomputed rate is 1200 Hz. The mode's `vrefresh` field (`objects.rs:120`) only
-has to agree with those three; it is a label, not the rate.
+(`gamescope/src/Backends/DRMBackend.cpp:3727-3728`), and `GetModeRefresh` is
+`(clock*1e6/htotal + vtotal/2)/vtotal` (`:229-246`). The daemon's one mode carries
+its own rate in `clock`/`htotal`/`vtotal`/`vrefresh` alike
+(`gamenative-drm/modules/gndrm-daemon/src/objects.rs:121-160`): the panel's rate as
+the app reported it through `nativeSetPanelRefreshHz`, raised to the
+frame-generation output rate when that is higher. The recomputed rate is therefore
+the panel's, and the 1200 Hz constant
+(`SESSION_REFRESH_MHZ`, `objects.rs:68`) is the grid alone.
 
 Consequences, all structural:
 
 - the grid interval is `mHzToRefreshCycle(1200 Hz)` ≈ 833 µs — three orders of
   magnitude below the panel's frame time, so the composite is never the ceiling
   and a guest can present faster than the panel at all;
-- the refresh pushed to clients is a fabricated 1200 Hz;
-- every reachable capped rate is `1200/N`, which is what the limiter's parity
-  between a requested target and a landed rate is measured against.
+- the refresh pushed to clients is the panel's (or the generated rate), never the grid;
+- every capped rate reachable through gamescope is `1200/N`, which is what the
+  limiter's parity between a requested target and a landed rate is measured
+  against there; the shim's own floor is exact.
 
 The daemon's flip-event timebase is built from the same constant —
 `VblankTimeline::interval_ns = 1e12 / SESSION_REFRESH_MHZ`
-(`gamenative-drm/modules/gndrm-daemon/src/lib.rs:1834`) — so the timeline and
-the grid agree by construction. `objects.rs:55-62` states the intent: the
-advertised rate is a deliberate decoupling from the panel, so that the only cap
-on a guest is the user's own fps limit, and the panel downstream coalesces.
+(`gamenative-drm/modules/gndrm-daemon/src/lib.rs:2091`) — so the timeline and
+the grid agree by construction. `objects.rs:53-68` states the intent: the grid is a
+deliberately high timer so the only cap on a guest is the user's own fps limit,
+while the mode's rate stays truthful to the panel.
 
 ## 2. The current limiter path
 
@@ -155,7 +159,7 @@ Which stage binds is per title, not per build. A title whose lap through the
 shim and the compositor exceeds the panel's frame time is bound by its own lap
 (stage 1+2). A fast title is bound by how often gamescope releases its buffers,
 which is per grid tick (stage 3). Nothing bounds it at the panel rate: that is
-the intent of the fabricated 1200 Hz grid (`objects.rs:55-62`).
+the intent of the 1200 Hz grid (`objects.rs:53-68`).
 
 **A frame presented early** — the guest obtained a slot and committed before the
 panel's next edge. The daemon publishes it, and `VblankTimeline::claim` stamps it
@@ -514,9 +518,10 @@ Three candidates, and which one bounds:
   repaint (`steamcompmgr.cpp:10762`, `:10817`) — i.e. when a client committed.
   The project's own figure for that pipeline is ~259 presents/s
   (`objects.rs:60-61`, from an earlier session and not re-measured here).
-- **The panel's real rate.** Nothing. `g_nOutputRefresh` is the fabricated 1200
-  and `PanelDesc` carries no rate (`objects.rs:69-75`); the panel reaches the
-  stack only through SurfaceFlinger, downstream of everything we own.
+- **The panel's real rate.** Nothing on the loop: `g_nOutputRefresh` is the
+  panel's rate, but the grid is the daemon's 1200 Hz constant, so the
+  compositor's tick is not tied to the panel; the panel reaches the stack only
+  through SurfaceFlinger, downstream of everything we own.
 
 So the loop is bounded by the **guest's present rate** for the per-frame path
 (shim present, daemon commit, presenter publish), and by the **1200 Hz grid** for

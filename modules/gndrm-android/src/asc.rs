@@ -806,10 +806,12 @@ impl Drop for ForeignSlot {
 }
 
 /// The layer-rect probe's change key: the published source and destination
-/// rects plus the panel the destination is bounded by. A plain tuple, so the
-/// probe has a `Copy + PartialEq` value to compare against the last one and
-/// prints on a change instead of every frame.
+/// rects plus the mode and window the destination is bounded by. A plain tuple,
+/// so the probe has a `Copy + PartialEq` value to compare against the last one
+/// and prints on a change instead of every frame.
 type RectLogKey = (
+    c_int,
+    c_int,
     c_int,
     c_int,
     c_int,
@@ -848,8 +850,15 @@ pub struct AscState {
     /// [`AscState::publish`] for why that matters and why the SurfaceFlinger
     /// completion callback does not depend on it.
     looper: Option<ffi::LooperApi>,
-    panel_w: c_int,
-    panel_h: c_int,
+    /// The session's mode: the scan-out size the connector advertises and the
+    /// pool's buffers are allocated at.
+    mode_w: c_int,
+    mode_h: c_int,
+    /// The app's window — the display's own pixels — which the layer is
+    /// composited in. Equal to the mode unless the app asked for a smaller
+    /// scan-out size, in which case the window's compositor does the upscale.
+    win_w: c_int,
+    win_h: c_int,
     /// The scan-out buffer pool, on its own lock (see [`ScanoutPool`]). The
     /// lock is tracked (see `gndrm_daemon::diag`): a request that stalls on it
     /// must be able to name the thread holding it.
@@ -896,11 +905,18 @@ pub struct AscState {
 unsafe impl Send for AscState {}
 
 impl AscState {
-    /// Create the child layer under `window`. Never fails: a missing publish
-    /// surface or a null layer leaves the presenter disabled, which drops
-    /// frames instead of failing the session.
+    /// Create the child layer under `window`, presenting the session's `mode_w`x`mode_h`
+    /// scan-out into the `win_w`x`win_h` window. Never fails: a missing publish
+    /// surface or a null layer leaves the presenter disabled, which drops frames
+    /// instead of failing the session.
     #[must_use]
-    pub fn new(window: *mut ffi::ANativeWindow, panel_w: i32, panel_h: i32) -> Self {
+    pub fn new(
+        window: *mut ffi::ANativeWindow,
+        mode_w: i32,
+        mode_h: i32,
+        win_w: i32,
+        win_h: i32,
+    ) -> Self {
         let loaded = ffi::ScApi::load();
         // SAFETY: `window` is a live ANativeWindow owned by the caller for the
         // whole session; createFromWindow only reads it.
@@ -925,7 +941,9 @@ impl AscState {
         } else {
             log_info!(
                 "{}",
-                gndrm_obf::obf!("asc: SurfaceControl layer created ({panel_w}x{panel_h} panel)")
+                gndrm_obf::obf!(
+                    "asc: SurfaceControl layer created (mode {mode_w}x{mode_h} in a {win_w}x{win_h} window)"
+                )
             );
         }
         // The `ALooper` is deliberately *not* prepared here. This function runs
@@ -939,8 +957,10 @@ impl AscState {
             api,
             sc,
             looper: None,
-            panel_w,
-            panel_h,
+            mode_w,
+            mode_h,
+            win_w,
+            win_h,
             pool: Arc::new(TrackedMutex::new(
                 diag::diag(),
                 LOCK_SCANOUT_POOL,
@@ -967,14 +987,14 @@ impl AscState {
         // allocator pool, which is empty at this point, so there is normally
         // nothing to put up yet — re-publishing is a no-op here and only does
         // work on a path that re-creates the layer over an existing table.
-        // The panel mode is a geometry the daemon can serve from a bare length,
-        // so a mode-sized scan-out allocation resolves by length even before a
+        // The mode is a geometry the daemon can serve from a bare length, so a
+        // mode-sized scan-out allocation resolves by length even before a
         // framebuffer of that size is committed.
-        if panel_w > 0 && panel_h > 0 {
+        if mode_w > 0 && mode_h > 0 {
             state.pool.lock(Role::Commit).note_framebuffer(
-                panel_w as u32,
-                panel_h as u32,
-                panel_w as u64 * panel_h as u64 * 4,
+                mode_w as u32,
+                mode_h as u32,
+                mode_w as u64 * mode_h as u64 * 4,
             );
         }
         state.republish_last();
@@ -1047,24 +1067,32 @@ impl AscState {
             return;
         };
 
-        // KMS geometry: the FB's SRC rect (16.16 fixed point) is scaled into
-        // the CRTC rect, and the output is black outside it. The layer is
-        // sized to the CRTC rect only, so the app's window shows through
-        // around it, and the layer's background covers transparent regions
-        // inside it (gamescope letterboxes with transparent bars).
+        // The FB's SRC rect (16.16 fixed point) is the crop inside the buffer,
+        // which the mode's coordinates then scale into the window.
         let src = ffi::ARect {
             left: (plane.src_x >> 16) as c_int,
             top: (plane.src_y >> 16) as c_int,
             right: ((plane.src_x + plane.src_w) >> 16) as c_int,
             bottom: ((plane.src_y + plane.src_h) >> 16) as c_int,
         };
-        // KMS clips the plane to the mode: the destination rect is the CRTC
-        // rect bounded by the panel.
+        // KMS clips the plane to the mode, and the layer is composited in the
+        // window: the CRTC rect (mode pixels) is fitted into the window, so a
+        // scan-out size below the display's is upscaled by the display's own
+        // compositor rather than by gamescope's composite, which stops at the
+        // mode. The output is black outside the rect, and the layer is sized to
+        // it only, so whatever lies outside is the app's window showing through;
+        // the layer's background covers transparent regions inside it
+        // (gamescope letterboxes with transparent bars).
+        let (dst_left, dst_top, dst_right, dst_bottom) = gndrm_daemon::scanout::layer_rect(
+            (plane.crtc_x, plane.crtc_y, plane.crtc_w, plane.crtc_h),
+            (self.mode_w as u32, self.mode_h as u32),
+            (self.win_w as u32, self.win_h as u32),
+        );
         let dst = ffi::ARect {
-            left: plane.crtc_x.max(0),
-            top: plane.crtc_y.max(0),
-            right: (plane.crtc_x + plane.crtc_w).min(self.panel_w),
-            bottom: (plane.crtc_y + plane.crtc_h).min(self.panel_h),
+            left: dst_left,
+            top: dst_top,
+            right: dst_right,
+            bottom: dst_bottom,
         };
         let drawable = src.right > src.left
             && src.bottom > src.top
@@ -1073,11 +1101,12 @@ impl AscState {
         let keep = self.last_publish.map(|lp| lp.ino);
 
         // UNGATED, change-latched: the rect this commit publishes the layer
-        // with, against the panel it is bounded by. The layer is a child of the
-        // app's window and is sized to the CRTC rect only, so whatever lies
-        // inside the panel but outside that rect is the app's own window
+        // with, against the window it is composited in. The layer is a child of
+        // the app's window and is sized to the CRTC rect only, so whatever lies
+        // inside the window but outside that rect is the app's own window
         // showing through — the bands this probe exists to measure. Prints on a
-        // rect or panel change and once at session start, never per frame.
+        // rect, mode or window change and once at session start, never per
+        // frame.
         let key: RectLogKey = (
             src.left,
             src.top,
@@ -1087,14 +1116,16 @@ impl AscState {
             dst.top,
             dst.right,
             dst.bottom,
-            self.panel_w,
-            self.panel_h,
+            self.mode_w,
+            self.mode_h,
+            self.win_w,
+            self.win_h,
         );
         if self.last_rect_log != Some(key) {
             self.last_rect_log = Some(key);
             asc_log!(
                 "{}",
-                gndrm_obf::obf!("gndrm-daemon: asc layer rect src=({},{})-({},{}) dst=({},{})-({},{}) panel={}x{} band left={} top={} right={} bottom={} drawable={}",key.0,
+                gndrm_obf::obf!("gndrm-daemon: asc layer rect src=({},{})-({},{}) dst=({},{})-({},{}) mode={}x{} window={}x{} band left={} top={} right={} bottom={} drawable={}",key.0,
                 key.1,
                 key.2,
                 key.3,
@@ -1104,10 +1135,12 @@ impl AscState {
                 key.7,
                 key.8,
                 key.9,
+                key.10,
+                key.11,
                 dst.left,
                 dst.top,
-                self.panel_w - dst.right,
-                self.panel_h - dst.bottom,
+                self.win_w - dst.right,
+                self.win_h - dst.bottom,
                 drawable,)
             );
         }
@@ -1374,13 +1407,15 @@ impl AscState {
                         self.hidden = false;
                         asc_log!(
                             "{}",
-                            gndrm_obf::obf!("gndrm-daemon: asc layer shown again fb={} dst=({},{})-({},{}) panel={}x{}",fb.id,
+                            gndrm_obf::obf!("gndrm-daemon: asc layer shown again fb={} dst=({},{})-({},{}) mode={}x{} window={}x{}",fb.id,
                             dst.left,
                             dst.top,
                             dst.right,
                             dst.bottom,
-                            self.panel_w,
-                            self.panel_h)
+                            self.mode_w,
+                            self.mode_h,
+                            self.win_w,
+                            self.win_h)
                         );
                     }
                     match build_show(&api, self.sc, ahb, ctx, rect, fence) {
@@ -1425,7 +1460,7 @@ impl AscState {
                         self.hidden = true;
                         asc_log!(
                             "{}",
-                            gndrm_obf::obf!("gndrm-daemon: asc layer HIDDEN (plane not drawable) fb={} src=({},{})-({},{}) dst=({},{})-({},{}) panel={}x{}",fb.id,
+                            gndrm_obf::obf!("gndrm-daemon: asc layer HIDDEN (plane not drawable) fb={} src=({},{})-({},{}) dst=({},{})-({},{}) mode={}x{} window={}x{}",fb.id,
                             src.left,
                             src.top,
                             src.right,
@@ -1434,8 +1469,10 @@ impl AscState {
                             dst.top,
                             dst.right,
                             dst.bottom,
-                            self.panel_w,
-                            self.panel_h)
+                            self.mode_w,
+                            self.mode_h,
+                            self.win_w,
+                            self.win_h)
                         );
                     }
                     if let Some(tx) = build_hide(&api, self.sc) {
@@ -1724,10 +1761,12 @@ impl AscState {
         asc_log!(
             "{}",
             gndrm_obf::obf!(
-                "gndrm-daemon: asc re-published retained ino {} onto a {}x{} layer (frames={})",
+                "gndrm-daemon: asc re-published retained ino {} onto a mode {}x{} in a {}x{} window (frames={})",
                 lp.ino,
-                self.panel_w,
-                self.panel_h,
+                self.mode_w,
+                self.mode_h,
+                self.win_w,
+                self.win_h,
                 self.frames
             )
         );
@@ -1739,14 +1778,14 @@ impl AscState {
     /// retained last frame put back on it, so a display power cycle never
     /// leaves the panel with a bufferless layer.
     ///
+    /// The session's mode does not move: it is what gamescope is compositing at
+    /// and what the connector advertises, and neither can be re-moded from here.
+    /// A new window of another size is therefore reached by the same fit the
+    /// first window used.
+    ///
     /// Returns `false` when publishing is disabled or the new layer cannot be
     /// created, in which case the caller keeps the current window and layer.
-    pub fn retarget(
-        &mut self,
-        window: *mut ffi::ANativeWindow,
-        panel_w: i32,
-        panel_h: i32,
-    ) -> bool {
+    pub fn retarget(&mut self, window: *mut ffi::ANativeWindow, win_w: i32, win_h: i32) -> bool {
         let Some(api) = self.api else {
             return false;
         };
@@ -1770,8 +1809,8 @@ impl AscState {
         // layer handle, so no completion callback can reach the old layer this
         // call is about to drop.
         let old_sc = core::mem::replace(&mut self.sc, new_sc);
-        self.panel_w = panel_w;
-        self.panel_h = panel_h;
+        self.win_w = win_w;
+        self.win_h = win_h;
         // SAFETY: the old layer was created by this API, is no longer
         // referenced by the presenter or any mailbox, and is released exactly
         // once here. The window it was created from is released by the caller
@@ -1781,7 +1820,7 @@ impl AscState {
         }
         log_info!(
             "{}",
-            gndrm_obf::obf!("asc: retargeted to the new window ({panel_w}x{panel_h})")
+            gndrm_obf::obf!("asc: retargeted to the new window ({win_w}x{win_h})")
         );
         // A layer with no buffer set composites nothing (the app's background
         // shows through as a blank panel), so the retained frame goes straight
@@ -1790,12 +1829,12 @@ impl AscState {
         true
     }
 
-    /// Adopt a panel geometry reported by a new window without rebuilding the
-    /// layer (a resize on the same window: the geometry only bounds the
-    /// published rect).
-    pub fn set_panel(&mut self, panel_w: i32, panel_h: i32) {
-        self.panel_w = panel_w;
-        self.panel_h = panel_h;
+    /// Adopt a window geometry reported by the same window without rebuilding the
+    /// layer (a resize on the same window: the geometry only bounds the published
+    /// rect).
+    pub fn set_window(&mut self, win_w: i32, win_h: i32) {
+        self.win_w = win_w;
+        self.win_h = win_h;
     }
 }
 
@@ -1808,15 +1847,17 @@ impl Drop for AscState {
         // and this is the last line the presenter can print.
         asc_log!(
             "{}",
-            gndrm_obf::obf!("gndrm-daemon: asc teardown frames_published={} hidden={} last_publish_ino={} last_dst=({},{})-({},{}) panel={}x{}",self.frames,
+            gndrm_obf::obf!("gndrm-daemon: asc teardown frames_published={} hidden={} last_publish_ino={} last_dst=({},{})-({},{}) mode={}x{} window={}x{}",self.frames,
             self.hidden,
             self.last_publish.map_or(0, |lp| lp.ino),
             self.last_publish.map_or(0, |lp| lp.dst.left),
             self.last_publish.map_or(0, |lp| lp.dst.top),
             self.last_publish.map_or(0, |lp| lp.dst.right),
             self.last_publish.map_or(0, |lp| lp.dst.bottom),
-            self.panel_w,
-            self.panel_h)
+            self.mode_w,
+            self.mode_h,
+            self.win_w,
+            self.win_h)
         );
         // Return every buffer before the layer goes: the presenter owns the
         // daemon's reference on each, and SurfaceFlinger may still be reading

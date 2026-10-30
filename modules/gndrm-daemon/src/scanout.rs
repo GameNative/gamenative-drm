@@ -46,6 +46,55 @@ pub fn serves_len(buffer_len: u64, requested_len: u64) -> bool {
     buffer_len >= requested_len
 }
 
+/// Where a scan-out buffer lands on the session's window: a KMS plane rect in
+/// *mode* pixels, mapped into the app's window (the display's own pixels).
+///
+/// The session's mode is its scan-out size, which the app may ask for below the
+/// window's (the Upscaling Resolution), so the two are not the same box. The
+/// layer is composited in window pixels: a smaller mode is scaled up uniformly
+/// and centred — a mode of another aspect is letterboxed, never stretched — and
+/// that upscale belongs to the display compositor rather than to gamescope,
+/// whose composite stops at the mode. Mode equal to window is the identity, so
+/// a 1:1 present is unchanged.
+///
+/// `crtc` is `(x, y, width, height)` in mode pixels, as the plane committed it;
+/// the result is `(left, top, right, bottom)` in window pixels, clipped to the
+/// mode (a plane rect can exceed it) and therefore inside the window.
+#[must_use]
+pub fn layer_rect(
+    crtc: (i32, i32, i32, i32),
+    mode: (u32, u32),
+    window: (u32, u32),
+) -> (i32, i32, i32, i32) {
+    let mw = i64::from(mode.0.max(1));
+    let mh = i64::from(mode.1.max(1));
+    let ww = i64::from(window.0.max(1));
+    let wh = i64::from(window.1.max(1));
+    // The mode's box fitted into the window: width-limited or height-limited.
+    let (fit_w, fit_h) = if ww * mh <= wh * mw {
+        (ww, mh * ww / mw)
+    } else {
+        (mw * wh / mh, wh)
+    };
+    let off_x = (ww - fit_w) / 2;
+    let off_y = (wh - fit_h) / 2;
+    // One axis: clamp to the mode's span, scale, offset, round to nearest.
+    let place =
+        |v: i64, span: i64, fit: i64, off: i64| off + (v.clamp(0, span) * fit + span / 2) / span;
+    let (x, y, w, h) = (
+        i64::from(crtc.0),
+        i64::from(crtc.1),
+        i64::from(crtc.2),
+        i64::from(crtc.3),
+    );
+    (
+        place(x, mw, fit_w, off_x) as i32,
+        place(y, mh, fit_h, off_y) as i32,
+        place(x + w, mw, fit_w, off_x) as i32,
+        place(y + h, mh, fit_h, off_y) as i32,
+    )
+}
+
 /// Geometry a pooled buffer can serve. A free buffer only matches a request of
 /// the exact same width, height and format.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -1037,5 +1086,56 @@ mod tests {
             Reservation::Cold { .. } => "cold",
             Reservation::Full => "full",
         }
+    }
+
+    /// The mode filling the window is the identity, so a session whose scan-out size
+    /// is the display's presents exactly as before this mapping existed — including a
+    /// plane rect that is letterboxed inside the mode.
+    #[test]
+    fn layer_rect_is_the_identity_for_a_mode_that_fills_the_window() {
+        assert_eq!(
+            layer_rect((0, 0, 1280, 720), (1280, 720), (1280, 720)),
+            (0, 0, 1280, 720)
+        );
+        assert_eq!(
+            layer_rect((0, 27, 1280, 904), (1280, 960), (1280, 960)),
+            (0, 27, 1280, 931),
+            "a window letterboxed inside the mode keeps its rect"
+        );
+    }
+
+    /// A mode below the window is upscaled by the display compositor: one uniform
+    /// 1.5x here, covering the window.
+    #[test]
+    fn layer_rect_upscales_a_mode_below_the_window() {
+        assert_eq!(
+            layer_rect((0, 0, 1280, 720), (1280, 720), (1920, 1080)),
+            (0, 0, 1920, 1080)
+        );
+        assert_eq!(
+            layer_rect((320, 180, 640, 360), (1280, 720), (1920, 1080)),
+            (480, 270, 1440, 810),
+            "a window inside the mode is scaled with it"
+        );
+    }
+
+    /// A mode of another aspect is letterboxed, never stretched.
+    #[test]
+    fn layer_rect_letterboxes_a_mode_of_another_aspect() {
+        assert_eq!(
+            layer_rect((0, 0, 1024, 768), (1024, 768), (1920, 1080)),
+            (240, 0, 1680, 1080),
+            "4:3 in a 16:9 window: pillarboxed"
+        );
+    }
+
+    /// A plane rect that runs past the mode is clipped to it, so the layer never
+    /// leaves the window.
+    #[test]
+    fn layer_rect_clips_to_the_mode() {
+        assert_eq!(
+            layer_rect((-40, -40, 1280 + 80, 720 + 80), (1280, 720), (1920, 1080)),
+            (0, 0, 1920, 1080)
+        );
     }
 }

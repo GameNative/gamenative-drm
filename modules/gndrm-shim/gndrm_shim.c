@@ -1313,6 +1313,106 @@ _Static_assert(sizeof(struct gndrm_dmaheap_alloc) == 24,
 static uint32_t g_scan_modes[GNDRM_MAX_MODES][2];
 static int g_scan_nmodes;
 
+/*
+ * The row stride the daemon's pool buffer has for a scan-out geometry. gralloc
+ * pads rows for widths it does not like (1024 px -> 5120 B on Adreno) while a
+ * LINEAR Vulkan image is laid out at width * 4, so a client that binds the
+ * buffer at its own pitch writes rows at one stride into a buffer the
+ * compositor reads at another. A client that asks here before creating its
+ * image can lay that image out at the buffer's stride instead; see the
+ * gamescope A51 patch.
+ *
+ * Keyed by geometry because that is what such a client knows: the output size
+ * it is about to create an image for.
+ */
+#define GNDRM_MAX_STRIDES 8
+
+struct gndrm_stride_note {
+    uint32_t w;
+    uint32_t h;
+    uint32_t stride;
+    uint64_t len;
+};
+
+static struct gndrm_stride_note g_scan_strides[GNDRM_MAX_STRIDES];
+static int g_scan_nstrides;
+
+static int scanout_request(uint32_t w, uint32_t h, uint64_t len, int *out_fd,
+                           uint64_t *out_ino, uint32_t *out_stride,
+                           int *out_attempts, long *out_elapsed_ms);
+
+/* Remember the stride the daemon reported for a pool buffer of `len` bytes,
+ * allocated for `w`x`h` when the shim matched a mode, else for whichever
+ * geometry the daemon resolved. */
+static void scanout_note_stride(uint64_t len, uint32_t w, uint32_t h,
+                                uint32_t stride)
+{
+    if (!len || !stride)
+        return;
+    for (int i = 0; i < g_scan_nstrides; i++)
+        if ((w && g_scan_strides[i].w == w && g_scan_strides[i].h == h) ||
+            g_scan_strides[i].len == len) {
+            g_scan_strides[i].w = w;
+            g_scan_strides[i].h = h;
+            g_scan_strides[i].len = len;
+            g_scan_strides[i].stride = stride;
+            return;
+        }
+    if (g_scan_nstrides >= GNDRM_MAX_STRIDES)
+        return;
+    g_scan_strides[g_scan_nstrides].w = w;
+    g_scan_strides[g_scan_nstrides].h = h;
+    g_scan_strides[g_scan_nstrides].len = len;
+    g_scan_strides[g_scan_nstrides].stride = stride;
+    g_scan_nstrides++;
+}
+
+/* The noted stride for `w`x`h` or, failing that, for the tight length of that
+ * geometry (a length-only hand-out knew the geometry only from its length). */
+static uint32_t scanout_noted_pitch(uint32_t w, uint32_t h)
+{
+    uint64_t tight = (uint64_t)w * (uint64_t)h * 4u;
+    for (int i = 0; i < g_scan_nstrides; i++)
+        if (g_scan_strides[i].w == w && g_scan_strides[i].h == h)
+            return g_scan_strides[i].stride;
+    for (int i = 0; i < g_scan_nstrides; i++)
+        if (g_scan_strides[i].len == tight)
+            return g_scan_strides[i].stride;
+    return 0;
+}
+
+/*
+ * The pool buffer's row stride for a `w`x`h` scan-out image, or 0 when the
+ * shim cannot find out — no daemon channel, so the allocation has no pool
+ * buffer behind it and the driver's own pitch is the right one.
+ *
+ * gralloc's stride is not derivable from the geometry, so an unrecorded
+ * geometry is measured by asking the daemon for one buffer of it and keeping
+ * the stride. The buffer is not kept: its fd is closed, the daemon releases it
+ * at the next commit and its geometry (and so its padded length) stays in the
+ * pool's index, which is what the client's real allocation then resolves
+ * against.
+ */
+uint32_t gamenative_drm_scanout_pitch(uint32_t w, uint32_t h);
+uint32_t gamenative_drm_scanout_pitch(uint32_t w, uint32_t h)
+{
+    if (!w || !h)
+        return 0;
+    uint32_t pitch = scanout_noted_pitch(w, h);
+    if (pitch)
+        return pitch;
+
+    int fd = -1;
+    uint64_t ino = 0;
+    uint32_t stride = 0;
+    uint64_t len = (uint64_t)w * (uint64_t)h * 4u;
+    if (scanout_request(w, h, len, &fd, &ino, &stride, NULL, NULL) != 0)
+        return 0;
+    syscall(SYS_close, fd);
+    scanout_note_stride(len, w, h, stride);
+    return stride;
+}
+
 /* ------------------------------------------------------------------ */
 /* scan-out allocator channel                                          */
 /* ------------------------------------------------------------------ */
@@ -1719,6 +1819,10 @@ static int scanout_hand_out(struct gndrm_dmaheap_alloc *a,
         syscall(SYS_fcntl, fd, F_SETFD, FD_CLOEXEC);
     a->fd = (uint32_t)fd;
     a->heap_flags = 0;
+    /* The client that owns this allocation is about to bind it at a pitch of
+     * its own choosing; recording the daemon's lets it ask before it does
+     * (A51). */
+    scanout_note_stride(len, w, h, stride);
     if (w && h)
         LOG("scanout: heap alloc %llu B -> daemon buffer %ux%u fd=%d ino=%llu stride=%u\n",
             (unsigned long long)len, w, h, fd, (unsigned long long)ino, stride);

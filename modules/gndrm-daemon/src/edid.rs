@@ -210,12 +210,12 @@ fn write_chromaticity(edid: &mut [u8; 128], primaries: [(f32, f32); 3], white: (
 
 /// One 18-byte detailed timing descriptor matching the connector's mode.
 ///
-/// The advertised mode's refresh is the daemon's 1200 Hz vblank grid
-/// (`SESSION_REFRESH_MHZ`), which no DTD can express (the pixel-clock field
-/// tops out at 655.35 MHz). gamescope reads the mode from the connector, not
-/// from EDID timings, so the descriptor carries the advertised geometry and
-/// porches exactly and a nominal 60 Hz pixel clock — a legal, self-consistent
-/// value rather than a truncated one.
+/// The pixel clock is the mode's own (`PanelDesc::modeinfo` builds it from the
+/// mode's rate), so the descriptor and the connector describe one timing. The
+/// 16-bit 10 kHz field tops out at 655.35 MHz, which only a frame-generated rate
+/// above 4K reaches; such a mode falls back to a nominal 60 Hz. gamescope reads
+/// the mode from the connector and the EDID only for colorimetry and HDR
+/// metadata, so these timings are for consistency, not for mode selection.
 fn detailed_timing(mode: &DrmModeModeinfo, panel: &PanelDesc) -> [u8; 18] {
     let hact = u32::from(mode.hdisplay);
     let hblank = u32::from(mode.htotal).saturating_sub(hact);
@@ -226,7 +226,11 @@ fn detailed_timing(mode: &DrmModeModeinfo, panel: &PanelDesc) -> [u8; 18] {
     let vfront = u32::from(mode.vsync_start).saturating_sub(vact);
     let vsync = u32::from(mode.vsync_end).saturating_sub(u32::from(mode.vsync_start));
     let mut d = [0u8; 18];
-    let clock_khz = u32::from(mode.htotal) * u32::from(mode.vtotal) * 60 / 1000;
+    let clock_khz = if (10..=655_350).contains(&mode.clock) {
+        mode.clock
+    } else {
+        u32::from(mode.htotal) * u32::from(mode.vtotal) * 60 / 1000
+    };
     let pc = (clock_khz / 10) & 0xFFFF; // pixel clock in 10 kHz units
     d[0] = (pc & 0xFF) as u8;
     d[1] = (pc >> 8) as u8;
@@ -276,6 +280,42 @@ mod tests {
 
     fn mode() -> DrmModeModeinfo {
         PanelDesc::default().modeinfo()
+    }
+
+    #[test]
+    fn the_detailed_timing_carries_the_modes_own_rate() {
+        let panel = PanelDesc {
+            width: 1280,
+            height: 960,
+            mm_width: 0,
+            mm_height: 0,
+            refresh_mhz: 120_000,
+        };
+        let mode = panel.modeinfo();
+        let edid = build(None, &mode, &panel);
+        let pc = u32::from(edid[54]) | (u32::from(edid[55]) << 8);
+        // The descriptor's timings imply the connector's rate, not a nominal one.
+        let hz = u64::from(pc) * 10_000 / (u64::from(mode.htotal) * u64::from(mode.vtotal));
+        assert!((119..=120).contains(&hz), "descriptor implies {hz} Hz");
+    }
+
+    #[test]
+    fn a_clock_the_field_cannot_hold_falls_back_to_60_hz() {
+        let panel = PanelDesc {
+            width: 1920,
+            height: 1080,
+            mm_width: 0,
+            mm_height: 0,
+            refresh_mhz: 500_000,
+        };
+        let mode = panel.modeinfo();
+        assert!(
+            mode.clock > 655_350,
+            "the mode must exceed the 10 kHz field"
+        );
+        let edid = build(None, &mode, &panel);
+        let pc = u32::from(edid[54]) | (u32::from(edid[55]) << 8);
+        assert_eq!(pc * 10, 2000 * 1100 * 60 / 1000);
     }
 
     #[test]

@@ -79,7 +79,7 @@ EINVAL (probing clients treat that as unsupported).
 
 | ioctl | notes |
 |---|---|
-| `DRM_IOCTL_MODE_GETCONNECTOR` | 1 connector, `DRM_MODE_CONNECTED`, type `DRM_MODE_CONNECTOR_DSI`; modes: panel mode from the SurfaceView size; two-call count/array semantics; `count_props` exposes the connector props |
+| `DRM_IOCTL_MODE_GETCONNECTOR` | 1 connector, `DRM_MODE_CONNECTED`, type `DRM_MODE_CONNECTOR_DSI`; one mode: the session's scan-out size (`nativeSetScanoutGeometry`, the app's Upscaling Resolution), or the window's size when the app named none or the size does not fit the window; two-call count/array semantics; `count_props` exposes the connector props |
 | `DRM_IOCTL_MODE_GETENCODER` | 1 encoder, `possible_crtcs=0x1`, `possible_clones=0` |
 | `DRM_IOCTL_MODE_GETCRTC` | current mode = panel mode |
 | `DRM_IOCTL_MODE_SETCRTC` | never called on the atomic path; EINVAL (gamescope is atomic-only) |
@@ -262,6 +262,17 @@ documented in 06-presenter-latency.md; the shape is:
   The shim requests a pool buffer by geometry and receives a dup'd dma-buf fd;
   gamescope renders into it; the same `AHardwareBuffer` is published. No
   import, no copy.
+- **Row stride.** The pool buffer's rows are gralloc's, which pads them for
+  widths it does not like (1024 px → 5120 B, 1440 px → 5888 B on Adreno), while
+  a LINEAR Vulkan image is otherwise laid out at `width * 4`. A client that
+  binds the buffer at its own pitch writes rows the compositor reads one row
+  apart — a sheared frame. The shim answers the pitch (`gamenative_drm_scanout_pitch`,
+  measuring an unseen geometry with one throwaway pool allocation), and
+  gamescope's A51 patch creates the scan-out image at that stride through an
+  explicit LINEAR modifier, so the AddFB2 export reports the same stride the
+  compositor reads. The guest's own buffers are handled on the ICD side
+  (`icd_shim` `proxy`/`export`), which does the same thing for the images it
+  creates.
 - **Layout per session.** BGRA (`XR24`/`AR24` byte order) is the default.
   RGBA (`XB24`/`AB24`) is chosen at `nativeStart` on SDK 36+ when
   SurfaceFlinger's render engine is Skia GLES (`debug.renderengine.backend`,
@@ -299,6 +310,9 @@ in the app's `jniLibs/arm64-v8a/` and is loaded via
 
 - `nativeStart(socketName: String, surface: Surface, width: Int, height: Int): Int`
 - `nativeStop()`, `nativeRetargetSurface(surface, w, h)`
+- session inputs, before `nativeStart`: `nativeSetPanelRefreshHz(hz)` (the mode's
+  rate) and `nativeSetScanoutGeometry(w, h)` (the mode's size — the app's
+  Upscaling Resolution; `0, 0` clears it).
 - injector calls: `nativePointerAbsolute(x, y)`, `nativePointerMotion(dx, dy)`,
   `nativePointerButton(btn, pressed)`, `nativePointerAxis(axis, value)`,
   `nativeKey(evdevCode, pressed)`.

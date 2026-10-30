@@ -2,63 +2,70 @@
 
 ## Two variables, two jobs
 
-**`g_nOutputRefresh`** (mHz, `main.cpp:305`) — the **panel mode's** rate, assigned by the
-DRM backend from the selected mode (`Backends/DRMBackend.cpp:3695`). It is what the
-whole stack *and the clients* are told:
+**`g_nOutputRefresh`** (mHz, `main.cpp:305`) — the **mode's** rate, assigned by the DRM
+backend from the mode it selected (`Backends/DRMBackend.cpp:3727-3728`, the
+`GetModeRefresh` recompute at `:229-246`). It is what the whole stack *and the clients*
+are told:
 
-- the Xwayland server mode (`steamcompmgr.cpp:7356`, `:10382`),
-- the `_GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK` root property (`:9283-9288`),
-- `gamescope_control.active_display_info`'s rate list (`wlserver.cpp:1538-1541`),
-- mangoapp's snapshot (`mangoapp.cpp:205`), ReShade (`reshade_effect_manager.cpp:293`).
+- the Xwayland server mode (`steamcompmgr.cpp:7458`, `:10496`),
+- the `_GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK` root property (`:9384-9390`),
+- `gamescope_control.active_display_info`'s rate list (`wlserver.cpp:1483-1487`),
+- mangoapp's snapshot (`mangoapp.cpp:221`), ReShade (`reshade_effect_manager.cpp:293`).
 
 **`g_nNestedRefresh`** (mHz, `main.cpp:299`) — `-r/--nested-refresh`; **0 means fall back
-to the output refresh** (`main.cpp:749` rejects only negatives). In the nested backends it
-*becomes* the output refresh (`SDLBackend.cpp:230`, `WaylandBackend.cpp:1989`,
+to the output refresh** (`main.cpp:740-746` rejects only negatives). In the nested backends
+it *becomes* the output refresh (`SDLBackend.cpp:230`, `WaylandBackend.cpp:1989`,
 `HeadlessBackend.cpp:112`). In the **DRM** backend — ours — it is passed to
-`init_drm( &g_DRM, w, h, g_nNestedRefresh )` (`Backends/DRMBackend.cpp:3910`) and stored as
-`drm->preferred_refresh` (`:1503`).
+`init_drm( &g_DRM, w, h, g_nNestedRefresh )` (`Backends/DRMBackend.cpp:3943`) and stored as
+`drm->preferred_refresh` (`:1545`).
 
-## A preferred refresh selects the mode
+## In the DRM backend they are separate
 
-`find_mode( connector, w, h, preferred_refresh_hz )` (`DRMBackend.cpp:1385`) matches
-`mode->vrefresh` **exactly** (`:1029`), and where a preference exists `g_nOutputRefresh` is
-taken from it (`:3628`, `:3647`).
+`find_mode( connector, w, h, vrefresh )` (`DRMBackend.cpp:1042-1069`) matches `vrefresh`
+**exactly** when one is given, so a grid that names no exposed mode falls through —
+which is why A47 re-runs the lookup by size with the refresh unconstrained
+(`:1417-1426`). `drm_unset_mode` then declares the preferred refresh
+(`:3680`), and `drm_set_mode` overwrites it with the selected mode's own rate (`:3728`).
 
-So in the DRM backend **`-r N` is a declaration that the display is N Hz** — it reaches
-mode selection, the client-visible refresh and the grid together. It is not a cap layered
-on top of a 120 Hz grid.
+So in the DRM backend **`-r` is the session's grid** — the compositor's paint tick and
+the app-refresh cycle — while the **mode's rate is what clients are told**. A cap is a
+grid divisor, or the shim's acquire floor (doc 10); it never re-times the mode.
 
 ## What the grid and the pacing read
 
 - **Grid:** `CVBlankTimer::GetRefresh()` = `g_nNestedRefresh ?: g_nOutputRefresh`
-  (`vblankmanager.cpp:77`); the interval comes from `mHzToRefreshCycle(GetRefresh())`
+  (`vblankmanager.cpp:75-77`); the interval comes from `mHzToRefreshCycle(GetRefresh())`
   in `GetNextVBlank()`, and the same expression times the timer's idle sleep (`:405`).
 - **App pacing:** `g_SteamCompMgrAppRefreshCycle = mHzToRefreshCycle( g_nNestedRefresh ?:
-  g_nOutputRefresh )` (`steamcompmgr.cpp:10492`), consumed per window at `:8246-8253`
+  g_nOutputRefresh )` (`steamcompmgr.cpp:10606-10607`), consumed per window at `:8355`
   (that is what throttles the guest's frame callbacks).
-- **Limiter divisor base:** `nRefreshHz` = the same nested-expression (`:6911`); the
+- **Limiter divisor base:** `nRefreshHz` = the same nested-expression (`:7013`); the
   divisor only applies while `g_nSteamCompMgrTargetFPS != 0`.
 
 Both the grid and the app pacing come from **one** expression, so there is no way to pace
-the app at N while keeping the grid at the mode rate — they move together.
+the app at N while keeping the grid at the mode's rate — they move together.
 
-## Consequences on the session's own rate
+## What gndrm does with it
 
-gndrm advertises **one** preferred mode — `1280x960@1200`, from its own
-`SESSION_REFRESH_MHZ` constant (`gndrm-daemon/src/objects.rs`,
-`vrefresh: SESSION_REFRESH_MHZ.div_ceil(1000)`), not the panel's rate — so a
-preferred refresh with no matching exposed mode has nothing to select, and the
-grid, declared output refresh and client-visible refresh move together with `-r`.
+GameNative launches with `-r 1200` (`GamescopeState.SESSION_GRID_HZ` → `gridArg()`), the
+grid the daemon's flip timeline is also built from (`SESSION_REFRESH_MHZ`,
+`gndrm-daemon/src/objects.rs:68`; `lib.rs:2091`), so the grid never binds a session.
 
-- **Uncapped:** `-r 0` falls back to the output refresh (1200 Hz); the loop
-  reaches its measured ceiling (~259 presents/s).
-- **`-r N`:** declares N Hz everywhere — the guest is told N, the grid runs at N —
-  while the single 1200 Hz DRM mode is kept.
-- **Capping at 30/40/60 is exact arithmetic** — all three divide 1200, and a
-  divisor cap lands on its target exactly (`-r 60` reads 60.0 presents/s).
+The **one** mode the connector exposes is the session's scan-out size at the panel's real
+rate (`PanelDesc::modeinfo`, `objects.rs:121-160`: `mode_refresh_mhz()` is the rate the app
+reported through `nativeSetPanelRefreshHz`, raised to the frame-generation output rate when
+that is higher, and `clock`/`htotal`/`vtotal`/`vrefresh` all describe it). The rate clients
+see is therefore the panel's:
+
+- **Uncapped:** the loop reaches its measured ceiling (~259 presents/s); the grid is three
+  orders of magnitude above the panel's frame time and never the limit.
+- **Mode rate vs panel rate:** equal unless frame generation raises the output rate, in
+  which case the mode advertises that higher rate and the shim still paces on the panel's.
+- **Capping at 30/40/60 against the grid is exact arithmetic** — all three divide 1200, and
+  a divisor cap lands on its target exactly (`-r 60` reads 60.0 presents/s).
 
 ## Open — to measure, not assume
 
-- The `active_display_info` refresh list carries the connector's mode list, not
-  `g_nOutputRefresh`; the client-visible refresh for a low `-r` was not measured
-  directly on device.
+- `active_display_info`'s rate list is the single mode rate above (there are no dynamic
+  rates on this connector), so a client sees one entry — the panel's rate, or the
+  generated one.
