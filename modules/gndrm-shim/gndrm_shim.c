@@ -1413,6 +1413,55 @@ uint32_t gamenative_drm_scanout_pitch(uint32_t w, uint32_t h)
     return stride;
 }
 
+/*
+ * The panel's latch grid for gamescope's frame-rate limit: a latch point
+ * (CLOCK_MONOTONIC ns), the spacing of latch points, and how far ahead of one a
+ * commit has to be made to land on it. The daemon measures the grid from
+ * SurfaceFlinger's latch stats and pushes it to the Vulkan ICD shim loaded in
+ * this same process, which keeps the latest note; this LD_PRELOAD library is
+ * the one gamescope can bind a weak reference to, so it answers on the ICD's
+ * behalf. 1 with the out-params filled once a grid has been reported, 0 before
+ * that and when the ICD is not loaded (gamescope then keeps its free-running
+ * grid). The ICD is looked up by its loaded name, never loaded here.
+ */
+int gamenative_drm_latch_grid(uint64_t *anchor_ns, uint32_t *period_ns, uint32_t *lead_ns);
+int gamenative_drm_latch_grid(uint64_t *anchor_ns, uint32_t *period_ns, uint32_t *lead_ns)
+{
+    typedef int (*latch_grid_fn)(uint64_t *, uint32_t *, uint32_t *);
+    static latch_grid_fn fn;
+    static int looked_up;
+    if (!looked_up) {
+        /* The ICD carries no DT_SONAME, so it is found by the path it was
+         * loaded from, read off this process's maps; RTLD_NOLOAD never loads. */
+        char path[512] = "";
+        FILE *maps = fopen("/proc/self/maps", "r");
+        if (maps) {
+            char line[1024];
+            while (fgets(line, sizeof line, maps)) {
+                char *p = strchr(line, '/');
+                if (!p || !strstr(p, "/libadrenotools_gamescope.so"))
+                    continue;
+                p[strcspn(p, "\n")] = 0;
+                snprintf(path, sizeof path, "%s", p);
+                break;
+            }
+            fclose(maps);
+        }
+        void *h = path[0] ? dlopen(path, RTLD_NOLOAD | RTLD_LAZY) : NULL;
+        if (!h)
+            h = dlopen("libadrenotools_gamescope.so", RTLD_NOLOAD | RTLD_LAZY);
+        if (!h)
+            return 0;
+        fn = (latch_grid_fn)dlsym(h, "gamenative_drm_icd_latch_grid");
+        looked_up = 1;
+        if (!fn)
+            LOG("latch grid: the loaded ICD has no gamenative_drm_icd_latch_grid\n");
+    }
+    if (!fn)
+        return 0;
+    return fn(anchor_ns, period_ns, lead_ns);
+}
+
 /* ------------------------------------------------------------------ */
 /* scan-out allocator channel                                          */
 /* ------------------------------------------------------------------ */

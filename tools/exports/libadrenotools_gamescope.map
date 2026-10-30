@@ -1,13 +1,16 @@
 /* Export allowlist for libadrenotools_gamescope.so (the Vulkan ICD shim).
  *
  * The Khronos loader resolves exactly these three entry points by dlsym; a
- * missing one means the loader cannot load the shim at all. Everything else —
- * the interception/proxy internals — is local. Audited by
+ * missing one means the loader cannot load the shim at all. The latch-grid
+ * getter is read by libgndrm_shim.so on behalf of gamescope (see
+ * gamenative_drm_latch_grid there). Everything else — the interception/proxy
+ * internals — is local. Audited by
  * tools/check-exports.sh. */
 {
   global:
     vk_icdGetInstanceProcAddr;
     vk_icdGetPhysicalDeviceProcAddr;
     vk_icdNegotiateLoaderICDInterfaceVersion;
+    gamenative_drm_icd_latch_grid;
   local: *;
 };

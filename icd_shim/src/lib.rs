@@ -678,6 +678,40 @@ pub fn proxy_active() -> bool {
     unsafe { DRIVER.proxy_active }
 }
 
+/// The panel's latch grid as the daemon last reported it, for the process this
+/// ICD is loaded into: `anchor_ns` a latch point (`CLOCK_MONOTONIC`), `period_ns`
+/// the spacing of latch points, `lead_ns` how far ahead of one a commit must be
+/// made to land on it. Returns 1 and fills the out-params when a grid has been
+/// reported, 0 (out-params untouched) before the first note. gamescope reaches
+/// it through `libgndrm_shim.so`'s `gamenative_drm_latch_grid`, which resolves
+/// this symbol from the loaded ICD: the compositor's frame-rate limit places its
+/// releases on this grid so each one's commit lands in its own latch window.
+///
+/// # Safety
+/// Each non-null pointer must be valid for a write of its type.
+#[no_mangle]
+pub unsafe extern "C" fn gamenative_drm_icd_latch_grid(
+    anchor_ns: *mut u64,
+    period_ns: *mut u32,
+    lead_ns: *mut u32,
+) -> i32 {
+    let Some(grid) = crate::lsfg::latch_grid() else {
+        return 0;
+    };
+    unsafe {
+        if !anchor_ns.is_null() {
+            *anchor_ns = grid.anchor_ns;
+        }
+        if !period_ns.is_null() {
+            *period_ns = u32::try_from(grid.period_ns).unwrap_or(u32::MAX);
+        }
+        if !lead_ns.is_null() {
+            *lead_ns = u32::try_from(grid.lead_ns).unwrap_or(u32::MAX);
+        }
+    }
+    1
+}
+
 /// # Safety: loader-ICD v5 interface (called by the Khronos loader).
 #[allow(non_snake_case)]
 #[no_mangle]
