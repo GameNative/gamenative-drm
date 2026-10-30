@@ -126,15 +126,22 @@ pub(crate) fn period_ns(target_fps: u32) -> u64 {
 ///
 /// The cap is applied here rather than to a release: a frame that may not start
 /// yet is the only point where waiting costs neither rendered work nor display
-/// latency. `max(prev, now) + period` holds the interval at the target when the
-/// guest is faster and lets it be its own rate when it is slower — never two
-/// frames closer than one period, and no debt carried out of a stall.
+/// latency. `prev + period` holds the interval at the target while the guest
+/// keeps up: the wait for `prev` returns a hair late, and that hair must not
+/// become the cadence (it did, as `max(prev, now) + period`: a 60 cap ran at
+/// 59.4). Once the guest is a whole period behind it is its own rate again,
+/// `now + period` — never two frames closer than one period, and no debt
+/// carried out of a stall.
 #[must_use]
 pub(crate) fn next_acquire_after(prev_ns: u64, now_ns: u64, period_ns: u64) -> u64 {
     if period_ns == 0 {
         return prev_ns;
     }
-    prev_ns.max(now_ns).saturating_add(period_ns)
+    if prev_ns != 0 && now_ns < prev_ns.saturating_add(period_ns) {
+        prev_ns + period_ns
+    } else {
+        now_ns.saturating_add(period_ns)
+    }
 }
 
 /// Adopt one frame-cap note: the target it carries.
@@ -916,6 +923,19 @@ mod tests {
 
     /// The acquire schedule: one period after the previous start, never closer,
     /// and never later than the guest's own next frame when it is slower.
+    #[test]
+    fn the_cadence_does_not_carry_the_wakeup_overshoot() {
+        let period = 16_666_666;
+        let first = next_acquire_after(0, 1_000_000_000, period);
+        assert_eq!(first, 1_016_666_666);
+        // The wait returned 150 us late: the next deadline is still one period on.
+        let second = next_acquire_after(first, first + 150_000, period);
+        assert_eq!(second, first + period);
+        // A whole period late: no debt.
+        let third = next_acquire_after(second, second + period + 5_000_000, period);
+        assert_eq!(third, second + period + 5_000_000 + period);
+    }
+
     #[test]
     fn the_acquire_schedule_spaces_frame_starts() {
         let period = period_ns(40);
