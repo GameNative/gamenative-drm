@@ -262,6 +262,17 @@ documented in 06-presenter-latency.md; the shape is:
   The shim requests a pool buffer by geometry and receives a dup'd dma-buf fd;
   gamescope renders into it; the same `AHardwareBuffer` is published. No
   import, no copy.
+- **Row stride.** The pool buffer's rows are gralloc's, which pads them for
+  widths it does not like (1024 px → 5120 B, 1440 px → 5888 B on Adreno), while
+  a LINEAR Vulkan image is otherwise laid out at `width * 4`. A client that
+  binds the buffer at its own pitch writes rows the compositor reads one row
+  apart — a sheared frame. The shim answers the pitch (`gamenative_drm_scanout_pitch`,
+  measuring an unseen geometry with one throwaway pool allocation), and
+  gamescope's A51 patch creates the scan-out image at that stride through an
+  explicit LINEAR modifier, so the AddFB2 export reports the same stride the
+  compositor reads. The guest's own buffers are handled on the ICD side
+  (`icd_shim` `proxy`/`export`), which does the same thing for the images it
+  creates.
 - **Layout per session.** BGRA (`XR24`/`AR24` byte order) is the default.
   RGBA (`XB24`/`AB24`) is chosen at `nativeStart` on SDK 36+ when
   SurfaceFlinger's render engine is Skia GLES (`debug.renderengine.backend`,

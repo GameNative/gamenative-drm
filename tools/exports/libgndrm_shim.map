@@ -8,6 +8,7 @@
 {
   global:
     gamenative_drm_connect;
+    gamenative_drm_scanout_pitch;
     open;
     openat;
     open64;
