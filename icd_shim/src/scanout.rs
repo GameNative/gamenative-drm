@@ -23,7 +23,7 @@ use gndrm_uapi::wire::{
 };
 use std::ffi::c_void;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Default budget for one exchange, matching the LD_PRELOAD shim's: a daemon
@@ -126,15 +126,126 @@ pub(crate) fn period_ns(target_fps: u32) -> u64 {
 ///
 /// The cap is applied here rather than to a release: a frame that may not start
 /// yet is the only point where waiting costs neither rendered work nor display
-/// latency. `max(prev, now) + period` holds the interval at the target when the
-/// guest is faster and lets it be its own rate when it is slower — never two
-/// frames closer than one period, and no debt carried out of a stall.
+/// latency. `prev + period` holds the interval at the target while the guest
+/// keeps up: the wait for `prev` returns a hair late, and that hair must not
+/// become the cadence (it did, as `max(prev, now) + period`: a 60 cap ran at
+/// 59.4). Once the guest is a whole period behind it is its own rate again,
+/// `now + period` — never two frames closer than one period, and no debt
+/// carried out of a stall.
 #[must_use]
 pub(crate) fn next_acquire_after(prev_ns: u64, now_ns: u64, period_ns: u64) -> u64 {
     if period_ns == 0 {
         return prev_ns;
     }
-    prev_ns.max(now_ns).saturating_add(period_ns)
+    if prev_ns != 0 && now_ns < prev_ns.saturating_add(period_ns) {
+        prev_ns + period_ns
+    } else {
+        now_ns.saturating_add(period_ns)
+    }
+}
+
+/// The acquire gate's lead on the panel's latch grid, ns: how far ahead of a
+/// latch point the guest is let into its frame, so the frame's commit lands in
+/// the middle of that point's window. Steered from the latch reports.
+static GATE_LEAD_NS: AtomicU64 = AtomicU64::new(0);
+static GATE_ON_GRID: AtomicBool = AtomicBool::new(false);
+static GATE_ACQUIRES: AtomicU64 = AtomicU64::new(0);
+
+/// `v` reduced into `[-period/2, period/2)`.
+fn wrap_ns(v: i64, period: i64) -> i64 {
+    let half = period / 2;
+    ((v + half).rem_euclid(period)) - half
+}
+
+/// The next acquire deadline: `prev + period` while the guest keeps up (the
+/// wait returns a hair after the deadline, and that hair must not become the
+/// cadence), `now + period` once it fell a whole period behind (no debt). Then,
+/// when the panel's latch grid is known and the period is a whole number of
+/// latch periods, snapped onto that grid less the lead, so every frame's commit
+/// lands on its own latch point: a cadence that is merely the right rate drifts
+/// across the latch deadline, where two commits share one point and one is
+/// dropped.
+#[must_use]
+pub(crate) fn next_acquire_gated(prev_ns: u64, now_ns: u64, period_ns: u64) -> u64 {
+    if period_ns == 0 {
+        return prev_ns;
+    }
+    let mut next = next_acquire_after(prev_ns, now_ns, period_ns);
+    let grid = if crate::lsfg::source_cap().is_some() {
+        None
+    } else {
+        crate::lsfg::latch_grid()
+    };
+    let Some(grid) = grid else {
+        GATE_ON_GRID.store(false, Ordering::Relaxed);
+        return next;
+    };
+    let latch = grid.period_ns;
+    if latch == 0 {
+        return next;
+    }
+    let mult = (period_ns + latch / 2) / latch;
+    if mult == 0 || (mult * latch).abs_diff(period_ns) * 100 > period_ns {
+        GATE_ON_GRID.store(false, Ordering::Relaxed);
+        return next;
+    }
+    let step = mult * latch;
+    let mut lead = GATE_LEAD_NS.load(Ordering::Relaxed);
+    if lead == 0 {
+        // Until the latch reports steer it: half a window for the commit's own
+        // margin plus a frame of rendering.
+        lead = (latch / 2 + 4_000_000).min(step - 1);
+        GATE_LEAD_NS.store(lead, Ordering::Relaxed);
+    }
+    let base = grid.anchor_ns as i64 - lead as i64;
+    let off = wrap_ns(next as i64 - base, step as i64);
+    next = (next as i64 - off).max(0) as u64;
+    if !GATE_ON_GRID.swap(true, Ordering::Relaxed) {
+        crate::logf!(gndrm_obf::obf!(
+            "scanout frame cap: on the panel latch grid period={}us x{} lead={}us",
+            latch / 1000,
+            mult,
+            lead / 1000
+        ));
+    }
+    let n = GATE_ACQUIRES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_multiple_of(600) {
+        crate::logf!(gndrm_obf::obf!(
+            "scanout frame cap: latch grid lead={}us after {} frames",
+            GATE_LEAD_NS.load(Ordering::Relaxed) / 1000,
+            n
+        ));
+    }
+    next
+}
+
+/// A frame the daemon latched at `latch_ns`, committed by this shim at
+/// `commit_ns`: steer the gate's lead so commits land half a window plus the
+/// compositor's hop ahead of their latch point. Only latches on the grid count:
+/// a release-time stand-in is not one.
+pub(crate) fn note_latch_margin(latch_ns: u64, commit_ns: u64) {
+    if !GATE_ON_GRID.load(Ordering::Relaxed) || commit_ns == 0 || latch_ns <= commit_ns {
+        return;
+    }
+    let Some(grid) = crate::lsfg::latch_grid() else {
+        return;
+    };
+    let latch = grid.period_ns as i64;
+    if latch == 0 {
+        return;
+    }
+    let margin = (latch_ns - commit_ns) as i64;
+    if margin >= 2 * latch {
+        return;
+    }
+    if wrap_ns(latch_ns as i64 - grid.anchor_ns as i64, latch).abs() > latch / 8 {
+        return;
+    }
+    let target = latch / 2 + 2_000_000;
+    let err = margin - target;
+    let lead = GATE_LEAD_NS.load(Ordering::Relaxed) as i64;
+    let step = lead - err / 8;
+    GATE_LEAD_NS.store(step.clamp(0, latch * 64) as u64, Ordering::Relaxed);
 }
 
 /// Adopt one frame-cap note: the target it carries.
@@ -916,6 +1027,29 @@ mod tests {
 
     /// The acquire schedule: one period after the previous start, never closer,
     /// and never later than the guest's own next frame when it is slower.
+    #[test]
+    fn gated_cadence_does_not_carry_the_wakeup_overshoot() {
+        // No grid in a host test: the drift fix alone.
+        let period = 16_666_666;
+        let first = next_acquire_gated(0, 1_000_000_000, period);
+        assert_eq!(first, 1_016_666_666);
+        // The wait returned 150 us late: the next deadline is still one period on.
+        let second = next_acquire_gated(first, first + 150_000, period);
+        assert_eq!(second, first + period);
+        // A whole period late: no debt.
+        let third = next_acquire_gated(second, second + period + 5_000_000, period);
+        assert_eq!(third, second + period + 5_000_000 + period);
+    }
+
+    #[test]
+    fn wrap_is_centred() {
+        assert_eq!(wrap_ns(0, 100), 0);
+        assert_eq!(wrap_ns(49, 100), 49);
+        assert_eq!(wrap_ns(50, 100), -50);
+        assert_eq!(wrap_ns(-1, 100), -1);
+        assert_eq!(wrap_ns(151, 100), -49);
+    }
+
     #[test]
     fn the_acquire_schedule_spaces_frame_starts() {
         let period = period_ns(40);

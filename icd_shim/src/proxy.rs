@@ -2274,7 +2274,7 @@ unsafe fn gn_acquire_common(
                     // not start before this one plus a period.
                     let now_ns = monotonic_ns();
                     (*sc).next_acquire_ns =
-                        crate::scanout::next_acquire_after((*sc).next_acquire_ns, now_ns, period);
+                        crate::scanout::next_acquire_gated((*sc).next_acquire_ns, now_ns, period);
                 }
                 break;
             }

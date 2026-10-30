@@ -107,12 +107,23 @@ pub(crate) fn arm(id: u64, sc: usize) {
 
 /// A completed present, reported by the daemon with the panel's latch time.
 pub(crate) fn record(id: u64, latch_ns: u64) {
+    record_at(id, latch_ns, true);
+}
+
+/// `from_latch`: the time is the panel's latch of this frame, which steers the
+/// acquire gate; a release-time stand-in only answers the wait.
+fn record_at(id: u64, latch_ns: u64, from_latch: bool) {
     if id == 0 {
         return;
     }
     let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(i) = w.armed.iter().position(|&(armed, _)| armed == id) {
         w.armed.remove(i);
+    }
+    if from_latch {
+        if let Some(&(_, commit_ns)) = w.committed.iter().find(|&&(c, _)| c == id) {
+            crate::scanout::note_latch_margin(latch_ns, commit_ns);
+        }
     }
     w.committed.retain(|&(c, _)| c != id);
     if w.done.len() >= CAP {
@@ -151,7 +162,7 @@ pub(crate) fn complete_on_release(id: u64, release_ns: u64) {
         w.armed.iter().any(|&(armed, _)| armed == id)
     };
     if armed {
-        record(id, release_ns);
+        record_at(id, release_ns, false);
     }
 }
 
