@@ -1450,11 +1450,16 @@ int gamenative_drm_latch_grid(uint64_t *anchor_ns, uint32_t *period_ns, uint32_t
         void *h = path[0] ? dlopen(path, RTLD_NOLOAD | RTLD_LAZY) : NULL;
         if (!h)
             h = dlopen("libadrenotools_gamescope.so", RTLD_NOLOAD | RTLD_LAZY);
-        if (!h)
+        if (!h) {
+            /* Not loaded yet (the Vulkan loader opens it on the first instance):
+             * ask again next time. */
             return 0;
+        }
         fn = (latch_grid_fn)dlsym(h, "gamenative_drm_icd_latch_grid");
         looked_up = 1;
-        if (!fn)
+        if (fn)
+            LOG("latch grid: answered from %s\n", path[0] ? path : "the loaded ICD");
+        else
             LOG("latch grid: the loaded ICD has no gamenative_drm_icd_latch_grid\n");
     }
     if (!fn)
