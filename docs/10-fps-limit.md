@@ -96,10 +96,15 @@ divisor cap reads its target exactly.
   re-issues it when the value or the panel's screen type changes
   (`injector.rs:717-722`); `set_frame_cap_target` (`lib.rs:322`) holds the target
   so the scan-out channel pushes a `FrameCapNote` to a subscribed shim.
-- **The shim enforces it** (`icd_shim/src/scanout.rs:118-140`): the next acquire
-  may start no sooner than one `1/target` period after the previous one, so the
-  guest blocks in `vkAcquireNextImageKHR` — the one point where waiting costs
-  neither rendered work nor display latency.
+- **The shim enforces it** (`icd_shim/src/scanout.rs:118-146`,
+  `next_acquire_after`): the next acquire may start no sooner than one
+  `1/target` period after the previous *deadline*, so the guest blocks in
+  `vkAcquireNextImageKHR` — the one point where waiting costs neither rendered
+  work nor display latency. The deadline, not the wake: the wait returns a hair
+  after it, and `max(prev, now) + period` made that hair part of every period
+  (a 60 cap read 59.78 on an Odin 3 menu, 60.00 once stepped from `prev`).
+  Only a guest a whole period behind is re-based on `now`, so no debt is
+  carried out of a stall.
 - **`-r` is not part of it**: the grid is the constant 1200 Hz, and no launch
   argument carries the limit. `--framerate-limit` is never built.
 
@@ -107,10 +112,11 @@ Open points:
 - **Divisor rounding bites the gamescope route only.** `nVblankDivisor =
   nRefreshHz / nTargetFPS` (`steamcompmgr.cpp:7040`, and `:10621` for the window's
   limited cycle) lands on the nearest divisor of the grid; the shim's floor is
-  exact.
+  exact (measured: 60.00 commits/s at a 60 cap).
 - **The client-visible refresh is the mode's.** `-r` reaches `g_nOutputRefresh`
   only transiently (`drm_unset_mode`, `:3680`), before `drm_set_mode` (`:3728`)
   overwrites it with the mode's rate — `_GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK`
   and `active_display_info` therefore carry the panel's rate, never the grid.
 - **Engagement feedback**: `gamescope_limiter.state` covers the gamescope route;
-  the shim logs `scanout frame cap: fps=… effective=…` (`scanout.rs:141-149`).
+  the shim logs `scanout frame cap: fps=… effective=…` (`scanout.rs:148-158`),
+  `effective` being the target in force once the note is adopted.
