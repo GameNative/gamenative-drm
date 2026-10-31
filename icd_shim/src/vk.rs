@@ -546,6 +546,15 @@ pub struct VkXlibSurfaceCreateInfoKHR {
 }
 
 #[repr(C)]
+pub struct VkXcbSurfaceCreateInfoKHR {
+    pub sType: VkStructureType,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub connection: *mut c_void, // xcb_connection_t *
+    pub window: u32,             // xcb_window_t
+}
+
+#[repr(C)]
 pub struct VkSubresourceLayout {
     pub offset: VkDeviceSize,
     pub size: VkDeviceSize,

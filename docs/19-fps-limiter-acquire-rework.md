@@ -151,7 +151,7 @@ source rate the tuner compares against).
 |---|---|---|---|
 | Vulkan, LSFG off | 60 | guest 60, A34 also armed | guest 60 at acquire, no output timer |
 | Vulkan, LSFG on | 60×2 | floor paces source, presenter multiplies | unchanged (same source cap) |
-| GL through Xwayland | 60 | A34 caps the display | **uncapped** — accepted regression, see §7 |
+| GL through Xwayland (zink) | 60 | A34 caps the display | guest 60 at acquire — the shim serves `VK_KHR_xcb_surface`, which zink's WSI needs to create a swapchain at all, so GL takes the Vulkan gate |
 | uncapped (0) | — | no gate | no gate |
 | title ignoring acquire | 60 | floor has nothing to hold | gate also inert; present-queue pacer is the fallback |
 
@@ -176,15 +176,22 @@ alternating, two runs each.
 
 ## 7. Risks
 
-- **GL titles lose their cap.** A34 was the only limiter for presents outside the
-  ICD. Mitigation: keep the patch in `disabled/`, and decide after measurement
-  whether to re-enable it for non-Vulkan sessions (which needs the session-kind
-  signal, since gamescope cannot see the client's API).
+- **GL titles and the cap.** A34 was the only limiter for presents outside the
+  ICD; with it parked, a GL guest keeps a cap only where its frames reach the
+  shim. A zink (GL-on-Vulkan) guest does: the shim serves `VK_KHR_xcb_surface`,
+  the extension zink's kopper WSI creates its swapchain from on X11, so its
+  frames ride the same swapchain and the same acquire gate. A GL guest that
+  presents without Vulkan at all (glx/DRI3 into Xwayland) never reaches the ICD
+  and still has no cap from us.
 - **Wire skew.** `FrameAcquired` reaches a daemon that does not know it → logged
   as an unrecognised frame and ignored (existing behaviour), so the counter simply
   stops; the cap is unaffected because it is local to the shim.
 - **A guest that ignores acquire** sees no cap at all. Same gap as today's floor;
   not made worse.
+- **A GL guest now creates its swapchain here.** Before `VK_KHR_xcb_surface` was
+  served, zink's swapchain could not be created on the shim; routing it through
+  means any WSI gap the Vulkan path has is now reachable from GL too. Read
+  `proxy swapchain create` / the refusal lines before blaming the cap.
 - **Schedule reset on swapchain recreation** (resolution change): `next_acquire_ns`
   is per swapchain, so a recreated chain starts unthrottled for one frame. Fine.
 
