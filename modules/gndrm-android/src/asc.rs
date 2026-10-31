@@ -74,7 +74,7 @@ use gndrm_uapi::wire::{
 };
 
 use crate::ffi;
-use crate::foreign::{transform_cursor, CursorStage, ForeignCopy, Layout};
+use crate::foreign::{CursorStage, ForeignCopy, Layout};
 use crate::{log_always, log_info, log_warn};
 
 /// Budget for the previous release fence (a 30 Hz frame). A fence that never
@@ -160,56 +160,55 @@ const SC_CURSOR_DEBUG_NAME: &core::ffi::CStr = c"gndrm-cursor";
 const Z_CURSOR: i32 = 1;
 /// Always-on cursor-image lines printed per session.
 const CURSOR_LOG_BUDGET: u32 = 8;
-/// Always-on cursor-mode lines printed per session (see [`cursor_mode`]).
-const CURSOR_MODE_LOG_BUDGET: u32 = 64;
-/// The buffer transform the scan-out layer is published with.
-const SCANOUT_TRANSFORM: i32 = 0;
+/// Always-on cursor-presentation lines printed per session.
+const CURSOR_STAGE_LOG_BUDGET: u32 = 64;
 
-/// A small integer system property, or `default` when unset or unparsable.
-fn int_property(name: &core::ffi::CStr, default: u32) -> u32 {
+/// A system property, or an empty string when it is unset.
+fn property(name: &core::ffi::CStr) -> String {
     let mut value = [0u8; 92];
     // SAFETY: `name` is NUL-terminated and `value` is PROP_VALUE_MAX bytes.
     let n = unsafe {
         libc::__system_property_get(name.as_ptr(), value.as_mut_ptr().cast::<libc::c_char>())
     };
     let n = usize::try_from(n).unwrap_or(0).min(value.len());
-    core::str::from_utf8(&value[..n])
+    String::from_utf8_lossy(&value[..n]).trim().to_owned()
+}
+
+/// Whether the panel is taken to be landscape in its natural orientation:
+/// tablets (`ro.build.characteristics` lists `tablet`); phones and handhelds
+/// are portrait panels. See [`gndrm_daemon::cursor::derive_rotation`].
+fn natural_landscape() -> bool {
+    static NATURAL_LANDSCAPE: OnceLock<bool> = OnceLock::new();
+    *NATURAL_LANDSCAPE.get_or_init(|| {
+        property(c"ro.build.characteristics")
+            .split(',')
+            .any(|c| c.trim() == "tablet")
+    })
+}
+
+/// The cursor layer's debug overrides, read on every cursor show/move/image so
+/// they can be switched live:
+/// - `debug.gndrm.cursor_mode`: `0` hands the padded cursor buffer to
+///   SurfaceFlinger as KMS describes it (scaled by the composer, buffer
+///   transform 0); unset or anything else stages it (the default, see
+///   [`gndrm_daemon::cursor`]).
+/// - `debug.gndrm.cursor_rot`: the staging rotation in degrees clockwise
+///   (0/90/180/270) instead of the derived one.
+///
+/// Returns `(staged, rotation override)`.
+fn cursor_overrides() -> (bool, Option<u32>) {
+    let staged = property(c"debug.gndrm.cursor_mode").parse::<u32>() != Ok(0);
+    let rot = property(c"debug.gndrm.cursor_rot")
+        .parse::<u32>()
         .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
+        .map(gndrm_daemon::cursor::normalize_rotation);
+    (staged, rot)
 }
 
-/// How the cursor layer is presented (`debug.gndrm.cursor_mode`, read on every
-/// cursor show/move/image so it can be switched live):
-/// 0 = the padded cursor buffer, scaled by SurfaceFlinger, transform 0;
-/// 1 = 0 with the scan-out layer's buffer transform; 2 = unscaled;
-/// 3 = 1+2; 4 = a tight copy of the cursor's opaque extent, scaled by
-/// SurfaceFlinger; 5 = 4 with the scan-out allocation (the same as 4: the
-/// copy target already uses it); 6 = tight, pre-rotated into panel
-/// orientation (`debug.gndrm.cursor_rot` degrees clockwise, default 90) with
-/// the inverse buffer transform, unscaled; 7 = 6 pre-scaled to the output
-/// scale, so the panel sees an unrotated, unscaled layer of the right size.
-fn cursor_mode() -> (u32, u32) {
-    let mode = int_property(c"debug.gndrm.cursor_mode", 0);
-    let rot = int_property(c"debug.gndrm.cursor_rot", 90) % 360 / 90 * 90;
-    (if mode > 7 { 0 } else { mode }, rot)
-}
-
-/// The buffer transform that undoes a clockwise pre-rotation of `rot` degrees.
-fn inverse_rotation_transform(rot: u32) -> i32 {
-    match rot {
-        90 => 7,  // ROTATE_270
-        180 => 3, // ROTATE_180
-        270 => 4, // ROTATE_90
-        _ => 0,
-    }
-}
-
-/// What a prepared cursor image was built from.
+/// What a staged cursor image was built from.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct StageKey {
     images: u64,
-    mode: u32,
     rot: u32,
     crop: (u32, u32, u32, u32),
     out: (u32, u32),
@@ -888,15 +887,16 @@ struct CursorLayer {
     hides: u64,
     failures: u64,
     logged: u32,
-    /// The prepared image for modes 4..=7, and what it was built from.
+    /// The staged image on the layer, and what it was built from.
     stage: Option<(StageKey, CursorStage)>,
     /// The current image's pixels (`images`, pixels, width, format) and its
     /// opaque extent for the last source rect, so a motion costs no read.
     pixels: Option<(u64, Vec<u8>, u32, u32)>,
-    extent: Option<((u64, u32, u32, u32, u32), (u32, u32))>,
-    /// The mode the layer was last shown with.
-    mode: u32,
-    mode_logged: u32,
+    extent: Option<((u64, gndrm_daemon::scanout::Edges), (u32, u32))>,
+    /// How the layer was last shown: staged, and with which rotation (`None`:
+    /// the padded buffer as KMS describes it).
+    shown_as: Option<Option<u32>>,
+    stage_logged: u32,
 }
 
 impl CursorLayer {
@@ -909,8 +909,8 @@ impl CursorLayer {
             stage: None,
             pixels: None,
             extent: None,
-            mode: 0,
-            mode_logged: 0,
+            shown_as: None,
+            stage_logged: 0,
             images: 0,
             moves: 0,
             hides: 0,
@@ -2074,140 +2074,68 @@ impl AscState {
             right: dst.2,
             bottom: dst.3,
         };
-        let (mode, rot) = cursor_mode();
-        let mode_changed = mode != self.cursor.mode;
+        let plane = (
+            src.right - src.left,
+            src.bottom - src.top,
+            dst.right - dst.left,
+            dst.bottom - dst.top,
+        );
+        let (staged, rot_override) = cursor_overrides();
+        let derived = gndrm_daemon::cursor::derive_rotation(
+            (self.win_w as u32, self.win_h as u32),
+            natural_landscape(),
+        );
+        let rot = rot_override.unwrap_or(derived);
         let mut transform = 0;
         let mut ahb = ahb;
         let (mut src, mut dst) = (src, dst);
         let mut restaged = false;
-        let (sw, sh) = (src.right - src.left, src.bottom - src.top);
-        let (dw, dh) = (dst.right - dst.left, dst.bottom - dst.top);
-        match mode {
-            1 => transform = SCANOUT_TRANSFORM,
-            2 | 3 => {
-                transform = SCANOUT_TRANSFORM;
-                dst.right = dst.left + sw;
-                dst.bottom = dst.top + sh;
-            }
-            4..=7 => {
-                // The opaque extent from the source rect's origin, so the
-                // top-left (and with it the hotspot offset) stays in place.
-                let images = self.cursor.images;
-                if self.cursor.pixels.as_ref().is_none_or(|p| p.0 != images) {
-                    let staged = self.cursor.slot.as_ref().and_then(|s| {
-                        s.copy
-                            .stage_rows()
-                            .map(|(px, w, _)| (images, px, w, s.copy.format))
-                    });
-                    self.cursor.pixels = staged;
-                }
-                let Some((_, pixels, bw, format)) = self.cursor.pixels.as_ref() else {
-                    return;
-                };
-                let (bw, format) = (*bw, *format);
-                let (l, t, r, b) = (
-                    src.left as u32,
-                    src.top as u32,
-                    src.right as u32,
-                    src.bottom as u32,
-                );
-                let ekey = (images, l, t, r, b);
-                let (ex, ey) = match self.cursor.extent {
-                    Some((k, e)) if k == ekey => e,
-                    _ => {
-                        let (mut ex, mut ey) = (0u32, 0u32);
-                        for y in t..b {
-                            for x in l..r {
-                                if pixels[((y * bw + x) * 4 + 3) as usize] != 0 {
-                                    ex = ex.max(x - l + 1);
-                                    ey = ey.max(y - t + 1);
-                                }
-                            }
-                        }
-                        self.cursor.extent = Some((ekey, (ex, ey)));
-                        (ex, ey)
-                    }
-                };
-                let cw = ex.max(1).div_ceil(4).saturating_mul(4).min(r - l);
-                let ch = ey.max(1).div_ceil(4).saturating_mul(4).min(b - t);
-                let sx = dw as f32 / sw as f32;
-                let sy = dh as f32 / sh as f32;
-                let scaled = (
-                    (cw as f32 * sx).round() as u32,
-                    (ch as f32 * sy).round() as u32,
-                );
-                let (out, prerot) = match mode {
-                    4 | 5 => ((cw, ch), 0),
-                    6 => ((cw, ch), rot),
-                    _ => (scaled, rot),
-                };
-                let key = StageKey {
-                    images,
-                    mode,
-                    rot: prerot,
-                    crop: (l, t, cw, ch),
-                    out,
-                };
-                if self.cursor.stage.as_ref().is_none_or(|(k, _)| *k != key) {
-                    let Some((_, pixels, _, _)) = self.cursor.pixels.as_ref() else {
-                        return;
-                    };
-                    let (img, iw, ih) = transform_cursor(pixels, bw, (l, t, cw, ch), out, prerot);
-                    match CursorStage::new(&img, iw, ih, format) {
-                        Ok(st) => {
-                            self.cursor.stage = Some((key, st));
-                            restaged = true;
-                        }
-                        Err(reason) => {
-                            log_always!(
-                                "{}",
-                                gndrm_obf::obf!(
-                                    "gndrm-daemon: asc cursor mode={mode} stage FAILED ({reason})"
-                                )
-                            );
-                            return;
-                        }
-                    }
-                }
-                let Some((_, st)) = self.cursor.stage.as_ref() else {
-                    return;
-                };
+        // Staged: the cursor's opaque extent, pre-scaled and pre-rotated, so
+        // the composer sees an unrotated, unscaled layer. A source that cannot
+        // be read back (10-bit) or staged keeps the padded buffer.
+        let mut shown_as = None;
+        if let Some((plan, new_stage)) =
+            staged.then(|| self.stage_cursor(&src, &dst, rot)).flatten()
+        {
+            if let Some((_, st)) = self.cursor.stage.as_ref() {
                 ahb = st.ahb;
+                restaged = new_stage;
                 src = ffi::ARect {
                     left: 0,
                     top: 0,
                     right: st.width as c_int,
                     bottom: st.height as c_int,
                 };
-                let (fw, fh) = match mode {
-                    4 | 5 => scaled,
-                    _ => out,
+                dst = ffi::ARect {
+                    left: plan.dst.0,
+                    top: plan.dst.1,
+                    right: plan.dst.2,
+                    bottom: plan.dst.3,
                 };
-                dst.right = dst.left + fw as c_int;
-                dst.bottom = dst.top + fh as c_int;
-                transform = if mode >= 6 {
-                    inverse_rotation_transform(prerot)
-                } else {
-                    SCANOUT_TRANSFORM
-                };
+                transform = plan.transform;
+                shown_as = Some(plan.rot);
             }
-            _ => {}
         }
-        let set_buffer = set_buffer || mode_changed || restaged;
-        self.cursor.mode = mode;
+        let presentation_changed = self.cursor.shown_as != Some(shown_as);
+        self.cursor.shown_as = Some(shown_as);
+        let set_buffer = set_buffer || presentation_changed || restaged;
         let sc = self.cursor.sc;
         let becomes_visible = !self.cursor.visible;
-        if (becomes_visible || mode_changed || restaged)
-            && self.cursor.mode_logged < CURSOR_MODE_LOG_BUDGET
+        if (becomes_visible || presentation_changed || restaged)
+            && self.cursor.stage_logged < CURSOR_STAGE_LOG_BUDGET
         {
-            self.cursor.mode_logged += 1;
+            self.cursor.stage_logged += 1;
             log_always!(
                 "{}",
                 gndrm_obf::obf!(
-                    "gndrm-daemon: asc cursor mode={mode} rot={rot} transform={transform} src=({},{})-({},{}) dst=({},{})-({},{}) plane_src={}x{} plane_dst={}x{}",
+                    "gndrm-daemon: asc cursor {} rot={rot} ({}) transform={transform} src=({},{})-({},{}) dst=({},{})-({},{}) plane_src={}x{} plane_dst={}x{} window={}x{} natural={}",
+                    if shown_as.is_some() { "staged" } else { "padded" },
+                    if rot_override.is_some() { "override" } else { "derived" },
                     src.left, src.top, src.right, src.bottom,
                     dst.left, dst.top, dst.right, dst.bottom,
-                    sw, sh, dw, dh
+                    plane.0, plane.1, plane.2, plane.3,
+                    self.win_w, self.win_h,
+                    if natural_landscape() { "landscape" } else { "portrait" }
                 )
             );
         }
@@ -2256,6 +2184,78 @@ impl AscState {
             }
         } else {
             self.cursor.moves += 1;
+        }
+    }
+
+    /// Stage the current cursor image for the plane's visible `src` (buffer
+    /// pixels) and `dst` (window pixels), pre-rotated by `rot`: the plan, and
+    /// whether a new staged buffer was made. `None` when the image cannot be
+    /// read back (10-bit) or staged; the caller then shows the padded buffer.
+    fn stage_cursor(
+        &mut self,
+        src: &ffi::ARect,
+        dst: &ffi::ARect,
+        rot: u32,
+    ) -> Option<(gndrm_daemon::cursor::StagePlan, bool)> {
+        use gndrm_daemon::cursor::{opaque_extent, stage_plan, transform_cursor};
+        let images = self.cursor.images;
+        if self.cursor.pixels.as_ref().is_none_or(|p| p.0 != images) {
+            self.cursor.pixels = self.cursor.slot.as_ref().and_then(|s| {
+                s.copy
+                    .stage_rows()
+                    .map(|(px, w, _)| (images, px, w, s.copy.format))
+            });
+        }
+        let (_, pixels, bw, format) = self.cursor.pixels.as_ref()?;
+        let (bw, format) = (*bw, *format);
+        let src_e = (src.left, src.top, src.right, src.bottom);
+        let extent = match self.cursor.extent {
+            Some((k, e)) if k == (images, src_e) => e,
+            _ => {
+                let e = opaque_extent(pixels, bw, src_e);
+                self.cursor.extent = Some(((images, src_e), e));
+                e
+            }
+        };
+        let plan = stage_plan(
+            src_e,
+            (dst.left, dst.top, dst.right, dst.bottom),
+            extent,
+            rot,
+        )?;
+        // The crop must lie inside the read-back image.
+        let rows = pixels.len() / (bw.max(1) as usize * 4);
+        if plan.crop.0 + plan.crop.2 > bw || (plan.crop.1 + plan.crop.3) as usize > rows {
+            return None;
+        }
+        let key = StageKey {
+            images,
+            rot: plan.rot,
+            crop: plan.crop,
+            out: plan.out,
+        };
+        if self.cursor.stage.as_ref().is_some_and(|(k, _)| *k == key) {
+            return Some((plan, false));
+        }
+        let (img, w, h) = transform_cursor(pixels, bw, plan.crop, plan.out, plan.rot);
+        match CursorStage::new(&img, w, h, format) {
+            Ok(st) => {
+                self.cursor.stage = Some((key, st));
+                Some((plan, true))
+            }
+            Err(reason) => {
+                self.cursor.stage = None;
+                if self.cursor.stage_logged < CURSOR_STAGE_LOG_BUDGET {
+                    self.cursor.stage_logged += 1;
+                    log_always!(
+                        "{}",
+                        gndrm_obf::obf!(
+                            "gndrm-daemon: asc cursor stage FAILED ({reason}); showing the padded buffer"
+                        )
+                    );
+                }
+                None
+            }
         }
     }
 

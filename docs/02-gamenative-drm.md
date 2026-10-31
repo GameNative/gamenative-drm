@@ -285,6 +285,33 @@ documented in 06-presenter-latency.md; the shape is:
   byte order (plus `RG16`, and `XR24`/`AR24` under BGRA), so no conversion and
   no shader; under RGBA `XR24`/`AR24` are on the cursor plane only, so gamescope
   samples them but never scans them out.
+- **Cursor layer (GNCL).** A client that sets the private client cap
+  `GNDRM_CLIENT_CAP_CURSOR_LAYER` (`0x474E434C`, card node only; gamescope's
+  A55) gets a 256x256 cursor plane that is presented on a second child layer,
+  `gndrm-cursor`, z 1 above the scan-out layer. Anything larger than 256 (rect
+  or framebuffer) is refused, so libliftoff never parks the game there.
+  Without the cap the cursor plane stays 64x64 and is not presented. A new
+  cursor image is copied once (session layout rule, R/B swap as needed); a
+  motion is a geometry-only transaction; FB 0 hides the layer.
+  The image is *staged* (`gndrm_daemon::cursor`): its opaque extent is copied
+  out of the padded buffer, pre-scaled to the size it is shown at and
+  pre-rotated clockwise by the display rotation, and the layer carries the
+  inverse buffer transform. The two cancel in window space, and the composer
+  sees an unrotated, unscaled layer: on the Retroid Pocket 6 (portrait panel at
+  `ROTATION_90`) the padded, scaled cursor with transform 90 fell back to GPU
+  composition (the inline rotator takes UBWC only and the single inline
+  writeback path belongs to the scan-out layer); staged it is DEVICE.
+  The rotation is derived from the window, as no NDK call reports the display
+  rotation: 90 when the window's orientation differs from the panel's assumed
+  natural one (landscape for `ro.build.characteristics` containing `tablet`,
+  portrait otherwise), else 0. 90 and 270 cannot be told apart, and a panel of
+  the other natural orientation gets the wrong value; the picture is right in
+  every case, only the composer may then see a residual rotation. A 10-bit
+  cursor (or a failed staging allocation) is shown padded.
+  Debug overrides, read live on every cursor update:
+  `debug.gndrm.cursor_mode=0` shows the padded buffer as KMS describes it
+  (composer-scaled, transform 0); `debug.gndrm.cursor_rot=0|90|180|270` replaces
+  the derived rotation.
 - **Publish tail.** `ASurfaceControl`/`ASurfaceTransaction`, resolved by
   `dlopen("libandroid.so")` (the NDK gates these symbols at API 29; the build
   targets API 28). One child `SurfaceControl` from the window, one layer per

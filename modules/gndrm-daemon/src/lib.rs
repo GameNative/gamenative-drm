@@ -13,6 +13,7 @@
 #![deny(clippy::all)]
 
 mod commit;
+pub mod cursor;
 pub mod diag;
 mod edid;
 pub mod foreign;
