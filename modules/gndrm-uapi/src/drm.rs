@@ -139,6 +139,16 @@ pub const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
 pub const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
 pub const DRM_CLIENT_CAP_WRITEBACK_CONNECTORS: u64 = 5;
 
+/// gndrm private client cap `"GNCL"`: this client drives the cursor plane as a
+/// real plane. With it the daemon presents the cursor plane on a layer of its
+/// own above the scan-out layer, answers `DRM_CAP_CURSOR_WIDTH`/`_HEIGHT` with
+/// the cursor-layer limit (256), and refuses (`EINVAL`) any cursor-plane
+/// framebuffer or rectangle larger than that. Without it the cursor plane keeps
+/// the 64x64 rule and is never presented. Not a kernel cap: a real kernel, or a
+/// daemon without it, answers `EINVAL`, and gamescope keeps its cursor in the
+/// composite. Card node only.
+pub const GNDRM_CLIENT_CAP_CURSOR_LAYER: u64 = 0x474E_434C;
+
 // ---------------------------------------------------------------------------
 // event types (`DRM_EVENT_*`)
 // ---------------------------------------------------------------------------

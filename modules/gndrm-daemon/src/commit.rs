@@ -24,7 +24,7 @@ use gndrm_uapi::wire::errno;
 
 use crate::objects::{PlaneState, CONNECTOR_ID, CRTC_ID, PLANE_CURSOR_ID, PLANE_PRIMARY_ID};
 use crate::pod::*;
-use crate::{props, CommitJob, Device, DispatchResult, CURSOR_SIZE};
+use crate::{props, CommitJob, CursorKey, CursorUpdate, Device, DispatchResult};
 
 /// One parsed `(obj, prop, value)` triple.
 #[derive(Debug, Clone, Copy)]
@@ -455,24 +455,37 @@ impl Device {
             }
         }
         // The cursor plane takes a cursor-sized rectangle and nothing larger.
+        // A client driving the cursor layer (GNCL) is also held to a
+        // cursor-sized framebuffer: a game-sized buffer with a cropped source
+        // rect is refused too, so libliftoff can never park the game there.
+        let limit = self.cursor_limit();
+        let fb_dims = self
+            .stores
+            .fbs
+            .get(&cursor.fb_id)
+            .map_or((0, 0), |fb| (fb.width, fb.height));
+        let fb_too_big = self.cursor_layer_on() && (fb_dims.0 > limit || fb_dims.1 > limit);
         if cursor.fb_id != 0
-            && (cursor.src_w >> 16 > CURSOR_SIZE
-                || cursor.src_h >> 16 > CURSOR_SIZE
-                || cursor.crtc_w > CURSOR_SIZE as i32
-                || cursor.crtc_h > CURSOR_SIZE as i32)
+            && (cursor.src_w >> 16 > limit
+                || cursor.src_h >> 16 > limit
+                || cursor.crtc_w > limit as i32
+                || cursor.crtc_h > limit as i32
+                || fb_too_big)
         {
             self.diag(|| {
                 format!(
                     "{}",
                     gndrm_obf::obf!(
-                        "atomic: reject EINVAL cursor fb={} src={}x{} crtc={}x{} exceeds {}x{}",
+                        "atomic: reject EINVAL cursor fb={} {}x{} src={}x{} crtc={}x{} exceeds {}x{}",
                         cursor.fb_id,
+                        fb_dims.0,
+                        fb_dims.1,
                         cursor.src_w >> 16,
                         cursor.src_h >> 16,
                         cursor.crtc_w,
                         cursor.crtc_h,
-                        CURSOR_SIZE,
-                        CURSOR_SIZE
+                        limit,
+                        limit
                     )
                 )
             });
@@ -560,6 +573,8 @@ impl Device {
             None
         };
 
+        let (cursor, cursor_src_fd) = self.cursor_change(crtc_on);
+
         self.queue_commit(CommitJob {
             fb,
             plane,
@@ -568,7 +583,64 @@ impl Device {
             live_inos,
             fence: fence_fd,
             event,
+            cursor,
+            cursor_src_fd,
         });
+    }
+
+    /// The cursor plane's change in the commit just applied, for a client
+    /// driving the cursor layer: the update for the presenter plus a duplicate
+    /// of the cursor buffer's dma-buf (owned by the job). `(None, None)` when
+    /// the client has no cursor layer or the visible cursor did not change, so
+    /// a commit that only re-flips the primary plane never touches the cursor
+    /// layer and a cursor-only commit touches nothing else.
+    ///
+    /// The change key is the plane state plus the buffer's identity and
+    /// layout: a new cursor image can reuse a freed framebuffer id, never a
+    /// live dma-buf.
+    fn cursor_change(&mut self, crtc_on: bool) -> (Option<CursorUpdate>, Option<RawFd>) {
+        if !self.cursor_layer_on() {
+            return (None, None);
+        }
+        let plane = self.cursor_state();
+        let fb = (crtc_on && plane.fb_id != 0 && plane.crtc_id == CRTC_ID)
+            .then(|| self.stores.fbs.get(&plane.fb_id).cloned())
+            .flatten();
+        let gem = fb.as_ref().and_then(|fb| {
+            fb.handles
+                .first()
+                .copied()
+                .filter(|h| *h != 0)
+                .and_then(|h| {
+                    self.stores
+                        .gems
+                        .get(&h)
+                        .or_else(|| self.stores.gems_closed.get(&h))
+                })
+        });
+        let ino = gem.map(|g| g.ino);
+        let key = fb.as_ref().map(|fb| CursorKey {
+            plane: plane.clone(),
+            ino: ino.unwrap_or(0),
+            layout: (
+                fb.width,
+                fb.height,
+                fb.pixel_format,
+                fb.pitches[0],
+                fb.offsets[0],
+            ),
+        });
+        if key == self.presented_cursor {
+            return (None, None);
+        }
+        let src_fd = gem.and_then(|gem| {
+            // SAFETY: `gem.fd` is the store's live duplicate; the new
+            // descriptor is owned by the job.
+            let fd = unsafe { libc::fcntl(gem.fd, libc::F_DUPFD_CLOEXEC, 0) };
+            (fd >= 0).then_some(fd)
+        });
+        self.presented_cursor = key;
+        (Some(CursorUpdate { fb, plane, ino }), src_fd)
     }
 
     /// Validate a writable property's value the way the kernel would — a

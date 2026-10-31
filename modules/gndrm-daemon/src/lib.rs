@@ -65,6 +65,13 @@ const MAX_HEIGHT: u32 = 8192;
 /// game buffer on the cursor plane whenever its format is listed there, and
 /// the presenter publishes only the primary plane.
 pub(crate) const CURSOR_SIZE: u32 = 64;
+/// Cursor size cap for a client holding [`GNDRM_CLIENT_CAP_CURSOR_LAYER`],
+/// whose cursor plane is presented on a layer of its own. Android exposes no
+/// query for the composer's cursor limits, so this is the largest cursor
+/// gamescope ever builds (`MouseCursor::GetDesiredSize` clamps to 256). Any
+/// framebuffer or rectangle larger than this is refused on the cursor plane, so
+/// libliftoff can never park a game-sized buffer there.
+pub const CURSOR_LAYER_MAX: u32 = 256;
 
 /// Formats on the primary plane for a [`ScanoutLayout::Bgra8888`] pool (the SDR
 /// set). `XRGB8888` stays first: gamescope renders its output in the first
@@ -465,6 +472,37 @@ pub trait Presenter: Send {
         let _ = src_fd;
         self.publish(fb, plane, ino, live_inos, fence);
     }
+
+    /// Put the cursor plane's new state on the cursor layer (a client holding
+    /// [`GNDRM_CLIENT_CAP_CURSOR_LAYER`] only). Called on the commit worker
+    /// after the commit's primary publish, for every commit that changed the
+    /// cursor plane. `src_fd` is the cursor buffer's dma-buf, borrowed for the
+    /// call. The default drops it: a presenter without a cursor layer shows no
+    /// cursor plane, as before.
+    fn publish_cursor(&mut self, cursor: &CursorUpdate, src_fd: Option<RawFd>) {
+        let _ = (cursor, src_fd);
+    }
+}
+
+/// What the cursor layer last showed: the plane state, the buffer's identity
+/// and its layout (`width, height, fourcc, pitch, offset`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CursorKey {
+    pub(crate) plane: PlaneState,
+    pub(crate) ino: u64,
+    pub(crate) layout: (u32, u32, u32, u32, u32),
+}
+
+/// One cursor-plane change handed to [`Presenter::publish_cursor`].
+#[derive(Debug, Clone)]
+pub struct CursorUpdate {
+    /// The cursor framebuffer to show, or `None` to hide the cursor layer
+    /// (`FB_ID` 0, or the CRTC is off).
+    pub fb: Option<Framebuffer>,
+    /// The cursor plane's committed state (rects in mode pixels).
+    pub plane: PlaneState,
+    /// The cursor buffer's identity (`st_ino`), resolved at commit time.
+    pub ino: Option<u64>,
 }
 
 /// Default presenter: drops frames and completes them immediately. Phase-1
@@ -517,6 +555,12 @@ pub struct Device {
     cap_atomic: bool,
     cap_universal_planes: bool,
     cap_writeback: bool,
+    /// [`GNDRM_CLIENT_CAP_CURSOR_LAYER`]: the cursor plane is presented on a
+    /// layer of its own and capped at [`CURSOR_LAYER_MAX`]. Card node only.
+    cap_cursor_layer: bool,
+    /// The cursor plane state last handed to the presenter (`None` = hidden or
+    /// never shown), so only a commit that changes it reaches the cursor layer.
+    pub(crate) presented_cursor: Option<CursorKey>,
 
     /// Which node type this connection impersonates. A card node carries the
     /// full KMS surface (gamescope); a render node carries only the
@@ -677,6 +721,8 @@ impl Device {
             cap_atomic: false,
             cap_universal_planes: false,
             cap_writeback: false,
+            cap_cursor_layer: false,
+            presented_cursor: None,
             node_kind: NODE_KIND_CARD,
             conn_crtc_id: 0,
             conn_colorspace: DRM_MODE_COLORIMETRY_DEFAULT,
@@ -833,6 +879,22 @@ impl Device {
 
     pub(crate) fn cursor_state(&self) -> PlaneState {
         self.cursor.clone()
+    }
+
+    /// The largest cursor-plane framebuffer and rectangle this client may
+    /// commit: [`CURSOR_LAYER_MAX`] with [`GNDRM_CLIENT_CAP_CURSOR_LAYER`],
+    /// the legacy [`CURSOR_SIZE`] without it.
+    pub(crate) fn cursor_limit(&self) -> u32 {
+        if self.cap_cursor_layer {
+            CURSOR_LAYER_MAX
+        } else {
+            CURSOR_SIZE
+        }
+    }
+
+    /// Whether this client drives the cursor plane as a presented layer.
+    pub(crate) fn cursor_layer_on(&self) -> bool {
+        self.cap_cursor_layer
     }
 
     pub(crate) fn crtc_state(&self) -> CrtcState {
@@ -1063,7 +1125,7 @@ impl Device {
             // glamor's device probe read this cap before allocating.
             DRM_CAP_PRIME => DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT,
             DRM_CAP_TIMESTAMP_MONOTONIC => 1,
-            DRM_CAP_CURSOR_WIDTH | DRM_CAP_CURSOR_HEIGHT => u64::from(CURSOR_SIZE),
+            DRM_CAP_CURSOR_WIDTH | DRM_CAP_CURSOR_HEIGHT => u64::from(self.cursor_limit()),
             // Advertised: gamescope's DRM backend creates an always-signalled
             // sync object here and exports it as the in-fence it rides on every
             // atomic commit. With this 0 it logs "Syncobjs are not supported"
@@ -1095,6 +1157,24 @@ impl Device {
             DRM_CLIENT_CAP_ATOMIC => self.cap_atomic = c.value == 1,
             DRM_CLIENT_CAP_UNIVERSAL_PLANES => self.cap_universal_planes = c.value == 1,
             DRM_CLIENT_CAP_WRITEBACK_CONNECTORS => self.cap_writeback = c.value == 1,
+            GNDRM_CLIENT_CAP_CURSOR_LAYER if self.node_kind == NODE_KIND_CARD => {
+                let on = c.value == 1;
+                if on != self.cap_cursor_layer {
+                    self.cap_cursor_layer = on;
+                    // Once per session (the client sets it at bring-up).
+                    self.always_log(|| {
+                        format!(
+                            "{}",
+                            gndrm_obf::obf!(
+                                "cursor: cursor layer {} (max {}x{})",
+                                if on { "on" } else { "off" },
+                                self.cursor_limit(),
+                                self.cursor_limit()
+                            )
+                        )
+                    });
+                }
+            }
             _ => return DispatchResult::err(errno::EINVAL),
         }
         DispatchResult::ok(Vec::new())
@@ -2049,6 +2129,11 @@ struct CommitJob {
     /// Built at commit time when `PAGE_FLIP_EVENT` was requested; the worker
     /// stamps its vblank and emits it with the publish.
     event: Option<DrmEventVblank>,
+    /// The cursor plane's change in this commit, for a client holding
+    /// [`GNDRM_CLIENT_CAP_CURSOR_LAYER`]; `None` when it did not change.
+    cursor: Option<CursorUpdate>,
+    /// A duplicate of the cursor buffer's dma-buf, owned by the job.
+    cursor_src_fd: Option<RawFd>,
 }
 
 impl Drop for CommitJob {
@@ -2059,6 +2144,9 @@ impl Drop for CommitJob {
             close_fd(fd);
         }
         if let Some(fd) = self.src_fd.take() {
+            close_fd(fd);
+        }
+        if let Some(fd) = self.cursor_src_fd.take() {
             close_fd(fd);
         }
     }
@@ -2203,6 +2291,16 @@ fn commit_worker_loop(
                 if let Some(fd) = job.fence.take() {
                     close_fd(fd);
                 }
+            }
+        }
+        // The cursor layer, after the primary publish: a cursor-only commit
+        // reaches the presenter here and nowhere else, so it never re-flips
+        // the scan-out layer (nor feeds a frame generator on it).
+        if let Some(cursor) = job.cursor.take() {
+            let src_fd = job.cursor_src_fd.take();
+            presenter.publish_cursor(&cursor, src_fd);
+            if let Some(fd) = src_fd {
+                close_fd(fd);
             }
         }
         // The frame is now queued to SurfaceFlinger. Emit the page-flip event
