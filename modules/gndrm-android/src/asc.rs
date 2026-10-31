@@ -67,14 +67,14 @@ use gndrm_daemon::diag::{self, Diag, Reply, Role, Stage, State, TrackedMutex, LO
 use gndrm_daemon::scanout::{
     serves_len, Geometry, Removed, Reservation as CacheReservation, ReusePool,
 };
-use gndrm_daemon::{FrameCap, Framebuffer, PlaneState, Presenter};
+use gndrm_daemon::{CursorUpdate, FrameCap, Framebuffer, PlaneState, Presenter};
 use gndrm_uapi::wire::{
     scanout_ahb_format, FrameAcquired, FrameCapSubscribe, LsfgConfig, PresentDone, PresentMark,
     ScanoutAllocReq, ScanoutAllocResp, CAP_FRAME_CAP, CAP_PRESENT_ID, CAP_VSYNC_NOTE,
 };
 
 use crate::ffi;
-use crate::foreign::{ForeignCopy, Layout};
+use crate::foreign::{CursorStage, ForeignCopy, Layout};
 use crate::{log_always, log_info, log_warn};
 
 /// Budget for the previous release fence (a 30 Hz frame). A fence that never
@@ -154,6 +154,65 @@ fn dump_dir() -> Option<&'static std::ffi::OsString> {
 
 /// Debug name of the layer; shows up in SurfaceFlinger dumps.
 const SC_DEBUG_NAME: &core::ffi::CStr = c"gndrm-scanout";
+/// Debug name of the cursor layer (`dumpsys SurfaceFlinger`).
+const SC_CURSOR_DEBUG_NAME: &core::ffi::CStr = c"gndrm-cursor";
+/// Z-order of the scan-out and cursor layers among the window's children.
+const Z_CURSOR: i32 = 1;
+/// Always-on cursor-image lines printed per session.
+const CURSOR_LOG_BUDGET: u32 = 8;
+/// Always-on cursor-presentation lines printed per session.
+const CURSOR_STAGE_LOG_BUDGET: u32 = 64;
+
+/// A system property, or an empty string when it is unset.
+fn property(name: &core::ffi::CStr) -> String {
+    let mut value = [0u8; 92];
+    // SAFETY: `name` is NUL-terminated and `value` is PROP_VALUE_MAX bytes.
+    let n = unsafe {
+        libc::__system_property_get(name.as_ptr(), value.as_mut_ptr().cast::<libc::c_char>())
+    };
+    let n = usize::try_from(n).unwrap_or(0).min(value.len());
+    String::from_utf8_lossy(&value[..n]).trim().to_owned()
+}
+
+/// Whether the panel is taken to be landscape in its natural orientation:
+/// tablets (`ro.build.characteristics` lists `tablet`); phones and handhelds
+/// are portrait panels. See [`gndrm_daemon::cursor::derive_rotation`].
+fn natural_landscape() -> bool {
+    static NATURAL_LANDSCAPE: OnceLock<bool> = OnceLock::new();
+    *NATURAL_LANDSCAPE.get_or_init(|| {
+        property(c"ro.build.characteristics")
+            .split(',')
+            .any(|c| c.trim() == "tablet")
+    })
+}
+
+/// The cursor layer's debug overrides, read on every cursor show/move/image so
+/// they can be switched live:
+/// - `debug.gndrm.cursor_mode`: `0` hands the padded cursor buffer to
+///   SurfaceFlinger as KMS describes it (scaled by the composer, buffer
+///   transform 0); unset or anything else stages it (the default, see
+///   [`gndrm_daemon::cursor`]).
+/// - `debug.gndrm.cursor_rot`: the staging rotation in degrees clockwise
+///   (0/90/180/270) instead of the derived one.
+///
+/// Returns `(staged, rotation override)`.
+fn cursor_overrides() -> (bool, Option<u32>) {
+    let staged = property(c"debug.gndrm.cursor_mode").parse::<u32>() != Ok(0);
+    let rot = property(c"debug.gndrm.cursor_rot")
+        .parse::<u32>()
+        .ok()
+        .map(gndrm_daemon::cursor::normalize_rotation);
+    (staged, rot)
+}
+
+/// What a staged cursor image was built from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StageKey {
+    images: u64,
+    rot: u32,
+    crop: (u32, u32, u32, u32),
+    out: (u32, u32),
+}
 
 /// One scan-out buffer the daemon allocated, on its way to the client.
 pub struct ScanoutBuffer {
@@ -805,6 +864,62 @@ impl Drop for ForeignSlot {
     }
 }
 
+/// The cursor image on the cursor layer: a daemon-owned copy of the cursor
+/// framebuffer in the session's scan-out layout (`ForeignCopy` follows the
+/// layout rule, so a GLES sdk>=36 session gets an RGBA layer here too).
+struct CursorSlot {
+    ino: u64,
+    layout: Layout,
+    fb_id: u32,
+    copy: ForeignCopy,
+}
+
+/// The cursor layer: a sibling of the scan-out layer under the app's window,
+/// above it, placed in window pixels by the same fit as the scan-out layer.
+struct CursorLayer {
+    sc: *mut ffi::ASurfaceControl,
+    slot: Option<CursorSlot>,
+    /// The last update applied, so a rebuilt layer can be given it back.
+    last: Option<CursorUpdate>,
+    visible: bool,
+    images: u64,
+    moves: u64,
+    hides: u64,
+    failures: u64,
+    logged: u32,
+    /// The staged image on the layer, and what it was built from.
+    stage: Option<(StageKey, CursorStage)>,
+    /// The current image's pixels (`images`, pixels, width, format) and its
+    /// opaque extent for the last source rect, so a motion costs no read.
+    pixels: Option<(u64, Vec<u8>, u32, u32)>,
+    extent: Option<((u64, gndrm_daemon::scanout::Edges), (u32, u32))>,
+    /// How the layer was last shown: staged, and with which rotation (`None`:
+    /// the padded buffer as KMS describes it).
+    shown_as: Option<Option<u32>>,
+    stage_logged: u32,
+}
+
+impl CursorLayer {
+    fn new(sc: *mut ffi::ASurfaceControl) -> Self {
+        Self {
+            sc,
+            slot: None,
+            last: None,
+            visible: false,
+            stage: None,
+            pixels: None,
+            extent: None,
+            shown_as: None,
+            stage_logged: 0,
+            images: 0,
+            moves: 0,
+            hides: 0,
+            failures: 0,
+            logged: 0,
+        }
+    }
+}
+
 /// The layer-rect probe's change key: the published source and destination
 /// rects plus the mode and window the destination is bounded by. A plain tuple,
 /// so the probe has a `Copy + PartialEq` value to compare against the last one
@@ -895,6 +1010,8 @@ pub struct AscState {
     foreign_frames: u64,
     foreign_buffers: u64,
     foreign_failures: u64,
+    /// The cursor layer (see [`AscState::publish_cursor`]).
+    cursor: CursorLayer,
 }
 
 // SAFETY: the state is only ever reached through the `Arc<Mutex<_>>` shared by
@@ -924,6 +1041,13 @@ impl AscState {
             (api.sc_create_from_window)(window, SC_DEBUG_NAME.as_ptr())
         });
         let api = if sc.is_null() { None } else { loaded };
+        // The cursor layer: created with the scan-out layer from the same
+        // window, empty (it composites nothing) until a client driving the
+        // cursor plane shows a cursor on it.
+        let cursor_sc = api.map_or(ptr::null_mut(), |api| unsafe {
+            // SAFETY: as above.
+            (api.sc_create_from_window)(window, SC_CURSOR_DEBUG_NAME.as_ptr())
+        });
         if loaded.is_none() {
             log_warn!(
                 "{}",
@@ -981,6 +1105,7 @@ impl AscState {
             foreign_frames: 0,
             foreign_buffers: 0,
             foreign_failures: 0,
+            cursor: CursorLayer::new(cursor_sc),
         };
         // A layer is created empty, and an empty layer makes SurfaceFlinger
         // composite nothing. Everything this session knows lives in the
@@ -1229,10 +1354,9 @@ impl AscState {
                 // was marked against the buffer before the commit that named it.
                 // SAFETY: `ctx` is the leaked mailbox of this registered buffer.
                 unsafe {
-                    (*ctx).present_id.store(
-                        take_present_mark(published_ino),
-                        Ordering::Release,
-                    )
+                    (*ctx)
+                        .present_id
+                        .store(take_present_mark(published_ino), Ordering::Release)
                 };
                 // Attach a looper to *this* thread the first time we publish.
                 // `ALooper_pollOnce` must run on the thread the looper was
@@ -1818,6 +1942,16 @@ impl AscState {
         if !old_sc.is_null() {
             unsafe { (api.sc_release)(old_sc) };
         }
+        // The cursor layer follows the window too; its current image goes
+        // back on below.
+        // SAFETY: as for the scan-out layer above.
+        let new_cursor_sc =
+            unsafe { (api.sc_create_from_window)(window, SC_CURSOR_DEBUG_NAME.as_ptr()) };
+        let old_cursor_sc = core::mem::replace(&mut self.cursor.sc, new_cursor_sc);
+        if !old_cursor_sc.is_null() {
+            // SAFETY: created by this API, no longer referenced, released once.
+            unsafe { (api.sc_release)(old_cursor_sc) };
+        }
         log_info!(
             "{}",
             gndrm_obf::obf!("asc: retargeted to the new window ({win_w}x{win_h})")
@@ -1826,7 +1960,337 @@ impl AscState {
         // shows through as a blank panel), so the retained frame goes straight
         // back on before anything else can run.
         self.republish_last();
+        if let Some(last) = self.cursor.last.clone() {
+            self.cursor.visible = false;
+            self.show_cursor(&last, true);
+        }
         true
+    }
+
+    /// Put a cursor-plane change on the cursor layer: show the cursor image at
+    /// the plane's rect, move it, or hide it. A new image is copied once into a
+    /// daemon-owned buffer in the session's layout; a motion is a geometry-only
+    /// transaction. The scan-out layer is never touched here, so a cursor-only
+    /// commit costs SurfaceFlinger one small layer update and no frame.
+    /// `src_fd` is the cursor buffer's dma-buf, borrowed.
+    pub fn publish_cursor(&mut self, update: &CursorUpdate, src_fd: Option<RawFd>) {
+        if self.api.is_none() || self.cursor.sc.is_null() {
+            return;
+        }
+        if update.fb.is_none() || update.ino.is_none() {
+            self.cursor.last = None;
+            self.hide_cursor();
+            return;
+        }
+        // A new image (or a new framebuffer on the same buffer) is copied
+        // before it goes on the layer.
+        let mut new_buffer = false;
+        if let (Some(fb), Some(ino)) = (update.fb.as_ref(), update.ino) {
+            let layout = Layout::of(fb);
+            let same_target = self
+                .cursor
+                .slot
+                .as_ref()
+                .is_some_and(|s| s.ino == ino && s.layout == layout);
+            if !same_target {
+                let Some(fd) = src_fd else {
+                    self.note_cursor_failure(ino, layout, "no dma-buf");
+                    return;
+                };
+                match ForeignCopy::new(fb, fd) {
+                    Ok(copy) => {
+                        self.cursor.slot = Some(CursorSlot {
+                            ino,
+                            layout,
+                            fb_id: 0,
+                            copy,
+                        });
+                    }
+                    Err(reason) => {
+                        self.note_cursor_failure(ino, layout, &reason);
+                        return;
+                    }
+                }
+            }
+            let Some(slot) = self.cursor.slot.as_mut() else {
+                return;
+            };
+            if slot.fb_id != fb.id {
+                if let Err(reason) = slot.copy.copy() {
+                    self.cursor.slot = None;
+                    self.note_cursor_failure(ino, layout, &reason);
+                    return;
+                }
+                slot.fb_id = fb.id;
+                new_buffer = true;
+                self.cursor.images += 1;
+                if self.cursor.logged < CURSOR_LOG_BUDGET {
+                    self.cursor.logged += 1;
+                    log_always!(
+                        "{}",
+                        gndrm_obf::obf!(
+                            "gndrm-daemon: asc cursor image fb={} ino={ino} {} -> cursor layer (images={})",
+                            fb.id,
+                            layout,
+                            self.cursor.images
+                        )
+                    );
+                }
+            }
+        }
+        self.cursor.last = Some(update.clone());
+        self.show_cursor(update, new_buffer);
+    }
+
+    /// Show (or move) the cursor layer at `update`'s rect; `set_buffer` puts
+    /// the slot's buffer on it as well.
+    fn show_cursor(&mut self, update: &CursorUpdate, set_buffer: bool) {
+        let Some(api) = self.api else {
+            return;
+        };
+        let Some(ahb) = self.cursor.slot.as_ref().map(|s| s.copy.ahb) else {
+            return;
+        };
+        let p = &update.plane;
+        let Some((src, dst)) = gndrm_daemon::scanout::cursor_rects(
+            (p.crtc_x, p.crtc_y, p.crtc_w, p.crtc_h),
+            (p.src_x >> 16, p.src_y >> 16, p.src_w >> 16, p.src_h >> 16),
+            (self.mode_w as u32, self.mode_h as u32),
+            (self.win_w as u32, self.win_h as u32),
+        ) else {
+            // Entirely off the mode: nothing of it is on the panel.
+            self.hide_cursor();
+            return;
+        };
+        let src = ffi::ARect {
+            left: src.0,
+            top: src.1,
+            right: src.2,
+            bottom: src.3,
+        };
+        let dst = ffi::ARect {
+            left: dst.0,
+            top: dst.1,
+            right: dst.2,
+            bottom: dst.3,
+        };
+        let plane = (
+            src.right - src.left,
+            src.bottom - src.top,
+            dst.right - dst.left,
+            dst.bottom - dst.top,
+        );
+        let (staged, rot_override) = cursor_overrides();
+        let derived = gndrm_daemon::cursor::derive_rotation(
+            (self.win_w as u32, self.win_h as u32),
+            natural_landscape(),
+        );
+        let rot = rot_override.unwrap_or(derived);
+        let mut transform = 0;
+        let mut ahb = ahb;
+        let (mut src, mut dst) = (src, dst);
+        let mut restaged = false;
+        // Staged: the cursor's opaque extent, pre-scaled and pre-rotated, so
+        // the composer sees an unrotated, unscaled layer. A source that cannot
+        // be read back (10-bit) or staged keeps the padded buffer.
+        let mut shown_as = None;
+        if let Some((plan, new_stage)) =
+            staged.then(|| self.stage_cursor(&src, &dst, rot)).flatten()
+        {
+            if let Some((_, st)) = self.cursor.stage.as_ref() {
+                ahb = st.ahb;
+                restaged = new_stage;
+                src = ffi::ARect {
+                    left: 0,
+                    top: 0,
+                    right: st.width as c_int,
+                    bottom: st.height as c_int,
+                };
+                dst = ffi::ARect {
+                    left: plan.dst.0,
+                    top: plan.dst.1,
+                    right: plan.dst.2,
+                    bottom: plan.dst.3,
+                };
+                transform = plan.transform;
+                shown_as = Some(plan.rot);
+            }
+        }
+        let presentation_changed = self.cursor.shown_as != Some(shown_as);
+        self.cursor.shown_as = Some(shown_as);
+        let set_buffer = set_buffer || presentation_changed || restaged;
+        let sc = self.cursor.sc;
+        let becomes_visible = !self.cursor.visible;
+        if (becomes_visible || presentation_changed || restaged)
+            && self.cursor.stage_logged < CURSOR_STAGE_LOG_BUDGET
+        {
+            self.cursor.stage_logged += 1;
+            log_always!(
+                "{}",
+                gndrm_obf::obf!(
+                    "gndrm-daemon: asc cursor {} rot={rot} ({}) transform={transform} src=({},{})-({},{}) dst=({},{})-({},{}) plane_src={}x{} plane_dst={}x{} window={}x{} natural={}",
+                    if shown_as.is_some() { "staged" } else { "padded" },
+                    if rot_override.is_some() { "override" } else { "derived" },
+                    src.left, src.top, src.right, src.bottom,
+                    dst.left, dst.top, dst.right, dst.bottom,
+                    plane.0, plane.1, plane.2, plane.3,
+                    self.win_w, self.win_h,
+                    if natural_landscape() { "landscape" } else { "portrait" }
+                )
+            );
+        }
+        // SAFETY: one transaction, applied and deleted below; `sc` and `ahb`
+        // are live (the slot or stage owns the buffer reference;
+        // SurfaceFlinger takes its own on setBuffer).
+        unsafe {
+            let tx = (api.st_create)();
+            if tx.is_null() {
+                return;
+            }
+            (api.st_set_zorder)(tx, sc, Z_CURSOR);
+            if becomes_visible || set_buffer {
+                (api.st_set_visibility)(tx, sc, 1);
+                (api.st_set_buffer_transparency)(
+                    tx,
+                    sc,
+                    ffi::ASURFACE_TRANSACTION_TRANSPARENCY_TRANSLUCENT,
+                );
+            }
+            if set_buffer || becomes_visible {
+                (api.st_set_buffer)(tx, sc, ahb, -1);
+                (api.st_set_buffer_dataspace)(tx, sc, ffi::ADATASPACE_UNKNOWN);
+            }
+            (api.st_set_geometry)(tx, sc, &src, &dst, transform);
+            apply_transaction(&api, tx);
+        }
+        if becomes_visible {
+            self.cursor.visible = true;
+            if self.cursor.logged < CURSOR_LOG_BUDGET {
+                self.cursor.logged += 1;
+                log_always!(
+                    "{}",
+                    gndrm_obf::obf!(
+                        "gndrm-daemon: asc cursor layer shown dst=({},{})-({},{}) mode={}x{} window={}x{}",
+                        dst.left,
+                        dst.top,
+                        dst.right,
+                        dst.bottom,
+                        self.mode_w,
+                        self.mode_h,
+                        self.win_w,
+                        self.win_h
+                    )
+                );
+            }
+        } else {
+            self.cursor.moves += 1;
+        }
+    }
+
+    /// Stage the current cursor image for the plane's visible `src` (buffer
+    /// pixels) and `dst` (window pixels), pre-rotated by `rot`: the plan, and
+    /// whether a new staged buffer was made. `None` when the image cannot be
+    /// read back (10-bit) or staged; the caller then shows the padded buffer.
+    fn stage_cursor(
+        &mut self,
+        src: &ffi::ARect,
+        dst: &ffi::ARect,
+        rot: u32,
+    ) -> Option<(gndrm_daemon::cursor::StagePlan, bool)> {
+        use gndrm_daemon::cursor::{opaque_extent, stage_plan, transform_cursor};
+        let images = self.cursor.images;
+        if self.cursor.pixels.as_ref().is_none_or(|p| p.0 != images) {
+            self.cursor.pixels = self.cursor.slot.as_ref().and_then(|s| {
+                s.copy
+                    .stage_rows()
+                    .map(|(px, w, _)| (images, px, w, s.copy.format))
+            });
+        }
+        let (_, pixels, bw, format) = self.cursor.pixels.as_ref()?;
+        let (bw, format) = (*bw, *format);
+        let src_e = (src.left, src.top, src.right, src.bottom);
+        let extent = match self.cursor.extent {
+            Some((k, e)) if k == (images, src_e) => e,
+            _ => {
+                let e = opaque_extent(pixels, bw, src_e);
+                self.cursor.extent = Some(((images, src_e), e));
+                e
+            }
+        };
+        let plan = stage_plan(
+            src_e,
+            (dst.left, dst.top, dst.right, dst.bottom),
+            extent,
+            rot,
+        )?;
+        // The crop must lie inside the read-back image.
+        let rows = pixels.len() / (bw.max(1) as usize * 4);
+        if plan.crop.0 + plan.crop.2 > bw || (plan.crop.1 + plan.crop.3) as usize > rows {
+            return None;
+        }
+        let key = StageKey {
+            images,
+            rot: plan.rot,
+            crop: plan.crop,
+            out: plan.out,
+        };
+        if self.cursor.stage.as_ref().is_some_and(|(k, _)| *k == key) {
+            return Some((plan, false));
+        }
+        let (img, w, h) = transform_cursor(pixels, bw, plan.crop, plan.out, plan.rot);
+        match CursorStage::new(&img, w, h, format) {
+            Ok(st) => {
+                self.cursor.stage = Some((key, st));
+                Some((plan, true))
+            }
+            Err(reason) => {
+                self.cursor.stage = None;
+                if self.cursor.stage_logged < CURSOR_STAGE_LOG_BUDGET {
+                    self.cursor.stage_logged += 1;
+                    log_always!(
+                        "{}",
+                        gndrm_obf::obf!(
+                            "gndrm-daemon: asc cursor stage FAILED ({reason}); showing the padded buffer"
+                        )
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// Hide the cursor layer (cursor plane off). The image is kept: the
+    /// cursor usually comes back with the same one.
+    fn hide_cursor(&mut self) {
+        if !self.cursor.visible {
+            return;
+        }
+        let Some(api) = self.api else {
+            return;
+        };
+        if let Some(tx) = build_hide(&api, self.cursor.sc) {
+            // SAFETY: `tx` is live; the z-order build_hide sets is the
+            // scan-out layer's, so restore the cursor's before applying.
+            unsafe { (api.st_set_zorder)(tx, self.cursor.sc, Z_CURSOR) };
+            apply_transaction(&api, tx);
+        }
+        self.cursor.visible = false;
+        self.cursor.hides += 1;
+    }
+
+    /// The always-on failure line for a cursor image, within the budget.
+    fn note_cursor_failure(&mut self, ino: u64, layout: Layout, reason: &str) {
+        self.cursor.failures += 1;
+        self.hide_cursor();
+        if self.cursor.logged < CURSOR_LOG_BUDGET {
+            self.cursor.logged += 1;
+            log_always!(
+                "{}",
+                gndrm_obf::obf!(
+                    "gndrm-daemon: asc cursor image ino={ino} {layout} copy FAILED ({reason}); cursor hidden"
+                )
+            );
+        }
     }
 
     /// Adopt a window geometry reported by the same window without rebuilding the
@@ -1875,6 +2339,26 @@ impl Drop for AscState {
                     self.foreign_failures
                 )
             );
+        }
+        if self.cursor.images > 0 || self.cursor.failures > 0 {
+            log_always!(
+                "{}",
+                gndrm_obf::obf!(
+                    "gndrm-daemon: asc cursor summary images={} moves={} hides={} failures={}",
+                    self.cursor.images,
+                    self.cursor.moves,
+                    self.cursor.hides,
+                    self.cursor.failures
+                )
+            );
+        }
+        self.cursor.slot = None;
+        if !self.cursor.sc.is_null() {
+            if let Some(api) = self.api {
+                // SAFETY: created by this API, released once, here.
+                unsafe { (api.sc_release)(self.cursor.sc) };
+            }
+            self.cursor.sc = ptr::null_mut();
         }
         self.foreign.clear();
         if !self.sc.is_null() {
@@ -1930,6 +2414,10 @@ impl Presenter for AscPresenter {
     ) {
         self.lock()
             .publish(fb, plane, ino, src_fd, live_inos, fence);
+    }
+
+    fn publish_cursor(&mut self, cursor: &CursorUpdate, src_fd: Option<RawFd>) {
+        self.lock().publish_cursor(cursor, src_fd);
     }
 }
 
@@ -2623,11 +3111,7 @@ pub fn serve_scanout(
 /// `AHardwareBuffer` when asked. gamescope's ICD uses it to import a guest's
 /// pool buffer as an `AHardwareBuffer` on a driver that refuses the dma-buf.
 /// Nothing in the pool changes. `false` when the channel broke.
-fn serve_lookup(
-    fd: RawFd,
-    req: ScanoutAllocReq,
-    pool: &Arc<TrackedMutex<ScanoutPool>>,
-) -> bool {
+fn serve_lookup(fd: RawFd, req: ScanoutAllocReq, pool: &Arc<TrackedMutex<ScanoutPool>>) -> bool {
     let ino = req.len;
     let (found, api) = {
         let guard = pool.lock(Role::Scanout);
@@ -2662,7 +3146,11 @@ fn serve_lookup(
         "{}",
         gndrm_obf::obf!(
             "asc: scan-out lookup ino {ino}: {}",
-            if resp.ret == 0 { "found" } else { "not handed out" }
+            if resp.ret == 0 {
+                "found"
+            } else {
+                "not handed out"
+            }
         )
     );
     let mut ok = send_resp(fd, &resp.encode(), fd_out).is_ok();

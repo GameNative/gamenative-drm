@@ -68,6 +68,8 @@ pub(crate) struct ForeignCopy {
     pub(crate) ahb: *mut ffi::AHardwareBuffer,
     /// Target row pitch in bytes.
     pub(crate) stride: u32,
+    /// Target gralloc format.
+    pub(crate) format: u32,
     /// Frames copied through this target.
     pub(crate) copies: u64,
 }
@@ -144,6 +146,7 @@ impl ForeignCopy {
             map_len: len as usize,
             ahb,
             stride: real.stride.saturating_mul(4),
+            format,
             copies: 0,
         })
     }
@@ -191,6 +194,101 @@ impl ForeignCopy {
         unsafe { ffi::AHardwareBuffer_unlock(self.ahb, ptr::null_mut()) };
         self.copies += 1;
         Ok(())
+    }
+}
+
+impl ForeignCopy {
+    /// The source's current pixels in the target's channel order, tightly
+    /// packed (`(pixels, width, height)`, row pitch `width * 4`). `None` for a
+    /// 10-bit source.
+    pub(crate) fn stage_rows(&self) -> Option<(Vec<u8>, u32, u32)> {
+        if self.plan.ten_bit {
+            return None;
+        }
+        let pitch = self.plan.row_bytes;
+        let mut v = vec![0u8; self.plan.dst_len(pitch)];
+        sync(self.src_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+        // SAFETY: as in `copy`; the destination is a live Vec of `dst_len`.
+        unsafe {
+            let src = core::slice::from_raw_parts(self.map, self.map_len);
+            self.plan.copy_rows(src, &mut v, pitch);
+        }
+        sync(self.src_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+        v.resize(pitch * self.plan.height as usize, 0);
+        Some((v, self.plan.width, self.plan.height))
+    }
+}
+
+/// A small daemon-owned buffer holding a prepared (cropped, scaled, rotated)
+/// cursor image. One per prepared image: a new image gets a new buffer, so a
+/// buffer SurfaceFlinger may still show is never rewritten.
+pub(crate) struct CursorStage {
+    pub(crate) ahb: *mut ffi::AHardwareBuffer,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+// SAFETY: as for `ForeignCopy`.
+unsafe impl Send for CursorStage {}
+
+impl CursorStage {
+    /// Allocate a `width` x `height` buffer of `format` with the scan-out
+    /// usage and fill it from tightly packed `pixels`.
+    pub(crate) fn new(pixels: &[u8], width: u32, height: u32, format: u32) -> Result<Self, String> {
+        let desc = ffi::AHardwareBufferDesc {
+            width,
+            height,
+            layers: 1,
+            format,
+            usage: ffi::SCANOUT_POOL_USAGE | ffi::AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
+            ..Default::default()
+        };
+        let mut ahb: *mut ffi::AHardwareBuffer = ptr::null_mut();
+        // SAFETY: `desc` is a live stack value; `ahb` receives one reference.
+        let rc = unsafe { ffi::AHardwareBuffer_allocate(&desc, &mut ahb) };
+        if rc != 0 || ahb.is_null() {
+            return Err(gndrm_obf::obf!("AHardwareBuffer_allocate failed (rc={rc})").to_string());
+        }
+        let stage = Self { ahb, width, height };
+        let mut real = ffi::AHardwareBufferDesc::default();
+        // SAFETY: `ahb` is live.
+        unsafe { ffi::AHardwareBuffer_describe(ahb, &mut real) };
+        let dst_pitch = real.stride as usize * 4;
+        let row = width as usize * 4;
+        let mut addr: *mut c_void = ptr::null_mut();
+        // SAFETY: allocated with CPU write usage above.
+        let rc = unsafe {
+            ffi::AHardwareBuffer_lock(
+                ahb,
+                ffi::AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
+                -1,
+                ptr::null(),
+                &mut addr,
+            )
+        };
+        if rc != 0 || addr.is_null() {
+            return Err(gndrm_obf::obf!("AHardwareBuffer_lock failed (rc={rc})").to_string());
+        }
+        // SAFETY: the locked buffer covers `dst_pitch * height` bytes.
+        unsafe {
+            let dst = core::slice::from_raw_parts_mut(
+                addr.cast::<u8>(),
+                dst_pitch * (height as usize - 1) + row,
+            );
+            for y in 0..height as usize {
+                dst[y * dst_pitch..y * dst_pitch + row]
+                    .copy_from_slice(&pixels[y * row..(y + 1) * row]);
+            }
+            ffi::AHardwareBuffer_unlock(ahb, ptr::null_mut());
+        }
+        Ok(stage)
+    }
+}
+
+impl Drop for CursorStage {
+    fn drop(&mut self) {
+        // SAFETY: one reference owned by `self`; SurfaceFlinger keeps its own.
+        unsafe { ffi::AHardwareBuffer_release(self.ahb) };
     }
 }
 

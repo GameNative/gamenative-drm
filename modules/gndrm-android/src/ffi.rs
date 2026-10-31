@@ -239,6 +239,9 @@ pub const fn is_ten_bit_drm_format(fourcc: u32) -> bool {
 /// frame). The pool's `AHardwareBuffer` is `BGRA_8888` or `RGBA_8888`, whose
 /// alpha is honoured by default, so this must be asserted explicitly.
 pub const ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE: i8 = 2;
+/// `ASURFACE_TRANSACTION_TRANSPARENCY_TRANSLUCENT`: the buffer's (premultiplied)
+/// alpha is honoured. The cursor layer only.
+pub const ASURFACE_TRANSACTION_TRANSPARENCY_TRANSLUCENT: i8 = 1;
 
 pub type FnScCreateFromWindow = unsafe extern "C" fn(
     window: *mut ANativeWindow,

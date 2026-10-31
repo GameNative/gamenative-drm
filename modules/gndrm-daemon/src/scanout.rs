@@ -95,6 +95,73 @@ pub fn layer_rect(
     )
 }
 
+/// A rect as `(left, top, right, bottom)`.
+pub type Edges = (i32, i32, i32, i32);
+
+/// Where the cursor plane lands on the session's window: the source rect to
+/// sample (buffer pixels) and the destination (window pixels), as
+/// `(left, top, right, bottom)` each.
+///
+/// A KMS cursor may hang off the mode's edges (negative `CRTC_X`/`CRTC_Y`, or
+/// past the right/bottom). The part outside the mode is clipped and the source
+/// is cropped by the same fraction, so the cursor is cut at the edge rather
+/// than squashed into what is left, which [`layer_rect`] alone would do. The
+/// visible part is then fitted into the window exactly like the scan-out layer.
+///
+/// `crtc` is `(x, y, width, height)` in mode pixels; `src` is
+/// `(x, y, width, height)` in buffer pixels. `None` when nothing of the cursor
+/// is on the mode (or either rect is empty): the layer is hidden.
+#[must_use]
+pub fn cursor_rects(
+    crtc: (i32, i32, i32, i32),
+    src: (u32, u32, u32, u32),
+    mode: (u32, u32),
+    window: (u32, u32),
+) -> Option<(Edges, Edges)> {
+    let (x, y, w, h) = (
+        i64::from(crtc.0),
+        i64::from(crtc.1),
+        i64::from(crtc.2),
+        i64::from(crtc.3),
+    );
+    let (sx, sy, sw, sh) = (
+        i64::from(src.0),
+        i64::from(src.1),
+        i64::from(src.2),
+        i64::from(src.3),
+    );
+    if w <= 0 || h <= 0 || sw <= 0 || sh <= 0 {
+        return None;
+    }
+    let (mw, mh) = (i64::from(mode.0), i64::from(mode.1));
+    let (x0, x1) = (x.max(0), (x + w).min(mw));
+    let (y0, y1) = (y.max(0), (y + h).min(mh));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    // The visible slice of the destination, mapped back into the source.
+    let crop = |lo: i64, hi: i64, origin: i64, span: i64, s0: i64, slen: i64| {
+        (
+            s0 + (lo - origin) * slen / span,
+            s0 + ((hi - origin) * slen + span - 1) / span,
+        )
+    };
+    let (sl, sr) = crop(x0, x1, x, w, sx, sw);
+    let (st, sb) = crop(y0, y1, y, h, sy, sh);
+    if sr <= sl || sb <= st {
+        return None;
+    }
+    let dst = layer_rect(
+        (x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32),
+        mode,
+        window,
+    );
+    if dst.2 <= dst.0 || dst.3 <= dst.1 {
+        return None;
+    }
+    Some(((sl as i32, st as i32, sr as i32, sb as i32), dst))
+}
+
 /// Geometry a pooled buffer can serve. A free buffer only matches a request of
 /// the exact same width, height and format.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -1137,5 +1204,77 @@ mod tests {
             layer_rect((-40, -40, 1280 + 80, 720 + 80), (1280, 720), (1920, 1080)),
             (0, 0, 1920, 1080)
         );
+    }
+
+    #[test]
+    fn cursor_rects_place_an_unclipped_cursor_one_to_one() {
+        let r = cursor_rects(
+            (100, 200, 64, 64),
+            (0, 0, 64, 64),
+            (1920, 1080),
+            (1920, 1080),
+        );
+        assert_eq!(r, Some(((0, 0, 64, 64), (100, 200, 164, 264))));
+    }
+
+    #[test]
+    fn cursor_rects_crop_the_source_at_the_mode_edge() {
+        // Hanging 20 px off the left and 30 px off the bottom.
+        let r = cursor_rects(
+            (-20, 1050, 64, 64),
+            (0, 0, 64, 64),
+            (1920, 1080),
+            (1920, 1080),
+        );
+        assert_eq!(r, Some(((20, 0, 64, 30), (0, 1050, 44, 1080))));
+        // Past the right edge.
+        let r = cursor_rects(
+            (1900, 0, 64, 64),
+            (0, 0, 64, 64),
+            (1920, 1080),
+            (1920, 1080),
+        );
+        assert_eq!(r, Some(((0, 0, 20, 64), (1900, 0, 1920, 64))));
+    }
+
+    #[test]
+    fn cursor_rects_hide_a_cursor_entirely_off_the_mode() {
+        assert_eq!(
+            cursor_rects(
+                (-64, 10, 64, 64),
+                (0, 0, 64, 64),
+                (1920, 1080),
+                (1920, 1080)
+            ),
+            None
+        );
+        assert_eq!(
+            cursor_rects(
+                (1920, 10, 64, 64),
+                (0, 0, 64, 64),
+                (1920, 1080),
+                (1920, 1080)
+            ),
+            None
+        );
+        assert_eq!(
+            cursor_rects((10, 10, 0, 64), (0, 0, 64, 64), (1920, 1080), (1920, 1080)),
+            None
+        );
+    }
+
+    #[test]
+    fn cursor_rects_follow_the_scan_out_fit_into_a_larger_window() {
+        // 1280x720 mode upscaled into a 1920x1080 window: x1.5 both axes.
+        let r = cursor_rects(
+            (640, 360, 32, 32),
+            (0, 0, 32, 32),
+            (1280, 720),
+            (1920, 1080),
+        );
+        assert_eq!(r, Some(((0, 0, 32, 32), (960, 540, 1008, 588))));
+        // A scaled cursor (64 px buffer drawn at 32 px) keeps its whole source.
+        let r = cursor_rects((0, 0, 32, 32), (0, 0, 64, 64), (1920, 1080), (1920, 1080));
+        assert_eq!(r, Some(((0, 0, 64, 64), (0, 0, 32, 32))));
     }
 }

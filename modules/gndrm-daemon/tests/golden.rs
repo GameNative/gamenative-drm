@@ -2726,3 +2726,352 @@ fn connector_advertises_the_session_scanout_size() {
     let c: DrmModeCrtc = pod_read(&r.body).unwrap();
     assert_eq!((c.mode.hdisplay, c.mode.vdisplay), (1920, 1080));
 }
+
+// ---------------------------------------------------------------------------
+// cursor layer (GNDRM_CLIENT_CAP_CURSOR_LAYER)
+// ---------------------------------------------------------------------------
+
+/// Import a `width`x`height` ARGB8888 framebuffer (gamescope's cursor format).
+fn import_sized_fb(d: &mut Device, width: u32, height: u32) -> (u32, u32, RawFd) {
+    let fd = memfd(i64::from(width) * i64::from(height) * 4);
+    let r = call_fd(
+        d,
+        DRM_IOCTL_PRIME_FD_TO_HANDLE,
+        &pod(&DrmPrimeHandle::default()),
+        fd,
+    );
+    let handle = pod_read::<DrmPrimeHandle>(&r.body).unwrap().handle;
+    let r = call(
+        d,
+        DRM_IOCTL_MODE_ADDFB2,
+        &pod(&DrmModeFbCmd2 {
+            width,
+            height,
+            pixel_format: DRM_FORMAT_ARGB8888,
+            handles: [handle, 0, 0, 0],
+            pitches: [width * 4, 0, 0, 0],
+            offsets: [0; 4],
+            modifier: [0; 4],
+            ..Default::default()
+        }),
+    );
+    ok(&r);
+    let fb_id = pod_read::<DrmModeFbCmd2>(&r.body).unwrap().fb_id;
+    (handle, fb_id, fd)
+}
+
+fn set_cursor_layer_cap(d: &mut Device, value: u64) -> DispatchResult {
+    call(
+        d,
+        DRM_IOCTL_SET_CLIENT_CAP,
+        &pod(&DrmSetClientCap {
+            capability: GNDRM_CLIENT_CAP_CURSOR_LAYER,
+            value,
+        }),
+    )
+}
+
+fn get_cap(d: &mut Device, capability: u64) -> u64 {
+    let r = call(
+        d,
+        DRM_IOCTL_GET_CAP,
+        &pod(&DrmGetCap {
+            capability,
+            value: 0,
+        }),
+    );
+    ok(&r);
+    pod_read::<DrmGetCap>(&r.body).unwrap().value
+}
+
+/// Cursor-plane property sets: fb, CRTC, source and destination rects.
+fn cursor_plane_sets(
+    fb: u32,
+    x: i32,
+    y: i32,
+    src: (u64, u64),
+    crtc: (u64, u64),
+) -> Vec<(u32, u32, u64)> {
+    let prop = |name: &str| find_prop_id(PLANE_CURSOR_ID, name).unwrap();
+    vec![
+        (PLANE_CURSOR_ID, prop("FB_ID"), u64::from(fb)),
+        (
+            PLANE_CURSOR_ID,
+            prop("CRTC_ID"),
+            if fb == 0 { 0 } else { u64::from(CRTC_ID) },
+        ),
+        (PLANE_CURSOR_ID, prop("SRC_X"), 0),
+        (PLANE_CURSOR_ID, prop("SRC_Y"), 0),
+        (PLANE_CURSOR_ID, prop("SRC_W"), src.0 << 16),
+        (PLANE_CURSOR_ID, prop("SRC_H"), src.1 << 16),
+        (PLANE_CURSOR_ID, prop("CRTC_X"), x as u32 as u64),
+        (PLANE_CURSOR_ID, prop("CRTC_Y"), y as u32 as u64),
+        (PLANE_CURSOR_ID, prop("CRTC_W"), crtc.0),
+        (PLANE_CURSOR_ID, prop("CRTC_H"), crtc.1),
+    ]
+}
+
+/// The cursor-layer cap is a card-node client cap: it raises the cursor limit
+/// gamescope reads to 256, and a render node is refused.
+#[test]
+fn cursor_layer_cap_raises_the_cursor_limit() {
+    let mut d = dev();
+    assert_eq!(get_cap(&mut d, DRM_CAP_CURSOR_WIDTH), 64);
+    assert_eq!(get_cap(&mut d, DRM_CAP_CURSOR_HEIGHT), 64);
+    is_err(&set_cursor_layer_cap(&mut d, 2), errno::EINVAL);
+    ok(&set_cursor_layer_cap(&mut d, 1));
+    assert_eq!(get_cap(&mut d, DRM_CAP_CURSOR_WIDTH), 256);
+    assert_eq!(get_cap(&mut d, DRM_CAP_CURSOR_HEIGHT), 256);
+    ok(&set_cursor_layer_cap(&mut d, 0));
+    assert_eq!(get_cap(&mut d, DRM_CAP_CURSOR_WIDTH), 64);
+
+    let mut r = dev();
+    ok(&call(
+        &mut r,
+        GNDRM_IOCTL_NODE_KIND,
+        &pod(&NODE_KIND_RENDER),
+    ));
+    is_err(&set_cursor_layer_cap(&mut r, 1), errno::EINVAL);
+}
+
+/// With the cursor layer on, the cursor plane takes up to 256x256 and nothing
+/// larger: a game-sized framebuffer is refused even with a cursor-sized source
+/// crop, in TEST_ONLY and for real, so libliftoff can never park the game on
+/// it. Without the cap the 64x64 rule is unchanged.
+#[test]
+fn cursor_layer_rejects_anything_larger_than_a_cursor() {
+    let mut d = dev();
+    let blob = create_mode_blob(&mut d).0;
+    let (_h1, primary_fb, fd1) = import_fb(&mut d);
+    let (_h2, game_fb, fd2) = import_sized_fb(&mut d, 1280, 720);
+    let (_h3, cursor_fb, fd3) = import_sized_fb(&mut d, 256, 256);
+    let base = modeset_sets(&d, blob, primary_fb);
+    let with = |fb: u32, src: (u64, u64), crtc: (u64, u64)| {
+        let mut sets = base.clone();
+        sets.extend(cursor_plane_sets(fb, 10, 10, src, crtc));
+        sets
+    };
+    let both = [
+        DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_TEST_ONLY,
+        DRM_MODE_ATOMIC_ALLOW_MODESET,
+    ];
+
+    // No cap: a 256x256 cursor is over the legacy 64x64 limit.
+    for flags in both {
+        let req = atomic_req(&with(cursor_fb, (256, 256), (256, 256)), flags, 0);
+        is_err(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req), errno::EINVAL);
+    }
+
+    ok(&set_cursor_layer_cap(&mut d, 1));
+    for flags in both {
+        // The game's framebuffer, full size or cropped to a cursor-sized rect.
+        for (src, crtc) in [
+            ((1280, 720), (1280, 720)),
+            ((256, 256), (256, 256)),
+            ((64, 64), (64, 64)),
+        ] {
+            let req = atomic_req(&with(game_fb, src, crtc), flags, 0);
+            is_err(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req), errno::EINVAL);
+        }
+        // A rect one pixel over the limit.
+        let req = atomic_req(&with(cursor_fb, (256, 256), (257, 256)), flags, 0);
+        is_err(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req), errno::EINVAL);
+        let req = atomic_req(&with(cursor_fb, (256, 257), (256, 256)), flags, 0);
+        is_err(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req), errno::EINVAL);
+    }
+    // A 256x256 cursor, and a scaled one inside the limit, go through.
+    let req = atomic_req(
+        &with(cursor_fb, (256, 256), (256, 256)),
+        DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_TEST_ONLY,
+        0,
+    );
+    ok(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req));
+    let req = atomic_req(
+        &with(cursor_fb, (256, 256), (128, 128)),
+        DRM_MODE_ATOMIC_ALLOW_MODESET,
+        0,
+    );
+    ok(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req));
+
+    // SAFETY: caller's fds.
+    unsafe {
+        libc::close(fd1);
+        libc::close(fd2);
+        libc::close(fd3);
+    }
+}
+
+/// One cursor update as the presenter saw it: fb, CRTC_X, CRTC_Y, inode, and
+/// whether a source descriptor came with it.
+type CursorSeenUpdate = (Option<u32>, i32, i32, Option<u64>, bool);
+
+/// What a presenter saw: primary publishes and cursor updates.
+#[derive(Default)]
+struct CursorSeen {
+    publishes: u32,
+    cursor: Vec<CursorSeenUpdate>,
+}
+
+struct CursorSpyPresenter {
+    seen: Arc<Mutex<CursorSeen>>,
+}
+
+impl Presenter for CursorSpyPresenter {
+    fn publish(
+        &mut self,
+        _fb: &Framebuffer,
+        _plane: &PlaneState,
+        _ino: Option<u64>,
+        _live_inos: &HashSet<u64>,
+        fence: Option<RawFd>,
+    ) {
+        if let Some(fd) = fence {
+            // SAFETY: the mock owns the fence the device handed it.
+            unsafe { libc::close(fd) };
+        }
+        self.seen.lock().unwrap().publishes += 1;
+    }
+
+    fn publish_cursor(&mut self, cursor: &gndrm_daemon::CursorUpdate, src_fd: Option<RawFd>) {
+        self.seen.lock().unwrap().cursor.push((
+            cursor.fb.as_ref().map(|fb| fb.id),
+            cursor.plane.crtc_x,
+            cursor.plane.crtc_y,
+            cursor.ino,
+            src_fd.is_some(),
+        ));
+    }
+}
+
+fn cursor_spy_dev() -> (Device, Arc<Mutex<CursorSeen>>) {
+    let seen = Arc::new(Mutex::new(CursorSeen::default()));
+    let mut d = Device::new(
+        PanelDesc::default(),
+        Box::new(CursorSpyPresenter {
+            seen: Arc::clone(&seen),
+        }),
+    );
+    d.set_clock(Box::new(|| (1000, 500)));
+    (d, seen)
+}
+
+/// A cursor motion is a cursor-layer update and nothing else: the scan-out
+/// layer is not re-published (no new frame, nothing for a frame generator),
+/// an unchanged cursor is not re-sent, and FB_ID 0 hides the layer.
+#[test]
+fn cursor_motion_updates_only_the_cursor_layer() {
+    let (mut d, seen) = cursor_spy_dev();
+    ok(&set_cursor_layer_cap(&mut d, 1));
+    let blob = create_mode_blob(&mut d).0;
+    let (_h1, primary_fb, fd1) = import_fb(&mut d);
+    let (_h2, cursor_fb, fd2) = import_sized_fb(&mut d, 256, 256);
+    let flags = DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_PAGE_FLIP_EVENT;
+
+    let mut sets = modeset_sets(&d, blob, primary_fb);
+    sets.extend(cursor_plane_sets(
+        cursor_fb,
+        100,
+        200,
+        (256, 256),
+        (256, 256),
+    ));
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(&sets, flags, 1),
+    ));
+    wait_flip(&mut d, 1000);
+
+    // Cursor-only commits: the primary fb is the same, only CRTC_X/Y move.
+    for (i, x) in [110, 120, 130].into_iter().enumerate() {
+        let mut sets = modeset_sets(&d, blob, primary_fb);
+        sets.extend(cursor_plane_sets(cursor_fb, x, 205, (256, 256), (256, 256)));
+        ok(&call(
+            &mut d,
+            DRM_IOCTL_MODE_ATOMIC,
+            &atomic_req(&sets, flags, 2 + i as u64),
+        ));
+        wait_flip(&mut d, 1000);
+    }
+    // The same state again: nothing for the cursor layer.
+    let mut sets = modeset_sets(&d, blob, primary_fb);
+    sets.extend(cursor_plane_sets(
+        cursor_fb,
+        130,
+        205,
+        (256, 256),
+        (256, 256),
+    ));
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(&sets, flags, 9),
+    ));
+    wait_flip(&mut d, 1000);
+    // Cursor hidden.
+    let mut sets = modeset_sets(&d, blob, primary_fb);
+    sets.extend(cursor_plane_sets(0, 0, 0, (0, 0), (0, 0)));
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(&sets, flags, 10),
+    ));
+    wait_flip(&mut d, 1000);
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.publishes, 1,
+        "a cursor motion must not re-publish the scan-out layer"
+    );
+    let positions: Vec<_> = seen.cursor.iter().map(|c| (c.0, c.1, c.2)).collect();
+    assert_eq!(
+        positions,
+        vec![
+            (Some(cursor_fb), 100, 200),
+            (Some(cursor_fb), 110, 205),
+            (Some(cursor_fb), 120, 205),
+            (Some(cursor_fb), 130, 205),
+            (None, 0, 0),
+        ]
+    );
+    // Every shown state carries the buffer's identity and its dma-buf.
+    assert!(seen.cursor[..4].iter().all(|c| c.3.is_some() && c.4));
+    drop(seen);
+
+    // SAFETY: caller's fds.
+    unsafe {
+        libc::close(fd1);
+        libc::close(fd2);
+    }
+}
+
+/// Without the cap (an older gamescope) the cursor plane is never presented,
+/// exactly as before: commits are accepted and no cursor update is made.
+#[test]
+fn cursor_plane_without_the_cap_is_not_presented() {
+    let (mut d, seen) = cursor_spy_dev();
+    let blob = create_mode_blob(&mut d).0;
+    let (_h1, primary_fb, fd1) = import_fb(&mut d);
+    let (_h2, cursor_fb, fd2) = import_sized_fb(&mut d, 64, 64);
+    let mut sets = modeset_sets(&d, blob, primary_fb);
+    sets.extend(cursor_plane_sets(cursor_fb, 100, 200, (64, 64), (64, 64)));
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_MODE_ATOMIC,
+        &atomic_req(
+            &sets,
+            DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_PAGE_FLIP_EVENT,
+            1,
+        ),
+    ));
+    wait_flip(&mut d, 1000);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.publishes, 1);
+    assert!(seen.cursor.is_empty());
+    drop(seen);
+    // SAFETY: caller's fds.
+    unsafe {
+        libc::close(fd1);
+        libc::close(fd2);
+    }
+}

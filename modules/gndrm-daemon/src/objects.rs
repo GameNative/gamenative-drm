@@ -193,7 +193,7 @@ pub struct Blob {
 }
 
 /// Plane software state updated by commits.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlaneState {
     pub fb_id: u32,
     pub crtc_id: u32,
