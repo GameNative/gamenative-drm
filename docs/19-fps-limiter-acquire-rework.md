@@ -61,7 +61,10 @@ on acquire:
         wait until min(next_acquire_ns, timeout)  # condvar, no spin
         retry
     take a free slot
-    next_acquire_ns = max(next_acquire_ns + period, now)
+    if next_acquire_ns == 0 or now >= next_acquire_ns + period:
+        next_acquire_ns = now + period     # a whole period late: re-anchor, no debt
+    else:
+        next_acquire_ns += period          # on the grid; the wake-up's lateness is not the cadence
 ```
 
 - `next_acquire_ns` lives on `GnSwapchain`, appended at the end so no existing
@@ -74,6 +77,12 @@ on acquire:
   `release_held`, `slice_to_floor`, and the `acquire_take_free` release branch are
   removed. A release just marks the slot free and notifies `cv_free`.
 - `CAP_FPS` stays as the *target* (note or `source_cap()`), read by the gate.
+- The cap is read off the acquire census, not the release one: `cap=[fps= notes=
+  gate_holds= gate_avg_us= gate_max_us= acq_fps=]`. `notes=0` is a target that
+  never arrived; `notes>0` with `gate_holds=0` is a target that arrived and never
+  bound, so the guest or the compositor is the slower element and a low frame
+  count is not the cap's; `gate_holds>0` with `acq_fps` under the target is the
+  gate binding and the rate still short, which is a schedule fault.
 - LSFG is unaffected: generated frames are never acquired by the guest, and the
   presenter's grid still reads `source_cap()`.
 

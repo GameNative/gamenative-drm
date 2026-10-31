@@ -177,23 +177,20 @@ static PRES_IV_MAX_US: AtomicUsize = AtomicUsize::new(0);
 static PRES_IV_GE_16667: AtomicUsize = AtomicUsize::new(0); // >= 16.67 ms: a missed 60 Hz frame
 static PRES_IV_GE_33333: AtomicUsize = AtomicUsize::new(0); // >= 33.3 ms: two
 static PRES_IV_LAST_NS: AtomicU64 = AtomicU64::new(0);
-// Release-floor census, in microseconds, the same shape as the acquire dwell
-// and the present interval above and reported on the same lines. A release is
-// held when it arrives sooner than one target period after this shim's own
-// previous release, so `REL_HOLD_N` counts the releases the floor actually
-// delayed, `REL_HOLD_SUM_US` is the total time they were held — the pacing the
-// cap added — and the threshold bucket separates a floor that bit hard from the
-// sub-millisecond residue of one that had almost elapsed. Read against
-// `REL_CAPPED_N` (releases seen while a target was set) and `cap=[fps=…
-// notes=…]`, which is what tells "the target never arrived" (notes=0) from "a
-// target arrived and the floor never bound" (notes>0, capped_rel>0, held=0).
-static REL_HOLD_N: AtomicUsize = AtomicUsize::new(0);
-static REL_HOLD_SUM_US: AtomicUsize = AtomicUsize::new(0);
-static REL_HOLD_MAX_US: AtomicUsize = AtomicUsize::new(0);
-static REL_HOLD_GE_8333: AtomicUsize = AtomicUsize::new(0); // >= 8.33 ms: one 120 Hz frame
-/// Releases seen while a target was set, held or not: the denominator the
-/// `held=` count is read against.
-static REL_CAPPED_N: AtomicUsize = AtomicUsize::new(0);
+// Acquire-gate census, in microseconds, the same shape as the dwell and the
+// present interval above and reported on the same lines. The cap is applied in
+// `gn_acquire_common`, so its proof lives there and not on the release: a
+// release carries no pacing, and a census read on that side reports zeroes for a
+// cap that is working. `GATE_HOLD_N` counts the acquires the deadline actually
+// delayed, `GATE_HOLD_SUM_US` the total time they were parked, and the max the
+// worst single park. Read against `cap=[fps=… notes=… acq_fps=…]`: `notes=0` is
+// a target that never arrived; `notes>0` with `gate_holds=0` is a target that
+// arrived and never bound, so the guest or the compositor is the slower element;
+// `gate_holds>0` with `acq_fps` short of the target is the gate binding and the
+// rate still below it, which is a schedule fault rather than a missing target.
+static GATE_HOLD_N: AtomicUsize = AtomicUsize::new(0);
+static GATE_HOLD_SUM_US: AtomicUsize = AtomicUsize::new(0);
+static GATE_HOLD_MAX_US: AtomicUsize = AtomicUsize::new(0);
 
 /// Record the interval since the previous present. Called once per present at
 /// entry; the first present only seeds the stamp, so the delta count is
@@ -309,13 +306,26 @@ fn rate_ok(slot: &'static Mutex<Option<Instant>>, every: Duration) -> bool {
     true
 }
 
-/// The mean hold per delayed release, or 0 while none has been delayed — the
-/// aggregate `held_us=` divided by `held=`.
-fn held_avg_us() -> usize {
-    REL_HOLD_SUM_US
+/// The mean park per delayed acquire, or 0 while none has been delayed — the
+/// aggregate `gate_us=` divided by `gate_holds=`.
+fn gate_hold_avg_us() -> usize {
+    GATE_HOLD_SUM_US
         .load(Ordering::Relaxed)
-        .checked_div(REL_HOLD_N.load(Ordering::Relaxed))
+        .checked_div(GATE_HOLD_N.load(Ordering::Relaxed))
         .unwrap_or(0)
+}
+
+/// The rate the acquire intervals imply, in frames per second, over the whole
+/// window the census counts. This is the only number that can be checked against
+/// a target without a stopwatch: it is measured at the instant the cap acts, so a
+/// display-side frame count reading low cannot be mistaken for the cap's rate.
+fn acq_fps() -> f64 {
+    let n = ACQ_US_N.load(Ordering::Relaxed);
+    let sum = ACQ_US_SUM.load(Ordering::Relaxed);
+    if n == 0 || sum == 0 {
+        return 0.0;
+    }
+    1_000_000.0 * n as f64 / sum as f64
 }
 
 /// "0:-F 1:A- …": A = held by the app, F = committed and awaiting release.
@@ -339,7 +349,7 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
     format!(
         "{}",
         gndrm_obf::obf!(
-            "acq={} pres={} rel={} commit={} starved={} in_flight={in_flight} slots=[{}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} capped_rel={} held={} held_us={} held_avg_us={} held_max_us={} held_ge8333={}]",
+            "acq={} pres={} rel={} commit={} starved={} in_flight={in_flight} slots=[{}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} acq_fps={:.2}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
@@ -360,12 +370,11 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
                 PRES_IV_GE_33333.load(Ordering::Relaxed),
                 crate::scanout::target_fps(),
                 crate::scanout::notes_seen(),
-                REL_CAPPED_N.load(Ordering::Relaxed),
-                REL_HOLD_N.load(Ordering::Relaxed),
-                REL_HOLD_SUM_US.load(Ordering::Relaxed),
-                held_avg_us(),
-                REL_HOLD_MAX_US.load(Ordering::Relaxed),
-                REL_HOLD_GE_8333.load(Ordering::Relaxed),
+                GATE_HOLD_N.load(Ordering::Relaxed),
+                GATE_HOLD_SUM_US.load(Ordering::Relaxed),
+                gate_hold_avg_us(),
+                GATE_HOLD_MAX_US.load(Ordering::Relaxed),
+                acq_fps(),
         )
     )
 }
@@ -375,7 +384,7 @@ fn counters() -> String {
     format!(
         "{}",
         gndrm_obf::obf!(
-            "acq={} pres={} rel={} commit={} starved={} acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} capped_rel={} held={} held_us={} held_avg_us={} held_max_us={} held_ge8333={}]",
+            "acq={} pres={} rel={} commit={} starved={} acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} acq_fps={:.2}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
@@ -395,12 +404,11 @@ fn counters() -> String {
                 PRES_IV_GE_33333.load(Ordering::Relaxed),
                 crate::scanout::target_fps(),
                 crate::scanout::notes_seen(),
-                REL_CAPPED_N.load(Ordering::Relaxed),
-                REL_HOLD_N.load(Ordering::Relaxed),
-                REL_HOLD_SUM_US.load(Ordering::Relaxed),
-                held_avg_us(),
-                REL_HOLD_MAX_US.load(Ordering::Relaxed),
-                REL_HOLD_GE_8333.load(Ordering::Relaxed),
+                GATE_HOLD_N.load(Ordering::Relaxed),
+                GATE_HOLD_SUM_US.load(Ordering::Relaxed),
+                gate_hold_avg_us(),
+                GATE_HOLD_MAX_US.load(Ordering::Relaxed),
+                acq_fps(),
         )
     )
 }
@@ -2246,6 +2254,10 @@ unsafe fn gn_acquire_common(
     let period = crate::scanout::period_ns(crate::scanout::target_fps());
     let mut idx: i32 = -1;
     let mut timed_out = false;
+    // First instant this acquire was parked by the deadline, 0 while it never
+    // was: the census reads one park per acquire, not one per wait, because a
+    // wake-up that finds the deadline still ahead parks again.
+    let mut hold_from: u64 = 0;
     {
         let mut g = (*sc).shared.lock().unwrap();
         loop {
@@ -2255,6 +2267,9 @@ unsafe fn gn_acquire_common(
                 if next_ns != 0 && now_ns < next_ns {
                     if timeout == 0 {
                         break;
+                    }
+                    if hold_from == 0 {
+                        hold_from = now_ns;
                     }
                     let mut wait = Duration::from_nanos(next_ns - now_ns);
                     if let Some(dl) = deadline {
@@ -2325,6 +2340,12 @@ unsafe fn gn_acquire_common(
             return VK_ERROR_OUT_OF_DATE_KHR;
         }
         drop(g);
+    }
+    if idx >= 0 && hold_from != 0 {
+        let held_us = monotonic_ns().saturating_sub(hold_from) as usize / 1_000;
+        GATE_HOLD_N.fetch_add(1, Ordering::Relaxed);
+        GATE_HOLD_SUM_US.fetch_add(held_us, Ordering::Relaxed);
+        GATE_HOLD_MAX_US.fetch_max(held_us, Ordering::Relaxed);
     }
     let _ = timed_out;
     if idx < 0 {

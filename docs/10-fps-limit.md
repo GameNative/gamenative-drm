@@ -119,4 +119,7 @@ Open points:
   and `active_display_info` therefore carry the panel's rate, never the grid.
 - **Engagement feedback**: `gamescope_limiter.state` covers the gamescope route;
   the shim logs `scanout frame cap: fps=… effective=…` (`scanout.rs:148-158`),
-  `effective` being the target in force once the note is adopted.
+  `effective` being the target in force once the note is adopted, and reports what
+  the cap delivered in its own census (`cap=[fps= notes= gate_holds= acq_fps=]`,
+  `GNDRM_LOG_VKSHIM=1`): `acq_fps` is the rate at the instant the cap acts, so it
+  — not the app's display-side frame count — is what a target is checked against.
