@@ -74,7 +74,7 @@ use gndrm_uapi::wire::{
 };
 
 use crate::ffi;
-use crate::foreign::{ForeignCopy, Layout};
+use crate::foreign::{transform_cursor, CursorStage, ForeignCopy, Layout};
 use crate::{log_always, log_info, log_warn};
 
 /// Budget for the previous release fence (a 30 Hz frame). A fence that never
@@ -160,6 +160,60 @@ const SC_CURSOR_DEBUG_NAME: &core::ffi::CStr = c"gndrm-cursor";
 const Z_CURSOR: i32 = 1;
 /// Always-on cursor-image lines printed per session.
 const CURSOR_LOG_BUDGET: u32 = 8;
+/// Always-on cursor-mode lines printed per session (see [`cursor_mode`]).
+const CURSOR_MODE_LOG_BUDGET: u32 = 64;
+/// The buffer transform the scan-out layer is published with.
+const SCANOUT_TRANSFORM: i32 = 0;
+
+/// A small integer system property, or `default` when unset or unparsable.
+fn int_property(name: &core::ffi::CStr, default: u32) -> u32 {
+    let mut value = [0u8; 92];
+    // SAFETY: `name` is NUL-terminated and `value` is PROP_VALUE_MAX bytes.
+    let n = unsafe {
+        libc::__system_property_get(name.as_ptr(), value.as_mut_ptr().cast::<libc::c_char>())
+    };
+    let n = usize::try_from(n).unwrap_or(0).min(value.len());
+    core::str::from_utf8(&value[..n])
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// How the cursor layer is presented (`debug.gndrm.cursor_mode`, read on every
+/// cursor show/move/image so it can be switched live):
+/// 0 = the padded cursor buffer, scaled by SurfaceFlinger, transform 0;
+/// 1 = 0 with the scan-out layer's buffer transform; 2 = unscaled;
+/// 3 = 1+2; 4 = a tight copy of the cursor's opaque extent, scaled by
+/// SurfaceFlinger; 5 = 4 with the scan-out allocation (the same as 4: the
+/// copy target already uses it); 6 = tight, pre-rotated into panel
+/// orientation (`debug.gndrm.cursor_rot` degrees clockwise, default 90) with
+/// the inverse buffer transform, unscaled; 7 = 6 pre-scaled to the output
+/// scale, so the panel sees an unrotated, unscaled layer of the right size.
+fn cursor_mode() -> (u32, u32) {
+    let mode = int_property(c"debug.gndrm.cursor_mode", 0);
+    let rot = int_property(c"debug.gndrm.cursor_rot", 90) % 360 / 90 * 90;
+    (if mode > 7 { 0 } else { mode }, rot)
+}
+
+/// The buffer transform that undoes a clockwise pre-rotation of `rot` degrees.
+fn inverse_rotation_transform(rot: u32) -> i32 {
+    match rot {
+        90 => 7,  // ROTATE_270
+        180 => 3, // ROTATE_180
+        270 => 4, // ROTATE_90
+        _ => 0,
+    }
+}
+
+/// What a prepared cursor image was built from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StageKey {
+    images: u64,
+    mode: u32,
+    rot: u32,
+    crop: (u32, u32, u32, u32),
+    out: (u32, u32),
+}
 
 /// One scan-out buffer the daemon allocated, on its way to the client.
 pub struct ScanoutBuffer {
@@ -834,6 +888,15 @@ struct CursorLayer {
     hides: u64,
     failures: u64,
     logged: u32,
+    /// The prepared image for modes 4..=7, and what it was built from.
+    stage: Option<(StageKey, CursorStage)>,
+    /// The current image's pixels (`images`, pixels, width, format) and its
+    /// opaque extent for the last source rect, so a motion costs no read.
+    pixels: Option<(u64, Vec<u8>, u32, u32)>,
+    extent: Option<((u64, u32, u32, u32, u32), (u32, u32))>,
+    /// The mode the layer was last shown with.
+    mode: u32,
+    mode_logged: u32,
 }
 
 impl CursorLayer {
@@ -843,6 +906,11 @@ impl CursorLayer {
             slot: None,
             last: None,
             visible: false,
+            stage: None,
+            pixels: None,
+            extent: None,
+            mode: 0,
+            mode_logged: 0,
             images: 0,
             moves: 0,
             hides: 0,
@@ -1286,10 +1354,9 @@ impl AscState {
                 // was marked against the buffer before the commit that named it.
                 // SAFETY: `ctx` is the leaked mailbox of this registered buffer.
                 unsafe {
-                    (*ctx).present_id.store(
-                        take_present_mark(published_ino),
-                        Ordering::Release,
-                    )
+                    (*ctx)
+                        .present_id
+                        .store(take_present_mark(published_ino), Ordering::Release)
                 };
                 // Attach a looper to *this* thread the first time we publish.
                 // `ALooper_pollOnce` must run on the thread the looper was
@@ -2007,11 +2074,146 @@ impl AscState {
             right: dst.2,
             bottom: dst.3,
         };
+        let (mode, rot) = cursor_mode();
+        let mode_changed = mode != self.cursor.mode;
+        let mut transform = 0;
+        let mut ahb = ahb;
+        let (mut src, mut dst) = (src, dst);
+        let mut restaged = false;
+        let (sw, sh) = (src.right - src.left, src.bottom - src.top);
+        let (dw, dh) = (dst.right - dst.left, dst.bottom - dst.top);
+        match mode {
+            1 => transform = SCANOUT_TRANSFORM,
+            2 | 3 => {
+                transform = SCANOUT_TRANSFORM;
+                dst.right = dst.left + sw;
+                dst.bottom = dst.top + sh;
+            }
+            4..=7 => {
+                // The opaque extent from the source rect's origin, so the
+                // top-left (and with it the hotspot offset) stays in place.
+                let images = self.cursor.images;
+                if self.cursor.pixels.as_ref().is_none_or(|p| p.0 != images) {
+                    let staged = self.cursor.slot.as_ref().and_then(|s| {
+                        s.copy
+                            .stage_rows()
+                            .map(|(px, w, _)| (images, px, w, s.copy.format))
+                    });
+                    self.cursor.pixels = staged;
+                }
+                let Some((_, pixels, bw, format)) = self.cursor.pixels.as_ref() else {
+                    return;
+                };
+                let (bw, format) = (*bw, *format);
+                let (l, t, r, b) = (
+                    src.left as u32,
+                    src.top as u32,
+                    src.right as u32,
+                    src.bottom as u32,
+                );
+                let ekey = (images, l, t, r, b);
+                let (ex, ey) = match self.cursor.extent {
+                    Some((k, e)) if k == ekey => e,
+                    _ => {
+                        let (mut ex, mut ey) = (0u32, 0u32);
+                        for y in t..b {
+                            for x in l..r {
+                                if pixels[((y * bw + x) * 4 + 3) as usize] != 0 {
+                                    ex = ex.max(x - l + 1);
+                                    ey = ey.max(y - t + 1);
+                                }
+                            }
+                        }
+                        self.cursor.extent = Some((ekey, (ex, ey)));
+                        (ex, ey)
+                    }
+                };
+                let cw = ex.max(1).div_ceil(4).saturating_mul(4).min(r - l);
+                let ch = ey.max(1).div_ceil(4).saturating_mul(4).min(b - t);
+                let sx = dw as f32 / sw as f32;
+                let sy = dh as f32 / sh as f32;
+                let scaled = (
+                    (cw as f32 * sx).round() as u32,
+                    (ch as f32 * sy).round() as u32,
+                );
+                let (out, prerot) = match mode {
+                    4 | 5 => ((cw, ch), 0),
+                    6 => ((cw, ch), rot),
+                    _ => (scaled, rot),
+                };
+                let key = StageKey {
+                    images,
+                    mode,
+                    rot: prerot,
+                    crop: (l, t, cw, ch),
+                    out,
+                };
+                if self.cursor.stage.as_ref().is_none_or(|(k, _)| *k != key) {
+                    let Some((_, pixels, _, _)) = self.cursor.pixels.as_ref() else {
+                        return;
+                    };
+                    let (img, iw, ih) = transform_cursor(pixels, bw, (l, t, cw, ch), out, prerot);
+                    match CursorStage::new(&img, iw, ih, format) {
+                        Ok(st) => {
+                            self.cursor.stage = Some((key, st));
+                            restaged = true;
+                        }
+                        Err(reason) => {
+                            log_always!(
+                                "{}",
+                                gndrm_obf::obf!(
+                                    "gndrm-daemon: asc cursor mode={mode} stage FAILED ({reason})"
+                                )
+                            );
+                            return;
+                        }
+                    }
+                }
+                let Some((_, st)) = self.cursor.stage.as_ref() else {
+                    return;
+                };
+                ahb = st.ahb;
+                src = ffi::ARect {
+                    left: 0,
+                    top: 0,
+                    right: st.width as c_int,
+                    bottom: st.height as c_int,
+                };
+                let (fw, fh) = match mode {
+                    4 | 5 => scaled,
+                    _ => out,
+                };
+                dst.right = dst.left + fw as c_int;
+                dst.bottom = dst.top + fh as c_int;
+                transform = if mode >= 6 {
+                    inverse_rotation_transform(prerot)
+                } else {
+                    SCANOUT_TRANSFORM
+                };
+            }
+            _ => {}
+        }
+        let set_buffer = set_buffer || mode_changed || restaged;
+        self.cursor.mode = mode;
         let sc = self.cursor.sc;
         let becomes_visible = !self.cursor.visible;
+        if (becomes_visible || mode_changed || restaged)
+            && self.cursor.mode_logged < CURSOR_MODE_LOG_BUDGET
+        {
+            self.cursor.mode_logged += 1;
+            log_always!(
+                "{}",
+                gndrm_obf::obf!(
+                    "gndrm-daemon: asc cursor mode={mode} rot={rot} transform={transform} src=({},{})-({},{}) dst=({},{})-({},{}) plane_src={}x{} plane_dst={}x{}",
+                    src.left, src.top, src.right, src.bottom,
+                    dst.left, dst.top, dst.right, dst.bottom,
+                    sw, sh, dw, dh
+                )
+            );
+        }
         // SAFETY: one transaction, applied and deleted below; `sc` and `ahb`
-        // are live (the slot owns the buffer reference; SurfaceFlinger takes
-        // its own on setBuffer).
+        // are live (the slot or stage owns the buffer reference;
+        // SurfaceFlinger takes its own on setBuffer).
         unsafe {
             let tx = (api.st_create)();
             if tx.is_null() {
@@ -2030,7 +2232,7 @@ impl AscState {
                 (api.st_set_buffer)(tx, sc, ahb, -1);
                 (api.st_set_buffer_dataspace)(tx, sc, ffi::ADATASPACE_UNKNOWN);
             }
-            (api.st_set_geometry)(tx, sc, &src, &dst, 0);
+            (api.st_set_geometry)(tx, sc, &src, &dst, transform);
             apply_transaction(&api, tx);
         }
         if becomes_visible {
@@ -2909,11 +3111,7 @@ pub fn serve_scanout(
 /// `AHardwareBuffer` when asked. gamescope's ICD uses it to import a guest's
 /// pool buffer as an `AHardwareBuffer` on a driver that refuses the dma-buf.
 /// Nothing in the pool changes. `false` when the channel broke.
-fn serve_lookup(
-    fd: RawFd,
-    req: ScanoutAllocReq,
-    pool: &Arc<TrackedMutex<ScanoutPool>>,
-) -> bool {
+fn serve_lookup(fd: RawFd, req: ScanoutAllocReq, pool: &Arc<TrackedMutex<ScanoutPool>>) -> bool {
     let ino = req.len;
     let (found, api) = {
         let guard = pool.lock(Role::Scanout);
@@ -2948,7 +3146,11 @@ fn serve_lookup(
         "{}",
         gndrm_obf::obf!(
             "asc: scan-out lookup ino {ino}: {}",
-            if resp.ret == 0 { "found" } else { "not handed out" }
+            if resp.ret == 0 {
+                "found"
+            } else {
+                "not handed out"
+            }
         )
     );
     let mut ok = send_resp(fd, &resp.encode(), fd_out).is_ok();
