@@ -113,13 +113,17 @@ impl Tracker {
     /// Fold in one completion: the latch point `SurfaceFlinger` took the frame
     /// at and the instant the daemon's apply of it returned (0 when unknown).
     /// `pacing` says whether a shim is placing frames by the note, which is
-    /// when the lead can be measured. Returns the note to push when it moved.
+    /// when the lead can be measured. `fixed_lead` replaces the measured lead
+    /// outright (a latch-grid compositor is connected: the daemon's own apply
+    /// margins then follow that compositor's wake, not the shim's lead, so the
+    /// loop would walk to a clamp). Returns the note to push when it moved.
     fn track(
         &mut self,
         latch_ns: u64,
         applied_ns: u64,
         period: u64,
         pacing: bool,
+        fixed_lead: Option<u64>,
     ) -> Option<VsyncNote> {
         if self.anchor_ns == 0 {
             self.anchor_ns = latch_ns;
@@ -151,7 +155,9 @@ impl Tracker {
         // error is taken modulo the period: a frame that missed its point by a
         // hair shows as almost a whole period early, and the wrap reads it as
         // late, which is what it was.
-        if pacing && applied_ns != 0 && latch_ns > applied_ns {
+        if let Some(lead) = fixed_lead {
+            self.lead_ns = lead;
+        } else if pacing && applied_ns != 0 && latch_ns > applied_ns {
             let margin = latch_ns - applied_ns;
             if margin < 4 * period {
                 let target = period / 2;
@@ -220,11 +226,20 @@ pub(crate) fn sample(latch_ns: u64, applied_ns: u64) {
     if period == 0 || latch_ns == 0 {
         return;
     }
-    let pacing = crate::lsfg_pacing() && SUBSCRIBED.load(Ordering::Relaxed);
+    // While a latch-grid compositor (gamescope with `GNLG`) is connected the
+    // daemon's publishes are that compositor's, a fixed distance ahead of the
+    // latch whatever the shim does, so the lead loop is frozen and the shim is
+    // told to commit mid-way between two of the compositor's wakes.
+    let grid_client = gndrm_daemon::latch::client_connected();
+    let fixed_lead = grid_client
+        .then(|| gndrm_daemon::latch::presenter_lead_ns(period, gndrm_daemon::latch::lead_ns()));
+    let pacing = !grid_client && crate::lsfg_pacing() && SUBSCRIBED.load(Ordering::Relaxed);
     let note = {
         let mut t = TRACKER.lock().unwrap_or_else(|e| e.into_inner());
         let first = t.pushed.is_none();
-        let note = t.track(latch_ns, applied_ns, period, pacing);
+        let note = t.track(latch_ns, applied_ns, period, pacing, fixed_lead);
+        // The flip-event timeline stamps a latch-grid client's flips on this.
+        gndrm_daemon::latch::set(t.anchor_ns, period);
         if first && note.is_some() {
             log_info!(
                 "{}",
@@ -287,7 +302,7 @@ mod tests {
     fn the_first_sample_anchors_the_grid_and_is_pushed() {
         let mut t = fresh();
         let note = t
-            .track(1_000_000_000, 0, P, false)
+            .track(1_000_000_000, 0, P, false, None)
             .expect("first sample pushes");
         assert_eq!(note.anchor_ns, 1_000_000_000);
         assert_eq!(u64::from(note.period_ns), P);
@@ -297,12 +312,12 @@ mod tests {
     #[test]
     fn samples_on_the_grid_do_not_push_again() {
         let mut t = fresh();
-        t.track(1_000_000_000, 0, P, false);
+        t.track(1_000_000_000, 0, P, false, None);
         for k in 1..200 {
             // Jitter of +-100 us, as `SurfaceFlinger`'s latch wakeups have.
             let jitter = if k % 2 == 0 { 100_000 } else { -100_000 };
             let latch = (1_000_000_000 + k * P) as i64 + jitter;
-            assert_eq!(t.track(latch as u64, 0, P, false), None, "sample {k}");
+            assert_eq!(t.track(latch as u64, 0, P, false, None), None, "sample {k}");
         }
         // The anchor stayed within the jitter of the grid.
         assert!(wrap(t.anchor_ns as i64 - 1_000_000_000, P as i64).unsigned_abs() < 150_000);
@@ -311,12 +326,12 @@ mod tests {
     #[test]
     fn a_moved_latch_phase_is_adopted_after_a_run_of_samples() {
         let mut t = fresh();
-        t.track(1_000_000_000, 0, P, false);
+        t.track(1_000_000_000, 0, P, false, None);
         // `SurfaceFlinger` moves its latch 3 ms later from now on.
         let shift = 3_000_000;
         let mut pushed = None;
         for k in 1..=REPHASE_AFTER as u64 + 1 {
-            if let Some(n) = t.track(1_000_000_000 + k * P + shift, 0, P, false) {
+            if let Some(n) = t.track(1_000_000_000 + k * P + shift, 0, P, false, None) {
                 pushed = Some(n);
             }
         }
@@ -333,9 +348,12 @@ mod tests {
     #[test]
     fn a_single_late_sample_is_ignored() {
         let mut t = fresh();
-        t.track(1_000_000_000, 0, P, false);
-        assert_eq!(t.track(1_000_000_000 + P + 3_000_000, 0, P, false), None);
-        assert_eq!(t.track(1_000_000_000 + 2 * P, 0, P, false), None);
+        t.track(1_000_000_000, 0, P, false, None);
+        assert_eq!(
+            t.track(1_000_000_000 + P + 3_000_000, 0, P, false, None),
+            None
+        );
+        assert_eq!(t.track(1_000_000_000 + 2 * P, 0, P, false, None), None);
         assert_eq!(wrap(t.anchor_ns as i64 - 1_000_000_000, P as i64), 0);
     }
 
@@ -344,13 +362,13 @@ mod tests {
     /// `pipeline` later, and is taken at the first latch point after that.
     fn settle(pipeline: u64) -> u64 {
         let mut t = fresh();
-        t.track(1_000_000_000, 0, P, true);
+        t.track(1_000_000_000, 0, P, true, None);
         for k in 1..400u64 {
             let target = 1_000_000_000 + k * P;
             let applied = target - t.lead_ns + pipeline;
             // The latch that actually takes it.
             let latch = if applied < target { target } else { target + P };
-            t.track(latch, applied, P, true);
+            t.track(latch, applied, P, true, None);
         }
         t.lead_ns
     }
@@ -373,7 +391,7 @@ mod tests {
     #[test]
     fn the_lead_is_not_touched_while_nothing_paces_on_it() {
         let mut t = fresh();
-        t.track(1_000_000_000, 0, P, false);
+        t.track(1_000_000_000, 0, P, false, None);
         let lead = t.lead_ns;
         for k in 1..50u64 {
             t.track(
@@ -381,16 +399,57 @@ mod tests {
                 1_000_000_000 + k * P - 100_000,
                 P,
                 false,
+                None,
             );
         }
         assert_eq!(t.lead_ns, lead);
+    }
+
+    /// gamescope with the latch-grid cap: `P/2 + 2 ms + 3 ms` at 120 Hz.
+    const FIXED: u64 = 9_166_666;
+
+    #[test]
+    fn a_fixed_lead_is_pushed_from_the_first_sample() {
+        let mut t = fresh();
+        let note = t
+            .track(1_000_000_000, 0, P, true, Some(FIXED))
+            .expect("first sample pushes");
+        assert_eq!(u64::from(note.lead_ns), FIXED);
+    }
+
+    #[test]
+    fn a_fixed_lead_freezes_the_loop_even_while_pacing() {
+        let mut t = fresh();
+        t.track(1_000_000_000, 0, P, true, Some(FIXED));
+        // Margins that would walk the measured lead hard (100 us early).
+        for k in 1..200u64 {
+            let latch = 1_000_000_000 + k * P;
+            t.track(latch, latch - 100_000, P, true, Some(FIXED));
+            assert_eq!(t.lead_ns, FIXED, "sample {k}");
+        }
+    }
+
+    #[test]
+    fn switching_to_a_fixed_lead_pushes_it_and_back_resumes_the_loop() {
+        let mut t = fresh();
+        t.track(1_000_000_000, 0, P, true, None);
+        let measured = t.lead_ns;
+        assert_ne!(measured, FIXED);
+        let note = t
+            .track(1_000_000_000 + P, 0, P, true, Some(FIXED))
+            .expect("the fixed lead is a push");
+        assert_eq!(u64::from(note.lead_ns), FIXED);
+        // The client left: the loop measures again from where it was held.
+        let latch = 1_000_000_000 + 2 * P;
+        t.track(latch, latch - 100_000, P, true, None);
+        assert_ne!(t.lead_ns, FIXED);
     }
 
     #[test]
     fn note_is_none_until_a_latch_was_seen() {
         let mut t = fresh();
         assert_eq!(t.note(P), None);
-        t.track(1_000_000_000, 0, P, false);
+        t.track(1_000_000_000, 0, P, false, None);
         assert!(t.note(P).is_some());
         assert_eq!(t.note(0), None);
     }

@@ -568,6 +568,7 @@ impl Device {
             live_inos,
             fence: fence_fd,
             event,
+            latch_grid: self.cap_latch_grid,
         });
     }
 

@@ -187,9 +187,11 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetLsfgCo
 /// [`Java_app_gamenative_display_GameNativeDrm_nativeSetPanelRefreshHz`] before
 /// the session starts; 0 until then.
 ///
-/// It is a session-level input, not per-frame: the emulated mode is built once
+/// It is a session-level input for the mode: the emulated mode is built once
 /// when `nativeStart` assembles the [`PanelDesc`], and gamescope learns it then.
-/// A value set after `nativeStart` does not reach the running session. It is
+/// A value set after `nativeStart` does not change that session's mode; it does
+/// reach the vsync period, the presenter's pacing, and gamescope's tick (as the
+/// `gn_panel_refresh` ConVar, see [`set_panel_refresh_hz`]). It is
 /// process-lifetime (not reset per session) so an app that supplies it once
 /// still gets it for every later session.
 static PANEL_REFRESH_MHZ: AtomicU32 = AtomicU32::new(0);
@@ -1330,10 +1332,11 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeInjectorS
 /// `GameNativeDrm.nativeSetPanelRefreshHz(refreshHz)` — tell the daemon the
 /// panel's real refresh rate in whole hertz, before `nativeStart`. It becomes
 /// the emulated mode's `clock`/`vrefresh`, i.e. the rate gamescope recomputes
-/// into `g_nOutputRefresh` and advertises to clients; the session's vblank grid
-/// stays the daemon's own constant. A value outside `1..=1000` Hz is rejected
-/// with a log and leaves the previous setting in place. Safe to call with no
-/// session running; a value set after `nativeStart` does not reach that session.
+/// into `g_nOutputRefresh` and advertises to clients. A value outside
+/// `1..=1000` Hz is rejected with a log and leaves the previous setting in
+/// place. Safe to call with no session running; a value set after `nativeStart`
+/// does not change that session's mode, but is forwarded to a running gamescope
+/// as `gn_panel_refresh <Hz>` and becomes the latch grid's period.
 #[no_mangle]
 pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetPanelRefreshHz(
     _env: JNIEnv,
@@ -1418,6 +1421,13 @@ fn set_panel_refresh_hz(refresh_hz: jint) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .refresh_mhz = refresh_hz as u32 * 1000;
+    // The flip-event latch grid walks at this period until a latch is seen, and
+    // a running gamescope ticks at its launch `-r` until told otherwise: the
+    // emulated mode is fixed at `nativeStart`, so this is the only route a
+    // mid-session panel change has to the compositor. With no injector up (no
+    // session yet) the command is dropped, and the launch value is the `-r`.
+    gndrm_daemon::latch::set_period(1_000_000_000_000 / (u64::from(refresh_hz as u32) * 1000));
+    let _ = injector::gamescope_command(&format!("gn_panel_refresh {refresh_hz}"));
 }
 
 /// `GameNativeDrm.nativeReshadeSetEffect(name)` — load and enable a ReShade

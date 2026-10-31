@@ -58,7 +58,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::RawFd;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -200,6 +200,12 @@ struct ReleaseCtx {
     /// when the app did not chain one. Written by the publish path, consumed by
     /// the completion callback, which reports it with the latch time.
     present_id: AtomicU64,
+    /// The latch point a latch-grid client's flip for the frame in this
+    /// registration was stamped for (see `gndrm_daemon::latch`), 0 when none.
+    claimed_ns: AtomicU64,
+    /// The `applied_ns` of the publish `claimed_ns` belongs to, so a claim that
+    /// lands after its own completion is never scored against the next frame's.
+    claimed_for_applied_ns: AtomicU64,
     /// Set by the completion callback: SurfaceFlinger reported the flip event
     /// for this registration, so the buffer is safe to hand back out (the
     /// reuse cache keys on it). Never cleared: the flag belongs to this
@@ -290,6 +296,117 @@ fn note_present_done(id: u64, latch_ns: u64) {
     }
 }
 
+// ---------------------------------------------------------- latch-grid misses
+//
+// A latch-grid client (gamescope with `GNLG`) has each flip stamped for the
+// latch its publish targets (`gndrm_daemon::latch`). The commit worker reports
+// that latch point right after the publish returns, on the same thread, so the
+// registration the publish went out on is the one to hold it until the
+// completion says which latch `SurfaceFlinger` really used.
+
+/// The registration the commit worker's current publish went out on; null
+/// between publishes and once its claim was taken.
+static LAST_PUBLISHED: AtomicPtr<ReleaseCtx> = AtomicPtr::new(ptr::null_mut());
+
+/// `gndrm_daemon::latch` claim sink: attach the claimed latch point to the
+/// registration just published.
+fn note_claim(latch_ns: u64) {
+    let ctx = LAST_PUBLISHED.swap(ptr::null_mut(), Ordering::AcqRel);
+    if ctx.is_null() {
+        return;
+    }
+    // SAFETY: registrations are leaked mailboxes (see `ReleaseCtx`), valid for
+    // the process.
+    let ctx = unsafe { &*ctx };
+    ctx.claimed_for_applied_ns
+        .store(ctx.applied_ns.load(Ordering::Relaxed), Ordering::Release);
+    ctx.claimed_ns.store(latch_ns, Ordering::Release);
+}
+
+/// The running latch-miss count and its periodic summary.
+mod latch_misses {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use gndrm_daemon::latch::{self, LatchOutcome};
+
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    static LATE: AtomicU64 = AtomicU64::new(0);
+    static EARLY: AtomicU64 = AtomicU64::new(0);
+    /// When the current window opened (`CLOCK_MONOTONIC` ns), 0 before the first.
+    static WINDOW_START_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// The summary period with `GNDRM_LOG_DAEMON` on.
+    const VERBOSE_WINDOW_NS: u64 = 10_000_000_000;
+    /// The summary period otherwise (the gated info line).
+    const QUIET_WINDOW_NS: u64 = 60_000_000_000;
+
+    /// Fold in one completion of a stamped frame. Runs on `SurfaceFlinger`'s
+    /// completion thread: atomics, plus one line per window.
+    pub(super) fn record(latch_ns: u64, claimed_ns: u64) {
+        let period = latch::period_ns();
+        if period == 0 {
+            return;
+        }
+        TOTAL.fetch_add(1, Ordering::Relaxed);
+        match latch::classify(latch_ns, claimed_ns, period) {
+            LatchOutcome::OnTime => {}
+            LatchOutcome::Late => {
+                LATE.fetch_add(1, Ordering::Relaxed);
+            }
+            LatchOutcome::Early => {
+                EARLY.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let now = crate::vsync::now_ns();
+        let start = WINDOW_START_NS.load(Ordering::Relaxed);
+        if start == 0 {
+            WINDOW_START_NS.store(now, Ordering::Relaxed);
+            return;
+        }
+        let verbose = gndrm_daemon::verbose_logging();
+        let window = if verbose {
+            VERBOSE_WINDOW_NS
+        } else {
+            QUIET_WINDOW_NS
+        };
+        if now.saturating_sub(start) < window
+            || WINDOW_START_NS
+                .compare_exchange(start, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        let total = TOTAL.swap(0, Ordering::Relaxed);
+        let late = LATE.swap(0, Ordering::Relaxed);
+        let early = EARLY.swap(0, Ordering::Relaxed);
+        if verbose {
+            crate::log_always!(
+                "{}",
+                gndrm_obf::obf!(
+                    "vsync: gamescope latch misses {}/{} early {} lead={}us period={}us",
+                    late,
+                    total,
+                    early,
+                    latch::lead_ns() / 1000,
+                    period / 1000
+                )
+            );
+        } else {
+            crate::log_info!(
+                "{}",
+                gndrm_obf::obf!(
+                    "vsync: gamescope latch misses {}/{} early {} lead={}us period={}us",
+                    late,
+                    total,
+                    early,
+                    latch::lead_ns() / 1000,
+                    period / 1000
+                )
+            );
+        }
+    }
+}
+
 /// `ASurfaceTransaction_setOnComplete`: capture the fence that says
 /// SurfaceFlinger has finished with the buffer published in the previous
 /// transaction. First writer wins; a second fence arriving before the present
@@ -355,7 +472,13 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
         let latch = unsafe { latch_time(stats) };
         if latch > 0 {
             latch_ns = latch as u64;
-            crate::vsync::sample(latch_ns, ctx.applied_ns.load(Ordering::Relaxed));
+            let applied_ns = ctx.applied_ns.load(Ordering::Relaxed);
+            crate::vsync::sample(latch_ns, applied_ns);
+            // Score the latch-grid stamp this frame's flip carried, if any.
+            let claimed = ctx.claimed_ns.swap(0, Ordering::AcqRel);
+            if claimed != 0 && ctx.claimed_for_applied_ns.load(Ordering::Acquire) == applied_ns {
+                latch_misses::record(latch_ns, claimed);
+            }
         }
     }
     note_present_done(ctx.present_id.swap(0, Ordering::AcqRel), latch_ns);
@@ -768,6 +891,8 @@ fn new_release_ctx(api: &ffi::ScApi) -> (*mut ReleaseCtx, Arc<AtomicBool>) {
         latch_time: api.st_stats_latch_time,
         applied_ns: AtomicU64::new(0),
         present_id: AtomicU64::new(0),
+        claimed_ns: AtomicU64::new(0),
+        claimed_for_applied_ns: AtomicU64::new(0),
         latched: Arc::clone(&latched),
     }));
     (ctx, latched)
@@ -1054,6 +1179,9 @@ impl AscState {
                 );
             }
         }
+        // A claim for this publish attaches only to a registration it put on
+        // the layer; a dropped frame leaves nothing to score.
+        LAST_PUBLISHED.store(ptr::null_mut(), Ordering::Release);
         let Some(api) = self.api else {
             close_fence(fence);
             return;
@@ -1427,6 +1555,9 @@ impl AscState {
                                     .applied_ns
                                     .store(crate::vsync::now_ns(), Ordering::Relaxed);
                             }
+                            // The registration a latch-grid claim for this
+                            // publish attaches to (see `note_claim`).
+                            LAST_PUBLISHED.store(ctx, Ordering::Release);
                             // What is on the layer is what a later commit falls
                             // back to.
                             self.last_publish = Some(LastPublish {
@@ -1896,6 +2027,7 @@ pub struct AscPresenter {
 impl AscPresenter {
     #[must_use]
     pub fn new(state: Arc<Mutex<AscState>>) -> Self {
+        gndrm_daemon::latch::set_claim_sink(note_claim);
         Self { state }
     }
 

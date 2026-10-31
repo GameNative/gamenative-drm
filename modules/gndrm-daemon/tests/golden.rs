@@ -1676,6 +1676,104 @@ fn atomic_test_only_then_modeset_then_flip() {
     unsafe { libc::close(fd) };
 }
 
+/// A client with the latch-grid cap gets its flips stamped on the panel's latch
+/// grid: the latch the publish targets minus the lead, and a second flip in
+/// the same period on the next point. Only this test touches the process-wide
+/// grid, and the default-path tests above prove a client without the cap never
+/// reads it.
+#[test]
+fn latch_grid_client_flips_are_stamped_on_the_panel_grid() {
+    use gndrm_daemon::latch;
+
+    const P: u64 = 8_333_333;
+    let lead = latch::lead_ns();
+    let anchor = 1_000_000_000_000u64; // 1000 s, the mocked clock's second
+    latch::set(anchor, P);
+
+    let mut d = dev_async();
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_SET_CLIENT_CAP,
+        &pod(&DrmSetClientCap {
+            capability: GNDRM_CLIENT_CAP_LATCH_GRID,
+            value: 1,
+        }),
+    ));
+    assert!(latch::client_connected());
+
+    let blob = create_mode_blob(&mut d).0;
+    let (_handle, fb, fd) = import_fb(&mut d);
+    let sets = modeset_sets(&d, blob, fb);
+    let req = atomic_req(
+        &sets,
+        DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
+        1,
+    );
+    ok(&call(&mut d, DRM_IOCTL_MODE_ATOMIC, &req));
+    let flip = |d: &mut Device, user_data: u64| {
+        let req = atomic_req(
+            &[(
+                PLANE_PRIMARY_ID,
+                find_prop_id(PLANE_PRIMARY_ID, "FB_ID").unwrap(),
+                u64::from(fb),
+            )],
+            DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
+            user_data,
+        );
+        ok(&call(d, DRM_IOCTL_MODE_ATOMIC, &req));
+    };
+    flip(&mut d, 2);
+    let events = wait_flips(&mut d, 2, 2000);
+    let ns =
+        |ev: &DrmEventVblank| u64::from(ev.tv_sec) * 1_000_000_000 + u64::from(ev.tv_usec) * 1_000;
+    // The clock reads 1000 s + 500 us: the first grid point at or after it is
+    // the latch one period on, minus the lead.
+    let first = anchor + P - lead;
+    assert_eq!(ns(&events[0]), first / 1_000 * 1_000);
+    // Same instant again: never the same point, the next one.
+    assert_eq!(ns(&events[1]), (first + P) / 1_000 * 1_000);
+
+    // Dropping the cap returns the client to the session timeline: one
+    // 1200 Hz interval after the last claim.
+    ok(&call(
+        &mut d,
+        DRM_IOCTL_SET_CLIENT_CAP,
+        &pod(&DrmSetClientCap {
+            capability: GNDRM_CLIENT_CAP_LATCH_GRID,
+            value: 0,
+        }),
+    ));
+    assert!(!latch::client_connected());
+    flip(&mut d, 3);
+    let events = wait_flips(&mut d, 1, 2000);
+    assert_eq!(ns(&events[0]), (first + P + 833_333) / 1_000 * 1_000);
+
+    // SAFETY: caller's fd.
+    unsafe { libc::close(fd) };
+}
+
+/// A render node has no flips to stamp: the cap is refused there.
+#[test]
+fn latch_grid_cap_is_card_only() {
+    let mut d = dev();
+    ok(&call(
+        &mut d,
+        GNDRM_IOCTL_NODE_KIND,
+        &pod(&NODE_KIND_RENDER),
+    ));
+    is_err(
+        &call(
+            &mut d,
+            DRM_IOCTL_SET_CLIENT_CAP,
+            &pod(&DrmSetClientCap {
+                capability: GNDRM_CLIENT_CAP_LATCH_GRID,
+                value: 1,
+            }),
+        ),
+        errno::EINVAL,
+    );
+}
+
 #[test]
 fn cursor_plane_rejects_a_full_size_rectangle() {
     let mut d = dev();
