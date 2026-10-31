@@ -1707,12 +1707,23 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
             // marking later frames with the last one it sent.
             (*s).present_id = 0;
         }
-        // The frame goes to the compositor now. A wait on it is answered at
-        // the latest when the refresh after this commit has passed: a frame
-        // that nothing replaces is never released, and the guest may wait on
-        // it before presenting again (vkd3d-proton does, on its first frame).
+        // The frame goes to the compositor now. Under FIFO a wait on it is
+        // answered at the latest when the refresh after this commit has
+        // passed: a frame that nothing replaces is never released, and the
+        // guest may wait on it before presenting again (vkd3d-proton does, on
+        // its first frame). Under an effective mailbox or immediate mode the
+        // wait is answered here: a guest that knew its real mode would not
+        // wait at all, and holding it couples the guest's frame-latency loop
+        // to a refresh period it does not pace by.
         if (*s).wait_id != 0 {
-            crate::present::note_commit((*s).wait_id, monotonic_ns());
+            let at_commit = answers_present_wait_at_commit((*sc).present_mode);
+            let id = if at_commit {
+                let _g = (*sc).shared.lock().unwrap();
+                core::mem::replace(&mut (*s).wait_id, 0)
+            } else {
+                (*s).wait_id
+            };
+            crate::present::committed(id, monotonic_ns(), at_commit);
         }
         // X11 route: the window carries its own content, so the frame is
         // presented into it (DRI3 + Present) instead of committed to a
@@ -2518,14 +2529,23 @@ unsafe fn present_mailbox(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
     unsafe {
         (*slot).acquired = false;
         (*slot).in_flight = true;
+        // The replaced frame is never committed, released or latched, so a
+        // wait on its present id is answered here (wp_presentation's
+        // "discarded"); otherwise the guest waits out present::wait's bound.
+        let mut replaced_id = 0;
         if let Some(old) = g.mailbox.replace(idx) {
             let os = (*sc).slots.as_mut_ptr().add(old as usize);
             (*os).in_flight = false;
+            (*os).present_id = 0;
+            replaced_id = core::mem::replace(&mut (*os).wait_id, 0);
         }
         (*sc).cv_free.notify_all();
         (*sc).cv_put.notify_one();
+        drop(g);
+        if replaced_id != 0 {
+            crate::present::discard(replaced_id, monotonic_ns());
+        }
     }
-    drop(g);
 }
 
 /// immediate: no vsync wait and no frame replacement. Every present is queued
@@ -2696,6 +2716,20 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
         let present_id = unsafe { crate::present::present_id(pi.pNext, i) };
         if i == 0 {
             log_present_chain_once(pi.pNext, present_id);
+        }
+        // A slot presented again while it still carries an armed id: that
+        // frame will never be committed, released or latched under its id
+        // now, so the wait on it is answered first.
+        let stale_id = unsafe {
+            let _g = (*sc).shared.lock().unwrap();
+            if (*slot).wait_id != 0 && (*slot).wait_id != present_id {
+                core::mem::replace(&mut (*slot).wait_id, 0)
+            } else {
+                0
+            }
+        };
+        if stale_id != 0 {
+            crate::present::discard(stale_id, monotonic_ns());
         }
         if present_id != 0 {
             unsafe {
@@ -6095,6 +6129,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn present_wait_is_answered_at_commit_only_for_unpaced_modes() {
+        assert!(answers_present_wait_at_commit(VK_PRESENT_MODE_MAILBOX_KHR));
+        assert!(answers_present_wait_at_commit(VK_PRESENT_MODE_IMMEDIATE_KHR));
+        assert!(!answers_present_wait_at_commit(VK_PRESENT_MODE_FIFO_KHR));
+        assert!(!answers_present_wait_at_commit(VK_PRESENT_MODE_FIFO_RELAXED_KHR));
+    }
+
     /// The override parser mirrors mesa's `MESA_VK_WSI_PRESENT_MODE`: exactly
     /// four names, matched case-sensitively; anything else is ignored.
     #[test]
@@ -8956,6 +8998,14 @@ fn effective_present_mode(ci: &VkSwapchainCreateInfoKHR) -> VkPresentModeKHR {
         | VK_PRESENT_MODE_FIFO_RELAXED_KHR => ci.presentMode,
         _ => VK_PRESENT_MODE_FIFO_KHR,
     }
+}
+
+/// Whether a present wait on a frame of a swapchain in effective `mode` is
+/// answered when the frame is committed. True for mailbox and immediate, where
+/// a guest that knew its real mode would not wait (DXVK skips the present wait
+/// for both); FIFO and FIFO_RELAXED keep the release-or-grace answer.
+fn answers_present_wait_at_commit(mode: VkPresentModeKHR) -> bool {
+    mode == VK_PRESENT_MODE_MAILBOX_KHR || mode == VK_PRESENT_MODE_IMMEDIATE_KHR
 }
 
 /// The wire value for `gamescope_swapchain.set_present_mode` that declares

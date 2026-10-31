@@ -72,6 +72,25 @@ pub(crate) fn note_commit(id: u64, commit_ns: u64) {
 
 static WAIT_CV: Condvar = Condvar::new();
 
+/// The frame carrying `id` has been committed to the compositor. With
+/// `answer_now`, a wait on it is answered at this commit; otherwise it is
+/// answered by the compositor's release or, at the latest, two refresh periods
+/// after the commit.
+///
+/// `answer_now` is for swapchains whose effective present mode is mailbox or
+/// immediate. The guest may believe it has FIFO (the shim applies
+/// `MESA_VK_WSI_PRESENT_MODE` behind its back) and wait on every frame, while a
+/// guest that knew its real mode would not wait at all: DXVK skips the present
+/// wait for mailbox and immediate. Holding the wait for the grace there throttles
+/// the guest's frame-latency loop to `(start-to-commit + 2 periods) / (L + 1)`.
+pub(crate) fn committed(id: u64, commit_ns: u64, answer_now: bool) {
+    if answer_now {
+        record(id, commit_ns);
+    } else {
+        note_commit(id, commit_ns);
+    }
+}
+
 /// Whether the guest enabled each feature. The shim serves both, so the answer
 /// is whichever the guest asked for at device creation.
 static ID_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -128,7 +147,7 @@ pub(crate) fn record(id: u64, latch_ns: u64) {
 fn note_outcome(id: u64, what: &str, t0: std::time::Instant) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    if n < 8 || n % 600 == 0 {
+    if n < 8 || n.is_multiple_of(600) {
         crate::logf!(gndrm_obf::obf!(
             "present wait #{}: id={} {} after {} us",
             n,
@@ -143,6 +162,15 @@ fn note_outcome(id: u64, what: &str, t0: std::time::Instant) {
 /// output, and the next refresh shows it. Answers the wait when no latch report
 /// came first; a daemon that did report is left as the authority.
 pub(crate) fn complete_on_release(id: u64, release_ns: u64) {
+    discard(id, release_ns);
+}
+
+/// The frame carrying `id` will never reach the panel under that id: a newer
+/// frame replaced it in the mailbox, or its slot was presented again before it
+/// was. A wait on it is answered now (`wp_presentation`'s "discarded"), so the
+/// guest does not sit out the bound in `wait`. An id no longer armed was
+/// answered already and is left alone.
+pub(crate) fn discard(id: u64, ns: u64) {
     if id == 0 {
         return;
     }
@@ -151,7 +179,7 @@ pub(crate) fn complete_on_release(id: u64, release_ns: u64) {
         w.armed.iter().any(|&(armed, _)| armed == id)
     };
     if armed {
-        record(id, release_ns);
+        record(id, ns);
     }
 }
 
@@ -372,5 +400,44 @@ mod tests {
         assert!(wait(7, 3, 0));
         // Consumed once: the second wait finds no armed id and returns.
         assert!(wait(7, 3, 0));
+    }
+
+    #[test]
+    fn a_fifo_commit_is_answered_only_after_the_grace() {
+        arm(101, 5);
+        committed(101, crate::proxy::monotonic_ns(), false);
+        // The grace (two refresh periods, at least 2 ms at any rate the shim
+        // accepts) has not passed, so a zero timeout expires.
+        assert!(!wait(101, 5, 0));
+        // A commit far enough in the past is answered as latched.
+        arm(102, 5);
+        committed(102, crate::proxy::monotonic_ns().saturating_sub(1_000_000_000), false);
+        assert!(wait(102, 5, 0));
+        record(101, 0);
+        assert!(wait(101, 5, 0));
+    }
+
+    #[test]
+    fn a_mailbox_commit_is_answered_at_the_commit() {
+        arm(201, 6);
+        committed(201, crate::proxy::monotonic_ns(), true);
+        assert!(wait(201, 6, 0));
+        // Answered once; nothing is left armed for the release to answer again.
+        assert!(!WAITS.lock().unwrap().armed.iter().any(|&(id, _)| id == 201));
+        assert!(wait(201, 6, 0));
+    }
+
+    #[test]
+    fn a_replaced_frame_is_answered_without_a_commit() {
+        // The mailbox drops a frame before it is ever committed: recording it
+        // is what releases a guest waiting on it before the one-second bound.
+        arm(301, 7);
+        discard(301, crate::proxy::monotonic_ns());
+        let t0 = std::time::Instant::now();
+        assert!(wait(301, 7, u64::MAX));
+        assert!(t0.elapsed() < Duration::from_millis(100));
+        // A second discard of an answered id leaves nothing for a later wait.
+        discard(301, 0);
+        assert!(!WAITS.lock().unwrap().done.iter().any(|&(id, _)| id == 301));
     }
 }
