@@ -181,8 +181,10 @@ xcb-only on X11) opens a `wl_display_connect(NULL)`, creates a
 `gamescope_swapchain` proxy surface, and binds it to the X window ID via
 `override_window_content` (05 §4). Guest frames present as dmabuf buffers on the
 proxy surface, off the X11 path. Both X11 extensions land in one surface — the
-window id is all either present route reads — so a GL guest (zink) and a Vulkan
-guest share the swapchain, and with it the acquire-gate frame cap.
+window id is all either present route reads — so a kopper GL guest (zink) and a
+Vulkan guest share the swapchain, and with it the acquire-gate frame cap. The
+shipped GL stack (Mesa `libgl-xlib`, software xlib winsys) creates no X11 Vulkan
+surface at all and is capped by gamescope's limiter instead (19 §7).
 
 The guest-visible halves are validated standalone by two payload binaries
 runnable as the session guest via `GUEST_PROGRAM_LAUNCHER_COMMAND`:
