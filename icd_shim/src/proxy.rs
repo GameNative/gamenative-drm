@@ -3,8 +3,11 @@
 //! platform compiled in, so no passthrough can ever present on GameScope's
 //! wayland socket).
 //!
-//! The proxy advertises VK_KHR_wayland_surface itself and implements the
-//! whole swapchain contract client-side. Nothing hooks-side may ever touch
+//! The proxy advertises the surface extensions a guest reaches it with —
+//! VK_KHR_wayland_surface, VK_KHR_xlib_surface and VK_KHR_xcb_surface (the
+//! last is what Mesa's zink/kopper WSI creates its swapchain from on X11, so
+//! a GL guest shares the Vulkan guest's swapchain and its acquire gate) — and
+//! implements the whole swapchain contract client-side. Nothing hooks-side may ever touch
 //! a surface handle: the hooks' surface-query/swapchain trampolines assume
 //! loader-wrapped surface objects their WSI never produces, so the
 //! swapchain is a shim-owned ring of dma-buf images (system-heap fds
@@ -174,23 +177,20 @@ static PRES_IV_MAX_US: AtomicUsize = AtomicUsize::new(0);
 static PRES_IV_GE_16667: AtomicUsize = AtomicUsize::new(0); // >= 16.67 ms: a missed 60 Hz frame
 static PRES_IV_GE_33333: AtomicUsize = AtomicUsize::new(0); // >= 33.3 ms: two
 static PRES_IV_LAST_NS: AtomicU64 = AtomicU64::new(0);
-// Release-floor census, in microseconds, the same shape as the acquire dwell
-// and the present interval above and reported on the same lines. A release is
-// held when it arrives sooner than one target period after this shim's own
-// previous release, so `REL_HOLD_N` counts the releases the floor actually
-// delayed, `REL_HOLD_SUM_US` is the total time they were held — the pacing the
-// cap added — and the threshold bucket separates a floor that bit hard from the
-// sub-millisecond residue of one that had almost elapsed. Read against
-// `REL_CAPPED_N` (releases seen while a target was set) and `cap=[fps=…
-// notes=…]`, which is what tells "the target never arrived" (notes=0) from "a
-// target arrived and the floor never bound" (notes>0, capped_rel>0, held=0).
-static REL_HOLD_N: AtomicUsize = AtomicUsize::new(0);
-static REL_HOLD_SUM_US: AtomicUsize = AtomicUsize::new(0);
-static REL_HOLD_MAX_US: AtomicUsize = AtomicUsize::new(0);
-static REL_HOLD_GE_8333: AtomicUsize = AtomicUsize::new(0); // >= 8.33 ms: one 120 Hz frame
-/// Releases seen while a target was set, held or not: the denominator the
-/// `held=` count is read against.
-static REL_CAPPED_N: AtomicUsize = AtomicUsize::new(0);
+// Acquire-gate census, in microseconds, the same shape as the dwell and the
+// present interval above and reported on the same lines. The cap is applied in
+// `gn_acquire_common`, so its proof lives there and not on the release: a
+// release carries no pacing, and a census read on that side reports zeroes for a
+// cap that is working. `GATE_HOLD_N` counts the acquires the deadline actually
+// delayed, `GATE_HOLD_SUM_US` the total time they were parked, and the max the
+// worst single park. Read against `cap=[fps=… notes=… acq_fps=…]`: `notes=0` is
+// a target that never arrived; `notes>0` with `gate_holds=0` is a target that
+// arrived and never bound, so the guest or the compositor is the slower element;
+// `gate_holds>0` with `acq_fps` short of the target is the gate binding and the
+// rate still below it, which is a schedule fault rather than a missing target.
+static GATE_HOLD_N: AtomicUsize = AtomicUsize::new(0);
+static GATE_HOLD_SUM_US: AtomicUsize = AtomicUsize::new(0);
+static GATE_HOLD_MAX_US: AtomicUsize = AtomicUsize::new(0);
 
 /// Record the interval since the previous present. Called once per present at
 /// entry; the first present only seeds the stamp, so the delta count is
@@ -306,13 +306,26 @@ fn rate_ok(slot: &'static Mutex<Option<Instant>>, every: Duration) -> bool {
     true
 }
 
-/// The mean hold per delayed release, or 0 while none has been delayed — the
-/// aggregate `held_us=` divided by `held=`.
-fn held_avg_us() -> usize {
-    REL_HOLD_SUM_US
+/// The mean park per delayed acquire, or 0 while none has been delayed — the
+/// aggregate `gate_us=` divided by `gate_holds=`.
+fn gate_hold_avg_us() -> usize {
+    GATE_HOLD_SUM_US
         .load(Ordering::Relaxed)
-        .checked_div(REL_HOLD_N.load(Ordering::Relaxed))
+        .checked_div(GATE_HOLD_N.load(Ordering::Relaxed))
         .unwrap_or(0)
+}
+
+/// The rate the acquire intervals imply, in frames per second, over the whole
+/// window the census counts. This is the only number that can be checked against
+/// a target without a stopwatch: it is measured at the instant the cap acts, so a
+/// display-side frame count reading low cannot be mistaken for the cap's rate.
+fn acq_fps() -> f64 {
+    let n = ACQ_US_N.load(Ordering::Relaxed);
+    let sum = ACQ_US_SUM.load(Ordering::Relaxed);
+    if n == 0 || sum == 0 {
+        return 0.0;
+    }
+    1_000_000.0 * n as f64 / sum as f64
 }
 
 /// "0:-F 1:A- …": A = held by the app, F = committed and awaiting release.
@@ -336,7 +349,7 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
     format!(
         "{}",
         gndrm_obf::obf!(
-            "acq={} pres={} rel={} commit={} starved={} in_flight={in_flight} slots=[{}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} capped_rel={} held={} held_us={} held_avg_us={} held_max_us={} held_ge8333={}]",
+            "acq={} pres={} rel={} commit={} starved={} in_flight={in_flight} slots=[{}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} acq_fps={:.2}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
@@ -357,12 +370,11 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
                 PRES_IV_GE_33333.load(Ordering::Relaxed),
                 crate::scanout::target_fps(),
                 crate::scanout::notes_seen(),
-                REL_CAPPED_N.load(Ordering::Relaxed),
-                REL_HOLD_N.load(Ordering::Relaxed),
-                REL_HOLD_SUM_US.load(Ordering::Relaxed),
-                held_avg_us(),
-                REL_HOLD_MAX_US.load(Ordering::Relaxed),
-                REL_HOLD_GE_8333.load(Ordering::Relaxed),
+                GATE_HOLD_N.load(Ordering::Relaxed),
+                GATE_HOLD_SUM_US.load(Ordering::Relaxed),
+                gate_hold_avg_us(),
+                GATE_HOLD_MAX_US.load(Ordering::Relaxed),
+                acq_fps(),
         )
     )
 }
@@ -372,7 +384,7 @@ fn counters() -> String {
     format!(
         "{}",
         gndrm_obf::obf!(
-            "acq={} pres={} rel={} commit={} starved={} acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} capped_rel={} held={} held_us={} held_avg_us={} held_max_us={} held_ge8333={}]",
+            "acq={} pres={} rel={} commit={} starved={} acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} acq_fps={:.2}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
@@ -392,12 +404,11 @@ fn counters() -> String {
                 PRES_IV_GE_33333.load(Ordering::Relaxed),
                 crate::scanout::target_fps(),
                 crate::scanout::notes_seen(),
-                REL_CAPPED_N.load(Ordering::Relaxed),
-                REL_HOLD_N.load(Ordering::Relaxed),
-                REL_HOLD_SUM_US.load(Ordering::Relaxed),
-                held_avg_us(),
-                REL_HOLD_MAX_US.load(Ordering::Relaxed),
-                REL_HOLD_GE_8333.load(Ordering::Relaxed),
+                GATE_HOLD_N.load(Ordering::Relaxed),
+                GATE_HOLD_SUM_US.load(Ordering::Relaxed),
+                gate_hold_avg_us(),
+                GATE_HOLD_MAX_US.load(Ordering::Relaxed),
+                acq_fps(),
         )
     )
 }
@@ -2243,6 +2254,10 @@ unsafe fn gn_acquire_common(
     let period = crate::scanout::period_ns(crate::scanout::target_fps());
     let mut idx: i32 = -1;
     let mut timed_out = false;
+    // First instant this acquire was parked by the deadline, 0 while it never
+    // was: the census reads one park per acquire, not one per wait, because a
+    // wake-up that finds the deadline still ahead parks again.
+    let mut hold_from: u64 = 0;
     {
         let mut g = (*sc).shared.lock().unwrap();
         loop {
@@ -2252,6 +2267,9 @@ unsafe fn gn_acquire_common(
                 if next_ns != 0 && now_ns < next_ns {
                     if timeout == 0 {
                         break;
+                    }
+                    if hold_from == 0 {
+                        hold_from = now_ns;
                     }
                     let mut wait = Duration::from_nanos(next_ns - now_ns);
                     if let Some(dl) = deadline {
@@ -2322,6 +2340,12 @@ unsafe fn gn_acquire_common(
             return VK_ERROR_OUT_OF_DATE_KHR;
         }
         drop(g);
+    }
+    if idx >= 0 && hold_from != 0 {
+        let held_us = monotonic_ns().saturating_sub(hold_from) as usize / 1_000;
+        GATE_HOLD_N.fetch_add(1, Ordering::Relaxed);
+        GATE_HOLD_SUM_US.fetch_add(held_us, Ordering::Relaxed);
+        GATE_HOLD_MAX_US.fetch_max(held_us, Ordering::Relaxed);
     }
     let _ = timed_out;
     if idx < 0 {
@@ -4449,6 +4473,17 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
                 ) -> VkResult,
         )
     }),
+    (c"vkCreateXcbSurfaceKHR", HandlerScope::ProxyOnly, unsafe {
+        std::mem::transmute(
+            gn_vkCreateXcbSurfaceKHR
+                as unsafe extern "C" fn(
+                    VkInstance,
+                    *const VkXcbSurfaceCreateInfoKHR,
+                    *const VkAllocationCallbacks,
+                    *mut VkSurfaceKHR,
+                ) -> VkResult,
+        )
+    }),
     (c"vkDestroySurfaceKHR", HandlerScope::ProxyOnly, unsafe {
         std::mem::transmute(
             gn_vkDestroySurfaceKHR
@@ -4545,6 +4580,16 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
             std::mem::transmute(
                 gn_vkGetPhysicalDeviceXlibPresentationSupportKHR
                     as unsafe extern "C" fn(VkPhysicalDevice, u32, *mut c_void, usize) -> VkBool32,
+            )
+        },
+    ),
+    (
+        c"vkGetPhysicalDeviceXcbPresentationSupportKHR",
+        HandlerScope::ProxyOnly,
+        unsafe {
+            std::mem::transmute(
+                gn_vkGetPhysicalDeviceXcbPresentationSupportKHR
+                    as unsafe extern "C" fn(VkPhysicalDevice, u32, *mut c_void, u32) -> VkBool32,
             )
         },
     ),
@@ -7807,7 +7852,10 @@ unsafe extern "C" fn gn_vkCreateInstance(
     let mut exts: Vec<*const c_char> = vec![ptr::null(); names.len() + 16];
     for &name in names {
         let n_ = unsafe { CStr::from_ptr(name) };
-        if n_ == c"VK_KHR_wayland_surface" || n_ == c"VK_KHR_xlib_surface" {
+        if n_ == c"VK_KHR_wayland_surface"
+            || n_ == c"VK_KHR_xlib_surface"
+            || n_ == c"VK_KHR_xcb_surface"
+        {
             continue; // proxied, not real
         }
         if n < exts.len() {
@@ -8002,16 +8050,18 @@ unsafe extern "C" fn gn_vkEnumerateInstanceExtensionProperties(
     let Some(real_enum) = real_enum else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
-    // Extensions the proxy answers itself. The two surface extensions are always
-    // hidden from the real driver; `VK_EXT_swapchain_colorspace` is added in an
-    // HDR session because it defines the PQ colourspace the surface formats
-    // advertise, and a client that does not see the extension must ignore it.
-    let names: [&[u8]; 3] = [
+    // Extensions the proxy answers itself. The three surface extensions are
+    // always hidden from the real driver; `VK_EXT_swapchain_colorspace` is added
+    // in an HDR session because it defines the PQ colourspace the surface
+    // formats advertise, and a client that does not see the extension must
+    // ignore it.
+    let names: [&[u8]; 4] = [
         b"VK_KHR_wayland_surface\0",
         b"VK_KHR_xlib_surface\0",
+        b"VK_KHR_xcb_surface\0",
         b"VK_EXT_swapchain_colorspace\0",
     ];
-    let extra: u32 = 2;
+    let extra: u32 = 3;
     unsafe {
         if pProps.is_null() {
             let mut n: u32 = 0;
@@ -8034,9 +8084,10 @@ unsafe extern "C" fn gn_vkEnumerateInstanceExtensionProperties(
         }
         let total = n + extra;
         if cap >= total {
-            // Both surface extensions are proxied: winewayland clients use
+            // All three surface extensions are proxied: winewayland clients use
             // the wayland one, winex11 clients (the gamescope path) the xlib
-            // one — the real driver never sees either. `VK_EXT_swapchain_colorspace`
+            // one, and Mesa's zink WSI the xcb one — the real driver never sees
+            // them. `VK_EXT_swapchain_colorspace`
             // is NOT advertised: exposing it made vkd3d-proton titles present once
             // per swapchain and then stop, while the PQ surface format alone is
             // enough for DXVK to report an HDR10 output.
@@ -8423,42 +8474,33 @@ unsafe fn xlib_override_surface(
     VK_SUCCESS
 }
 
-unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
-    instance: VkInstance,
-    ci: *const VkXlibSurfaceCreateInfoKHR,
-    _alloc: *const VkAllocationCallbacks,
-    out: *mut VkSurfaceKHR,
-) -> VkResult {
-    let ci = unsafe { &*ci };
-    let gi = unsafe { find_instance(instance) };
-    if gi.is_null() {
-        crate::logf!(gndrm_obf::obf!(
-            "proxy xlib surface create FAILED: instance {instance:?} not one of ours"
-        ));
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
+/// The surface both X11 create functions produce. `VK_KHR_xlib_surface` and
+/// `VK_KHR_xcb_surface` differ only in the connection type and neither route
+/// reads it — the override route binds the XID to a gamescope surface, and the
+/// DRI3 route opens its own connection from `DISPLAY`.
+unsafe fn x11_surface(gi: *mut GnInstance, window: u32, out: *mut VkSurfaceKHR) -> VkResult {
     // Present-route capability switch (`GN_VKSHIM_GUEST_SURFACE`, see
     // `use_guest_surface`). The DEFAULT (unset, or anything but exactly "1") is
     // the gamescope override/Wayland surface, taken here; `=1` opts in to the
     // DRI3-into-wine's-X-window route below, which carries wine's GDI/2D and
     // hands the shim the real window.
     if !use_guest_surface() {
-        return unsafe { xlib_override_surface(gi, ci.window as u32, out) };
+        return unsafe { xlib_override_surface(gi, window, out) };
     }
-    let x11 = if ci.window == 0 {
+    let x11 = if window == 0 {
         crate::logf!(gndrm_obf::obf!(
             "x11 route: XID {:#x} unavailable ({})",
-            ci.window,
+            window,
             crate::x11::RouteUnavailable::NullXid.reason()
         ));
         ptr::null_mut()
     } else {
-        match unsafe { crate::x11::X11Present::new(ci.window as u32) } {
+        match unsafe { crate::x11::X11Present::new(window) } {
             Ok(p) => Box::into_raw(Box::new(p)),
             Err(e) => {
                 crate::logf!(gndrm_obf::obf!(
                     "x11 route: XID {:#x} unavailable ({})",
-                    ci.window,
+                    window,
                     e.reason()
                 ));
                 ptr::null_mut()
@@ -8472,7 +8514,7 @@ unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
         own_surface: ptr::null_mut(),
         swapchain_obj: ptr::null_mut(),
         x11,
-        window: ci.window as u32,
+        window,
         next: ptr::null_mut(),
     });
     let s = Box::into_raw(s);
@@ -8488,10 +8530,48 @@ unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
         crate::logf!(gndrm_obf::obf!(
             "proxy surface {:?} (X11 window {:#x}, DRI3+Present route)",
             s,
-            ci.window
+            window
         ));
     }
     VK_SUCCESS
+}
+
+unsafe extern "C" fn gn_vkCreateXlibSurfaceKHR(
+    instance: VkInstance,
+    ci: *const VkXlibSurfaceCreateInfoKHR,
+    _alloc: *const VkAllocationCallbacks,
+    out: *mut VkSurfaceKHR,
+) -> VkResult {
+    let ci = unsafe { &*ci };
+    let gi = unsafe { find_instance(instance) };
+    if gi.is_null() {
+        crate::logf!(gndrm_obf::obf!(
+            "proxy xlib surface create FAILED: instance {instance:?} not one of ours"
+        ));
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    unsafe { x11_surface(gi, ci.window as u32, out) }
+}
+
+/// `VK_KHR_xcb_surface`: what Mesa's zink (kopper) WSI creates its guest
+/// swapchain from on X11. Without it a GL guest cannot reach this swapchain and
+/// so never meets the acquire cap; with it, GL takes the same route and the same
+/// gate as a Vulkan guest.
+unsafe extern "C" fn gn_vkCreateXcbSurfaceKHR(
+    instance: VkInstance,
+    ci: *const VkXcbSurfaceCreateInfoKHR,
+    _alloc: *const VkAllocationCallbacks,
+    out: *mut VkSurfaceKHR,
+) -> VkResult {
+    let ci = unsafe { &*ci };
+    let gi = unsafe { find_instance(instance) };
+    if gi.is_null() {
+        crate::logf!(gndrm_obf::obf!(
+            "proxy xcb surface create FAILED: instance {instance:?} not one of ours"
+        ));
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    unsafe { x11_surface(gi, ci.window, out) }
 }
 
 unsafe extern "C" fn gn_vkGetPhysicalDeviceXlibPresentationSupportKHR(
@@ -8499,6 +8579,15 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceXlibPresentationSupportKHR(
     _qf: u32,
     _dpy: *mut c_void,
     _visual: usize,
+) -> VkBool32 {
+    VK_TRUE
+}
+
+unsafe extern "C" fn gn_vkGetPhysicalDeviceXcbPresentationSupportKHR(
+    _pd: VkPhysicalDevice,
+    _qf: u32,
+    _connection: *mut c_void,
+    _visual_id: u32,
 ) -> VkBool32 {
     VK_TRUE
 }

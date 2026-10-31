@@ -172,12 +172,19 @@ picks the real driver per process:
   driver_path, driver_name, redirect_dir, NULL)` — dlopen-compatible handle;
   wrapper fallback `/system/lib64/libvulkan.so`).
 
-Surface interception: the shim advertises `VK_KHR_xlib_surface` and
-`VK_KHR_wayland_surface`, strips both from the real instance create, and routes
+Surface interception: the shim advertises `VK_KHR_xlib_surface`,
+`VK_KHR_wayland_surface` and `VK_KHR_xcb_surface`, strips all three from the real
+instance create, and routes
 guest presentation through its own wayland connection: `vkCreateXlibSurfaceKHR`
-opens a `wl_display_connect(NULL)`, creates a `gamescope_swapchain` proxy
-surface, and binds it to the X window ID via `override_window_content` (05 §4).
-Guest frames present as dmabuf buffers on the proxy surface, off the X11 path.
+(and its `vkCreateXcbSurfaceKHR` twin, which exists because Mesa's zink WSI is
+xcb-only on X11) opens a `wl_display_connect(NULL)`, creates a
+`gamescope_swapchain` proxy surface, and binds it to the X window ID via
+`override_window_content` (05 §4). Guest frames present as dmabuf buffers on the
+proxy surface, off the X11 path. Both X11 extensions land in one surface — the
+window id is all either present route reads — so a kopper GL guest (zink) and a
+Vulkan guest share the swapchain, and with it the acquire-gate frame cap. The
+shipped GL stack (Mesa `libgl-xlib`, software xlib winsys) creates no X11 Vulkan
+surface at all and is capped by gamescope's limiter instead (19 §7).
 
 The guest-visible halves are validated standalone by two payload binaries
 runnable as the session guest via `GUEST_PROGRAM_LAUNCHER_COMMAND`:

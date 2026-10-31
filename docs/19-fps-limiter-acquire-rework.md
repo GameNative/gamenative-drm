@@ -61,7 +61,10 @@ on acquire:
         wait until min(next_acquire_ns, timeout)  # condvar, no spin
         retry
     take a free slot
-    next_acquire_ns = max(next_acquire_ns + period, now)
+    if next_acquire_ns == 0 or now >= next_acquire_ns + period:
+        next_acquire_ns = now + period     # a whole period late: re-anchor, no debt
+    else:
+        next_acquire_ns += period          # on the grid; the wake-up's lateness is not the cadence
 ```
 
 - `next_acquire_ns` lives on `GnSwapchain`, appended at the end so no existing
@@ -74,6 +77,12 @@ on acquire:
   `release_held`, `slice_to_floor`, and the `acquire_take_free` release branch are
   removed. A release just marks the slot free and notifies `cv_free`.
 - `CAP_FPS` stays as the *target* (note or `source_cap()`), read by the gate.
+- The cap is read off the acquire census, not the release one: `cap=[fps= notes=
+  gate_holds= gate_avg_us= gate_max_us= acq_fps=]`. `notes=0` is a target that
+  never arrived; `notes>0` with `gate_holds=0` is a target that arrived and never
+  bound, so the guest or the compositor is the slower element and a low frame
+  count is not the cap's; `gate_holds>0` with `acq_fps` under the target is the
+  gate binding and the rate still short, which is a schedule fault.
 - LSFG is unaffected: generated frames are never acquired by the guest, and the
   presenter's grid still reads `source_cap()`.
 
@@ -151,7 +160,8 @@ source rate the tuner compares against).
 |---|---|---|---|
 | Vulkan, LSFG off | 60 | guest 60, A34 also armed | guest 60 at acquire, no output timer |
 | Vulkan, LSFG on | 60×2 | floor paces source, presenter multiplies | unchanged (same source cap) |
-| GL through Xwayland | 60 | A34 caps the display | **uncapped** — accepted regression, see §7 |
+| GL through Xwayland, zink via kopper (not shipped) | 60 | A34 caps the display | guest 60 at acquire — the shim serves `VK_KHR_xcb_surface`, which kopper's WSI creates its swapchain from, so GL takes the Vulkan gate |
+| GL through Xwayland, shipped stack (Mesa libgl-xlib, sw xlib winsys, XShmPutImage) | 60 | A34 caps the display | no shim swapchain, no acquire gate; gamescope's own limiter (time grid, A52) is the cap |
 | uncapped (0) | — | no gate | no gate |
 | title ignoring acquire | 60 | floor has nothing to hold | gate also inert; present-queue pacer is the fallback |
 
@@ -172,19 +182,34 @@ alternating, two runs each.
   produced.
 - **A34 parked**: gamescope log shows no limiter deferral; the panel interval is
   still 16.7 ms at cap 60.
-- **GL title** (if one is available): expect uncapped, recorded as the known gap.
+- **GL title** (if one is available): on the shipped stack expect the cap from
+  gamescope's limiter, not from the gate (no `cap=[` line from the game process,
+  no `proxy swapchain create`); measured 2026-10-31 on a Retroid Pocket 6 with
+  SteamWorld Dig 2: Dig2.exe requests only `VK_KHR_surface` + `VK_EXT_headless_surface`.
 
 ## 7. Risks
 
-- **GL titles lose their cap.** A34 was the only limiter for presents outside the
-  ICD. Mitigation: keep the patch in `disabled/`, and decide after measurement
-  whether to re-enable it for non-Vulkan sessions (which needs the session-kind
-  signal, since gamescope cannot see the client's API).
+- **GL titles and the cap.** A GL guest keeps a cap from this shim only where
+  its frames reach it. A zink guest presenting through kopper does: the shim
+  serves `VK_KHR_xcb_surface`, the extension kopper's WSI creates its swapchain
+  from on X11, so its frames ride the same swapchain and the same acquire gate.
+  The shipped GL stack is not that guest: the container's `libGL.so.1` is Mesa's
+  `libgl-xlib` target (glx/xlib frontend, `winsys/sw/xlib`, XShmPutImage), which
+  renders with zink on a headless Vulkan instance and never creates an X11
+  Vulkan surface, so it never reaches the ICD's gate and `LIBGL_KOPPER_DISABLE`
+  does not apply to it (the string is not in that library). Until the kopper/EGL
+  backend ships, every GL guest is capped by gamescope's own limiter, which is
+  why that limiter stays armed (A52 moves it onto a time grid). Xwayland being
+  built `-Dglx=false` closes only server-side GLX; the xlib libGL needs none.
 - **Wire skew.** `FrameAcquired` reaches a daemon that does not know it → logged
   as an unrecognised frame and ignored (existing behaviour), so the counter simply
   stops; the cap is unaffected because it is local to the shim.
 - **A guest that ignores acquire** sees no cap at all. Same gap as today's floor;
   not made worse.
+- **A GL guest now creates its swapchain here.** Before `VK_KHR_xcb_surface` was
+  served, zink's swapchain could not be created on the shim; routing it through
+  means any WSI gap the Vulkan path has is now reachable from GL too. Read
+  `proxy swapchain create` / the refusal lines before blaming the cap.
 - **Schedule reset on swapchain recreation** (resolution change): `next_acquire_ns`
   is per swapchain, so a recreated chain starts unthrottled for one frame. Fine.
 
