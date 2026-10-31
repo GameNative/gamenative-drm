@@ -64,7 +64,7 @@ Android APIs.
 |---|---|---|
 | `DRM_IOCTL_VERSION` | `drm_version` | name="gamenative", date, desc; two-call length semantics |
 | `DRM_IOCTL_GET_CAP` | `drm_get_cap` | caps table below |
-| `DRM_IOCTL_SET_CLIENT_CAP` | `drm_set_client_cap` | accept `ATOMIC`, `UNIVERSAL_PLANES`, `WRITEBACK_CONNECTORS`; else EINVAL |
+| `DRM_IOCTL_SET_CLIENT_CAP` | `drm_set_client_cap` | accept `ATOMIC`, `UNIVERSAL_PLANES`, `WRITEBACK_CONNECTORS`, and on a card node the private `GNDRM_CLIENT_CAP_LATCH_GRID` (`0x474E4C47`, doc 11); else EINVAL |
 | `DRM_IOCTL_MODE_GETRESOURCES` | `drm_mode_card_res` | 1 fbid pool, 1 CRTC, 1 connector, 1 encoder; min/max size = panel caps |
 | `DRM_IOCTL_GEM_CLOSE` | `drm_gem_close` | drop handle; if a live FB references the GEM, move it to the orphan table (handle stops resolving, object dies at the RMFB of its last FB) — kernel semantics; gamescope closes handles right after ADDFB2 |
 | `DRM_IOCTL_PRIME_FD_TO_HANDLE` | `drm_prime_handle` | SCM_RIGHTS-received dma-buf fd → store, return GEM handle |

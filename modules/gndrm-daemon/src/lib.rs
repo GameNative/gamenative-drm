@@ -17,6 +17,7 @@ pub mod diag;
 mod edid;
 pub mod foreign;
 pub mod frame_cap;
+pub mod latch;
 mod objects;
 #[doc(hidden)] // exposed for integration tests; not public API
 pub mod pod;
@@ -517,6 +518,9 @@ pub struct Device {
     cap_atomic: bool,
     cap_universal_planes: bool,
     cap_writeback: bool,
+    /// [`GNDRM_CLIENT_CAP_LATCH_GRID`]: stamp this client's flip events on the
+    /// panel's latch grid (see [`latch`]). Card node only.
+    cap_latch_grid: bool,
 
     /// Which node type this connection impersonates. A card node carries the
     /// full KMS surface (gamescope); a render node carries only the
@@ -677,6 +681,7 @@ impl Device {
             cap_atomic: false,
             cap_universal_planes: false,
             cap_writeback: false,
+            cap_latch_grid: false,
             node_kind: NODE_KIND_CARD,
             conn_crtc_id: 0,
             conn_colorspace: DRM_MODE_COLORIMETRY_DEFAULT,
@@ -1095,6 +1100,25 @@ impl Device {
             DRM_CLIENT_CAP_ATOMIC => self.cap_atomic = c.value == 1,
             DRM_CLIENT_CAP_UNIVERSAL_PLANES => self.cap_universal_planes = c.value == 1,
             DRM_CLIENT_CAP_WRITEBACK_CONNECTORS => self.cap_writeback = c.value == 1,
+            // A render node never scans out, so it has no flips to stamp.
+            GNDRM_CLIENT_CAP_LATCH_GRID if self.node_kind == NODE_KIND_CARD => {
+                let on = c.value == 1;
+                if on != self.cap_latch_grid {
+                    self.cap_latch_grid = on;
+                    latch::set_client(on);
+                    // Once per session (the client sets it at bring-up).
+                    self.always_log(|| {
+                        format!(
+                            "{}",
+                            gndrm_obf::obf!(
+                                "vblank: latch-grid flip stamps {} (lead {}us)",
+                                if on { "on" } else { "off" },
+                                latch::lead_ns() / 1000
+                            )
+                        )
+                    });
+                }
+            }
             _ => return DispatchResult::err(errno::EINVAL),
         }
         DispatchResult::ok(Vec::new())
@@ -2020,6 +2044,9 @@ impl Drop for Device {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        if self.cap_latch_grid {
+            latch::set_client(false);
+        }
         close_fd(self.flip_event_fd);
     }
 }
@@ -2049,6 +2076,9 @@ struct CommitJob {
     /// Built at commit time when `PAGE_FLIP_EVENT` was requested; the worker
     /// stamps its vblank and emits it with the publish.
     event: Option<DrmEventVblank>,
+    /// The client holds [`GNDRM_CLIENT_CAP_LATCH_GRID`]: stamp `event` on the
+    /// panel's latch grid ([`latch::VblankTimeline::claim_on_grid`]).
+    latch_grid: bool,
 }
 
 impl Drop for CommitJob {
@@ -2061,54 +2091,6 @@ impl Drop for CommitJob {
         if let Some(fd) = self.src_fd.take() {
             close_fd(fd);
         }
-    }
-}
-
-/// The vblank timeline a page-flip event claims.
-///
-/// A real KMS page-flip event is delivered at the vblank the flip takes effect
-/// on, and gamescope re-anchors its entire vblank grid off that timestamp
-/// (`Backends/DRMBackend.cpp` `page_flip_handler` → `vblankmanager` `MarkVBlank`).
-/// As the display, gndrm owns that schedule: events are quantized to the mode's
-/// own rate — one interval apart while frames keep up, stepping whole intervals
-/// when one is late — which is what a real display's vblank timeline looks like.
-///
-/// Stamping the *emit* instant instead re-anchors that grid slightly early on
-/// every frame. The grid is armed early by design (its aim-early offset, so a
-/// real kernel can hold the flip to the panel cycle), so the error integrates
-/// into the grid's rate: every divisor-based fps cap then runs fast by roughly
-/// that offset over one interval — measured as +7 % on this port across four
-/// divisors (targets 20/24/30/40 → 21/26/32/43).
-struct VblankTimeline {
-    interval_ns: u64,
-    claimed_ns: u64,
-    started: bool,
-}
-
-impl VblankTimeline {
-    fn new() -> Self {
-        Self {
-            interval_ns: 1_000_000_000_000 / u64::from(SESSION_REFRESH_MHZ),
-            claimed_ns: 0,
-            started: false,
-        }
-    }
-
-    /// The vblank this frame lands on: the next boundary of the mode's rate at or
-    /// after `now_ns`. Never moves backwards, so a late frame skips whole vblanks
-    /// instead of claiming a time in the past.
-    fn claim(&mut self, now_ns: u64) -> u64 {
-        if !self.started {
-            self.started = true;
-            self.claimed_ns = now_ns;
-            return now_ns;
-        }
-        let mut t = self.claimed_ns + self.interval_ns;
-        while t < now_ns {
-            t += self.interval_ns;
-        }
-        self.claimed_ns = t;
-        t
     }
 }
 
@@ -2175,14 +2157,15 @@ fn commit_worker_loop(
     // Atomics only, so this cannot perturb the flip path.
     let d = diag();
     d.set_role(Role::Commit, State::CommitWaitingJob);
-    // The vblank schedule the flip events claim (see `VblankTimeline`).
-    let mut vblank = VblankTimeline::new();
+    // The vblank schedule the flip events claim (see `latch::VblankTimeline`).
+    let mut vblank = latch::VblankTimeline::new(1_000_000_000_000 / u64::from(SESSION_REFRESH_MHZ));
     while let Ok(mut job) = commit_rx.recv() {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
         // The fb id this commit published, if any.
         let in_flight_fb = job.fb.as_ref().map(|fb| fb.id);
+        let published = job.fb.is_some();
         // Publish the buffer when there is one; otherwise the commit carries no
         // presentation (the frame is dropped/hidden) and only its fence is
         // released.
@@ -2229,10 +2212,22 @@ fn commit_worker_loop(
         }
         if let Some(mut ev) = job.event.take() {
             // Stamp the vblank this frame lands on, not the instant the event is
-            // built or emitted (see `VblankTimeline`). Delivery stays immediate,
-            // so gamescope's present loop never waits on a display round trip.
+            // built or emitted (see `latch::VblankTimeline`). Delivery stays
+            // immediate, so gamescope's present loop never waits on a display
+            // round trip. A latch-grid client gets the latch this publish
+            // targets, minus the lead; everyone else the session timeline.
             let (sec, usec) = (clock.lock().unwrap_or_else(PoisonError::into_inner))();
-            let claimed = vblank.claim(u64::from(sec) * 1_000_000_000 + u64::from(usec) * 1_000);
+            let now = u64::from(sec) * 1_000_000_000 + u64::from(usec) * 1_000;
+            let claimed = if job.latch_grid {
+                let (stamp, latch_point) =
+                    vblank.claim_on_grid(now, latch::get(), latch::period_ns());
+                if let (Some(latch_point), true) = (latch_point, published) {
+                    latch::report_claim(latch_point);
+                }
+                stamp
+            } else {
+                vblank.claim(now)
+            };
             ev.tv_sec = (claimed / 1_000_000_000) as u32;
             ev.tv_usec = ((claimed % 1_000_000_000) / 1_000) as u32;
             flip_queue

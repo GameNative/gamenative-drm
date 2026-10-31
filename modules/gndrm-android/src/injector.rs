@@ -298,6 +298,10 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "set_look",
     "screenshot",
     "debug_force_repaint",
+    // The panel's refresh in whole Hz: the period of gamescope's vblank tick
+    // when it stamps on the latch grid (the daemon forwards a mid-session
+    // panel change; see `set_panel_refresh_hz`).
+    "gn_panel_refresh",
 ];
 
 /// Whether the session is suspended. Under the `auto`/`manual` suspend policy

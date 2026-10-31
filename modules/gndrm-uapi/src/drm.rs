@@ -139,6 +139,14 @@ pub const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
 pub const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
 pub const DRM_CLIENT_CAP_WRITEBACK_CONNECTORS: u64 = 5;
 
+/// gndrm private client cap `"GNLG"`: stamp each page-flip event this client
+/// receives with a point on the panel's latch grid (the `SurfaceFlinger` latch
+/// the published frame targets, minus a lead) instead of the session's 1200 Hz
+/// timeline. Not a kernel cap: a real kernel, or a daemon without it, answers
+/// `EINVAL`. gamescope sets it as `GNDRM_CLIENT_CAP_LATCH_GRID 0x474E4C47` and
+/// keeps going without it. See `docs/11-refresh-model.md`.
+pub const GNDRM_CLIENT_CAP_LATCH_GRID: u64 = 0x474E_4C47;
+
 // ---------------------------------------------------------------------------
 // event types (`DRM_EVENT_*`)
 // ---------------------------------------------------------------------------

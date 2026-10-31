@@ -64,6 +64,43 @@ see is therefore the panel's:
 - **Capping at 30/40/60 against the grid is exact arithmetic** — all three divide 1200, and
   a divisor cap lands on its target exactly (`-r 60` reads 60.0 presents/s).
 
+## Latch-grid flip stamps (`GNLG`)
+
+The 1200 Hz timeline above starts its phase at whatever instant the first flip happened
+to land, which has no relation to `SurfaceFlinger`'s latch. gamescope re-anchors its
+vblank timer on every flip stamp (`page_flip_handler` → `MarkVBlank`), so that arbitrary
+phase is where gamescope paints relative to the latch. When gamescope paints at the panel
+rate, that phase decides which latch a frame makes.
+
+A card client can opt out of the session timeline with the private client cap
+`GNDRM_CLIENT_CAP_LATCH_GRID` = `0x474E4C47` ("GNLG", value 1, through `drmSetClientCap`).
+The shim forwards `SET_CLIENT_CAP` verbatim on the RPC channel. A daemon without the cap
+answers `EINVAL`, and so does a render node. While the cap is set:
+
+- **Stamp.** Each flip event is stamped `anchor + k*P - lead` (`gndrm-daemon/src/latch.rs`
+  `VblankTimeline::claim_on_grid`). That is the first such point at or after the instant
+  the publish returned, and never earlier than the previous stamp plus `P/2`. `anchor` and
+  `P` are the latch grid the `vsync` tracker measures from every publish's completion
+  (`ASurfaceTransactionStats_getLatchTime`), fed through `latch::set`. `lead` defaults to
+  2 ms; `GNDRM_GS_LATCH_LEAD_US` overrides it in the app process, up to 50 ms. Before
+  any latch was seen, the stamp walks at the panel period (`nativeSetPanelRefreshHz`), or at
+  the session interval when that rate is unknown too. Delivery is unchanged: the event
+  still goes out right after the publish.
+- **Period.** The daemon forwards every `nativeSetPanelRefreshHz` to a running gamescope as
+  the ConVar command `gn_panel_refresh <Hz>` (through `gamescope_private.execute`, which is
+  allowlisted in `injector.rs`). The launch value is `-r`.
+- **Frame generation.** While a `GNLG` client is connected, the `vsync` lead loop is frozen.
+  The daemon's publishes are then gamescope's, a fixed distance before the latch, so the
+  measured margin no longer follows the shim's lead. The note pushes
+  `min(P/2 + lead + 3 ms, P + lead)`, which falls mid-way between two of gamescope's wakes.
+- **Measurement.** Each stamped publish's claimed latch is checked against the latch time its
+  completion reports. If the frame latched more than `P/2` later, that is a *miss*; more
+  than `P/2` earlier is *early*. `vsync: gamescope latch misses N/M early E lead=…` is
+  logged every 10 s with `GNDRM_LOG_DAEMON`, and otherwise once a minute through the
+  gated info log.
+
+A client without the cap gets the session timeline exactly as before.
+
 ## Open — to measure, not assume
 
 - `active_display_info`'s rate list is the single mode rate above (there are no dynamic

@@ -65,6 +65,10 @@ const END_SYNCOBJ_HANDLE: u32 = 0x5000;
 /// rate when the caller supplies one ([`PanelDesc::refresh_mhz`]) and falls back
 /// to this constant otherwise; keeping the two separate is what lets the refresh
 /// advertised to clients be truthful without clamping the grid onto the panel.
+///
+/// It is the timeline for clients without the latch-grid cap only. A client that
+/// sets [`gndrm_uapi::drm::GNDRM_CLIENT_CAP_LATCH_GRID`] gets its flips stamped on
+/// the panel's measured latch grid instead ([`crate::latch`], doc 11).
 pub const SESSION_REFRESH_MHZ: u32 = 1_200_000;
 
 /// Physical panel description: the surface size the session presents into and,
