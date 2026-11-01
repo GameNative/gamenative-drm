@@ -44,7 +44,7 @@ pub use objects::{
 };
 pub use props::find_prop_id;
 
-use objects::{Blob, Syncobj, SESSION_REFRESH_MHZ};
+use objects::{Blob, Syncobj};
 use pod::*;
 
 use crate::diag::{diag, Role, State};
@@ -2220,9 +2220,10 @@ struct VblankTimeline {
 }
 
 impl VblankTimeline {
+    /// One vblank of the mode in force: the display's own period.
     fn new() -> Self {
         Self {
-            interval_ns: 1_000_000_000_000 / u64::from(SESSION_REFRESH_MHZ),
+            interval_ns: 1_000_000_000_000 / u64::from(mode_refresh_mhz()),
             claimed_ns: 0,
             started: false,
         }

@@ -47,9 +47,10 @@ the app at N while keeping the grid at the mode's rate — they move together.
 
 ## What gndrm does with it
 
-GameNative launches with `-r 1200` (`GamescopeState.SESSION_GRID_HZ` → `gridArg()`), the
-grid the daemon's flip timeline is also built from (`SESSION_REFRESH_MHZ`,
-`gndrm-daemon/src/objects.rs:68`; `lib.rs:2091`), so the grid never binds a session.
+GameNative passes no `-r`: `g_nNestedRefresh` is 0, so the grid, the app-refresh cycle
+and the divisor base all fall back to `g_nOutputRefresh` — the mode's rate. The daemon's
+flip timeline is built from that same rate (`VblankTimeline`, one mode period), so the
+timeline and the grid agree by construction.
 
 The **one** mode the connector exposes is the session's scan-out size at the display's
 rate (`PanelDesc::modeinfo`, `objects.rs:100-160`, which takes the rate in force;

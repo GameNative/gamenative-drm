@@ -50,23 +50,6 @@ const FIRST_SYNCOBJ_HANDLE: u32 = 0x4000;
 /// Exclusive end of the syncobj handle space.
 const END_SYNCOBJ_HANDLE: u32 = 0x5000;
 
-/// The session's vblank grid, in millihertz (1200 Hz = 1_200_000).
-///
-/// gamescope builds its vblank grid — the compositor's paint and frame-done
-/// tick — from the refresh it is launched with (`-r`), and the daemon builds its
-/// flip-event timeline from this constant, so the grid and the timeline agree by
-/// construction. It is deliberately high: the grid is a timer, so a finite value
-/// is required, and 1200 Hz is ~4.6x the present pipeline's measured throughput
-/// (~259 presents/s), so it cannot bind and a guest can over-refresh the panel.
-/// The only real cap on the guest is the user's own fps limit in the QuickMenu;
-/// the physical panel is downstream and coalesces whatever the session sends.
-///
-/// This is NOT the emulated mode's refresh: the mode's rate is the session's own
-/// ([`crate::panel_refresh_mhz`]), and keeping the two separate is what lets the
-/// refresh advertised to clients be the session's without clamping the grid onto
-/// it.
-pub const SESSION_REFRESH_MHZ: u32 = 1_200_000;
-
 /// The mode's rate when the app never reported one: 60 Hz, the one rate every
 /// panel latches. An unknown rate gets the conservative answer rather than a
 /// fabricated high number that would have the compositor paint frames nothing
@@ -376,7 +359,6 @@ mod tests {
         let mode = PanelDesc::default().modeinfo(90_000);
         assert_eq!(mode.vrefresh, 90);
         assert_eq!(recomputed_mhz(&mode), 90_000);
-        assert_ne!(mode.vrefresh, SESSION_REFRESH_MHZ.div_ceil(1000));
     }
 
     #[test]
@@ -386,7 +368,6 @@ mod tests {
         let mode = PanelDesc::default().modeinfo(UNKNOWN_PANEL_HZ);
         assert_eq!(mode.vrefresh, UNKNOWN_PANEL_HZ.div_ceil(1000));
         assert_eq!(recomputed_mhz(&mode), u64::from(UNKNOWN_PANEL_HZ));
-        assert_ne!(mode.vrefresh, SESSION_REFRESH_MHZ.div_ceil(1000));
     }
 
     #[test]

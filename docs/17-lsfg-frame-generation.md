@@ -72,8 +72,8 @@ batches) reports both.
 
 SurfaceFlinger takes the newest buffer a layer holds at each of its latch
 points, one panel period apart, and shows it at the vsync after. Nothing between
-the shim and the panel paces to that grid — gamescope's tick is the 1200 Hz
-session grid, the daemon's `ASurfaceTransaction_apply` carries no present time —
+the shim and the panel paces to that grid — gamescope's tick is its mode's rate,
+the display's, and the daemon's `ASurfaceTransaction_apply` carries no present time —
 so a presenter that commits on its own timer beats against it: every so often
 two commits fall inside one period and the first is replaced before it is shown,
 and a rate above the panel's (60 × 3 on a 120 Hz panel) drops frames in a

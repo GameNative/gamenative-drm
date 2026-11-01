@@ -1666,11 +1666,10 @@ fn atomic_test_only_then_modeset_then_flip() {
     assert_eq!(events[0].sequence, 2);
     assert_eq!(events[0].user_data, 0xBEEF);
     // The claimed vblank advanced by exactly one mode interval (the mocked clock
-    // does not move), which is what keeps gamescope's grid on the mode's rate:
-    // the 1200 Hz session constant is 833 333 ns per frame.
+    // does not move): the mode is the 60 Hz fallback, 16 666 666 ns per frame.
     assert_eq!(
         (events[0].tv_sec, events[0].tv_usec),
-        (1000, 1_333),
+        (1000, 17_166),
         "the next claim is one interval after the previous vblank"
     );
 

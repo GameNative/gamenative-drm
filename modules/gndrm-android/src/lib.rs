@@ -19,12 +19,10 @@
 //! the retained last frame, keeping the listen sockets, the object stores and
 //! the gamescope connection alive; `nativeStop()` stays the session-exit path.
 //!
-//! The session's vblank grid is not a caller concern: the daemon owns it as
-//! its own constant (`gndrm_daemon::SESSION_REFRESH_MHZ`). The panel's real
-//! refresh rate *is* one: the app supplies it through
-//! `nativeSetPanelRefreshHz` before `nativeStart`, and it becomes the emulated
-//! mode's rate — the refresh advertised to clients — while the grid stays the
-//! daemon's constant.
+//! The session's vblank grid is not a caller concern: it is the emulated mode's
+//! own rate, and the mode's rate is the display's. The app supplies it through
+//! `nativeSetPanelRefreshHz` before `nativeStart`, and it is what the connector
+//! advertises and what the daemon's flip timeline claims.
 //!
 //! The mode's *size* is the other session-level input. `nativeStart` takes it
 //! from the window unless the app named one through `nativeSetScanoutGeometry`

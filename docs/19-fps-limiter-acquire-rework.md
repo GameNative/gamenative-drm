@@ -31,9 +31,9 @@ work (already merged, in `master`).
      target frame time instead of a whole number of panel cycles.
   2. `DRMBackend.cpp`: the `-r` mode lookup re-finds the mode by size when the
      grid matches no mode's `vrefresh`.
-  Parking the patch as a whole would also revert (2), and `GamescopeState.gridArg()`
-  passes `-r 1200` on every launch — a grid that matches no mode. **A34 must be
-  split**: (1) is parked, (2) stays as its own patch (`A47`, next free number).
+  Parking the patch as a whole would also revert (2), and the launcher passed a
+  nested-refresh grid on every launch — one that matched no mode. **A34 was split**:
+  (1) is parked, (2) stays as its own patch (`A47`).
 - **The cap** is enforced at release: `scanout::note_release` (`icd_shim/src/scanout.rs:161`)
   advances a process-wide schedule and stamps `slot.floor_ns`/`release_held`;
   `acquire_take_free` frees a held slot when the floor passes. The guest is
@@ -150,7 +150,7 @@ bounds — and hid every frame the display could not take.
 
 7. Split A34: `0034-A47-drm-mode-lookup-by-size.patch` from its `DRMBackend.cpp`
    hunk; move the whole A34 file to `disabled/`.
-8. Verify the train: 29 patches apply, A47 reverses cleanly, `-r 1200` still
+8. Verify the train: 29 patches apply, A47 reverses cleanly, a launch still
    resolves a mode (build log or device).
 9. No app-side change in this branch.
 

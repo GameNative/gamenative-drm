@@ -38,9 +38,9 @@ gamescope, so our pacer would be pacing a path the frames no longer take.
 3. **`-r <N>` / `--nested-refresh`** — the session's vblank grid.
    `main.cpp:740-741` stores it as `g_nNestedRefresh` in **mHz**; `0` is the
    unset sentinel (only negatives are rejected) and every consumer falls back to
-   `g_nOutputRefresh`. GameNative launches with a constant 1200 Hz
-   (`GamescopeState.SESSION_GRID_HZ` → `gridArg()`), high enough that the grid
-   never binds the session. Verified consumers:
+   `g_nOutputRefresh`. GameNative passes no `-r`, so `g_nNestedRefresh` is 0 and
+   every consumer below falls back to the mode's rate, which is the display's.
+   Verified consumers:
    - `vblankmanager.cpp:75-77` `GetRefresh()` — the vblank grid itself, and
      `:405` a sleep computed from the same value.
    - `steamcompmgr.cpp:10606-10607` — `nRealRefreshmHz` →
@@ -65,14 +65,12 @@ Method: deltas of gamescope's unconditional 1/s `drm: A23 flip commit <N>` over 
 ≥23 s window after ~95 s settle, same scene each run. Device 97c32e85, container
 `xuser-STEAM_1868140`.
 
-gndrm exposes **one** mode: the session's scan-out size at the panel's real rate
+gndrm exposes **one** mode: the session's scan-out size at the display's own rate
 (`PanelDesc::modeinfo` in `gndrm-daemon/src/objects.rs`; the rate comes from
-`nativeSetPanelRefreshHz`, or from the frame-generation output rate when that is
-higher). The vblank grid is a separate value — the daemon's own
-`SESSION_REFRESH_MHZ`, 1200 Hz — so `-r` matches no `vrefresh` by design: A47
-re-runs the lookup by size, and `drm_set_mode` makes the mode's rate the
-declared output refresh. `-r` is the grid (paint tick, app-refresh cycle) and
-never the client-visible rate.
+`nativeSetPanelRefreshHz`). The cap and the frame-generation multiplier never
+enter it, so the mode is the rate the compositor paints at and the rate clients
+are told. With no `-r` on the launch line, the paint tick, the app-refresh cycle
+and the divisor base all derive from that one rate.
 
 A divisor cap on the grid lands on its target exactly, and the uncapped ceiling
 is the client↔gamescope lap — the grid itself never binds.
@@ -115,8 +113,8 @@ divisor cap reads its target exactly.
   (a 60 cap read 59.78 on an Odin 3 menu, 60.00 once stepped from `prev`).
   Only a guest a whole period behind is re-based on `now`, so no debt is
   carried out of a stall.
-- **`-r` is not part of it**: the grid is the constant 1200 Hz, and no launch
-  argument carries the limit. `--framerate-limit` is never built.
+- **`-r` is not part of it, and no launch argument carries the limit.** The app
+  sends the cap to the shim's gate; `--framerate-limit` is never built.
 
 Open points:
 - **Divisor rounding bites the gamescope route only.** `nVblankDivisor =
