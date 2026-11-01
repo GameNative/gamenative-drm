@@ -303,6 +303,26 @@ static GENERATED_SEEN: AtomicU64 = AtomicU64::new(0);
 /// per acquired frame, so a healthy delta is one frame plus the multiplier; this
 /// only bounds what a corrupt count could make the loop do.
 const MAX_PRODUCED_PER_MESSAGE: u64 = 4096;
+/// Monotonic time of the last producer report, in ms since the daemon's epoch
+/// (0 = never). A session whose frames never go through the ICD shim (Xwayland
+/// GL, GDI, software rendering) sends no reports, so the publish path feeds the
+/// frame ring for it instead; once reports flow, the publish path goes quiet.
+static LAST_PRODUCER_REPORT_MS: AtomicU64 = AtomicU64::new(0);
+/// How long without a producer report before publishes count again.
+const PRODUCER_REPORT_GRACE_MS: u64 = 1000;
+
+fn monotonic_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    // Never 0: 0 means "no report yet" in LAST_PRODUCER_REPORT_MS.
+    Instant::now().duration_since(epoch).as_millis() as u64 + 1
+}
+
+/// Whether the frame ring is currently fed by producer reports.
+fn producer_reports_live() -> bool {
+    let last = LAST_PRODUCER_REPORT_MS.load(Ordering::Relaxed);
+    last != 0 && monotonic_ms().saturating_sub(last) <= PRODUCER_REPORT_GRACE_MS
+}
 
 /// Eventfd the completion callback writes to wake the scan-out thread. -1 until
 /// the channel is served, which is before any marked frame can exist.
@@ -1619,10 +1639,16 @@ impl AscState {
         self.frames += 1;
         if fb.id != 0 {
             crate::clear_booting_splash_on_first_frame();
-            // Not the frame ring: a publish is what the display latched, and the
-            // ring counts what the session produced (see the `FrameAcquired`
-            // branch in `serve_scanout`). Keeping both on one counter is what
-            // made a cap above the panel read as fps the panel never showed.
+            // The frame ring counts what the session produced, from the
+            // producer reports (see the `FrameAcquired` branch in
+            // `serve_scanout`): keeping both on one counter is what made a cap
+            // above the panel read as fps the panel never showed. A session
+            // without a producing shim (Xwayland GL, GDI, software rendering)
+            // sends no reports at all, and for it a publish is the only frame
+            // count there is.
+            if !producer_reports_live() {
+                crate::notify_frame_published();
+            }
         }
     }
 
@@ -3930,11 +3956,16 @@ fn cap_now() -> FrameCap {
 pub(crate) fn note_produced(acq: FrameAcquired) {
     let previous = ACQUIRED_SEEN.swap(acq.count, Ordering::Relaxed);
     let generated_seen = GENERATED_SEEN.swap(acq.generated, Ordering::Relaxed);
+    LAST_PRODUCER_REPORT_MS.store(monotonic_ms(), Ordering::Relaxed);
     if previous == 0 && acq.count != 0 {
         log_info!(
             "{}",
             gndrm_obf::obf!("asc: acquire counter connected (count={})", acq.count)
         );
+        // The frames behind this first total were already counted by the
+        // publish path while no reports flowed; counting them again here would
+        // put a one-off jump in the ring.
+        return;
     }
     // A total that went backwards is a new producer on this channel, so
     // `saturating_sub` reports all of it as new. Bounded: one message is sent per
