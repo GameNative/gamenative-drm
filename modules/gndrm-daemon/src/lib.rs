@@ -16,6 +16,7 @@ mod commit;
 pub mod cursor;
 pub mod diag;
 mod edid;
+pub mod flip;
 pub mod foreign;
 pub mod frame_cap;
 mod objects;
@@ -36,6 +37,7 @@ use gndrm_uapi::drm::*;
 use gndrm_uapi::mode::*;
 use gndrm_uapi::wire::{errno, ScanoutLayout, SCANOUT_LAYOUT_ENV};
 
+pub use flip::FlipDone;
 pub use frame_cap::FrameCap;
 pub use objects::{CrtcState, Framebuffer, GemObject, PanelDesc, PlaneState, Stores};
 pub use objects::{CONNECTOR_ID, CRTC_ID, ENCODER_ID, PLANE_CURSOR_ID, PLANE_PRIMARY_ID};
@@ -45,6 +47,7 @@ use objects::{Blob, Syncobj, SESSION_REFRESH_MHZ};
 use pod::*;
 
 use crate::diag::{diag, Role, State};
+use crate::flip::FlipGate;
 
 /// Driver identity reported by `DRM_IOCTL_VERSION`.
 const DRIVER_NAME: &[u8] = b"gamenative";
@@ -474,6 +477,25 @@ pub trait Presenter: Send {
         self.publish(fb, plane, ino, live_inos, fence);
     }
 
+    /// [`Self::publish_with_source`] for a commit whose page-flip event waits
+    /// for the compositor's latch (see [`crate::flip`]): a presenter that
+    /// reports completions fires `done` from the completion. The default drops
+    /// it, completing at once.
+    #[allow(clippy::too_many_arguments)]
+    fn publish_frame(
+        &mut self,
+        fb: &Framebuffer,
+        plane: &PlaneState,
+        ino: Option<u64>,
+        src_fd: Option<RawFd>,
+        live_inos: &HashSet<u64>,
+        fence: Option<RawFd>,
+        done: FlipDone,
+    ) {
+        self.publish_with_source(fb, plane, ino, src_fd, live_inos, fence);
+        drop(done);
+    }
+
     /// Put the cursor plane's new state on the cursor layer (a client holding
     /// [`GNDRM_CLIENT_CAP_CURSOR_LAYER`] only). Called on the commit worker
     /// after the commit's primary publish, for every commit that changed the
@@ -534,7 +556,7 @@ type ClockFn = Box<dyn Fn() -> (u32, u32) + Send + Sync>;
 /// The event clock, shared between the [`Device`] and the commit worker, which
 /// re-stamps a page-flip event at emission (see [`commit_worker_loop`]); the
 /// indirection lets [`Device::set_clock`] (tests) reach the worker too.
-type SharedClock = Arc<Mutex<ClockFn>>;
+pub(crate) type SharedClock = Arc<Mutex<ClockFn>>;
 /// Diagnostics sink for rejections (see `Device::set_logger`).
 pub type LogFn = Box<dyn Fn(&str) + Send>;
 /// Sink for a framebuffer geometry the client registered (`ADDFB2`), so a
@@ -609,6 +631,9 @@ pub struct Device {
     shutdown: Arc<AtomicBool>,
     /// The commit worker (owns the presenter for its whole lifetime).
     worker: Option<thread::JoinHandle<()>>,
+    /// Commits in order, waiting for their flip events (see [`flip`]).
+    gate: Arc<FlipGate>,
+    flip_thread: Option<thread::JoinHandle<()>>,
 
     /// Optional diagnostics sink (Android glue → GN_DRM logcat, hostd →
     /// stderr). Rejections are always reported; successes stay silent. Shared
@@ -694,25 +719,27 @@ impl Device {
         let in_flight = Arc::new(Mutex::new(HashSet::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger: Arc<Mutex<Option<LogFn>>> = Arc::new(Mutex::new(None));
-        // The worker owns the presenter and signals a dup of the flip eventfd.
-        let worker_fd = dup_fd(flip_event_fd, 0).expect(&gndrm_obf::obf!("dup flip eventfd"));
-        // The event clock is shared with the commit worker, which re-stamps a
-        // page-flip event when it emits it (see `commit_worker_loop`).
+        // The flip thread signals a dup of the flip eventfd and stamps events
+        // with the shared clock (see `flip::flip_thread`).
+        let flip_fd = dup_fd(flip_event_fd, 0).expect(&gndrm_obf::obf!("dup flip eventfd"));
         let clock: SharedClock = Arc::new(Mutex::new(Box::new(monotonic_now)));
+        let gate = Arc::new(FlipGate::default());
+        let flip_thread = thread::Builder::new()
+            .name("gndrm-flip".into())
+            .spawn({
+                let (gate, flip_queue) = (Arc::clone(&gate), Arc::clone(&flip_queue));
+                let (in_flight, clock) = (Arc::clone(&in_flight), Arc::clone(&clock));
+                let logger = Arc::clone(&logger);
+                move || flip::flip_thread(gate, flip_queue, flip_fd, in_flight, clock, logger)
+            })
+            .expect(&gndrm_obf::obf!("spawn the flip thread"));
         let worker = thread::Builder::new()
             .name("gndrm-commit".into())
             .spawn({
-                let flip_queue = Arc::clone(&flip_queue);
-                let in_flight = Arc::clone(&in_flight);
+                let gate = Arc::clone(&gate);
                 let shutdown = Arc::clone(&shutdown);
                 let logger = Arc::clone(&logger);
-                let clock = Arc::clone(&clock);
-                move || {
-                    commit_worker(
-                        presenter, commit_rx, flip_queue, worker_fd, in_flight, shutdown, logger,
-                        clock,
-                    )
-                }
+                move || commit_worker(presenter, commit_rx, gate, shutdown, logger)
             })
             .ok();
         Self {
@@ -742,6 +769,8 @@ impl Device {
             in_flight,
             shutdown,
             worker,
+            gate,
+            flip_thread: Some(flip_thread),
             logger,
             always_logger: None,
             addfb_geometry: None,
@@ -2101,6 +2130,10 @@ impl Drop for Device {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        self.gate.shutdown();
+        if let Some(flip) = self.flip_thread.take() {
+            let _ = flip.join();
+        }
         close_fd(self.flip_event_fd);
     }
 }
@@ -2199,6 +2232,12 @@ impl VblankTimeline {
         self.claimed_ns = t;
         t
     }
+
+    /// A latched frame took effect at `at_ns`: the grid continues from there.
+    fn anchor(&mut self, at_ns: u64) {
+        self.started = true;
+        self.claimed_ns = at_ns;
+    }
 }
 
 /// The commit worker: a thin panic barrier around [`commit_worker_loop`].
@@ -2207,28 +2246,16 @@ impl VblankTimeline {
 /// caught here, reported once, and ends the worker. The subsystem then stops
 /// (no further frames are presented) while `app.gamenative` stays alive: this
 /// replaces the old behaviour where a worker panic aborted the whole process.
-#[allow(clippy::too_many_arguments)]
 fn commit_worker(
     presenter: Box<dyn Presenter>,
     commit_rx: mpsc::Receiver<CommitJob>,
-    flip_queue: Arc<Mutex<VecDeque<DrmEventVblank>>>,
-    flip_event_fd: RawFd,
-    in_flight: Arc<Mutex<HashSet<u32>>>,
+    gate: Arc<FlipGate>,
     shutdown: Arc<AtomicBool>,
     logger: Arc<Mutex<Option<LogFn>>>,
-    clock: SharedClock,
 ) {
     let report = Arc::clone(&logger);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        commit_worker_loop(
-            presenter,
-            commit_rx,
-            flip_queue,
-            flip_event_fd,
-            in_flight,
-            shutdown,
-            clock,
-        );
+        commit_worker_loop(presenter, commit_rx, gate, shutdown);
     }));
     if caught.is_err() {
         if let Some(log) = report
@@ -2239,54 +2266,42 @@ fn commit_worker(
             log("commit: worker PANICKED; display path stopped, app continues");
         }
     }
-    // Always released, whether the loop returned or unwound through it.
-    close_fd(flip_event_fd);
 }
 
-/// The commit worker: one serial loop that pops a commit, publishes it, and
-/// emits the flip event. It never waits for the presenter's completion: the
-/// flip event is emitted with the publish (a real KMS page-flip event is
-/// delivered when the flip is queued for the next vblank), and a buffer's
-/// lifetime is gated by the presenter's own release-fence wait, not by this
-/// loop.
-#[allow(clippy::too_many_arguments)]
+/// The commit worker: pops a commit, arms its flip event on the gate (commit
+/// order) and publishes it. A commit with a new framebuffer hands the presenter
+/// a [`FlipDone`], fired when SurfaceFlinger's completion for the frame
+/// arrives (the latch); anything else completes when armed. The worker never
+/// waits for the compositor (see [`flip`]).
 fn commit_worker_loop(
     mut presenter: Box<dyn Presenter>,
     commit_rx: mpsc::Receiver<CommitJob>,
-    flip_queue: Arc<Mutex<VecDeque<DrmEventVblank>>>,
-    flip_event_fd: RawFd,
-    in_flight: Arc<Mutex<HashSet<u32>>>,
+    gate: Arc<FlipGate>,
     shutdown: Arc<AtomicBool>,
-    clock: SharedClock,
 ) {
-    // Publish what this worker is doing for the scan-out snapshot: "the commit
-    // worker was <state>" is one of the facts a stalled request has to explain.
-    // Atomics only, so this cannot perturb the flip path.
+    // Publish what this worker is doing for the scan-out snapshot (atomics).
     let d = diag();
     d.set_role(Role::Commit, State::CommitWaitingJob);
-    // The vblank schedule the flip events claim (see `VblankTimeline`).
-    let mut vblank = VblankTimeline::new();
     while let Ok(mut job) = commit_rx.recv() {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        // The fb id this commit published, if any.
         let in_flight_fb = job.fb.as_ref().map(|fb| fb.id);
-        // Publish the buffer when there is one; otherwise the commit carries no
-        // presentation (the frame is dropped/hidden) and only its fence is
-        // released.
+        let seq = gate.arm(in_flight_fb, job.event.take(), in_flight_fb.is_some());
         d.set_role(Role::Commit, State::CommitPublishing);
         match job.fb.take() {
             Some(fb) => {
                 let fence = job.fence.take();
-                presenter.publish_with_source(
+                presenter.publish_frame(
                     &fb,
                     &job.plane,
                     job.ino,
                     job.src_fd,
                     &job.live_inos,
                     fence,
+                    FlipDone::new(Arc::clone(&gate), seq),
                 );
+                gate.published(seq);
             }
             None => {
                 if let Some(fd) = job.fence.take() {
@@ -2295,50 +2310,13 @@ fn commit_worker_loop(
             }
         }
         // The cursor layer, after the primary publish: a cursor-only commit
-        // reaches the presenter here and nowhere else, so it never re-flips
-        // the scan-out layer (nor feeds a frame generator on it).
+        // reaches the presenter here and nowhere else.
         if let Some(cursor) = job.cursor.take() {
             let src_fd = job.cursor_src_fd.take();
             presenter.publish_cursor(&cursor, src_fd);
             if let Some(fd) = src_fd {
                 close_fd(fd);
             }
-        }
-        // The frame is now queued to SurfaceFlinger. Emit the page-flip event
-        // here, with the publish: a real KMS page-flip event is delivered when
-        // the flip is *queued* for the next vblank. gamescope's DRM backend
-        // blocks its present loop on this event
-        // (`drm->uPendingFlipCount.wait`, Backends/DRMBackend.cpp), so gating it
-        // on SurfaceFlinger's completion round trip would serialise that round
-        // trip (~8.4 ms median here) into every paced frame.
-        //
-        // Correctness is unchanged: nothing is reusable before the compositor
-        // has released it. A buffer is handed back out only once the client has
-        // stopped importing it (the pool's liveness gate), and the next publish
-        // onto that slot still waits on the previous release fence the
-        // presenter's completion stored. This loop never blocks on the
-        // completion itself — the flip event is a client pacing signal, and the
-        // buffer's lifetime is pinned to the compositor's release signal.
-        d.set_role(Role::Commit, State::CommitFlushing);
-        if let Some(fb_id) = in_flight_fb {
-            in_flight
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&fb_id);
-        }
-        if let Some(mut ev) = job.event.take() {
-            // Stamp the vblank this frame lands on, not the instant the event is
-            // built or emitted (see `VblankTimeline`). Delivery stays immediate,
-            // so gamescope's present loop never waits on a display round trip.
-            let (sec, usec) = (clock.lock().unwrap_or_else(PoisonError::into_inner))();
-            let claimed = vblank.claim(u64::from(sec) * 1_000_000_000 + u64::from(usec) * 1_000);
-            ev.tv_sec = (claimed / 1_000_000_000) as u32;
-            ev.tv_usec = ((claimed % 1_000_000_000) / 1_000) as u32;
-            flip_queue
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push_back(ev);
-            write_eventfd(flip_event_fd);
         }
         d.set_role(Role::Commit, State::CommitWaitingJob);
     }
