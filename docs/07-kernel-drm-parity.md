@@ -1,11 +1,14 @@
 # 07 — Kernel DRM parity: async commit + vblank event queue
 
 gndrm commits behave like a real kernel DRM driver: an atomic commit validates,
-queues, and returns immediately, and the flip event is delivered when the flip
-is queued for the next vblank. Gamescope's present loop blocks on that event, so
-the worker emits it as soon as it has published — never after SurfaceFlinger's
-completion. A buffer's lifetime is pinned to the compositor's own release
-signal, not to the event.
+queues, and returns immediately. The flip event of a commit with a new
+framebuffer is delivered when SurfaceFlinger's completion for that frame
+arrives (the frame latched), stamped with the latch time: gamescope hands the
+replaced buffer back to its producer on this event, and an event at `apply`
+time handed back buffers SurfaceFlinger had not even replaced yet. Commits
+with no new framebuffer get their event at once. Events stay ordered and one
+per commit (`gndrm-daemon/src/flip.rs`); a frame with no completion 50 ms
+after its publish is released anyway.
 
 ## Model
 

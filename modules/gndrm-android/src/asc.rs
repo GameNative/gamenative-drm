@@ -67,7 +67,7 @@ use gndrm_daemon::diag::{self, Diag, Reply, Role, Stage, State, TrackedMutex, LO
 use gndrm_daemon::scanout::{
     serves_len, Geometry, Removed, Reservation as CacheReservation, ReusePool,
 };
-use gndrm_daemon::{CursorUpdate, FrameCap, Framebuffer, PlaneState, Presenter};
+use gndrm_daemon::{CursorUpdate, FlipDone, FrameCap, Framebuffer, PlaneState, Presenter};
 use gndrm_uapi::wire::{
     scanout_ahb_format, FrameAcquired, FrameCapSubscribe, LsfgConfig, PresentDone, PresentMark,
     ScanoutAllocReq, ScanoutAllocResp, CAP_FRAME_CAP, CAP_PRESENT_ID, CAP_VSYNC_NOTE,
@@ -357,13 +357,16 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
     if context.is_null() {
         return;
     }
+    // SAFETY: `context` is the boxed TxCtx `build_show` handed to
+    // setOnComplete; ownership comes back here exactly once.
+    let TxCtx { buf, done } = *unsafe { Box::from_raw(context.cast::<TxCtx>()) };
     // Publish the callback's activity: the completion is SurfaceFlinger's
     // release signal for this frame, so a snapshot must be able to say whether
     // a callback was running when a request stalled.
     diag::diag().set_role(Role::PresenterCallback, State::PresenterCallback);
     // SAFETY: `context` is the leaked ReleaseCtx this presenter handed to
     // setOnComplete; it outlives every callback by construction.
-    let ctx = unsafe { &*context.cast::<ReleaseCtx>() };
+    let ctx = unsafe { &*buf };
     // Ask `stats` for the controls this transaction itself updated: a publish
     // transaction updates exactly one control — the layer it published on — so
     // the entry names the layer of *this* transaction. A control taken from
@@ -396,6 +399,12 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
         // exactly once here.
         unsafe { (ctx.stats_release_controls)(controls) };
     }
+    // A copy for the next commit's flip event (see gndrm_daemon::flip); the
+    // fence itself is stored as before.
+    // SAFETY: `fd` is valid for this call when >= 0.
+    let release_copy = (fd >= 0)
+        .then(|| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) })
+        .filter(|d| *d >= 0);
     if fd >= 0
         && ctx
             .release_fd
@@ -422,7 +431,24 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
     // completion. This is the frame's release signal — the return path the reuse
     // cache and the next publish's release-fence wait key on.
     ctx.latched.store(true, Ordering::Release);
+    // The frame latched: its page-flip event may leave (see gndrm_daemon::flip).
+    match done {
+        Some(done) => done.complete(latch_ns, release_copy),
+        None => {
+            if let Some(f) = release_copy {
+                // SAFETY: owned here.
+                unsafe { libc::close(f) };
+            }
+        }
+    }
     diag::diag().set_role(Role::PresenterCallback, State::Idle);
+}
+
+/// One show transaction's completion context: the shown buffer's mailbox and
+/// the commit's flip event. Freed by the callback (one per transaction).
+struct TxCtx {
+    buf: *mut ReleaseCtx,
+    done: Option<FlipDone>,
 }
 
 /// Payload the reuse cache stores for one registered scan-out buffer: the
@@ -1012,6 +1038,8 @@ pub struct AscState {
     foreign_failures: u64,
     /// The cursor layer (see [`AscState::publish_cursor`]).
     cursor: CursorLayer,
+    /// The commit being published's flip event, taken by its show transaction.
+    pending_done: Option<FlipDone>,
 }
 
 // SAFETY: the state is only ever reached through the `Arc<Mutex<_>>` shared by
@@ -1106,6 +1134,7 @@ impl AscState {
             foreign_buffers: 0,
             foreign_failures: 0,
             cursor: CursorLayer::new(cursor_sc),
+            pending_done: None,
         };
         // A layer is created empty, and an empty layer makes SurfaceFlinger
         // composite nothing. Everything this session knows lives in the
@@ -1542,7 +1571,8 @@ impl AscState {
                             self.win_h)
                         );
                     }
-                    match build_show(&api, self.sc, ahb, ctx, rect, fence) {
+                    let done = self.pending_done.take();
+                    match build_show(&api, self.sc, ahb, ctx, done, rect, fence) {
                         Some(tx) => {
                             apply_transaction(&api, tx);
                             // SAFETY: `ctx` is the leaked mailbox of this slot.
@@ -1870,7 +1900,7 @@ impl AscState {
             dst: lp.dst,
             dataspace: lp.dataspace,
         };
-        if let Some(tx) = build_show(&api, self.sc, ahb, ctx, rect, None) {
+        if let Some(tx) = build_show(&api, self.sc, ahb, ctx, None, rect, None) {
             apply_transaction(&api, tx);
             // SAFETY: `ctx` is the leaked mailbox of this slot.
             unsafe {
@@ -2414,6 +2444,24 @@ impl Presenter for AscPresenter {
     ) {
         self.lock()
             .publish(fb, plane, ino, src_fd, live_inos, fence);
+    }
+
+    fn publish_frame(
+        &mut self,
+        fb: &Framebuffer,
+        plane: &PlaneState,
+        ino: Option<u64>,
+        src_fd: Option<RawFd>,
+        live_inos: &HashSet<u64>,
+        fence: Option<RawFd>,
+        done: FlipDone,
+    ) {
+        let mut state = self.lock();
+        state.pending_done = Some(done);
+        state.publish(fb, plane, ino, src_fd, live_inos, fence);
+        // Not taken by a show transaction (dropped frame, hidden plane): the
+        // event goes now, as before.
+        drop(state.pending_done.take());
     }
 
     fn publish_cursor(&mut self, cursor: &CursorUpdate, src_fd: Option<RawFd>) {
@@ -3547,6 +3595,7 @@ fn build_show(
     sc: *mut ffi::ASurfaceControl,
     ahb: *mut ffi::AHardwareBuffer,
     ctx: *mut ReleaseCtx,
+    done: Option<FlipDone>,
     rect: ShowRect,
     fence: Option<RawFd>,
 ) -> Option<*mut ffi::ASurfaceTransaction> {
@@ -3649,7 +3698,8 @@ fn build_show(
         }
         // The completion reports the previous release fence, which is what
         // gates re-publishing this buffer.
-        (api.st_set_on_complete)(tx, ctx.cast(), on_complete);
+        let tx_ctx = Box::into_raw(Box::new(TxCtx { buf: ctx, done }));
+        (api.st_set_on_complete)(tx, tx_ctx.cast(), on_complete);
         Some(tx)
     }
 }
