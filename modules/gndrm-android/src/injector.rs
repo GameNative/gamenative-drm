@@ -298,6 +298,9 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "set_look",
     "screenshot",
     "debug_force_repaint",
+    // Dirties the backend and re-polls it: the connector's mode list is read
+    // again, so a rate the app changed mid-session becomes the mode.
+    "backend_set_dirty",
 ];
 
 /// Whether the session is suspended. Under the `auto`/`manual` suspend policy

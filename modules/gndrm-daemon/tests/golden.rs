@@ -12,7 +12,7 @@ use gndrm_daemon::pod::{pod_read, pod_write};
 use gndrm_daemon::{
     find_prop_id, select_scanout_layout, Device, DispatchResult, Framebuffer, NullPresenter,
     PanelDesc, PlaneState, Presenter, CONNECTOR_ID, CRTC_ID, ENCODER_ID, PLANE_CURSOR_ID,
-    PLANE_PRIMARY_ID,
+    PLANE_PRIMARY_ID, UNKNOWN_PANEL_HZ,
 };
 use gndrm_uapi::drm::*;
 use gndrm_uapi::mode::*;
@@ -502,7 +502,9 @@ fn connector_encoder_plane_queries() {
     assert_eq!(ext.len(), want);
     let m: DrmModeModeinfo = pod_read(&ext[4..]).unwrap();
     assert_eq!((m.hdisplay, m.vdisplay), (1280, 720));
-    assert_eq!(m.vrefresh, 1200);
+    // The mode is the panel's own rate; no panel was reported in this harness,
+    // so the conservative default.
+    assert_eq!(m.vrefresh, UNKNOWN_PANEL_HZ.div_ceil(1000));
     assert_ne!(m.ty & DRM_MODE_TYPE_PREFERRED, 0);
 
     // Unknown connector id.
@@ -769,7 +771,7 @@ fn property_queries_golden() {
 #[test]
 fn blob_lifecycle() {
     let mut d = dev();
-    let mode = PanelDesc::default().modeinfo();
+    let mode = PanelDesc::default().modeinfo(gndrm_daemon::UNKNOWN_PANEL_HZ);
     let mut req = pod(&DrmModeCreateBlob {
         length: core::mem::size_of::<DrmModeModeinfo>() as u32,
         ..Default::default()
@@ -1464,7 +1466,7 @@ fn commit_worker_panic_is_contained_and_non_fatal() {
 struct ModeBlob(u32);
 
 fn create_mode_blob(d: &mut Device) -> ModeBlob {
-    let mode = PanelDesc::default().modeinfo();
+    let mode = PanelDesc::default().modeinfo(gndrm_daemon::UNKNOWN_PANEL_HZ);
     let mut req = pod(&DrmModeCreateBlob {
         length: core::mem::size_of::<DrmModeModeinfo>() as u32,
         ..Default::default()

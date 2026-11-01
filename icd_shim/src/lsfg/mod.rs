@@ -348,8 +348,11 @@ pub fn skip(what: &str) -> bool {
 /// comes from here, not from a `FrameCapNote`.
 #[must_use]
 pub fn source_cap() -> Option<u32> {
-    let (enabled, multiplier, cap) = live();
-    (enabled && cap > 0).then(|| gndrm_lsfg::pacing::source_pace(cap, panel_hz(), multiplier))
+    let (enabled, _multiplier, cap) = live();
+    // The user's cap, as asked: the display does not reshape it, so a 40 cap is
+    // 40 acquires a second on a 60 Hz panel as much as on a 120 Hz one, and the
+    // multiplier decides what is generated on top.
+    (enabled && cap > 0).then_some(cap)
 }
 
 /// `(source, output)` rates in whole hertz while generation is on.

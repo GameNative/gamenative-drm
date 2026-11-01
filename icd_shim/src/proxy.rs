@@ -978,6 +978,15 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
         GEN_SKIPS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
+    // One batch per source frame. The guest's presents are not the cap — a
+    // mailbox guest presents again as soon as a buffer frees — so a batch per
+    // present would generate for frames that were never acquired and put the
+    // output above `cap × multiplier`.
+    let acquired = ACQ_COUNT.load(Ordering::Relaxed);
+    if acquired == unsafe { (*gd).gen_last_acq } {
+        GEN_SKIPS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
     // The queue ahead is bounded: a guest running ahead of its cap must not
     // stack frames further and further into the future.
     let period = unsafe { (*gd).gen_period_ns };
@@ -1063,18 +1072,6 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
     if planned < capacity {
         GEN_SHORT_PLAN.fetch_add(1, Ordering::Relaxed);
     }
-    // No more than the panel can show between two source frames: a frame above
-    // that is committed and never latched, and which frames those are drifts.
-    let source_hz = crate::lsfg::source_cap().unwrap_or(
-        (1_000_000_000 + period / 2)
-            .checked_div(period)
-            .unwrap_or(0) as u32,
-    );
-    let generations = generations.min(gndrm_lsfg::pacing::panel_budget(
-        crate::lsfg::panel_hz(),
-        source_hz,
-        capacity,
-    ));
 
     let (Some(alloc_cmd), Some(free_cmd), Some(submit)) = (f.alloc_cmd, f.free_cmd, f.submit)
     else {
@@ -1364,14 +1361,19 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
             (0, p) => p,
             (c, p) => c.max(p),
         };
-        // On the panel's latch grid once the daemon has reported one: the
-        // frames take consecutive latch points from the one after the previous
-        // queued frame's (or the first a commit can still reach, when that has
+        // On the panel's latch grid when the batch fits it: the frames take
+        // consecutive latch points from the one after the previous queued
+        // frame's (or the first a commit can still reach, when that has
         // passed), so one frame lands per panel period and none replaces
-        // another unshown. The budget above keeps a source period's frames
-        // within the periods it holds. Without a grid, the frames are spread
-        // over the source period on this clock.
-        let grid = crate::lsfg::latch_grid();
+        // another unshown. A batch with more frames than the panel has points
+        // in a source period goes out on this clock spread over the period
+        // instead: on the grid the source frame would follow the batch's last
+        // point, the queue would carry a period per extra frame and the
+        // multiplier the user asked for would never arrive. What the panel
+        // cannot latch is the compositor's to drop.
+        let grid = crate::lsfg::latch_grid().filter(|g| {
+            g.period_ns == 0 || (built as u64 + 1) * g.period_ns <= source_period
+        });
         let step = source_period / (built as u64 + 1);
         let base = now.max(unsafe { (*gd).gen_last_deadline });
         let first_latch = grid.map(|g| g.first_latch(now, unsafe { (*gd).gen_last_latch_ns }));
@@ -1406,6 +1408,7 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
             });
             (*gd).gen_last_deadline = real_at;
             (*gd).gen_last_latch_ns = real_latch;
+            (*gd).gen_last_acq = acquired;
         }
         queued = true;
     }
@@ -2408,7 +2411,13 @@ unsafe fn gn_acquire_common(
     // One line per frame for the app's frame ring: the count is cumulative, so
     // a message the socket refuses is carried by the next one.
     let acquired = ACQ_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    crate::scanout::send_frame_acquired(acquired);
+    // With what generation has inserted so far: the pair is what the session has
+    // produced, and the daemon turns the deltas into the app's frame ring. Sent
+    // once per acquired frame, so the ring's granularity is one frame.
+    crate::scanout::send_frame_acquired(
+        acquired,
+        GEN_COMMITS.load(Ordering::Relaxed).into(),
+    );
     let acq_ms = acq_t0.elapsed().as_millis();
     let acq_us = acq_t0.elapsed().as_micros() as usize;
     ACQ_US_N.fetch_add(1, Ordering::Relaxed);
@@ -6536,6 +6545,10 @@ pub struct GnDevice {
     /// The panel latch point the last queued frame was placed on, so the next
     /// one takes a later point; 0 before any frame was placed on the grid.
     pub gen_last_latch_ns: u64,
+    /// The acquire count when the last batch ran. A batch belongs to a source
+    /// frame, so a guest presenting faster than its cap must not add batches of
+    /// its own: those would multiply the surplus instead of the cap.
+    pub gen_last_acq: u64,
 }
 
 #[repr(C)]
@@ -9627,6 +9640,7 @@ unsafe extern "C" fn gn_vkCreateDevice(
         gen_period_ns: 0,
         lsfg: ptr::null_mut(),
         gen_last_latch_ns: 0,
+        gen_last_acq: 0,
     });
     // Real-device function resolution never uses the hooks'
     // vkGetDeviceProcAddr: its answers are vulkan::driver::* trampolines

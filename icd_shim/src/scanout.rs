@@ -647,12 +647,15 @@ pub(crate) fn fd_link(fd: RawFd) -> String {
 /// Non-blocking: this runs on the guest's present thread once per frame, and a
 /// full socket must cost a dropped message rather than a stall. Losing one is
 /// harmless — the count is cumulative and the next message carries the total.
-pub(crate) fn send_frame_acquired(count: u64) {
+pub(crate) fn send_frame_acquired(count: u64, generated: u64) {
     let ch = CHAN.lock().unwrap_or_else(|e| e.into_inner());
     if *ch < 0 {
         return;
     }
-    send_frame_nb(*ch, &gndrm_uapi::wire::FrameAcquired { count }.encode());
+    send_frame_nb(
+        *ch,
+        &gndrm_uapi::wire::FrameAcquired { count, generated }.encode(),
+    );
 }
 
 /// Mark a frame's present id for the daemon, immediately before the commit that

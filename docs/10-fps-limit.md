@@ -96,6 +96,16 @@ divisor cap reads its target exactly.
   re-issues it when the value or the panel's screen type changes
   (`injector.rs:717-722`); `set_frame_cap_target` (`lib.rs:322`) holds the target
   so the scan-out channel pushes a `FrameCapNote` to a subscribed shim.
+- **Every subscriber is pushed to, not the allocator.** The card listener hands
+  one client the allocator role at a time (`server::accept_newest`), and a session
+  has three that open it — the compositor, a wine child and the game — swapping it
+  for the first ~20 s. A `FrameCapSubscribe` therefore outlives that role:
+  `gndrm_daemon::pushes` keeps the registration and sends the cap, the panel's
+  grid and the frame-generation settings to every client that asked for them. A
+  live cap change reaches the guest that gates on it even after another client
+  took the slot; a subscriber whose peer is gone is dropped there, and the
+  connection currently being served stays its own loop's to close. This is what
+  makes a cap change made mid-session reach an already-connected shim at all.
 - **The shim enforces it** (`icd_shim/src/scanout.rs:118-146`,
   `next_acquire_after`): the next acquire may start no sooner than one
   `1/target` period after the previous *deadline*, so the guest blocks in
@@ -113,10 +123,23 @@ Open points:
   nRefreshHz / nTargetFPS` (`steamcompmgr.cpp:7040`, and `:10621` for the window's
   limited cycle) lands on the nearest divisor of the grid; the shim's floor is
   exact (measured: 60.00 commits/s at a 60 cap).
-- **The client-visible refresh is the mode's.** `-r` reaches `g_nOutputRefresh`
-  only transiently (`drm_unset_mode`, `:3680`), before `drm_set_mode` (`:3728`)
-  overwrites it with the mode's rate — `_GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK`
-  and `active_display_info` therefore carry the panel's rate, never the grid.
+- **The client-visible refresh is the mode's, and the mode is the display's.**
+  `-r` reaches `g_nOutputRefresh` only transiently (`drm_unset_mode`, `:3680`),
+  before `drm_set_mode` (`:3728`) overwrites it with the mode's rate —
+  `_GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK` and `active_display_info` therefore
+  carry the mode's rate, never the grid. The cap and the frame-generation
+  multiplier never enter it: the connector advertises the display's own rate, so
+  the compositor paints at the rate the display latches whatever the session does
+  (a 40 cap at x4 runs a 120 Hz mode and produces 160 frames a second). The
+  daemon serves the rate live — the mode is built on every connector read — so a
+  display change is applied by dirtying gamescope's backend
+  (`backend_set_dirty`), which re-reads the connector and re-selects the mode.
+  The QuickMenu never moves it.
+- **The frame ring counts produced frames**, not published ones: the shim reports
+  its acquire and generation totals (`FrameAcquired`), and the daemon turns the
+  deltas into `onFramePublished`. A cap above the panel therefore reads as more
+  frames than the panel shows — which is the point, and why the publish count is
+  kept only as the session's own statistic.
 - **Engagement feedback**: `gamescope_limiter.state` covers the gamescope route;
   the shim logs `scanout frame cap: fps=… effective=…` (`scanout.rs:148-158`),
   `effective` being the target in force once the note is adopted, and reports what
