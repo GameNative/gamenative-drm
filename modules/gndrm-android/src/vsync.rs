@@ -23,12 +23,19 @@ use std::sync::Mutex;
 
 use gndrm_uapi::wire::VsyncNote;
 
-/// Whether the scan-out connection in service declared it reads the note.
-/// The lead is measured only then: a shim that commits on its own clock gives
-/// margins that do not follow the lead, and the loop would walk it to a clamp.
+/// Whether any client reads the note. The lead is measured only then: a shim
+/// that commits on its own clock gives margins that do not follow the lead, and
+/// the loop would walk it to a clamp.
+///
+/// Kept as a local flag rather than read from the subscription registry, because
+/// this file is compiled on its own by the host harness
+/// (`tests/vsync.rs`) and must reach nothing in the crate root. The scan-out
+/// side refreshes it whenever the set of subscribers changes
+/// (`asc::sync_vsync_subscription`): a subscriber keeps its registration after
+/// it hands the allocator role on, and it is still placing frames by this note.
 static SUBSCRIBED: AtomicBool = AtomicBool::new(false);
 
-/// Record whether the connection in service reads the note.
+/// Record whether anyone reads the note (see [`SUBSCRIBED`]).
 pub(crate) fn set_subscribed(on: bool) {
     SUBSCRIBED.store(on, Ordering::Relaxed);
 }

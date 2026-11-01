@@ -5,8 +5,7 @@
 //! so a timer that is not phased to those points beats against them: every so
 //! often two commits fall inside one period and the second replaces the first
 //! before it is shown. This module turns an instant a frame is wanted at into
-//! the latch point it lands on and the commit instant that reaches it, and
-//! bounds how many frames a source period can carry at all.
+//! the latch point it lands on and the commit instant that reaches it.
 
 /// The panel's latch grid, as the daemon reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,49 +54,6 @@ impl Grid {
     pub fn commit_for(&self, latch_ns: u64) -> u64 {
         latch_ns.saturating_sub(self.lead_ns)
     }
-}
-
-/// The rate the source is paced to while generating `multiplier` frames per
-/// source frame for a `panel_hz` panel: the user's `cap`, unless the panel
-/// cannot show two frames per source frame at it, in which case half the
-/// panel's rate, so the panel is filled evenly (a 60 cap on a 90 Hz panel runs
-/// the game at 45 and shows 90; on a 120 Hz panel it stays 60 and shows 120).
-/// A cap of 0 (none) or an unknown panel is returned as is.
-#[must_use]
-pub fn source_pace(cap: u32, panel_hz: u32, multiplier: u32) -> u32 {
-    if cap == 0 || panel_hz == 0 || multiplier < 2 {
-        return cap;
-    }
-    // The tolerance `panel_budget` applies: a 120 Hz panel reported as 119 still
-    // holds a 60 cap twice.
-    if u64::from(panel_hz) * 17 / 16 >= 2 * u64::from(cap) {
-        cap
-    } else {
-        panel_hz / 2
-    }
-}
-
-/// How many generated frames a panel can show between two source frames, at
-/// most `capacity`.
-///
-/// A panel shows one frame per period; a source period at `source_hz` holds
-/// `panel_hz / source_hz` of them, one of which is the source frame itself.
-/// Anything above that is committed and never shown, and which frames are
-/// dropped drifts, so the output looks uneven. A rate a hair under an exact
-/// multiple (a 120 Hz panel reporting 119.88, a guest measured at 61 against a
-/// 60 cap) still gets the multiple: the presenter's queue bound absorbs the
-/// difference as an occasional skipped batch. 0 for either rate means it is
-/// unknown, which leaves the capacity alone.
-#[must_use]
-pub fn panel_budget(panel_hz: u32, source_hz: u32, capacity: u32) -> u32 {
-    if panel_hz == 0 || source_hz == 0 {
-        return capacity;
-    }
-    let slots = u64::from(panel_hz) * 17 / 16 / u64::from(source_hz);
-    u32::try_from(slots)
-        .unwrap_or(u32::MAX)
-        .saturating_sub(1)
-        .min(capacity)
 }
 
 #[cfg(test)]
@@ -174,46 +130,5 @@ mod tests {
         };
         assert_eq!(g.first_latch(100, 0), 107);
         assert_eq!(g.commit_for(107), 100);
-    }
-
-    #[test]
-    fn source_pace_halves_the_panel_when_the_cap_does_not_fit_twice() {
-        assert_eq!(source_pace(60, 120, 2), 60);
-        assert_eq!(source_pace(60, 119, 3), 60);
-        assert_eq!(source_pace(60, 90, 2), 45);
-        assert_eq!(source_pace(90, 144, 2), 72);
-        assert_eq!(source_pace(60, 60, 2), 30);
-        assert_eq!(source_pace(30, 60, 2), 30);
-        assert_eq!(source_pace(60, 90, 1), 60);
-        assert_eq!(source_pace(0, 90, 2), 0);
-        assert_eq!(source_pace(60, 0, 2), 60);
-    }
-
-    #[test]
-    fn panel_budget_counts_the_slots_a_source_period_leaves() {
-        assert_eq!(panel_budget(120, 60, 3), 1);
-        assert_eq!(panel_budget(120, 40, 3), 2);
-        assert_eq!(panel_budget(120, 30, 3), 3);
-        assert_eq!(panel_budget(120, 30, 2), 2);
-        assert_eq!(panel_budget(60, 60, 3), 0);
-        assert_eq!(panel_budget(60, 30, 3), 1);
-        assert_eq!(panel_budget(90, 45, 3), 1);
-        assert_eq!(panel_budget(90, 60, 3), 0);
-        assert_eq!(panel_budget(144, 72, 3), 1);
-        assert_eq!(panel_budget(144, 48, 3), 2);
-    }
-
-    #[test]
-    fn panel_budget_tolerates_a_rate_just_over_the_multiple() {
-        assert_eq!(panel_budget(120, 61, 3), 1);
-        assert_eq!(panel_budget(120, 62, 3), 1);
-        assert_eq!(panel_budget(119, 60, 3), 1);
-        assert_eq!(panel_budget(120, 41, 3), 2);
-    }
-
-    #[test]
-    fn panel_budget_leaves_an_unknown_rate_alone() {
-        assert_eq!(panel_budget(0, 60, 3), 3);
-        assert_eq!(panel_budget(120, 0, 3), 3);
     }
 }

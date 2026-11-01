@@ -19,12 +19,10 @@
 //! the retained last frame, keeping the listen sockets, the object stores and
 //! the gamescope connection alive; `nativeStop()` stays the session-exit path.
 //!
-//! The session's vblank grid is not a caller concern: the daemon owns it as
-//! its own constant (`gndrm_daemon::SESSION_REFRESH_MHZ`). The panel's real
-//! refresh rate *is* one: the app supplies it through
-//! `nativeSetPanelRefreshHz` before `nativeStart`, and it becomes the emulated
-//! mode's rate — the refresh advertised to clients — while the grid stays the
-//! daemon's constant.
+//! The session's vblank grid is not a caller concern: it is the emulated mode's
+//! own rate, and the mode's rate is the display's. The app supplies it through
+//! `nativeSetPanelRefreshHz` before `nativeStart`, and it is what the connector
+//! advertises and what the daemon's flip timeline claims.
 //!
 //! The mode's *size* is the other session-level input. `nativeStart` takes it
 //! from the window unless the app named one through `nativeSetScanoutGeometry`
@@ -53,7 +51,7 @@ mod vsync;
 
 use std::io;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
@@ -123,7 +121,7 @@ pub(crate) fn lsfg_settings() -> Option<LsfgConfig> {
     // The panel rate is the daemon's, not the app's: it arrives through
     // `nativeSetPanelRefreshHz` before the session starts. The presenter paces on
     // its own grid and only reports against this.
-    settings.refresh_mhz = PANEL_REFRESH_MHZ.load(Ordering::Relaxed);
+    settings.refresh_mhz = gndrm_daemon::advertised_refresh_mhz();
     LSFG_CONFIGURED.load(Ordering::Relaxed).then_some(settings)
 }
 
@@ -133,9 +131,10 @@ pub(crate) fn lsfg_pacing() -> bool {
     lsfg_settings().is_some_and(|s| s.enabled != 0 && s.multiplier >= 2)
 }
 
-/// The panel's refresh in millihertz as the app reported it, 0 when it has not.
+/// The display's rate in millihertz as the app reported it, 0 when it has not. The
+/// daemon owns it: it is the connector's mode, and it follows the display.
 pub(crate) fn panel_refresh_mhz() -> u32 {
-    PANEL_REFRESH_MHZ.load(Ordering::Relaxed)
+    gndrm_daemon::advertised_refresh_mhz()
 }
 
 /// `GameNativeDrm.nativeSetLsfgConfig(enabled, multiplier, flowPerMille, performance, fpsLimit, dllPath)`.
@@ -182,17 +181,6 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetLsfgCo
         report_panic("gndrm-lsfg", e.as_ref());
     }
 }
-
-/// The panel's real refresh rate in millihertz, supplied by the app through
-/// [`Java_app_gamenative_display_GameNativeDrm_nativeSetPanelRefreshHz`] before
-/// the session starts; 0 until then.
-///
-/// It is a session-level input, not per-frame: the emulated mode is built once
-/// when `nativeStart` assembles the [`PanelDesc`], and gamescope learns it then.
-/// A value set after `nativeStart` does not reach the running session. It is
-/// process-lifetime (not reset per session) so an app that supplies it once
-/// still gets it for every later session.
-static PANEL_REFRESH_MHZ: AtomicU32 = AtomicU32::new(0);
 
 /// The scan-out size the app asked the session to present at, supplied through
 /// [`Java_app_gamenative_display_GameNativeDrm_nativeSetScanoutGeometry`] before
@@ -309,10 +297,15 @@ pub(crate) fn clear_booting_splash() {
     }
 }
 
-/// Notify the app that the daemon published a new frame, so its frame-time ring
-/// sees gamescope's frames — the X11 present hook never ticks for them. Called
-/// on the commit worker per new frame; best-effort, and a no-op on the app side
-/// when the metrics collector is not running.
+/// Tell the app's frame-time ring that the session produced one frame: one the
+/// guest acquired, or one frame generation inserted.
+///
+/// Called from the scan-out channel, once per frame the producer reports — not
+/// from the publish path. What the display latched is a different number and the
+/// smaller one: the mode is the panel's own rate, so a session capped above it
+/// produces more frames than the panel can show, and the ring is what makes that
+/// visible. Best-effort, and a no-op on the app side when the ring is not
+/// running.
 pub(crate) fn notify_frame_published() {
     let _ = call_app_static("onFramePublished");
 }
@@ -631,23 +624,41 @@ fn server_thread_inner(
                 // on the main gndrm thread) stay alive.
                 let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     loop {
-                        let mut pfds = [
-                            libc::pollfd {
-                                fd: listener,
+                        // The note eventfds are watched here too: a subscriber
+                        // that lost the allocator role keeps its registration,
+                        // and between connections this loop is the only one that
+                        // can push to it. `-1` (no eventfd yet) is ignored.
+                        // Retired subscribers report while no connection is
+                        // being served, so their descriptors are watched here
+                        // beside the listener (see `gndrm_daemon::pushes`).
+                        let retired = gndrm_daemon::pushes::fds_except(-1);
+                        let mut pfds = Vec::with_capacity(4 + retired.len());
+                        for fd in [
+                            listener,
+                            signal,
+                            cap_fd,
+                            crate::vsync::changed_fd(),
+                        ] {
+                            pfds.push(libc::pollfd {
+                                fd,
                                 events: libc::POLLIN,
                                 revents: 0,
-                            },
-                            libc::pollfd {
-                                fd: signal,
+                            });
+                        }
+                        for fd in &retired {
+                            pfds.push(libc::pollfd {
+                                fd: *fd,
                                 events: libc::POLLIN,
                                 revents: 0,
-                            },
-                        ];
+                            });
+                        }
                         // Parked waiting for a connection: this row is what proves
                         // the daemon never accepted a request a shim timed out on.
                         diag::diag().set_role(diag::Role::Scanout, diag::State::ScanoutAccepting);
-                        // SAFETY: two valid pollfds waited on indefinitely.
-                        let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+                        // SAFETY: `pfds` holds live descriptors (`len` of them);
+                        // a negative one is ignored by `poll`.
+                        let count = u32::try_from(pfds.len()).unwrap_or(u32::MAX);
+                        let n = unsafe { libc::poll(pfds.as_mut_ptr(), count, -1) };
                         if n < 0 {
                             let e = io::Error::last_os_error();
                             if e.raw_os_error() == Some(libc::EINTR) {
@@ -659,6 +670,25 @@ fn server_thread_inner(
                         if pfds[1].revents != 0 {
                             log_info!("{}", gndrm_obf::obf!("scan-out acceptor stopping"));
                             return;
+                        }
+                        // A push owes nothing to the allocator: it goes out
+                        // whether or not a connection is being served.
+                        if pfds[2].revents != 0 {
+                            asc::flush_cap(cap_fd);
+                        }
+                        if pfds[3].revents != 0 {
+                            asc::flush_vsync(crate::vsync::changed_fd());
+                        }
+                        for (i, fd) in retired.iter().enumerate() {
+                            if pfds[4 + i].revents == 0 {
+                                continue;
+                            }
+                            if !asc::drain_retired(*fd) {
+                                let _ = gndrm_daemon::pushes::forget(*fd);
+                                // SAFETY: the peer closed; the registry held the
+                                // only claim on the descriptor.
+                                unsafe { libc::close(*fd) };
+                            }
                         }
                         if pfds[0].revents == 0 {
                             continue;
@@ -692,8 +722,30 @@ fn server_thread_inner(
                             }
                         }
                         log_info!("{}", gndrm_obf::obf!("scan-out channel closed (fd={fd})"));
-                        // SAFETY: this thread accepted the fd and is its only owner.
-                        unsafe { libc::close(fd) };
+                        // A connection that asked for pushes keeps its
+                        // registration when it only lost the allocator role: the
+                        // cap, the grid and the frame-generation settings are
+                        // still owed to whoever gates on them, and the guest
+                        // that lost the slot is usually the one that does. The
+                        // registry closes it when a push finds the peer gone
+                        // (`gndrm_daemon::pushes`). Everything else — a
+                        // connection that never subscribed, and any teardown —
+                        // is closed here, as before.
+                        asc::sync_vsync_subscription();
+                        if matches!(outcome, asc::ScanoutChannel::Superseded)
+                            && gndrm_daemon::pushes::holds(fd)
+                        {
+                            log_info!(
+                                "{}",
+                                gndrm_obf::obf!(
+                                    "scan-out channel {fd} keeps its push subscription"
+                                )
+                            );
+                        } else {
+                            let _ = gndrm_daemon::pushes::forget(fd);
+                            // SAFETY: this thread accepted the fd and is its only owner.
+                            unsafe { libc::close(fd) };
+                        }
                         if matches!(outcome, asc::ScanoutChannel::Stop) {
                             log_info!("{}", gndrm_obf::obf!("scan-out acceptor stopping"));
                             return;
@@ -809,6 +861,10 @@ fn server_thread_inner(
         // SAFETY: the acceptor is joined; nothing else uses this descriptor.
         unsafe { libc::close(signal) };
     }
+    // The acceptor is joined: no subscriber is being served, so every push
+    // registration can be closed with the session.
+    gndrm_daemon::pushes::close_all();
+    asc::sync_vsync_subscription();
     if cap_fd >= 0 {
         // Published before the close, so a late `nativeSetFpsLimit` never writes
         // a descriptor that has been reaped by the kernel.
@@ -943,27 +999,14 @@ fn start(
     // window's so the display's compositor upscales instead of the session
     // compositing at the panel's pixels (see `SCANOUT_GEOMETRY`).
     let (panel_w, panel_h) = scanout_geometry(win_w, win_h);
+    // The rate is the daemon's own live state, set by `nativeSetPanelRefreshHz`:
+    // the mode is built from it on every connector read, so a display change
+    // reaches the running session.
     let panel = PanelDesc {
         width: panel_w,
         height: panel_h,
         mm_width: 0,
         mm_height: 0,
-        // Frame generation presents more frames than the panel accepts, and
-        // gamescope paces its own paint loop off this mode rate: advertising only
-        // the panel's rate caps the output at the panel and discards every
-        // generated frame above it. The mode therefore carries the rate the
-        // session is asked to produce, floored at the panel's own.
-        refresh_mhz: {
-            let panel_hz = PANEL_REFRESH_MHZ.load(Ordering::Relaxed);
-            let output_hz = lsfg_settings().map_or(0, |s| {
-                s.refresh_mhz.max(
-                    s.fps_limit
-                        .saturating_mul(s.multiplier)
-                        .saturating_mul(1000),
-                )
-            });
-            panel_hz.max(output_hz)
-        },
     };
     let fds = Arc::new(Mutex::new(AcceptedFds {
         rpc: -1,
@@ -1411,7 +1454,9 @@ fn set_panel_refresh_hz(refresh_hz: jint) {
         return;
     }
     eprintln!("gndrm-daemon: panel refresh {} Hz", refresh_hz);
-    PANEL_REFRESH_MHZ.store(refresh_hz as u32 * 1000, Ordering::Relaxed);
+    // The connector's mode: gamescope re-reads it when its backend is dirtied, so
+    // this is what makes a display change the mode rather than a number.
+    gndrm_daemon::set_advertised_refresh_mhz(refresh_hz as u32 * 1000);
     // The presenter paces against this: a session that started before the mode was
     // known would otherwise keep an unclamped plan until the user changes a setting.
     LSFG_SETTINGS

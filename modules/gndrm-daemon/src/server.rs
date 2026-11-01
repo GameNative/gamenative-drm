@@ -7,7 +7,10 @@
 //!   contract: the first accepted connection is the RPC channel, the second is
 //!   the event channel (matches `gndrm-shim`'s connect order); every later
 //!   connection is the single scan-out allocator channel (newest wins). One
-//!   card client at a time — gamescope.
+//!   allocator at a time, but not one subscriber: the pushes a connection asks
+//!   for (frame cap, latch grid, frame-generation settings) are delivered to
+//!   every registered subscriber for the rest of the session, whether or not it
+//!   still holds the allocator slot — see [`crate::pushes`].
 //! - **render node** — [`render_socket_name`] (the main name + `-render`).
 //!   Served by [`serve_render_listener`], one [`Device`] per RPC/event pair,
 //!   for as many concurrent clients as connect. Xwayland's glamor/dri3/drm

@@ -31,9 +31,9 @@ work (already merged, in `master`).
      target frame time instead of a whole number of panel cycles.
   2. `DRMBackend.cpp`: the `-r` mode lookup re-finds the mode by size when the
      grid matches no mode's `vrefresh`.
-  Parking the patch as a whole would also revert (2), and `GamescopeState.gridArg()`
-  passes `-r 1200` on every launch — a grid that matches no mode. **A34 must be
-  split**: (1) is parked, (2) stays as its own patch (`A47`, next free number).
+  Parking the patch as a whole would also revert (2), and the launcher passed a
+  nested-refresh grid on every launch — one that matched no mode. **A34 was split**:
+  (1) is parked, (2) stays as its own patch (`A47`).
 - **The cap** is enforced at release: `scanout::note_release` (`icd_shim/src/scanout.rs:161`)
   advances a process-wide schedule and stamps `slot.floor_ns`/`release_held`;
   `acquire_take_free` frees a held slot when the floor passes. The guest is
@@ -103,23 +103,23 @@ what produced the 49 ms holds measured on Ori).
   now has no limiter to arm. It can stay (harmless, and keeps the API stable), or
   be dropped in a follow-up once the rework has device evidence.
 
-### 3.3 Count acquisitions, but keep the frame ring on publish
+### 3.3 Count what the session produced
 
-Two different numbers, two different events:
+Two numbers, two events, and the ring takes the *produced* one:
 
-- **Acquisitions** — the rate the cap controls. The shim keeps a running total and
-  sends it cumulatively (`FrameAcquired`); the daemon records it for the census.
-- **Publications** — the rate the panel shows. The daemon publishes every frame
-  that reaches SurfaceFlinger, generated frames included, and that is what the
-  app's frame ring (`onFramePublished` → `FrameRating`) must be fed: its fps is
-  computed from the *number of calls* in a second.
+- **Produced** — acquired frames plus the frames generation inserted. The shim
+  keeps both as running totals (`FrameAcquired { count, generated }`, sent once
+  per acquired frame) and the daemon turns their deltas into the app's ring
+  (`onFramePublished` → `FrameRating`).
+- **Published** — the rate the display latched. The daemon publishes each frame
+  that reaches SurfaceFlinger and keeps its own count for the session log
+  (`asc: N frames published`), but it does not feed the ring.
 
-Feeding the ring from acquisitions looks correct until generation runs: at a
-×2 multiplier the panel shows 120 while the guest acquires 60, so the overlay
-drops to half. The ring therefore stays on the publish path, and the acquire
-count is a census signal only. `PowerManager.frameSampleStride` keeps its meaning
-(one ring entry per displayed frame, sampled every multiplier-th to report the
-source rate the tuner compares against).
+The ring has to count production, because the mode is the panel's own rate: at a
+60 cap, ×2 generation and a 120 Hz panel the two agree, while a 90 cap ×2
+produces 180 against a 120 Hz display and the ring says so. Counting publishes
+instead made the overlay read the compositor's output — a number the panel rate
+bounds — and hid every frame the display could not take.
 
 ## 4. Task list
 
@@ -150,7 +150,7 @@ source rate the tuner compares against).
 
 7. Split A34: `0034-A47-drm-mode-lookup-by-size.patch` from its `DRMBackend.cpp`
    hunk; move the whole A34 file to `disabled/`.
-8. Verify the train: 29 patches apply, A47 reverses cleanly, `-r 1200` still
+8. Verify the train: 29 patches apply, A47 reverses cleanly, a launch still
    resolves a mode (build log or device).
 9. No app-side change in this branch.
 
@@ -218,8 +218,6 @@ alternating, two runs each.
 - Should `nativeSetFpsLimit` keep calling `injector::set_fps_limit` once A34 is
   parked? Keeping it is harmless and keeps the JNI contract; dropping it is a
   larger app change with no benefit until a non-Vulkan cap exists.
-- Should the app's frame ring be fed by the shim's acquire count *or* by the
-  daemon's own presentation count for the overlay? The acquire count matches the
-  cap; the presentation count matches the panel. Pick acquire for now (it is what
-  the limiter controls), and revisit if the overlay's fps disagrees with a
-  capture.
+- ~~Should the app's frame ring be fed by the shim's acquire count *or* by the
+  daemon's own presentation count?~~ Answered: by production — acquire plus
+  generation (§3.3). The presentation count is kept as a session statistic.

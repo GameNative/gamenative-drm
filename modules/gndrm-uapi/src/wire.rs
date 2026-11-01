@@ -586,6 +586,11 @@ pub const FRAME_ACQUIRED_MAGIC: u32 = 0x474E_4151;
 pub struct FrameAcquired {
     /// Frames acquired since this shim connected.
     pub count: u64,
+    /// Frames frame generation inserted since this shim connected. They are
+    /// never acquired — the presenter's engine makes them from a frame the guest
+    /// already finished — so a consumer counting what the session *produced* has
+    /// to add them to `count`. Zero when generation is off.
+    pub generated: u64,
 }
 
 impl FrameAcquired {
@@ -596,6 +601,7 @@ impl FrameAcquired {
         let mut b = [0u8; Self::LEN];
         b[0..4].copy_from_slice(&FRAME_ACQUIRED_MAGIC.to_le_bytes());
         b[8..16].copy_from_slice(&self.count.to_le_bytes());
+        b[16..24].copy_from_slice(&self.generated.to_le_bytes());
         b
     }
 
@@ -608,7 +614,36 @@ impl FrameAcquired {
         }
         Some(Self {
             count: u64::from_le_bytes(b[8..16].try_into().ok()?),
+            generated: u64::from_le_bytes(b[16..24].try_into().ok()?),
         })
+    }
+}
+
+#[cfg(test)]
+mod frame_acquired_tests {
+    use super::FrameAcquired;
+
+    #[test]
+    fn the_generated_total_rides_with_the_acquire_total() {
+        // Both totals are cumulative and travel together: one report per acquired
+        // frame is what the app's ring turns into "produced".
+        let report = FrameAcquired {
+            count: 900,
+            generated: 1800,
+        };
+        let decoded = FrameAcquired::decode(&report.encode()).expect("round trip");
+        assert_eq!(decoded.count, 900);
+        assert_eq!(decoded.generated, 1800);
+    }
+
+    #[test]
+    fn a_report_without_generation_leaves_the_field_zero() {
+        let decoded = FrameAcquired {
+            count: 7,
+            generated: 0,
+        };
+        let back = FrameAcquired::decode(&decoded.encode()).expect("round trip");
+        assert_eq!(back.generated, 0);
     }
 }
 

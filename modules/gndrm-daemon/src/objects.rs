@@ -50,25 +50,17 @@ const FIRST_SYNCOBJ_HANDLE: u32 = 0x4000;
 /// Exclusive end of the syncobj handle space.
 const END_SYNCOBJ_HANDLE: u32 = 0x5000;
 
-/// The session's vblank grid, in millihertz (1200 Hz = 1_200_000).
-///
-/// gamescope builds its vblank grid — the compositor's paint and frame-done
-/// tick — from the refresh it is launched with (`-r`), and the daemon builds its
-/// flip-event timeline from this constant, so the grid and the timeline agree by
-/// construction. It is deliberately high: the grid is a timer, so a finite value
-/// is required, and 1200 Hz is ~4.6x the present pipeline's measured throughput
-/// (~259 presents/s), so it cannot bind and a guest can over-refresh the panel.
-/// The only real cap on the guest is the user's own fps limit in the QuickMenu;
-/// the physical panel is downstream and coalesces whatever the session sends.
-///
-/// This is NOT the emulated mode's refresh. The mode's rate is the panel's real
-/// rate when the caller supplies one ([`PanelDesc::refresh_mhz`]) and falls back
-/// to this constant otherwise; keeping the two separate is what lets the refresh
-/// advertised to clients be truthful without clamping the grid onto the panel.
-pub const SESSION_REFRESH_MHZ: u32 = 1_200_000;
+/// The mode's rate when the app never reported one: 60 Hz, the one rate every
+/// panel latches. An unknown rate gets the conservative answer rather than a
+/// fabricated high number that would have the compositor paint frames nothing
+/// can show.
+pub const UNKNOWN_PANEL_HZ: u32 = 60_000;
 
-/// Physical panel description: the surface size the session presents into and,
-/// when known, the panel's real refresh rate.
+/// Physical panel description: the surface size the session presents into.
+///
+/// The rate the connector advertises is not part of it: that is the display's
+/// ([`crate::panel_refresh_mhz`]) and changes when the display does, whereas this
+/// is what the surface was built with.
 #[derive(Debug, Clone, Copy)]
 pub struct PanelDesc {
     pub width: u16,
@@ -76,11 +68,6 @@ pub struct PanelDesc {
     /// Physical size in millimetres (0 = unknown).
     pub mm_width: u32,
     pub mm_height: u32,
-    /// The panel's real refresh rate in millihertz as supplied by the caller, or
-    /// 0 when it is not known. It sets the emulated mode's `clock` and
-    /// `vrefresh` only; the session's vblank grid stays [`SESSION_REFRESH_MHZ`].
-    /// See [`PanelDesc::mode_refresh_mhz`].
-    pub refresh_mhz: u32,
 }
 
 impl Default for PanelDesc {
@@ -90,35 +77,18 @@ impl Default for PanelDesc {
             height: 720,
             mm_width: 0,
             mm_height: 0,
-            refresh_mhz: 0,
         }
     }
 }
 
 impl PanelDesc {
-    /// The emulated mode's refresh rate in millihertz: the panel's real rate when
-    /// the caller supplied one, else [`SESSION_REFRESH_MHZ`].
+    /// Build the connector's mode at `refresh_mhz`.
     ///
-    /// The mode's rate and the session's vblank grid are separate values on
-    /// purpose. The mode's rate is what gamescope recomputes into
-    /// `g_nOutputRefresh` and advertises to every client — the Xwayland mode, the
-    /// refresh-rate feedback property, `active_display_info` — so it must be the
-    /// panel's truth. The grid is the compositor's paint/frame-done tick and the
-    /// daemon's flip-event interval, and it must stay above the present
-    /// pipeline's ceiling so a guest can over-refresh the panel. One constant
-    /// served both jobs, which forced a fabricated rate onto the clients.
+    /// The rate is the display's, not this description's: the launcher reports
+    /// the panel's, and a display change arrives while the session runs, so the
+    /// caller passes the rate in force rather than this snapshot holding it.
     #[must_use]
-    pub fn mode_refresh_mhz(&self) -> u32 {
-        if self.refresh_mhz == 0 {
-            SESSION_REFRESH_MHZ
-        } else {
-            self.refresh_mhz
-        }
-    }
-
-    /// Build the single preferred mode exposed on the connector.
-    #[must_use]
-    pub fn modeinfo(&self) -> DrmModeModeinfo {
+    pub fn modeinfo(&self, refresh_mhz: u32) -> DrmModeModeinfo {
         let hdisplay = self.width;
         let vdisplay = self.height;
         // Generic CVT-ish timings: porch values only matter for real panels;
@@ -129,11 +99,10 @@ impl PanelDesc {
         let vsync_start = vdisplay + 3;
         let vsync_end = vdisplay + 6;
         let vtotal = vdisplay + 20;
-        // The mode's rate is the panel's, not the session grid: clock, htotal and
-        // vtotal must agree with `vrefresh`, because gamescope recomputes the rate
-        // from them (`GetModeRefresh`) and the recomputed value is what reaches
-        // clients.
-        let refresh_mhz = self.mode_refresh_mhz();
+        // clock, htotal and vtotal must agree with `vrefresh`, because gamescope
+        // recomputes the rate from them (`GetModeRefresh`) and the recomputed
+        // value is what reaches clients.
+        //
         // clock[kHz] = total_px * refresh / 1000, rounded.
         let clock =
             (u64::from(htotal) * u64::from(vtotal) * u64::from(refresh_mhz) / 1_000_000) as u32;
@@ -387,20 +356,27 @@ mod tests {
 
     #[test]
     fn mode_rate_is_the_panel_rate_when_supplied() {
-        let mode = PanelDesc {
-            refresh_mhz: 90_000,
-            ..PanelDesc::default()
-        }
-        .modeinfo();
+        let mode = PanelDesc::default().modeinfo(90_000);
         assert_eq!(mode.vrefresh, 90);
         assert_eq!(recomputed_mhz(&mode), 90_000);
-        assert_ne!(mode.vrefresh, SESSION_REFRESH_MHZ.div_ceil(1000));
     }
 
     #[test]
-    fn mode_rate_falls_back_to_the_session_grid_when_absent() {
-        let mode = PanelDesc::default().modeinfo();
-        assert_eq!(mode.vrefresh, SESSION_REFRESH_MHZ.div_ceil(1000));
-        assert_eq!(recomputed_mhz(&mode), u64::from(SESSION_REFRESH_MHZ));
+    fn an_unreported_panel_gets_the_conservative_rate() {
+        // The mode is only ever the panel's own rate, so an unknown panel gets
+        // one every display latches rather than a fabricated high number.
+        let mode = PanelDesc::default().modeinfo(UNKNOWN_PANEL_HZ);
+        assert_eq!(mode.vrefresh, UNKNOWN_PANEL_HZ.div_ceil(1000));
+        assert_eq!(recomputed_mhz(&mode), u64::from(UNKNOWN_PANEL_HZ));
+    }
+
+    #[test]
+    fn the_mode_is_the_panel_rate_whatever_the_cap_is() {
+        // The cap is at acquire and never reaches the mode: a session capped at
+        // 30 on a 120 Hz panel still advertises 120, so the compositor paints at
+        // the rate the display can latch.
+        let mode = PanelDesc::default().modeinfo(120_000);
+        assert_eq!(mode.vrefresh, 120);
+        assert_eq!(recomputed_mhz(&mode), 120_000);
     }
 }

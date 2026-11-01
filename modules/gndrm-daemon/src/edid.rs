@@ -279,7 +279,7 @@ mod tests {
     use super::*;
 
     fn mode() -> DrmModeModeinfo {
-        PanelDesc::default().modeinfo()
+        PanelDesc::default().modeinfo(crate::UNKNOWN_PANEL_HZ)
     }
 
     #[test]
@@ -289,9 +289,8 @@ mod tests {
             height: 960,
             mm_width: 0,
             mm_height: 0,
-            refresh_mhz: 120_000,
         };
-        let mode = panel.modeinfo();
+        let mode = panel.modeinfo(120_000);
         let edid = build(None, &mode, &panel);
         let pc = u32::from(edid[54]) | (u32::from(edid[55]) << 8);
         // The descriptor's timings imply the connector's rate, not a nominal one.
@@ -306,9 +305,8 @@ mod tests {
             height: 1080,
             mm_width: 0,
             mm_height: 0,
-            refresh_mhz: 500_000,
         };
-        let mode = panel.modeinfo();
+        let mode = panel.modeinfo(500_000);
         assert!(
             mode.clock > 655_350,
             "the mode must exceed the 10 kHz field"

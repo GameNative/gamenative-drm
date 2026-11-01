@@ -47,25 +47,27 @@ the app at N while keeping the grid at the mode's rate — they move together.
 
 ## What gndrm does with it
 
-GameNative launches with `-r 1200` (`GamescopeState.SESSION_GRID_HZ` → `gridArg()`), the
-grid the daemon's flip timeline is also built from (`SESSION_REFRESH_MHZ`,
-`gndrm-daemon/src/objects.rs:68`; `lib.rs:2091`), so the grid never binds a session.
+GameNative passes no `-r`: `g_nNestedRefresh` is 0, so the grid, the app-refresh cycle
+and the divisor base all fall back to `g_nOutputRefresh` — the mode's rate. The daemon's
+flip timeline is built from that same rate (`VblankTimeline`, one mode period), so the
+timeline and the grid agree by construction.
 
-The **one** mode the connector exposes is the session's scan-out size at the panel's real
-rate (`PanelDesc::modeinfo`, `objects.rs:121-160`: `mode_refresh_mhz()` is the rate the app
-reported through `nativeSetPanelRefreshHz`, raised to the frame-generation output rate when
-that is higher, and `clock`/`htotal`/`vtotal`/`vrefresh` all describe it). The rate clients
-see is therefore the panel's:
+The **one** mode the connector exposes is the session's scan-out size at the display's
+rate (`PanelDesc::modeinfo`, `objects.rs:100-160`, which takes the rate in force;
+`clock`/`htotal`/`vtotal`/`vrefresh` all describe it). That rate is the panel's, reported
+through `nativeSetPanelRefreshHz`, and the daemon serves it live so a display change is
+applied to the running session. Neither the cap nor the frame-generation multiplier
+enters it — they move what the session produces, not what the compositor runs at. The
+rate clients see is therefore the display's:
 
 - **Uncapped:** the loop reaches its measured ceiling (~259 presents/s); the grid is three
   orders of magnitude above the panel's frame time and never the limit.
-- **Mode rate vs panel rate:** equal unless frame generation raises the output rate, in
-  which case the mode advertises that higher rate and the shim still paces on the panel's.
+- **Mode rate vs panel rate:** equal, always (a 40 cap at x4 on a 120 Hz panel runs a
+  120 Hz mode and produces 160 frames a second).
 - **Capping at 30/40/60 against the grid is exact arithmetic** — all three divide 1200, and
   a divisor cap lands on its target exactly (`-r 60` reads 60.0 presents/s).
 
 ## Open — to measure, not assume
 
 - `active_display_info`'s rate list is the single mode rate above (there are no dynamic
-  rates on this connector), so a client sees one entry — the panel's rate, or the
-  generated one.
+  rates on this connector), so a client sees one entry — the display's rate.

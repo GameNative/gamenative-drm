@@ -22,6 +22,7 @@ mod objects;
 #[doc(hidden)] // exposed for integration tests; not public API
 pub mod pod;
 mod props;
+pub mod pushes;
 pub mod scanout;
 pub mod server;
 
@@ -38,10 +39,12 @@ use gndrm_uapi::wire::{errno, ScanoutLayout, SCANOUT_LAYOUT_ENV};
 
 pub use frame_cap::FrameCap;
 pub use objects::{CrtcState, Framebuffer, GemObject, PanelDesc, PlaneState, Stores};
-pub use objects::{CONNECTOR_ID, CRTC_ID, ENCODER_ID, PLANE_CURSOR_ID, PLANE_PRIMARY_ID};
+pub use objects::{
+    CONNECTOR_ID, CRTC_ID, ENCODER_ID, PLANE_CURSOR_ID, PLANE_PRIMARY_ID, UNKNOWN_PANEL_HZ,
+};
 pub use props::find_prop_id;
 
-use objects::{Blob, Syncobj, SESSION_REFRESH_MHZ};
+use objects::{Blob, Syncobj};
 use pod::*;
 
 use crate::diag::{diag, Role, State};
@@ -535,6 +538,40 @@ type ClockFn = Box<dyn Fn() -> (u32, u32) + Send + Sync>;
 /// re-stamps a page-flip event at emission (see [`commit_worker_loop`]); the
 /// indirection lets [`Device::set_clock`] (tests) reach the worker too.
 type SharedClock = Arc<Mutex<ClockFn>>;
+
+/// The rate the connector advertises, in millihertz; 0 while the launcher has
+/// not reported one.
+///
+/// Process state, not per-connection: gamescope reads the connector's modes
+/// again whenever its backend is dirtied, and a display that changes mid-run has
+/// to be able to change the mode the session runs on. A snapshot taken when the
+/// session started could not. The cap and the frame-generation multiplier never
+/// reach it: they move what the session produces, not what the compositor runs at.
+static ADVERTISED_REFRESH_MHZ: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Set the rate the connector advertises. Called before a session starts and
+/// again whenever the launcher's answer changes.
+pub fn set_advertised_refresh_mhz(mhz: u32) {
+    ADVERTISED_REFRESH_MHZ.store(mhz, Ordering::Relaxed);
+}
+
+/// The rate the connector advertises, 0 when the launcher never reported one.
+#[must_use]
+pub fn advertised_refresh_mhz() -> u32 {
+    ADVERTISED_REFRESH_MHZ.load(Ordering::Relaxed)
+}
+
+/// The rate a mode is built at: the advertised one, or [`objects::UNKNOWN_PANEL_HZ`]
+/// when the launcher never reported one.
+#[must_use]
+fn mode_refresh_mhz() -> u32 {
+    match advertised_refresh_mhz() {
+        0 => objects::UNKNOWN_PANEL_HZ,
+        mhz => mhz,
+    }
+}
+
 /// Diagnostics sink for rejections (see `Device::set_logger`).
 pub type LogFn = Box<dyn Fn(&str) + Send>;
 /// Sink for a framebuffer geometry the client registered (`ADDFB2`), so a
@@ -549,7 +586,6 @@ pub type AddFbGeometryFn = Box<dyn Fn(u32, u32, u64) + Send>;
 /// The emulated device (one per connected client / open file description).
 pub struct Device {
     panel: PanelDesc,
-    mode: DrmModeModeinfo,
     stores: Stores,
 
     // client caps
@@ -651,11 +687,21 @@ pub struct Device {
 }
 
 impl Device {
+    /// The connector's mode at the rate in force right now.
+    ///
+    /// Read per request rather than stored: the launcher can change the rate
+    /// while the session runs, and gamescope re-reads the connector when it is
+    /// told the backend is dirty.
+    #[must_use]
+    fn mode(&self) -> DrmModeModeinfo {
+        self.panel.modeinfo(mode_refresh_mhz())
+    }
+
     /// New device for `panel`; presents to `presenter` on a dedicated commit
     /// worker thread.
     pub fn new(panel: PanelDesc, presenter: Box<dyn Presenter>) -> Self {
         let mut stores = Stores::default();
-        let mode = panel.modeinfo();
+        let mode = panel.modeinfo(mode_refresh_mhz());
         // Infallible: a fresh store has the whole blob space free.
         let in_formats_blob = stores
             .alloc_blob()
@@ -717,7 +763,6 @@ impl Device {
             .ok();
         Self {
             panel,
-            mode,
             stores,
             cap_atomic: false,
             cap_universal_planes: false,
@@ -1265,7 +1310,7 @@ impl Device {
         c.y = 0;
         c.gamma_size = 0;
         c.mode_valid = u32::from(self.crtc.mode_id != 0);
-        c.mode = self.mode;
+        c.mode = self.mode();
         let mut ordered = Vec::new();
         pod_write(&mut ordered, &c);
         ordered.extend_from_slice(&body);
@@ -1281,7 +1326,7 @@ impl Device {
         }
         let mut body = Vec::new();
         let encoders = [ENCODER_ID];
-        let modes = [self.mode];
+        let modes = [self.mode()];
         let (prop_ids, prop_vals) = self.connector_props();
         let count_enc = Self::two_call(&mut body, c.encoders_ptr, c.count_encoders, &encoders);
         let count_modes = Self::two_call(&mut body, c.modes_ptr, c.count_modes, &modes);
@@ -2175,9 +2220,10 @@ struct VblankTimeline {
 }
 
 impl VblankTimeline {
+    /// One vblank of the mode in force: the display's own period.
     fn new() -> Self {
         Self {
-            interval_ns: 1_000_000_000_000 / u64::from(SESSION_REFRESH_MHZ),
+            interval_ns: 1_000_000_000_000 / u64::from(mode_refresh_mhz()),
             claimed_ns: 0,
             started: false,
         }

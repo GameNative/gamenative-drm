@@ -72,26 +72,29 @@ batches) reports both.
 
 SurfaceFlinger takes the newest buffer a layer holds at each of its latch
 points, one panel period apart, and shows it at the vsync after. Nothing between
-the shim and the panel paces to that grid — gamescope's tick is the 1200 Hz
-session grid, the daemon's `ASurfaceTransaction_apply` carries no present time —
+the shim and the panel paces to that grid — gamescope's tick is its mode's rate,
+the display's, and the daemon's `ASurfaceTransaction_apply` carries no present time —
 so a presenter that commits on its own timer beats against it: every so often
 two commits fall inside one period and the first is replaced before it is shown,
 and a rate above the panel's (60 × 3 on a 120 Hz panel) drops frames in a
 drifting pattern. Three rules keep one frame per period, in order:
 
-- **Budget.** A source period at `cap` Hz holds `panel / cap` panel periods, one
-  of which is the source frame: `pacing::panel_budget` caps the generations per
-  batch at that minus one (60 → 120 Hz: x2 whatever the multiplier; 40 → 120:
-  x3; 30 → 60: x2). The rate is the user's cap, or the measured source interval
-  without one (a source hovering at the threshold, 64 fps on 120 Hz, flips
-  between x2 and none from batch to batch). When the panel cannot hold the cap
-  twice at all (60 on 90 Hz, 60 on 60 Hz), `pacing::source_pace` lowers the
-  source rate the release floor holds the guest to, to half the panel's: 45 → 90,
-  30 → 60. The panel's rate is the one the app reported
-  (`LsfgConfig.refresh_mhz`), not a measurement: while the daemon is the only
-  thing publishing, the latch samples are spaced by its own rate, so a panel
-  SurfaceFlinger runs below that rate (an LTPO panel that dropped to 60 Hz) is
-  still paced at the reported rate and shows every other frame, as before.
+- **Multiplier.** A batch generates `multiplier - 1` frames and the source frame
+  after them, one batch per acquired source frame, so the session produces
+  `cap × multiplier` frames whatever the display can latch: a 40 cap at x4 on a
+  120 Hz panel produces 160 and the panel shows 120 of them. Generation is not
+  capped by the panel: the mode is the display's rate and never moves for a cap or
+  a multiplier, so capping the output by it would only make x4 at 40 read 120 and
+  say nothing about what the session was doing. The rate is the user's cap, or
+  the measured source interval without one (a source hovering at the threshold,
+  64 fps on 120 Hz, flips between x2 and none from batch to batch), and the
+  display never reshapes it: a 40 cap runs 40 acquires a second on a 60 Hz panel
+  as much as on a 120 Hz one, and the multiplier decides what is generated on
+  top. The panel's rate is the one the app reported (`LsfgConfig.refresh_mhz`),
+  not a measurement: while the daemon is the only thing publishing, the latch
+  samples are spaced by its own rate, so a panel SurfaceFlinger runs below that
+  rate (an LTPO panel that dropped to 60 Hz) is still paced at the reported rate
+  and shows every other frame, as before.
 - **Grid.** The daemon reads `ASurfaceTransactionStats_getLatchTime` on every
   completion, tracks the grid's phase (`vsync.rs`), and pushes a `VsyncNote`
   (`anchor_ns, period_ns, lead_ns`) on the scan-out channel whenever it moves
@@ -100,9 +103,12 @@ drifting pattern. Three rules keep one frame per period, in order:
   takes an unknown frame for a dead channel. The shim gives the frames of a
   batch consecutive latch points from the one after the previous queued
   frame's, or the first a commit can still reach when that has passed
-  (`pacing::Grid::first_latch`), and commits `lead_ns` ahead of each. Without a
-  note the frames are spread over the source period on the shim's own clock, as
-  before; the budget and the order rules below apply either way.
+  (`pacing::Grid::first_latch`), and commits `lead_ns` ahead of each. A batch
+  with more frames than the panel has points in a source period goes out on the
+  shim's clock spread evenly over that period instead: on the grid the source
+  frame would follow the batch's last point, a whole period late, and the queue
+  would carry that lateness forever. Without a note the frames are spread the
+  same way; the order rules below apply either way.
 - **Lead.** The daemon stamps when its apply returned and measures how far ahead
   of the latch it was; a loop moves the lead so that margin sits at half a
   period, the middle of the window between two latch points, with the error

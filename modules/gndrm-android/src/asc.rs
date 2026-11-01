@@ -295,6 +295,35 @@ static PRESENT_DONE: Mutex<Vec<PresentDone>> = Mutex::new(Vec::new());
 /// the compositor shows.
 static ACQUIRED_SEEN: AtomicU64 = AtomicU64::new(0);
 
+/// Frames frame generation had inserted when the producer last reported, so the
+/// delta the app's ring sees includes them: they are produced, never acquired.
+static GENERATED_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// The most produced frames one report may add to the ring. One report is sent
+/// per acquired frame, so a healthy delta is one frame plus the multiplier; this
+/// only bounds what a corrupt count could make the loop do.
+const MAX_PRODUCED_PER_MESSAGE: u64 = 4096;
+/// Monotonic time of the last producer report, in ms since the daemon's epoch
+/// (0 = never). A session whose frames never go through the ICD shim (Xwayland
+/// GL, GDI, software rendering) sends no reports, so the publish path feeds the
+/// frame ring for it instead; once reports flow, the publish path goes quiet.
+static LAST_PRODUCER_REPORT_MS: AtomicU64 = AtomicU64::new(0);
+/// How long without a producer report before publishes count again.
+const PRODUCER_REPORT_GRACE_MS: u64 = 1000;
+
+fn monotonic_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    // Never 0: 0 means "no report yet" in LAST_PRODUCER_REPORT_MS.
+    Instant::now().duration_since(epoch).as_millis() as u64 + 1
+}
+
+/// Whether the frame ring is currently fed by producer reports.
+fn producer_reports_live() -> bool {
+    let last = LAST_PRODUCER_REPORT_MS.load(Ordering::Relaxed);
+    last != 0 && monotonic_ms().saturating_sub(last) <= PRODUCER_REPORT_GRACE_MS
+}
+
 /// Eventfd the completion callback writes to wake the scan-out thread. -1 until
 /// the channel is served, which is before any marked frame can exist.
 static PRESENT_FD: AtomicI32 = AtomicI32::new(-1);
@@ -1610,12 +1639,16 @@ impl AscState {
         self.frames += 1;
         if fb.id != 0 {
             crate::clear_booting_splash_on_first_frame();
-            // One entry per frame that reaches the panel, generated frames
-            // included: the app's frame ring is a *display* rate, and only this
-            // path knows about the ones the presenter inserted. The shim's
-            // acquire count is the source rate, which is a different number
-            // whenever frame generation runs.
-            crate::notify_frame_published();
+            // The frame ring counts what the session produced, from the
+            // producer reports (see the `FrameAcquired` branch in
+            // `serve_scanout`): keeping both on one counter is what made a cap
+            // above the panel read as fps the panel never showed. A session
+            // without a producing shim (Xwayland GL, GDI, software rendering)
+            // sends no reports at all, and for it a publish is the only frame
+            // count there is.
+            if !producer_reports_live() {
+                crate::notify_frame_published();
+            }
         }
     }
 
@@ -2490,17 +2523,19 @@ pub fn serve_scanout(
     doorbell: &Arc<WarmDoorbell>,
 ) -> ScanoutChannel {
     let d = diag::diag();
+    // This connection is the allocator until it ends; a failed push to it is
+    // left for this loop to close (see `gndrm_daemon::pushes`), and it stops
+    // being served when the loop returns however that happens.
+    gndrm_daemon::pushes::set_served(fd);
+    let _served = ServedGuard(fd);
     let mut buf = [0u8; ScanoutAllocReq::LEN];
-    // Whether this connection opted in to frame-cap notes with a
-    // [`FrameCapSubscribe`]. A connection that did not is sent exactly the
-    // frames it was sent before, so an older shim sharing this allocator is
-    // never handed a frame it would refuse to frame.
-    let mut cap_aware = false;
+    // Whether a connection opted in is `gndrm_daemon::pushes`' business: a
+    // subscription outlives this loop, so the notes cannot be gated on it here.
     // Whether this connection reads the panel's latch grid, pushed whenever it
     // moves. Only a shim that declared so is sent one: an older shim's reply
     // reader takes a frame it does not know for a dead channel. Cleared when
     // this connection is done, whichever way it returns.
-    let mut vsync_aware = VsyncSubscription(false);
+
     let vsync_fd = crate::vsync::changed_fd();
     // Wake this loop when a completion lands: the callback runs on
     // SurfaceFlinger's thread and may not write the channel itself.
@@ -2520,41 +2555,32 @@ pub fn serve_scanout(
         // makes the current fd the newest one; watching `cap_fd` is what lets a
         // target the user changed mid-session reach a shim that is not handing
         // a buffer over at that instant.
-        let mut pfds = [
-            libc::pollfd {
+        // Retired subscribers keep reporting (see `pushes`), and this loop is
+        // where the daemon spends its time: their descriptors are polled beside
+        // the served one, and their frames read in the drain below.
+        let retired = gndrm_daemon::pushes::fds_except(fd);
+        // Slots 0..6 keep their meaning whatever the descriptors are: a `-1`
+        // eventfd stays in its row (poll ignores it) rather than shifting the
+        // indices the branches below read.
+        let mut pfds = Vec::with_capacity(6 + retired.len());
+        for fd in [fd, listener, stop, cap_fd, vsync_fd, present_fd] {
+            pfds.push(libc::pollfd {
                 fd,
                 events: libc::POLLIN,
                 revents: 0,
-            },
-            libc::pollfd {
-                fd: listener,
+            });
+        }
+        for fd in &retired {
+            pfds.push(libc::pollfd {
+                fd: *fd,
                 events: libc::POLLIN,
                 revents: 0,
-            },
-            libc::pollfd {
-                fd: stop,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: cap_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: vsync_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: present_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        // SAFETY: six pollfds waited on indefinitely; a negative descriptor
-        // (no eventfd) is ignored by `poll`.
-        let ready = unsafe { libc::poll(pfds.as_mut_ptr(), 6, -1) };
+            });
+        }
+        // SAFETY: `pfds` holds live descriptors (`len` of them); a negative one
+        // (no eventfd yet) is ignored by `poll`.
+        let count = u32::try_from(pfds.len()).unwrap_or(u32::MAX);
+        let ready = unsafe { libc::poll(pfds.as_mut_ptr(), count, -1) };
         if ready < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
@@ -2566,6 +2592,19 @@ pub fn serve_scanout(
         if pfds[2].revents != 0 {
             return ScanoutChannel::Stop;
         }
+        // Retired connections: read what they report, and forget one that has
+        // gone away. Their allocator requests are not answered — the pool
+        // belongs to this connection.
+        for (i, fd) in retired.iter().enumerate() {
+            if pfds[6 + i].revents == 0 {
+                continue;
+            }
+            if !drain_retired(*fd) {
+                let _ = gndrm_daemon::pushes::forget(*fd);
+                // SAFETY: the peer closed; this registry held the only claim.
+                unsafe { libc::close(*fd) };
+            }
+        }
         if pfds[3].revents != 0 {
             // The target changed. Drain the eventfd first, so a count left
             // behind cannot wake this loop again. The note is pushed even when
@@ -2573,32 +2612,12 @@ pub fn serve_scanout(
             // skipped push would be lost — the shim reads frames by their magic
             // whatever order they arrive in, so a note ahead of the reply it
             // waits for is in step.
-            drain_eventfd(cap_fd);
-            if cap_aware {
-                let note = cap_now().note();
-                if send_resp(fd, &note.encode(), None).is_err() {
-                    return ScanoutChannel::Closed;
-                }
-                // The same event carries a settings change; the two are pushed
-                // together because one wake cannot say which of them moved.
-                if let Some(settings) = crate::lsfg_settings() {
-                    if send_resp(fd, &settings.encode(), None).is_err() {
-                        return ScanoutChannel::Closed;
-                    }
-                }
-            }
+            flush_cap(cap_fd);
         }
         if pfds[4].revents != 0 {
             // The panel's latch grid moved: its phase, or the lead the shim
             // should commit by. Drained first, like the cap's.
-            drain_eventfd(vsync_fd);
-            if vsync_aware.0 {
-                if let Some(note) = crate::vsync::note() {
-                    if send_resp(fd, &note.encode(), None).is_err() {
-                        return ScanoutChannel::Closed;
-                    }
-                }
-            }
+            flush_vsync(vsync_fd);
         }
         if pfds[5].revents != 0 {
             // A publish completed. Its id and latch time were queued by the
@@ -2679,8 +2698,12 @@ pub fn serve_scanout(
             continue;
         }
         if let Some(sub) = FrameCapSubscribe::decode(&buf[..n]) {
+            // Registered before the replies: from here the pushes follow this
+            // connection for the rest of the session, whether or not it keeps
+            // the allocator role. The replies below are its starting state.
+            gndrm_daemon::pushes::add(fd, sub.caps);
+            sync_vsync_subscription();
             if sub.caps & CAP_FRAME_CAP != 0 {
-                cap_aware = true;
                 let note = cap_now().note();
                 if send_resp(fd, &note.encode(), None).is_err() {
                     return ScanoutChannel::Closed;
@@ -2701,7 +2724,6 @@ pub fn serve_scanout(
                 PRESENT_FD.store(present_fd, Ordering::Relaxed);
             }
             if sub.caps & CAP_VSYNC_NOTE != 0 {
-                vsync_aware.set(true);
                 // The panel's latch grid, when it has been measured: a presenter
                 // that connects mid-session starts on it.
                 if let Some(note) = crate::vsync::note() {
@@ -2720,17 +2742,7 @@ pub fn serve_scanout(
             continue;
         }
         if let Some(acq) = FrameAcquired::decode(&buf[..n]) {
-            // The shim's running acquire total — the rate the cap controls, as
-            // opposed to the publish count above, which is the rate the panel
-            // shows. Recorded for the census; not fed to the app's ring, since
-            // with frame generation running the two differ by the multiplier.
-            let previous = ACQUIRED_SEEN.swap(acq.count, Ordering::Relaxed);
-            if previous == 0 && acq.count != 0 {
-                log_info!(
-                    "{}",
-                    gndrm_obf::obf!("asc: acquire counter connected (count={})", acq.count)
-                );
-            }
+            note_produced(acq);
             continue;
         }
         if let Some(mark) = PresentMark::decode(&buf[..n]) {
@@ -3672,23 +3684,13 @@ fn build_hide(
     }
 }
 
-/// Whether the connection in service reads [`gndrm_uapi::wire::VsyncNote`],
-/// mirrored into `vsync` for as long as it is, so the lead is measured only
-/// while a shim places frames by it.
-struct VsyncSubscription(bool);
+/// Marks `fd` as the served connection for as long as this loop runs, so a push
+/// that fails against it is left for the loop to close rather than closed twice.
+struct ServedGuard(RawFd);
 
-impl VsyncSubscription {
-    fn set(&mut self, on: bool) {
-        self.0 = on;
-        crate::vsync::set_subscribed(on);
-    }
-}
-
-impl Drop for VsyncSubscription {
+impl Drop for ServedGuard {
     fn drop(&mut self) {
-        if self.0 {
-            crate::vsync::set_subscribed(false);
-        }
+        gndrm_daemon::pushes::clear_served(self.0);
     }
 }
 
@@ -3943,6 +3945,120 @@ fn cap_now() -> FrameCap {
     *crate::FRAME_CAP
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Feed the app's frame ring from one producer report.
+///
+/// The count is what the session *produced* — frames the guest acquired plus the
+/// ones frame generation inserted — which is the number the display cannot always
+/// take. The publish path counts what the display actually latched, and that can
+/// never exceed its rate.
+pub(crate) fn note_produced(acq: FrameAcquired) {
+    let previous = ACQUIRED_SEEN.swap(acq.count, Ordering::Relaxed);
+    let generated_seen = GENERATED_SEEN.swap(acq.generated, Ordering::Relaxed);
+    LAST_PRODUCER_REPORT_MS.store(monotonic_ms(), Ordering::Relaxed);
+    if previous == 0 && acq.count != 0 {
+        log_info!(
+            "{}",
+            gndrm_obf::obf!("asc: acquire counter connected (count={})", acq.count)
+        );
+        // The frames behind this first total were already counted by the
+        // publish path while no reports flowed; counting them again here would
+        // put a one-off jump in the ring.
+        return;
+    }
+    // A total that went backwards is a new producer on this channel, so
+    // `saturating_sub` reports all of it as new. Bounded: one message is sent per
+    // acquired frame, so the plausible delta is one frame plus the multiplier,
+    // and a corrupt value must not spin here.
+    let produced = acq
+        .count
+        .saturating_sub(previous)
+        .saturating_add(acq.generated.saturating_sub(generated_seen));
+    let ones = produced.min(MAX_PRODUCED_PER_MESSAGE);
+    for _ in 0..ones {
+        crate::notify_frame_published();
+    }
+    if produced > ones {
+        log_warn!(
+            "{}",
+            gndrm_obf::obf!("asc: produced delta {produced} clamped to {ones} for the frame ring")
+        );
+    }
+}
+
+/// Read what a connection that lost the allocator role still sends, and `false`
+/// when it has gone away.
+///
+/// A subscription outlives that role, so the pushes reach a retired connection —
+/// but its reports have to be read by someone too, and the loop that used to read
+/// them has returned. Two kinds matter: the producer's running totals, which feed
+/// the app's frame ring, and a present mark, which answers a guest's present wait.
+/// Allocation is not served here: the pool belongs to whichever connection holds
+/// it, so an alloc request on a retired connection is left to the shim's own
+/// timeout, exactly as it was before any of this.
+pub(crate) fn drain_retired(fd: RawFd) -> bool {
+    let mut buf = [0u8; ScanoutAllocReq::LEN];
+    // SAFETY: `fd` is a connection this module owns until it is forgotten, and
+    // `buf` is one full frame; DONTWAIT leaves an unarrived frame for later.
+    let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
+    if n == 0 {
+        return false;
+    }
+    if n < 0 {
+        let e = io::Error::last_os_error();
+        // EAGAIN and EWOULDBLOCK are the same value on Linux.
+        return e.raw_os_error() == Some(libc::EAGAIN);
+    }
+    let n = n as usize;
+    if let Some(acq) = FrameAcquired::decode(&buf[..n]) {
+        note_produced(acq);
+    } else if let Some(mark) = PresentMark::decode(&buf[..n]) {
+        note_present_mark(mark);
+    } else if ScanoutAllocReq::decode(&buf[..n]).is_some() {
+        // An allocation on a retired connection. The pool belongs to the
+        // connection in service, so this one cannot be answered here — and
+        // leaving it unanswered is what hangs the guest: it blocks until its
+        // exchange times out, retries on the same dead channel, and a title
+        // recreating its swapchain (a vsync toggle, a resolution change) never
+        // finishes. Closing the connection instead makes the shim see a dead
+        // channel, reconnect, and take the allocator back — and its connect
+        // re-subscribes, so the pushes resume on the new descriptor.
+        return false;
+    }
+    true
+}
+
+/// Push the current frame cap, and the frame-generation settings that ride with
+/// it, to every subscriber. Both go out because one wake cannot say which of
+/// them moved.
+///
+/// Every subscriber, not only the connection in service: the guest that gates on
+/// the target may have handed the allocator role on long ago (`pushes`).
+pub(crate) fn flush_cap(cap_fd: RawFd) {
+    drain_eventfd(cap_fd);
+    gndrm_daemon::pushes::push(CAP_FRAME_CAP, &cap_now().note().encode());
+    if let Some(settings) = crate::lsfg_settings() {
+        gndrm_daemon::pushes::push(CAP_FRAME_CAP, &settings.encode());
+    }
+    sync_vsync_subscription();
+}
+
+/// Push the panel's latch grid to every subscriber that asked for it.
+pub(crate) fn flush_vsync(vsync_fd: RawFd) {
+    drain_eventfd(vsync_fd);
+    if let Some(note) = crate::vsync::note() {
+        gndrm_daemon::pushes::push(CAP_VSYNC_NOTE, &note.encode());
+    }
+    sync_vsync_subscription();
+}
+
+/// Tell the latch-grid tracker whether anyone still reads its note. Called from
+/// every place the subscriber set can change — a subscribe, a push that reaped a
+/// peer that had gone, a retirement, a teardown — because `pushes` is the only
+/// place that knows, and `vsync` is deliberately crate-root-free.
+pub(crate) fn sync_vsync_subscription() {
+    crate::vsync::set_subscribed(gndrm_daemon::pushes::wants(CAP_VSYNC_NOTE));
 }
 
 /// Drain the cap-change eventfd, so a count left behind cannot wake the scan-out
