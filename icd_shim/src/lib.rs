@@ -111,6 +111,7 @@ pub fn vkshim_enabled() -> bool {
 
 pub mod divisor;
 pub mod export;
+pub mod gputime;
 pub mod placed;
 pub mod present;
 pub mod lsfg;
@@ -287,6 +288,17 @@ fn is_gamescope_binary() -> bool {
 pub(crate) fn is_guest_process() -> bool {
     static GUEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GUEST.get_or_init(|| !is_gamescope_binary() && !is_xwayland_binary())
+}
+
+/// This process's part in the session, as the GPU-time export names it.
+pub(crate) fn process_role() -> &'static str {
+    if is_gamescope_binary() {
+        "gamescope"
+    } else if is_xwayland_binary() {
+        "xwayland"
+    } else {
+        "guest"
+    }
 }
 
 /// gamescope's Xwayland, also run through the linker. It keeps the payload

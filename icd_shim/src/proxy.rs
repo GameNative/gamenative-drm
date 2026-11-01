@@ -2796,6 +2796,7 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
             ));
         }
     }
+    crate::gputime::presented();
     VK_SUCCESS
 }
 
@@ -2876,7 +2877,17 @@ unsafe fn submit_impl(
         ));
     }
     let _submit = SUBMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    unsafe { (*gd).f.submit.unwrap()((*gq).real, count, args[2] as *const VkSubmitInfo, fence) }
+    // GPU-time brackets (GN_GPUTIME_DIR): a copy of the batch array with the
+    // slot's timestamp command buffers around it; None = submit as translated.
+    let translated = args[2] as *const VkSubmitInfo;
+    let timed =
+        unsafe { crate::gputime::wrap_submit(gd as usize, (*gq).family, count, translated) };
+    let batches = timed.as_ref().map_or(translated, |t| t.submits.as_ptr());
+    let res = unsafe { (*gd).f.submit.unwrap()((*gq).real, count, batches, fence) };
+    // The drain and the once-a-second file write run outside the submit lock.
+    drop(_submit);
+    crate::gputime::submitted(timed, res);
+    res
 }
 
 /// GPU waits. The guest blocks here when submitted work never completes, so log
@@ -3087,7 +3098,13 @@ unsafe fn submit2_impl(
         }
     }
     let _submit = SUBMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    unsafe { real_fn((*gq).real, count, translated, fence) }
+    let timed =
+        unsafe { crate::gputime::wrap_submit2(gd as usize, (*gq).family, count, translated) };
+    let batches = timed.as_ref().map_or(translated, |t| t.submits.as_ptr());
+    let res = unsafe { real_fn((*gq).real, count, batches, fence) };
+    drop(_submit);
+    crate::gputime::submitted(timed, res);
+    res
 }
 
 // Command buffers handed to the app are shim wrappers (same scratch-prefix
@@ -9718,6 +9735,9 @@ unsafe extern "C" fn gn_vkCreateDevice(
         }
     }
     let gd = Box::into_raw(gd);
+    if crate::gputime::enabled() {
+        unsafe { gputime_device_created(gd, ci) };
+    }
     // Frame generation is opened on the first present that has settings, not
     // here: the app pushes them through the daemon after this device exists, so
     // an attempt at create time would never see them.
@@ -9758,6 +9778,8 @@ unsafe extern "C" fn gn_vkDestroyDevice(device: VkDevice, _alloc: *const VkAlloc
         if let Some(wait_idle) = (*gd).f.wait_idle {
             wait_idle((*gd).real);
         }
+        // Idle now: the last timestamps are readable without waiting.
+        crate::gputime::device_destroyed(gd as usize);
         for batch in (*gd).gen_batches.drain(..) {
             if batch.fence != 0 {
                 if let Some(wait) = (*gd).f.wait_fences {
@@ -10292,6 +10314,45 @@ unsafe fn query_linear_modifier_support(
 }
 
 /// Read-only `vkGetPhysicalDeviceMemoryProperties` capture at device create.
+/// Set up GPU-time timers for a new device (only with GN_GPUTIME_DIR): the
+/// families the device was created with, their timestamp bits, and the
+/// device's timestamp period. Not on any hot path.
+unsafe fn gputime_device_created(gd: *mut GnDevice, ci: &VkDeviceCreateInfo) {
+    let Some(fns) = crate::gputime::Fns::resolve(|n| unsafe { gn_real_device_proc(gd, n) }) else {
+        crate::logi!(gndrm_obf::obf!(
+            "gputime: device entry points missing — untimed"
+        ));
+        return;
+    };
+    let (inst, pd) = unsafe { ((*(*gd).inst).real, (*gd).pd) };
+    let qfp = unsafe {
+        crate::gputime::queue_families(
+            gn_real_inst_proc(inst, c"vkGetPhysicalDeviceQueueFamilyProperties"),
+            pd,
+        )
+    };
+    let mut props: VkPhysicalDeviceProperties = unsafe { std::mem::zeroed() };
+    if let Some(f) = unsafe { gn_real_inst_proc(inst, c"vkGetPhysicalDeviceProperties") } {
+        let f: PFN_vkGetPhysicalDeviceProperties = unsafe { std::mem::transmute(f) };
+        unsafe { f(pd, &mut props) };
+    }
+    let families: Vec<u32> =
+        unsafe { slice_or_empty(ci.pQueueCreateInfos, ci.queueCreateInfoCount as usize) }
+            .iter()
+            .map(|q| q.queueFamilyIndex)
+            .collect();
+    unsafe {
+        crate::gputime::device_created(
+            gd as usize,
+            (*gd).real,
+            fns,
+            &families,
+            &qfp,
+            &props.limits,
+        )
+    };
+}
+
 unsafe fn fetch_mem_props(
     gi: *mut GnInstance,
     pd: VkPhysicalDevice,
