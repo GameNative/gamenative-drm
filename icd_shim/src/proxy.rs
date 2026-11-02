@@ -1995,7 +1995,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         slots: Vec::new(),
         guest_slots: 0,
         gen_no_grow: false,
-        next_acquire_ns: 0,
+        release: crate::vsync_gate::Schedule::default(),
         worker: None,
         shared: Mutex::new(ScShared {
             jobs: VecDeque::with_capacity(GN_JOB_CAP),
@@ -2318,16 +2318,9 @@ unsafe fn gn_acquire_common(
     );
     let deadline = (timeout != u64::MAX).then(|| Instant::now() + Duration::from_nanos(timeout));
     // The time gate: a frame that may not start yet waits before it is given an
-    // image. On gamescope's override route it runs only while frame generation
-    // sets the source rate (the app disarms gamescope's limiter then); any other
-    // cap is gamescope's limiter's, which holds the FIFO commits this shim
-    // declares while a cap is set (`live_present_mode`). Off that route the cap
-    // has no compositor to hold it, and the gate keeps it as before.
-    let period = if unsafe { (*(*sc).surf).swapchain_obj.is_null() } {
-        crate::scanout::period_ns(crate::scanout::target_fps())
-    } else {
-        crate::lsfg::source_cap().map_or(0, crate::scanout::period_ns)
-    };
+    // image. Which clock it runs on, if any, is `acquire_pacing`'s rule.
+    let pacing = unsafe { acquire_pacing(sc) };
+    let gated = pacing != crate::vsync_gate::Pacing::Off;
     let mut idx: i32 = -1;
     let mut timed_out = false;
     // First instant this acquire was parked by the deadline, 0 while it never
@@ -2337,9 +2330,9 @@ unsafe fn gn_acquire_common(
     {
         let mut g = (*sc).shared.lock().unwrap();
         loop {
-            if period != 0 && !g.stopping {
+            if gated && !g.stopping {
                 let now_ns = monotonic_ns();
-                let next_ns = (*sc).next_acquire_ns;
+                let next_ns = (*sc).release.next_ns;
                 if next_ns != 0 && now_ns < next_ns {
                     if timeout == 0 {
                         break;
@@ -2363,12 +2356,10 @@ unsafe fn gn_acquire_common(
             }
             unsafe { acquire_take_free(sc, &mut idx) };
             if idx >= 0 {
-                if period != 0 {
+                if gated {
                     // One timeline for the whole swapchain: the next frame may
-                    // not start before this one plus a period.
-                    let now_ns = monotonic_ns();
-                    (*sc).next_acquire_ns =
-                        crate::scanout::next_acquire_after((*sc).next_acquire_ns, now_ns, period);
+                    // not start before the release this one was booked to.
+                    (*sc).release.book_paced(monotonic_ns(), pacing);
                 }
                 break;
             }
@@ -6224,6 +6215,41 @@ mod tests {
     }
 
     #[test]
+    fn the_gate_on_the_gamescope_route_follows_the_mode() {
+        use crate::vsync_gate::{GateClock, Grid, Pacing};
+        let grid = Some(Grid {
+            anchor_ns: 1_000_000_000,
+            period_ns: 16_675_004,
+            clock: GateClock::Vsync,
+        });
+        // FIFO: gamescope's limiter is the cap, no gate.
+        assert_eq!(
+            gamescope_route_pacing(VK_PRESENT_MODE_FIFO_KHR, None, 60, grid),
+            Pacing::Off
+        );
+        // Mailbox, immediate, FIFO-relaxed under a cap: the gate, on the grid.
+        for m in [
+            VK_PRESENT_MODE_MAILBOX_KHR,
+            VK_PRESENT_MODE_IMMEDIATE_KHR,
+            VK_PRESENT_MODE_FIFO_RELAXED_KHR,
+        ] {
+            assert_eq!(
+                gamescope_route_pacing(m, None, 60, grid).clock(),
+                GateClock::Vsync
+            );
+            // Uncapped: nobody limits.
+            assert_eq!(gamescope_route_pacing(m, None, 0, grid), Pacing::Off);
+        }
+        // Frame generation's source cap: the cap's own clock, whatever the mode.
+        assert_eq!(
+            gamescope_route_pacing(VK_PRESENT_MODE_MAILBOX_KHR, Some(40), 0, grid),
+            Pacing::Clock {
+                period_ns: 25_000_000
+            }
+        );
+    }
+
+    #[test]
     fn the_env_mode_does_not_decide_the_gamescope_route() {
         // SAFETY: no other test reads this variable.
         unsafe { std::env::set_var("MESA_VK_WSI_PRESENT_MODE", "mailbox") };
@@ -6753,11 +6779,11 @@ pub struct GnSwapchain {
     pub next: *mut GnSwapchain,
     /// Set once a destination could not be made: the set stops growing.
     pub gen_no_grow: bool,
-    /// The instant the guest may start its next frame, in `CLOCK_MONOTONIC` ns:
-    /// 0 before the first, advanced by each acquire. One timeline per swapchain,
-    /// not per slot — a slot-local schedule would let a ring of N images run N
-    /// frames back to back.
-    pub next_acquire_ns: u64,
+    /// When the guest may start its next frame (`release.next_ns`,
+    /// `CLOCK_MONOTONIC` ns, 0 before the first), advanced by each gated
+    /// acquire. One timeline per swapchain, not per slot — a slot-local schedule
+    /// would let a ring of N images run N frames back to back.
+    pub release: crate::vsync_gate::Schedule,
 }
 
 // ---------------------------------------------------------------- wayland
@@ -9251,6 +9277,49 @@ fn choose_live_mode(requested: VkPresentModeKHR, generating: bool, capped: bool)
     }
 }
 
+/// How the acquire gate paces `sc` now.
+///
+/// - Off gamescope's override route (the X11 Present route) nothing holds the
+///   cap but the gate, on the cap's own clock, as before.
+/// - On the override route see [`gamescope_route_pacing`].
+unsafe fn acquire_pacing(sc: *mut GnSwapchain) -> crate::vsync_gate::Pacing {
+    if unsafe { (*(*sc).surf).swapchain_obj.is_null() } {
+        return crate::vsync_gate::Pacing::on_clock(crate::scanout::target_fps());
+    }
+    gamescope_route_pacing(
+        unsafe { live_present_mode(sc) },
+        crate::lsfg::source_cap(),
+        crate::scanout::cap_fps_note(),
+        crate::vsync_gate::current_grid(crate::lsfg::refresh_hz()),
+    )
+}
+
+/// [`acquire_pacing`]'s rule on gamescope's override route, for a present mode
+/// `live`, frame generation's source cap, the daemon's cap and the display's
+/// vblank grid:
+/// - frame generation sets the source rate: the gate holds it on the cap's own
+///   clock (the app disarms gamescope's limiter then; generation paces the
+///   output on the latch grid itself);
+/// - FIFO: no gate. gamescope's limiter holds FIFO commits, one per limited
+///   vblank, and is the cap;
+/// - mailbox, immediate, FIFO-relaxed: gamescope's limiter does not hold them
+///   (`wlserver_surface_is_fifo` is FIFO only), so the gate is the cap, on the
+///   display's vblank grid (`crate::vsync_gate`).
+fn gamescope_route_pacing(
+    live: VkPresentModeKHR,
+    source_cap: Option<u32>,
+    cap_fps: u32,
+    grid: Option<crate::vsync_gate::Grid>,
+) -> crate::vsync_gate::Pacing {
+    if let Some(cap) = source_cap {
+        return crate::vsync_gate::Pacing::on_clock(cap);
+    }
+    if live == VK_PRESENT_MODE_FIFO_KHR {
+        return crate::vsync_gate::Pacing::Off;
+    }
+    crate::vsync_gate::pacing(cap_fps, grid)
+}
+
 /// The mode a commit on `sc` declares to gamescope, counted for the census.
 unsafe fn declared_present_mode(sc: *mut GnSwapchain) -> VkPresentModeKHR {
     let mode = unsafe { live_present_mode(sc) };
@@ -9283,11 +9352,12 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
     let route = unsafe { !(*(*sc).surf).swapchain_obj.is_null() };
     let (presented, discarded, fallback) = crate::present::feedback_counts();
     crate::logi!(gndrm_obf::obf!(
-        "present mode: declared={} requested={} route={} cap={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={}",
+        "present mode: declared={} requested={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={}",
         mode_name(unsafe { live_present_mode(sc) }),
         mode_name(unsafe { (*sc).present_mode }),
         if route { "gamescope" } else { "x11" },
         crate::scanout::cap_fps_note(),
+        unsafe { acquire_pacing(sc) }.clock().name(),
         u8::from(crate::lsfg::live().0),
         N_ACQ.load(Ordering::Relaxed),
         N_COMMIT_OK.load(Ordering::Relaxed),

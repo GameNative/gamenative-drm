@@ -180,6 +180,13 @@ pub(crate) fn cap_fps_note() -> u32 {
     CAP_FPS.load(Ordering::Relaxed)
 }
 
+/// Adopt the daemon's vsync note: frame generation places its commits on the
+/// latch grid, and the acquire gate releases on the vblank grid it gives.
+fn apply_vsync(note: VsyncNote) {
+    crate::lsfg::apply_vsync(note);
+    crate::vsync_gate::apply_note(note);
+}
+
 /// How many frame-cap notes have been adopted on this connection, for the same
 /// census.
 pub(crate) fn notes_seen() -> usize {
@@ -302,7 +309,7 @@ pub fn lsfg_config() -> Option<LsfgConfig> {
             if let Some(note) = FrameCapNote::decode(&buf[..n as usize]) {
                 apply_note(note);
             } else if let Some(note) = VsyncNote::decode(&buf[..n as usize]) {
-                crate::lsfg::apply_vsync(note);
+                apply_vsync(note);
             } else if let Some(done) = gndrm_uapi::wire::PresentDone::decode(&buf[..n as usize]) {
                 crate::present::record(done.id, done.latch_ns);
             } else if gndrm_uapi::wire::FrameAcquired::decode(&buf[..n as usize]).is_some() {
@@ -543,7 +550,7 @@ fn exchange_req(fd: RawFd, req: ScanoutAllocReq) -> Result<ScanoutBuf, Failure> 
                     if recv_fd >= 0 {
                         libc::close(recv_fd);
                     }
-                    crate::lsfg::apply_vsync(note);
+                    apply_vsync(note);
                     if frames < MAX_BURST_FRAMES {
                         continue;
                     }
@@ -710,7 +717,7 @@ pub(crate) fn poll_notes() {
     if let Some(note) = FrameCapNote::decode(&buf[..len]) {
         apply_note(note);
     } else if let Some(note) = VsyncNote::decode(&buf[..len]) {
-        crate::lsfg::apply_vsync(note);
+        apply_vsync(note);
     } else if let Some(config) = LsfgConfig::decode(&buf[..len]) {
         if !config.is_request() {
             crate::lsfg::apply(config);
