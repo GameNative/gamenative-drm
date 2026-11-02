@@ -125,8 +125,8 @@ that rate is the display's.
   tracked in `vsync.rs`, and a `VsyncNote` (`anchor_ns, period_ns, lead_ns`) pushed
   whenever its phase moves by more than 300 µs or its period by more than 1 µs, and once
   on subscribe. Its period is the one measured from Choreographer while that is locked
-  (the mode's advertised rate otherwise), so the shim's vblank gate and frame
-  generation extrapolate the display's real rate. Its anchor is also the
+  (the mode's advertised rate otherwise), so frame generation extrapolates
+  the display's real rate. Its anchor is also the
   flip timeline's phase where Choreographer gives no deadline, and its fallback.
 - The lead: how far ahead of a latch point a commit has to be made to be the frame that
   point takes, driven so the margin sits at half a period.
