@@ -71,10 +71,17 @@ that rate is the display's.
   actually latched the daemon's publishes against it (`latch-after-deadline`, smoothed
   from `ASurfaceTransactionStats_getLatchTime`). A present-time stamp would aim
   gamescope's margin at an instant whose phase to the latch is the compositor's work
-  duration. A publish is claimed for the first latch at or after its apply returned —
-  the latch that takes it, even when that is after Choreographer's deadline; claiming
-  the next one would move gamescope's next wakeup a whole period out and leave a latch
-  with no new frame.
+  duration. A publish is claimed for the first latch at or after its apply *started* —
+  the latch that takes it, even when that is after Choreographer's deadline, and even
+  when the commit worker was preempted inside or after the apply and returned past the
+  latch (SurfaceFlinger already had the transaction). Claiming the next one would move
+  gamescope's next wakeup a whole period out and leave a latch with no new frame. The
+  event is still sent with the publish, not at the latch: the latch time
+  `SurfaceFlinger` reports comes with the completion a period or more later, and holding
+  the event for it would put that round trip into gamescope's present loop (`docs/12`).
+  A stamp in the past is what a KMS event always carries (it is read after the vblank);
+  gamescope arms its next wakeup at stamp + interval − draw time − red zone and steps
+  forward whole intervals if that has passed.
 - **The lead.** The stamp is that latch minus a lead. gamescope's 1.65 ms red zone was
   sized for a kernel commit; here a commit still crosses the daemon's commit worker and
   a binder apply, with about 1 ms of spread. Stamped on the deadline itself (Retroid

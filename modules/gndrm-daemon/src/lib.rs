@@ -487,6 +487,44 @@ pub trait Presenter: Send {
     fn publish_cursor(&mut self, cursor: &CursorUpdate, src_fd: Option<RawFd>) {
         let _ = (cursor, src_fd);
     }
+
+    /// The daemon-side stamps of the commit about to be published, handed over
+    /// before [`Self::publish_with_source`] so a presenter can report where a
+    /// late commit spent its time. The default ignores them.
+    fn note_commit_timing(&mut self, timing: CommitTiming) {
+        let _ = timing;
+    }
+
+    /// The `CLOCK_MONOTONIC` instant the last publish started its apply to the
+    /// compositor, taken once: `None` when it applied nothing (or the presenter
+    /// does not know). The flip event is stamped from it (see
+    /// `vblank::VblankTimeline`).
+    fn take_apply_start_ns(&mut self) -> Option<u64> {
+        None
+    }
+}
+
+/// When a commit reached each daemon stage, `CLOCK_MONOTONIC` ns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommitTiming {
+    /// The serve thread began the atomic commit ioctl.
+    pub received_ns: u64,
+    /// The serve thread queued the commit for the worker.
+    pub queued_ns: u64,
+    /// The commit worker took the job.
+    pub pickup_ns: u64,
+}
+
+/// `CLOCK_MONOTONIC` in nanoseconds (real, never the device's test clock).
+#[must_use]
+pub fn mono_ns() -> u64 {
+    // SAFETY: clock_gettime with a valid clock id and a valid out-pointer.
+    let ts = unsafe {
+        let mut ts: libc::timespec = core::mem::zeroed();
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        ts
+    };
+    (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 /// What the cursor layer last showed: the plane state, the buffer's identity
@@ -586,6 +624,9 @@ pub type AddFbGeometryFn = Box<dyn Fn(u32, u32, u64) + Send>;
 
 /// The emulated device (one per connected client / open file description).
 pub struct Device {
+    /// When the atomic commit ioctl in progress began (`mono_ns`), for the
+    /// commit's timing.
+    pub(crate) atomic_rx_ns: u64,
     panel: PanelDesc,
     stores: Stores,
 
@@ -783,6 +824,7 @@ impl Device {
             clock,
             flip_sequence: 0,
             commit_tx: Some(commit_tx),
+            atomic_rx_ns: 0,
             flip_queue,
             flip_event_fd,
             in_flight,
@@ -2181,6 +2223,9 @@ struct CommitJob {
     cursor: Option<CursorUpdate>,
     /// A duplicate of the cursor buffer's dma-buf, owned by the job.
     cursor_src_fd: Option<RawFd>,
+    /// When the serve thread began this commit's ioctl and queued it.
+    received_ns: u64,
+    queued_ns: u64,
 }
 
 impl Drop for CommitJob {
@@ -2268,6 +2313,11 @@ fn commit_worker_loop(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
+        presenter.note_commit_timing(CommitTiming {
+            received_ns: job.received_ns,
+            queued_ns: job.queued_ns,
+            pickup_ns: mono_ns(),
+        });
         // The fb id this commit published, if any.
         let in_flight_fb = job.fb.as_ref().map(|fb| fb.id);
         // Publish the buffer when there is one; otherwise the commit carries no
@@ -2330,8 +2380,16 @@ fn commit_worker_loop(
             // is known, else a walk of the mode's interval (see
             // `vblank::VblankTimeline`). Delivery stays immediate, so
             // gamescope's present loop never waits on a display round trip.
+            //
+            // The frame lands on the first latch after its apply *started*: once
+            // the transaction is on its way, SurfaceFlinger can take it, and a
+            // worker preempted after the apply (or inside its return) must not
+            // move the stamp, and gamescope's next wakeup, a whole period out
+            // when the frame made its latch. The clock is the fallback for a
+            // commit that applied nothing.
             let (sec, usec) = (clock.lock().unwrap_or_else(PoisonError::into_inner))();
-            let now = u64::from(sec) * 1_000_000_000 + u64::from(usec) * 1_000;
+            let clock_now = u64::from(sec) * 1_000_000_000 + u64::from(usec) * 1_000;
+            let now = presenter.take_apply_start_ns().unwrap_or(clock_now);
             let claimed = timeline.claim(
                 now,
                 vblank::display_grid(now),
