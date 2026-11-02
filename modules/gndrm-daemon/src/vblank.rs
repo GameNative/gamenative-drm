@@ -39,6 +39,9 @@ const STALE_NS: u64 = 1_000_000_000;
 const MAX_PERIOD_NS: u64 = 100_000_000;
 /// The fastest (1 kHz): anything closer together is a duplicate callback.
 const MIN_PERIOD_NS: u64 = 1_000_000;
+/// How far a fitted period may sit from the mode's advertised one (2 %), in
+/// per mille: a "60 Hz" panel latches at 59.97, never at 30 or 120.
+const MODE_TOLERANCE_PER_MILLE: u64 = 20;
 
 /// Recent display vsyncs and the period fitted through them.
 ///
@@ -57,6 +60,15 @@ pub struct VsyncRing {
     /// Whether `period_ns` is a fit over [`MIN_LOCK`] vsyncs or more of the
     /// current rate. Survives a gap in the callbacks, not a rate change.
     locked: bool,
+    /// The mode's advertised period, 0 when unknown. When known, the steps are
+    /// counted against it and a fit outside [`MODE_TOLERANCE_PER_MILLE`] of it
+    /// is rejected: a callback thread starved for a stretch delivers every
+    /// second vsync, which counts as two steps of the mode's period instead of
+    /// one step of twice it.
+    mode_ns: u64,
+    /// A fit is being rejected; set on the first rejection of a run, so it is
+    /// reported once.
+    rejecting: bool,
 }
 
 /// What one [`VsyncRing::push`] changed.
@@ -67,6 +79,9 @@ pub enum RingEvent {
     /// The ring locked onto a period it was not locked onto before: the first
     /// lock, or the first after a rate change.
     Locked(u64),
+    /// A fit this far from the mode's period was rejected; the period stays.
+    /// Reported on the first rejection of a run.
+    Rejected(u64),
 }
 
 impl VsyncRing {
@@ -74,6 +89,24 @@ impl VsyncRing {
     #[must_use]
     pub fn period_ns(&self) -> Option<u64> {
         self.locked.then_some(self.period_ns)
+    }
+
+    /// The mode's advertised period (0 when unknown). A change starts the fit
+    /// again from it: the app reports the new mode when the display changes.
+    pub fn set_mode(&mut self, mode_ns: u64) {
+        if mode_ns == self.mode_ns {
+            return;
+        }
+        self.mode_ns = mode_ns;
+        self.samples.clear();
+        self.period_ns = mode_ns;
+        self.locked = false;
+        self.rejecting = false;
+    }
+
+    fn within_mode(&self, period: u64) -> bool {
+        self.mode_ns == 0
+            || period.abs_diff(self.mode_ns) * 1000 <= self.mode_ns * MODE_TOLERANCE_PER_MILLE
     }
 
     /// Fold in one vsync timestamp (`CLOCK_MONOTONIC` ns).
@@ -105,6 +138,12 @@ impl VsyncRing {
         let k = (step + period / 2) / period;
         let residual = step.abs_diff(k * period);
         if k == 0 || residual > period / 4 {
+            if self.mode_ns != 0 {
+                // With the mode known, a rate change arrives as a new mode
+                // (`set_mode`); this is a stray callback. Count from here.
+                self.restart(t_ns);
+                return RingEvent::None;
+            }
             // The step is not a whole number of periods: the display changed
             // rate. Seed from this step and lock again.
             self.reseed(t_ns, step);
@@ -117,7 +156,8 @@ impl VsyncRing {
         // A full ring without one single-vsync step is counting a rate at a
         // multiple of the period it holds (the display halved its rate): take
         // the shortest step instead.
-        if self.samples.len() == RING
+        if self.mode_ns == 0
+            && self.samples.len() == RING
             && self
                 .samples
                 .iter()
@@ -138,6 +178,16 @@ impl VsyncRing {
             return RingEvent::None;
         }
         let fitted = self.fit();
+        if !self.within_mode(fitted) {
+            let first = !self.rejecting;
+            self.rejecting = true;
+            return if first {
+                RingEvent::Rejected(fitted)
+            } else {
+                RingEvent::None
+            };
+        }
+        self.rejecting = false;
         let was = self.locked.then_some(self.period_ns);
         self.period_ns = fitted;
         self.locked = true;
@@ -310,11 +360,13 @@ impl LeadLoop {
         }
     }
 
-    /// The lead in force, clamped to a third of `period`.
+    /// The lead in force, clamped to a third of `period` (half of it for the
+    /// fixed override: a lead of a period or more would stamp every event
+    /// before the previous latch).
     #[must_use]
     pub fn lead_ns(&self, period: u64) -> u64 {
         if self.fixed {
-            self.lead_ns
+            self.lead_ns.min(period / 2)
         } else {
             self.lead_ns.min(period / 3)
         }
@@ -389,6 +441,8 @@ pub struct DisplayVsync {
     latch_after_deadline: Option<i64>,
     lead: LeadLoop,
     window: Window,
+    /// A fit the ring just rejected, for the log (taken once).
+    rejected_fit: Option<u64>,
 }
 
 /// What [`DisplayVsync::note_vsync`] reports back for the log.
@@ -405,8 +459,17 @@ impl DisplayVsync {
     /// One Choreographer vsync: its timestamp and, on API 33+, the preferred
     /// frame timeline's deadline. Returns the lock to report when the ring
     /// locked onto a period.
-    pub fn note_vsync(&mut self, vsync_ns: u64, deadline_ns: Option<u64>) -> Option<VsyncLock> {
+    pub fn note_vsync(
+        &mut self,
+        vsync_ns: u64,
+        deadline_ns: Option<u64>,
+        mode_ns: u64,
+    ) -> Option<VsyncLock> {
+        self.ring.set_mode(mode_ns);
         let ev = self.ring.push(vsync_ns);
+        if let RingEvent::Rejected(p) = ev {
+            self.rejected_fit = Some(p);
+        }
         self.chor = Some((vsync_ns, deadline_ns));
         self.window.vsyncs += 1;
         match ev {
@@ -420,7 +483,7 @@ impl DisplayVsync {
                     latch_offset_ns,
                 })
             }
-            RingEvent::None => None,
+            RingEvent::None | RingEvent::Rejected(_) => None,
         }
     }
 
@@ -584,8 +647,19 @@ pub fn note_publish_latch(applied_ns: u64, latch_ns: u64) -> Option<VsyncReport>
 
 /// Feed one display vsync from the platform's vsync source (see
 /// [`DisplayVsync::note_vsync`]).
+///
+/// The mode's advertised period bounds the fit (see [`VsyncRing::set_mode`]).
 pub fn note_choreographer_vsync(vsync_ns: u64, deadline_ns: Option<u64>) -> Option<VsyncLock> {
-    with_display(|d| d.note_vsync(vsync_ns, deadline_ns))
+    let mhz = u64::from(crate::advertised_refresh_mhz());
+    let mode_ns = 1_000_000_000_000u64.checked_div(mhz).unwrap_or(0);
+    with_display(|d| d.note_vsync(vsync_ns, deadline_ns, mode_ns))
+}
+
+/// A fit the ring rejected as too far from the mode's period since the last
+/// call, with the mode's period: `(fit, mode)`. Reported once per run of
+/// rejections.
+pub fn take_rejected_fit() -> Option<(u64, u64)> {
+    with_display(|d| d.rejected_fit.take().map(|p| (p, d.ring.mode_ns)))
 }
 
 /// Feed the latch grid's current anchor (see [`DisplayVsync::note_latch`]).
@@ -775,7 +849,7 @@ mod tests {
         let mut d = DisplayVsync::default();
         let mut t = T0;
         for _ in 0..MIN_LOCK {
-            d.note_vsync(t, deadline_lead.map(|l| t + l));
+            d.note_vsync(t, deadline_lead.map(|l| t + l), 0);
             t += P;
         }
         (d, t - P)
@@ -828,7 +902,7 @@ mod tests {
         d.note_latch(T0 + 500_000, 16_666_666);
         let mut lock = None;
         for _ in 0..MIN_LOCK {
-            if let Some(l) = d.note_vsync(t, Some(t + 2 * P)) {
+            if let Some(l) = d.note_vsync(t, Some(t + 2 * P), 0) {
                 lock = Some(l);
             }
             t += P;
@@ -963,14 +1037,14 @@ mod tests {
         let mut tl = VblankTimeline::default();
         let mut t = T0;
         for _ in 0..MIN_LOCK {
-            d.note_vsync(t, Some(t + P));
+            d.note_vsync(t, Some(t + P), 0);
             t += P;
         }
         let mut stamp = tl.claim(t, d.grid(t), 16_666_666);
         let (mut late, mut counted) = (0u64, 0u64);
         let mut margins = Vec::new();
         for k in 0..frames {
-            d.note_vsync(t, Some(t + P));
+            d.note_vsync(t, Some(t + P), 0);
             t += P;
             // A spread of -spread..+spread, in a fixed pseudo-random order.
             let jitter = ((k * 7919) % 101) as i64 * 2 * spread / 100 - spread;
@@ -1024,7 +1098,7 @@ mod tests {
         d.fix_lead(0);
         let mut t = T0;
         for _ in 0..MIN_LOCK {
-            d.note_vsync(t, Some(t + P));
+            d.note_vsync(t, Some(t + P), 0);
             t += P;
         }
         // `SurfaceFlinger` takes every publish 1.5 ms after the deadline.
@@ -1046,7 +1120,7 @@ mod tests {
         let mut t = T0;
         let mut reports = Vec::new();
         for k in 0..1_300u64 {
-            d.note_vsync(t, Some(t + P));
+            d.note_vsync(t, Some(t + P), 0);
             // Every 60th vsync carries no publish.
             if k > MIN_LOCK as u64 && k % 60 != 0 {
                 let latch = t + P;
@@ -1064,5 +1138,69 @@ mod tests {
         assert_eq!(r.late, 0);
         assert!(r.vsyncs > r.publishes, "{r:?}");
         assert!((590..=600).contains(&r.vsyncs), "{r:?}");
+    }
+
+    #[test]
+    fn a_starved_thread_cannot_halve_the_rate_the_mode_names() {
+        // 120 Hz mode; the callback thread delivers only every second vsync
+        // for 64 straight vsyncs. Each step counts two of the mode's periods,
+        // and the period stays 8.33 ms.
+        let p120 = 8_333_333u64;
+        let mut r = VsyncRing::default();
+        r.set_mode(p120);
+        let mut t = T0;
+        for _ in 0..RING {
+            r.push(t);
+            t += p120;
+        }
+        assert_eq!(r.period_ns(), Some(p120));
+        for _ in 0..2 * RING {
+            r.push(t);
+            t += 2 * p120;
+        }
+        assert_eq!(r.period_ns(), Some(p120));
+    }
+
+    #[test]
+    fn a_fit_outside_the_mode_band_is_rejected_once() {
+        // The mode says 60 Hz; the callbacks come at 16.0 ms (4 % off).
+        let mut r = VsyncRing::default();
+        r.set_mode(16_666_667);
+        let mut events = Vec::new();
+        for i in 0..64u64 {
+            let e = r.push(T0 + i * 16_000_000);
+            if e != RingEvent::None {
+                events.push(e);
+            }
+        }
+        assert_eq!(events, vec![RingEvent::Rejected(16_000_000)]);
+        assert_eq!(r.period_ns(), None);
+    }
+
+    #[test]
+    fn a_new_mode_starts_the_fit_again() {
+        let mut r = VsyncRing::default();
+        r.set_mode(16_666_667);
+        let mut t = T0;
+        for _ in 0..RING {
+            r.push(t);
+            t += P;
+        }
+        assert_eq!(r.period_ns(), Some(P));
+        r.set_mode(8_333_333);
+        assert_eq!(r.period_ns(), None);
+        let mut locked = None;
+        for _ in 0..RING {
+            if let RingEvent::Locked(p) = r.push(t) {
+                locked = Some(p);
+            }
+            t += 8_337_836;
+        }
+        assert_eq!(locked, Some(8_337_836));
+    }
+
+    #[test]
+    fn the_fixed_lead_is_clamped_to_half_a_period() {
+        assert_eq!(LeadLoop::fixed(50_000_000).lead_ns(P), P / 2);
     }
 }

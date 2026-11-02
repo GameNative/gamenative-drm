@@ -1540,7 +1540,17 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeInjectorS
     _class: JClass,
     suspended: jboolean,
 ) {
-    let _ = std::panic::catch_unwind(|| injector::set_suspended(suspended != 0));
+    let _ = std::panic::catch_unwind(|| {
+        let suspended = suspended != 0;
+        injector::set_suspended(suspended);
+        // A suspended session draws nothing: no vsync callbacks for it. Resumed,
+        // they come back for a session that is still running.
+        if suspended {
+            choreographer::stop();
+        } else if RUNTIME.lock().is_ok_and(|rt| rt.is_some()) {
+            choreographer::start();
+        }
+    });
 }
 
 /// `GameNativeDrm.nativeGamescopeCommand(command)` — run one allowlisted

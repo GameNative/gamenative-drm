@@ -28,15 +28,19 @@ type FrameData = c_void;
 
 type FnGetInstance = unsafe extern "C" fn() -> *mut Choreographer;
 type VsyncCallback = unsafe extern "C" fn(data: *const FrameData, user: *mut c_void);
+// Both post functions return `void` (`<android/choreographer.h>`): there is no
+// status to read, so a callback that never comes is caught by the poll timeout
+// in `run`, not by a return value.
 type FnPostVsyncCallback =
-    unsafe extern "C" fn(ch: *mut Choreographer, cb: VsyncCallback, user: *mut c_void) -> c_int;
+    unsafe extern "C" fn(ch: *mut Choreographer, cb: VsyncCallback, user: *mut c_void);
 type FrameCallback64 = unsafe extern "C" fn(frame_time_nanos: i64, user: *mut c_void);
 type FnPostFrameCallback64 =
-    unsafe extern "C" fn(ch: *mut Choreographer, cb: FrameCallback64, user: *mut c_void) -> c_int;
+    unsafe extern "C" fn(ch: *mut Choreographer, cb: FrameCallback64, user: *mut c_void);
 type FnGetFrameTime = unsafe extern "C" fn(data: *const FrameData) -> i64;
 type FnGetPreferredIndex = unsafe extern "C" fn(data: *const FrameData) -> usize;
 type FnGetDeadline = unsafe extern "C" fn(data: *const FrameData, index: usize) -> i64;
 type FnLooperWake = unsafe extern "C" fn(looper: *mut c_void);
+type FnLooperAcquire = unsafe extern "C" fn(looper: *mut c_void);
 
 /// API 33's per-vsync data accessors.
 #[derive(Clone, Copy)]
@@ -55,6 +59,7 @@ struct Api {
     prepare: crate::ffi::FnALooperPrepare,
     poll_once: crate::ffi::FnALooperPollOnce,
     wake: FnLooperWake,
+    acquire: FnLooperAcquire,
 }
 
 impl Api {
@@ -107,6 +112,7 @@ impl Api {
                 prepare: sym(handle, c"ALooper_prepare")?,
                 poll_once: sym(handle, c"ALooper_pollOnce")?,
                 wake: sym(handle, c"ALooper_wake")?,
+                acquire: sym(handle, c"ALooper_acquire")?,
             })
         }
     }
@@ -118,8 +124,17 @@ static WANTED: AtomicBool = AtomicBool::new(false);
 static SPAWNED: AtomicBool = AtomicBool::new(false);
 /// Whether a callback is posted and has not run yet. Touched on the thread only.
 static OUTSTANDING: AtomicBool = AtomicBool::new(false);
-/// The thread's looper, to wake it when a session starts; null until prepared.
+/// Set by every callback, cleared by the thread: a callback arrived.
+static FIRED: AtomicBool = AtomicBool::new(false);
+/// The thread's looper, to wake it when a session starts; null until prepared
+/// and again once the thread has ended. The thread takes a reference on it
+/// (`ALooper_acquire`) that is never dropped, so a `start` that read the pointer
+/// just before the thread ended still wakes a live object, not a freed one.
 static LOOPER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// How long a posted callback may take before it is posted again: far beyond
+/// any refresh period, so only a callback that was lost (or a display that is
+/// off) reaches it.
+const CALLBACK_TIMEOUT_MS: c_int = 1000;
 /// The resolved table, set once by the thread before its first post.
 static API: std::sync::OnceLock<Api> = std::sync::OnceLock::new();
 
@@ -129,8 +144,8 @@ pub(crate) fn start() {
     if SPAWNED.swap(true, Ordering::AcqRel) {
         let looper = LOOPER.load(Ordering::Acquire);
         if let (false, Some(api)) = (looper.is_null(), API.get()) {
-            // SAFETY: the looper the thread prepared; it lives as long as the
-            // thread, which never exits once it holds one.
+            // SAFETY: the looper the thread prepared, kept alive by the
+            // reference the thread took on it (see `LOOPER`).
             unsafe { (api.wake)(looper) };
         }
         return;
@@ -139,6 +154,10 @@ pub(crate) fn start() {
         .name("gndrm-vsync".into())
         .spawn(|| {
             let _ = std::panic::catch_unwind(run);
+            // However the thread ended, the next session starts a new one.
+            LOOPER.store(std::ptr::null_mut(), Ordering::Release);
+            OUTSTANDING.store(false, Ordering::Relaxed);
+            SPAWNED.store(false, Ordering::Release);
         });
     if spawned.is_err() {
         SPAWNED.store(false, Ordering::Release);
@@ -172,44 +191,71 @@ fn run() {
         );
         return;
     }
+    // SAFETY: the looper this thread prepared; the reference is never
+    // released (see `LOOPER`).
+    unsafe { (api.acquire)(looper) };
     LOOPER.store(looper, Ordering::Release);
+    // Whether a callback was posted again after a timeout and none has come
+    // since: a callback that never comes is posted again once, not every
+    // second, so a display that is off cannot pile them up.
+    let mut reposted = false;
+    let mut logged_lost = false;
     loop {
+        if FIRED.swap(false, Ordering::Relaxed) {
+            reposted = false;
+        }
         if WANTED.load(Ordering::Acquire) && !OUTSTANDING.load(Ordering::Relaxed) {
             // SAFETY: `ch` is this thread's Choreographer; the callbacks are
             // `extern "C"` functions that live for the process and take no
             // user pointer.
-            let rc = unsafe {
+            unsafe {
                 match (api.vsync, api.frame64) {
                     (Some(v), _) => (v.post)(ch, on_vsync, std::ptr::null_mut()),
                     (None, Some(post)) => post(ch, on_frame, std::ptr::null_mut()),
-                    (None, None) => -1,
+                    (None, None) => {}
                 }
-            };
-            if rc != 0 {
-                crate::log_always!(
-                    "{}",
-                    gndrm_obf::obf!("vsync: posting a Choreographer callback failed ({rc})")
-                );
-                return;
             }
             OUTSTANDING.store(true, Ordering::Relaxed);
         }
         // SAFETY: this thread's looper; null out-pointers are allowed. Returns
-        // after a callback ran or a wake.
-        unsafe {
+        // after a callback ran, a wake, or the timeout.
+        let r = unsafe {
             (api.poll_once)(
-                -1,
+                if OUTSTANDING.load(Ordering::Relaxed) { CALLBACK_TIMEOUT_MS } else { -1 },
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )
         };
+        const ALOOPER_POLL_TIMEOUT: c_int = -3;
+        if r == ALOOPER_POLL_TIMEOUT
+            && OUTSTANDING.load(Ordering::Relaxed)
+            && WANTED.load(Ordering::Acquire)
+            && !reposted
+        {
+            // The callback was not delivered within a second. The flip
+            // events fall back to the latch grid by themselves once the
+            // vsync goes stale; post once more so the stream resumes if the
+            // callback was lost rather than the display stopped.
+            if !logged_lost {
+                logged_lost = true;
+                crate::log_always!(
+                    "{}",
+                    gndrm_obf::obf!(
+                        "vsync: no Choreographer callback for 1 s; posting again, flip events follow the latch grid meanwhile"
+                    )
+                );
+            }
+            OUTSTANDING.store(false, Ordering::Relaxed);
+            reposted = true;
+        }
     }
 }
 
 /// API 33+: one vsync with its frame timelines.
 unsafe extern "C" fn on_vsync(data: *const FrameData, _user: *mut c_void) {
     OUTSTANDING.store(false, Ordering::Relaxed);
+    FIRED.store(true, Ordering::Relaxed);
     let _ = std::panic::catch_unwind(|| {
         let Some(v) = API.get().and_then(|a| a.vsync) else {
             return;
@@ -229,6 +275,7 @@ unsafe extern "C" fn on_vsync(data: *const FrameData, _user: *mut c_void) {
 /// API 29-32: the vsync time only.
 unsafe extern "C" fn on_frame(frame_time_nanos: i64, _user: *mut c_void) {
     OUTSTANDING.store(false, Ordering::Relaxed);
+    FIRED.store(true, Ordering::Relaxed);
     let _ = std::panic::catch_unwind(|| {
         if frame_time_nanos > 0 {
             feed(frame_time_nanos as u64, None);
@@ -239,6 +286,19 @@ unsafe extern "C" fn on_frame(frame_time_nanos: i64, _user: *mut c_void) {
 fn feed(vsync_ns: u64, deadline_ns: Option<u64>) {
     if let Some(lock) = vblank::note_choreographer_vsync(vsync_ns, deadline_ns) {
         log_lock(&lock);
+    }
+    // Once per run of rejected fits, so not a per-frame line.
+    if let Some((fit, mode)) = vblank::take_rejected_fit() {
+        crate::log_always!(
+            "{}",
+            gndrm_obf::obf!(
+                "vsync: measured period {}.{:03}us is more than 2% from the mode's {}.{:03}us; kept the previous period",
+                fit / 1000,
+                fit % 1000,
+                mode / 1000,
+                mode % 1000
+            )
+        );
     }
 }
 
