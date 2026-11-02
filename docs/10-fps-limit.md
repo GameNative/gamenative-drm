@@ -104,31 +104,59 @@ divisor cap reads its target exactly.
   took the slot; a subscriber whose peer is gone is dropped there, and the
   connection currently being served stays its own loop's to close. This is what
   makes a cap change made mid-session reach an already-connected shim at all.
-- **gamescope's limiter enforces it; the shim declares FIFO while it is set.** On a
-  PC, gamescope's WSI layer declares FIFO to gamescope (`gamescope_swapchain.
-  set_present_mode`) while its limiter is engaged, gamescope latches one FIFO commit per
-  limited vblank (`steamcompmgr.cpp` `handle_done_commits_xwayland`), and the client is
-  paced by `wl_buffer.release`. The shim is that layer here: on gamescope's override
-  route it declares FIFO on every commit while the daemon's `FrameCapNote` carries a
-  cap, the guest's own mode otherwise, and mailbox while frame generation runs
-  (`icd_shim/src/proxy.rs` `live_present_mode`). `MESA_VK_WSI_PRESENT_MODE`, a container
-  default for the X11 path, no longer decides that route: honouring it declared every
-  commit mailbox, which the limiter never holds, and that is why an acquire gate on the
-  shim's own clock used to stand in for the cap. That time gate
-  (`scanout::next_acquire_after`) now runs only while frame generation sets the source
-  rate, and on the opt-in X11 Present route, which has no compositor declaration.
-  gamescope's fixed-rate limiter passes every `refresh / target`-th vblank with an integer
-  divisor, so a cap that does not divide the display's rate (40 or 45 on 60 Hz, 45 or 50
-  on 120 Hz) runs at the next divisor rate above it; that is upstream gamescope's
-  behaviour and is left to it for now.
+- **Who enforces it follows the present mode, and the mode follows the container.**
+  On gamescope's override route the shim declares to gamescope, per commit
+  (`gamescope_swapchain.set_present_mode`), the container's
+  `MESA_VK_WSI_PRESENT_MODE` (mailbox is the container default; the user may set
+  fifo, fifo_relaxed or immediate), or the guest's own mode when the env is absent
+  (`icd_shim/src/proxy.rs` `effective_present_mode`, `live_present_mode`).
+  gamescope's limiter holds only commits declared FIFO (`wlserver_surface_is_fifo`):
+  it latches one per limited vblank (`steamcompmgr.cpp` `handle_done_commits_xwayland`)
+  and the client is paced by `wl_buffer.release`. Any other mode is taken at the
+  next composite, so there the shim's acquire gate is the cap:
+
+  | container mode | cap | declared | what limits the rate |
+  |---|---|---|---|
+  | mailbox (default) | none | mailbox | nobody |
+  | mailbox | set | mailbox | the shim's acquire gate, on the display's vblank grid |
+  | fifo | none | fifo | the display (FIFO) |
+  | fifo | set | fifo | gamescope's divisor limiter |
+  | any, frame generation on | any | mailbox | the source-rate gate (`docs/17`) |
+
+  fifo_relaxed and immediate behave as mailbox in this table. No env: the guest's
+  own mode takes the env's place.
+
+  The gate (`icd_shim/src/vsync_gate.rs`) releases acquires on the vblank grid
+  gamescope composites from, not on a clock of its own: the daemon's `VsyncNote`
+  latch grid (measured period and phase) moved earlier by the lead the daemon
+  stamps flip events with (`stamp_lead_ns`). A cap at the display's rate releases
+  every vblank (60 on a 59.97 Hz panel is 59.97, one frame per latch); a cap that
+  divides the rate, every `refresh / cap`-th vblank (30 on 60, 60 on 120); any
+  other cap below the rate, the vblank nearest each instant of an ideal
+  `1e9 / cap` timeline, which averages the cap on vblank boundaries (45 on 60
+  releases 3 of 4 vblanks); a cap above the rate, the cap's own clock. A frame
+  that arrives after its release point starts at once, and the next release is
+  the next point of the schedule, so a game below the cap keeps its own rate. A
+  gate on the shim's own `1e9 / N` clock, as before 7bdcbae, beat against the
+  panel: 57-59 fps on `SurfaceFlinger` at a 60 cap on a 59.97 Hz panel. Until the
+  daemon's first note the grid is the mode's nominal period (phase unknown); with
+  no rate known at all, the cap's own clock.
+
+  The census reads which path ran, every 10 s while frames are presented:
+  `present mode: declared=… requested=… source=env|guest route=gamescope cap=…
+  gate=vsync|nominal|clock|off …` (`gate=clock` is frame generation's source rate
+  or a cap above the display's rate). Off the override route (the opt-in X11
+  Present route) the env decides the mode as in Mesa and the gate runs on the
+  cap's own clock, as before.
 - **`-r` is not part of it, and no launch argument carries the limit.** The app
   sends the cap to the shim's gate; `--framerate-limit` is never built.
 
 Open points:
-- **Divisor rounding bites the gamescope route only.** `nVblankDivisor =
+- **Divisor rounding bites the FIFO route only.** `nVblankDivisor =
   nRefreshHz / nTargetFPS` (`steamcompmgr.cpp:7040`, and `:10621` for the window's
-  limited cycle) lands on the nearest divisor of the grid; the shim's floor is
-  exact (measured: 60.00 commits/s at a 60 cap).
+  limited cycle) lands on the nearest divisor of the grid, so with the container
+  set to fifo a 40 or 45 cap on 60 Hz runs at 60. Under mailbox the shim's gate
+  averages a non-divisor cap on vblanks instead.
 - **The client-visible refresh is the mode's, and the mode is the display's.**
   `-r` reaches `g_nOutputRefresh` only transiently (`drm_unset_mode`, `:3680`),
   before `drm_set_mode` (`:3728`) overwrites it with the mode's rate —
