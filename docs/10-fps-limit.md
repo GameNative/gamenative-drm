@@ -136,7 +136,19 @@ divisor cap reads its target exactly.
   `1e9 / cap` timeline, which averages the cap on vblank boundaries (45 on 60
   releases 3 of 4 vblanks); a cap above the rate, the cap's own clock. A frame
   that arrives after its release point starts at once, and the next release is
-  the next point of the schedule, so a game below the cap keeps its own rate. A
+  the next point of the schedule, so a game below the cap keeps its own rate.
+  The gate limits how many frames start; it does not space when they finish. A
+  game that paces itself just below the display's rate (Unity's frame-rate target
+  with VSync off: ~59.3 fps on a 59.97 Hz panel) is late for most release points,
+  so the gate rarely holds it, and its frames reach the commit with its own
+  jitter; two inside one gamescope composite and the older is replaced, the panel
+  repeating the frame before. So the present worker also keeps one commit per
+  composite window (`CommitWindow`, `proxy.rs` `hold_for_window`): windows run
+  from one gamescope wakeup (2.5 ms before a stamp instant) to the next, and a
+  frame whose window already has a commit is held to the stamp instant that
+  closes it, after that composite, so the next composite shows it. A newer frame
+  that is ready while one is held replaces it. This is the one-deep version of
+  the queue FIFO has. A
   gate on the shim's own `1e9 / N` clock, as before 7bdcbae, beat against the
   panel: 57-59 fps on `SurfaceFlinger` at a 60 cap on a 59.97 Hz panel.
 
@@ -162,7 +174,10 @@ divisor cap reads its target exactly.
   their release point; `skipped`, release points moved past for them;
   `slot_waits`, acquires that passed the gate and then waited on a compositor
   release for a free image; `commit_lat_us`, the smoothed acquire-to-commit
-  time. Off the override route (the opt-in X11
+  time. Then `win_holds` (frames the commit window held), `win_replaced` (held
+  frames a newer one replaced) and `spacing=[<15:… 15-16.2:… 16.2-17.2:…
+  17.2-20:… >20:…]`, the spacing of consecutive commits in ms since the last
+  line: the game's own cadence as it reaches gamescope. Off the override route (the opt-in X11
   Present route) the env decides the mode as in Mesa and the gate runs on the
   cap's own clock, as before.
 - **`-r` is not part of it, and no launch argument carries the limit.** The app
