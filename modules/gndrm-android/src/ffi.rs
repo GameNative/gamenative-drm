@@ -490,7 +490,7 @@ impl ScApi {
 /// # Safety
 /// `handle` must be a live `dlopen` handle and `T` must be the exact C
 /// signature the platform exports under `name`.
-unsafe fn sym<T: Copy>(handle: *mut c_void, name: &core::ffi::CStr) -> Option<T> {
+pub(crate) unsafe fn sym<T: Copy>(handle: *mut c_void, name: &core::ffi::CStr) -> Option<T> {
     // SAFETY: caller guarantees the handle; `name` is NUL-terminated.
     let p = unsafe { libc::dlsym(handle, name.as_ptr()) };
     if p.is_null() {
