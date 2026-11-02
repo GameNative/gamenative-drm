@@ -41,17 +41,29 @@ pub const EXT_PRESENT_WAIT: &core::ffi::CStr = c"VK_KHR_present_wait";
 
 /// Every present id armed by a present and not yet completed, oldest first, and
 /// the completions the daemon has reported and no wait has consumed.
+///
+/// Every entry is keyed by the id *and* its swapchain: present ids restart at 1
+/// on every swapchain a guest creates (DXVK recreates on a resize or a mode
+/// change), so an id alone would let the old swapchain's late answer complete
+/// the new one's frame.
 struct Waits {
+    /// `(id, swapchain)`.
     armed: Vec<(u64, usize)>,
-    done: Vec<(u64, u64)>,
-    /// Ids whose frame has been committed, with the commit time: the latest a
-    /// wait on them is answered is two refresh periods after that.
-    committed: Vec<(u64, u64)>,
-    /// Ids whose commit asked gamescope for presentation feedback that has not
+    /// `(id, swapchain, ns)`.
+    done: Vec<(u64, usize, u64)>,
+    /// Frames committed, with the commit time: the latest a wait on them is
+    /// answered is two refresh periods after that. `(id, swapchain, ns)`.
+    committed: Vec<(u64, usize, u64)>,
+    /// Commits that asked gamescope for presentation feedback that has not
     /// arrived: only `presented` / `discarded` answers them (or, should it
-    /// never come, [`FEEDBACK_SAFETY_NS`] after the commit).
-    feedback: Vec<u64>,
+    /// never come, [`FEEDBACK_SAFETY_NS`] after the commit). `(token, id,
+    /// swapchain)`; the token is the feedback listener's data, unique per
+    /// request.
+    feedback: Vec<(u64, u64, usize)>,
 }
+
+/// The next feedback token; 0 is never handed out.
+static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Bound on both lists: the ids in flight are a handful of frames, so anything
 /// older is a guest that marked frames and never waited.
@@ -84,53 +96,64 @@ pub(crate) fn feedback_counts() -> (usize, usize, usize) {
     )
 }
 
-/// The commit carrying `id` asked gamescope for presentation feedback. Called
-/// before that commit is sent, so no release or grace can answer it first.
-pub(crate) fn expect_feedback(id: u64) {
+/// The commit carrying `id` on swapchain `sc` asks gamescope for presentation
+/// feedback. Called before that commit is sent, so no release or grace can
+/// answer it first. Returns the token the feedback's events carry (0 for id 0).
+pub(crate) fn expect_feedback(id: u64, sc: usize) -> u64 {
     if id == 0 {
-        return;
+        return 0;
     }
+    let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
     let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
     if w.feedback.len() >= CAP {
         w.feedback.remove(0);
     }
-    w.feedback.push(id);
+    w.feedback.push((token, id, sc));
+    token
 }
 
-/// gamescope's `wp_presentation_feedback.presented` for the commit carrying
-/// `id`, at `present_ns`.
-pub(crate) fn feedback_presented(id: u64, present_ns: u64) {
+/// gamescope's `wp_presentation_feedback.presented` for the commit `token`
+/// names, at `present_ns`.
+pub(crate) fn feedback_presented(token: u64, present_ns: u64) {
     PRESENTED_N.fetch_add(1, Ordering::Relaxed);
-    feedback_done(id, present_ns);
+    feedback_done(token, present_ns);
 }
 
-/// gamescope's `wp_presentation_feedback.discarded` for the commit carrying
-/// `id`: it will never be shown, and its wait is answered now.
-pub(crate) fn feedback_discarded(id: u64, now_ns: u64) {
+/// gamescope's `wp_presentation_feedback.discarded` for the commit `token`
+/// names: it will never be shown, and its wait is answered now.
+pub(crate) fn feedback_discarded(token: u64, now_ns: u64) {
     DISCARDED_N.fetch_add(1, Ordering::Relaxed);
-    feedback_done(id, now_ns);
+    feedback_done(token, now_ns);
 }
 
-/// The feedback for `id` could not be requested after all: the release and the
-/// grace answer it again.
-pub(crate) fn cancel_feedback(id: u64) {
-    if id == 0 {
+/// The feedback `token` names could not be requested after all: the release
+/// and the grace answer its frame again.
+pub(crate) fn cancel_feedback(token: u64) {
+    if token == 0 {
         return;
     }
     let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
-    w.feedback.retain(|&f| f != id);
+    w.feedback.retain(|&(t, _, _)| t != token);
 }
 
-fn feedback_done(id: u64, ns: u64) {
-    {
+fn feedback_done(token: u64, ns: u64) {
+    let key = {
         let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
-        w.feedback.retain(|&f| f != id);
+        let i = w.feedback.iter().position(|&(t, _, _)| t == token);
+        i.map(|i| {
+            let (_, id, sc) = w.feedback.remove(i);
+            (id, sc)
+        })
+    };
+    // A token no longer pending belongs to a swapchain that went away, or a
+    // frame another path answered: nothing to do.
+    if let Some((id, sc)) = key {
+        record_for(id, sc, ns);
     }
-    record(id, ns);
 }
 
-fn feedback_pending(w: &Waits, id: u64) -> bool {
-    w.feedback.contains(&id)
+fn feedback_pending(w: &Waits, id: u64, sc: usize) -> bool {
+    w.feedback.iter().any(|&(_, i, s)| i == id && s == sc)
 }
 
 /// Two refresh periods after a commit, the frame has been latched whatever the
@@ -140,8 +163,9 @@ fn commit_grace_ns() -> u64 {
     2 * (1_000_000_000 / hz)
 }
 
-/// The frame carrying `id` has been committed to the compositor.
-pub(crate) fn note_commit(id: u64, commit_ns: u64) {
+/// The frame carrying `id` on swapchain `sc` has been committed to the
+/// compositor.
+pub(crate) fn note_commit(id: u64, sc: usize, commit_ns: u64) {
     if id == 0 {
         return;
     }
@@ -149,7 +173,7 @@ pub(crate) fn note_commit(id: u64, commit_ns: u64) {
     if w.committed.len() >= CAP {
         w.committed.remove(0);
     }
-    w.committed.push((id, commit_ns));
+    w.committed.push((id, sc, commit_ns));
     drop(w);
     WAIT_CV.notify_all();
 }
@@ -167,11 +191,11 @@ static WAIT_CV: Condvar = Condvar::new();
 /// guest that knew its real mode would not wait at all: DXVK skips the present
 /// wait for mailbox and immediate. Holding the wait for the grace there throttles
 /// the guest's frame-latency loop to `(start-to-commit + 2 periods) / (L + 1)`.
-pub(crate) fn committed(id: u64, commit_ns: u64, answer_now: bool) {
+pub(crate) fn committed(id: u64, sc: usize, commit_ns: u64, answer_now: bool) {
     if answer_now {
-        record(id, commit_ns);
+        record_for(id, sc, commit_ns);
     } else {
-        note_commit(id, commit_ns);
+        note_commit(id, sc, commit_ns);
     }
 }
 
@@ -211,21 +235,42 @@ pub(crate) fn arm(id: u64, sc: usize) {
 /// A completed present: presentation feedback, the daemon's latch report, a
 /// commit under mailbox, or a fallback. An id no longer armed was answered
 /// already and is left alone, so a second answer never queues a stale one.
+///
+/// The daemon's latch report names an id only; it answers the oldest armed
+/// frame with that id, which is the live swapchain's (an old swapchain's ids
+/// are dropped when it is destroyed).
 pub(crate) fn record(id: u64, latch_ns: u64) {
     if id == 0 {
         return;
     }
+    let sc = {
+        let w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        w.armed
+            .iter()
+            .find(|&&(armed, _)| armed == id)
+            .map(|&(_, sc)| sc)
+    };
+    if let Some(sc) = sc {
+        record_for(id, sc, latch_ns);
+    }
+}
+
+/// [`record`] for the frame `id` of swapchain `sc`.
+pub(crate) fn record_for(id: u64, sc: usize, latch_ns: u64) {
+    if id == 0 {
+        return;
+    }
     let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(i) = w.armed.iter().position(|&(armed, _)| armed == id) else {
+    let Some(i) = w.armed.iter().position(|&k| k == (id, sc)) else {
         return;
     };
     w.armed.remove(i);
-    w.committed.retain(|&(c, _)| c != id);
-    w.feedback.retain(|&f| f != id);
+    w.committed.retain(|&(c, s, _)| (c, s) != (id, sc));
+    w.feedback.retain(|&(_, f, s)| (f, s) != (id, sc));
     if w.done.len() >= CAP {
         w.done.remove(0);
     }
-    w.done.push((id, latch_ns));
+    w.done.push((id, sc, latch_ns));
     drop(w);
     WAIT_CV.notify_all();
 }
@@ -252,14 +297,14 @@ fn note_outcome(id: u64, what: &str, t0: std::time::Instant) {
 ///
 /// Not while presentation feedback is pending for it: under FIFO the release of
 /// a frame comes when the next one is latched, a vblank after it was shown.
-pub(crate) fn complete_on_release(id: u64, release_ns: u64) {
+pub(crate) fn complete_on_release(id: u64, sc: usize, release_ns: u64) {
     let answers = {
         let w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
-        !feedback_pending(&w, id) && w.armed.iter().any(|&(armed, _)| armed == id)
+        !feedback_pending(&w, id, sc) && w.armed.contains(&(id, sc))
     };
     if answers {
         FALLBACK_N.fetch_add(1, Ordering::Relaxed);
-        record(id, release_ns);
+        record_for(id, sc, release_ns);
     }
 }
 
@@ -268,17 +313,8 @@ pub(crate) fn complete_on_release(id: u64, release_ns: u64) {
 /// was. A wait on it is answered now (`wp_presentation`'s "discarded"), so the
 /// guest does not sit out the bound in `wait`. An id no longer armed was
 /// answered already and is left alone.
-pub(crate) fn discard(id: u64, ns: u64) {
-    if id == 0 {
-        return;
-    }
-    let armed = {
-        let w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
-        w.armed.iter().any(|&(armed, _)| armed == id)
-    };
-    if armed {
-        record(id, ns);
-    }
+pub(crate) fn discard(id: u64, sc: usize, ns: u64) {
+    record_for(id, sc, ns);
 }
 
 /// The swapchain is going away: nothing armed on it will be released or
@@ -289,6 +325,11 @@ pub(crate) fn forget_swapchain(sc: usize) {
     let before = w.armed.len();
     w.armed.retain(|&(_, owner)| owner != sc);
     let dropped = before - w.armed.len();
+    // Its pending feedback, commits and unconsumed answers go with it: a new
+    // swapchain reuses the same ids.
+    w.feedback.retain(|&(_, _, owner)| owner != sc);
+    w.committed.retain(|&(_, owner, _)| owner != sc);
+    w.done.retain(|&(_, owner, _)| owner != sc);
     drop(w);
     if dropped != 0 {
         WAIT_CV.notify_all();
@@ -306,24 +347,36 @@ pub(crate) fn wait(id: u64, sc: usize, timeout_ns: u64) -> bool {
     // mismatched pair degrading to "no wait" instead. `VK_TIMEOUT` is positive,
     // so a caller that treats negative results as errors carries on.
     const MAX_WAIT_NS: u64 = 1_000_000_000;
-    let bound = if timeout_ns == u64::MAX { MAX_WAIT_NS } else { timeout_ns };
+    let bound = if timeout_ns == u64::MAX {
+        MAX_WAIT_NS
+    } else {
+        timeout_ns
+    };
     let deadline = Some(std::time::Instant::now() + Duration::from_nanos(bound));
     let t0 = std::time::Instant::now();
     let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(i) = w.done.iter().position(|&(done, _)| done == id) {
+        if let Some(i) = w
+            .done
+            .iter()
+            .position(|&(done, s, _)| (done, s) == (id, sc))
+        {
             w.done.remove(i);
             note_outcome(id, "done", t0);
             return true;
         }
-        if !w.armed.iter().any(|&(armed, owner)| armed == id && owner == sc) {
+        if !w
+            .armed
+            .iter()
+            .any(|&(armed, owner)| armed == id && owner == sc)
+        {
             note_outcome(id, "unarmed", t0);
             return true;
         }
         // A committed frame counts as latched two refresh periods after its
         // commit, whether or not its buffer ever comes back; one whose
         // presentation feedback is pending only at the feedback safety.
-        let grace = if feedback_pending(&w, id) {
+        let grace = if feedback_pending(&w, id, sc) {
             FEEDBACK_SAFETY_NS
         } else {
             commit_grace_ns()
@@ -331,16 +384,20 @@ pub(crate) fn wait(id: u64, sc: usize, timeout_ns: u64) -> bool {
         let latch_by = w
             .committed
             .iter()
-            .find(|&&(c, _)| c == id)
-            .map(|&(_, ns)| ns.saturating_add(grace));
+            .find(|&&(c, s, _)| (c, s) == (id, sc))
+            .map(|&(_, _, ns)| ns.saturating_add(grace));
         if let Some(latch_ns) = latch_by {
             let now_ns = crate::proxy::monotonic_ns();
             if now_ns >= latch_ns {
                 drop(w);
                 FALLBACK_N.fetch_add(1, Ordering::Relaxed);
-                record(id, latch_ns);
+                record_for(id, sc, latch_ns);
                 let mut w2 = WAITS.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(i) = w2.done.iter().position(|&(done, _)| done == id) {
+                if let Some(i) = w2
+                    .done
+                    .iter()
+                    .position(|&(done, s, _)| (done, s) == (id, sc))
+                {
                     w2.done.remove(i);
                 }
                 note_outcome(id, "latched", t0);
@@ -510,13 +567,18 @@ mod tests {
     #[test]
     fn a_fifo_commit_is_answered_only_after_the_grace() {
         arm(101, 5);
-        committed(101, crate::proxy::monotonic_ns(), false);
+        committed(101, 5, crate::proxy::monotonic_ns(), false);
         // The grace (two refresh periods, at least 2 ms at any rate the shim
         // accepts) has not passed, so a zero timeout expires.
         assert!(!wait(101, 5, 0));
         // A commit far enough in the past is answered as latched.
         arm(102, 5);
-        committed(102, crate::proxy::monotonic_ns().saturating_sub(1_000_000_000), false);
+        committed(
+            102,
+            5,
+            crate::proxy::monotonic_ns().saturating_sub(1_000_000_000),
+            false,
+        );
         assert!(wait(102, 5, 0));
         record(101, 0);
         assert!(wait(101, 5, 0));
@@ -525,7 +587,7 @@ mod tests {
     #[test]
     fn a_mailbox_commit_is_answered_at_the_commit() {
         arm(201, 6);
-        committed(201, crate::proxy::monotonic_ns(), true);
+        committed(201, 6, crate::proxy::monotonic_ns(), true);
         assert!(wait(201, 6, 0));
         // Answered once; nothing is left armed for the release to answer again.
         assert!(!WAITS.lock().unwrap().armed.iter().any(|&(id, _)| id == 201));
@@ -535,41 +597,56 @@ mod tests {
     #[test]
     fn presentation_feedback_answers_and_the_release_does_not_preempt_it() {
         arm(401, 8);
-        expect_feedback(401);
-        committed(401, crate::proxy::monotonic_ns().saturating_sub(50_000_000), false);
+        let token = expect_feedback(401, 8);
+        committed(
+            401,
+            8,
+            crate::proxy::monotonic_ns().saturating_sub(50_000_000),
+            false,
+        );
         // The release comes first (the next frame was latched): no answer.
-        complete_on_release(401, crate::proxy::monotonic_ns());
+        complete_on_release(401, 8, crate::proxy::monotonic_ns());
         // Nor does the two-period grace, 50 ms after the commit.
         assert!(!wait(401, 8, 0));
-        feedback_presented(401, 777);
+        feedback_presented(token, 777);
         assert!(wait(401, 8, 0));
         // A late duplicate from another path leaves nothing behind.
         record(401, 1);
-        assert!(!WAITS.lock().unwrap().done.iter().any(|&(id, _)| id == 401));
+        assert!(!WAITS
+            .lock()
+            .unwrap()
+            .done
+            .iter()
+            .any(|&(id, _, _)| id == 401));
     }
 
     #[test]
     fn a_discarded_frame_is_answered() {
         arm(501, 9);
-        expect_feedback(501);
-        committed(501, crate::proxy::monotonic_ns(), false);
-        feedback_discarded(501, crate::proxy::monotonic_ns());
+        let token = expect_feedback(501, 9);
+        committed(501, 9, crate::proxy::monotonic_ns(), false);
+        feedback_discarded(token, crate::proxy::monotonic_ns());
         assert!(wait(501, 9, 0));
     }
 
     #[test]
     fn a_feedback_that_never_comes_is_answered_by_the_safety() {
         arm(601, 10);
-        expect_feedback(601);
-        committed(601, crate::proxy::monotonic_ns().saturating_sub(FEEDBACK_SAFETY_NS + 1), false);
+        expect_feedback(601, 10);
+        committed(
+            601,
+            10,
+            crate::proxy::monotonic_ns().saturating_sub(FEEDBACK_SAFETY_NS + 1),
+            false,
+        );
         assert!(wait(601, 10, 0));
     }
 
     #[test]
     fn without_feedback_the_release_still_answers() {
         arm(701, 11);
-        committed(701, crate::proxy::monotonic_ns(), false);
-        complete_on_release(701, crate::proxy::monotonic_ns());
+        committed(701, 11, crate::proxy::monotonic_ns(), false);
+        complete_on_release(701, 11, crate::proxy::monotonic_ns());
         assert!(wait(701, 11, 0));
     }
 
@@ -578,12 +655,39 @@ mod tests {
         // The mailbox drops a frame before it is ever committed: recording it
         // is what releases a guest waiting on it before the one-second bound.
         arm(301, 7);
-        discard(301, crate::proxy::monotonic_ns());
+        discard(301, 7, crate::proxy::monotonic_ns());
         let t0 = std::time::Instant::now();
         assert!(wait(301, 7, u64::MAX));
         assert!(t0.elapsed() < Duration::from_millis(100));
         // A second discard of an answered id leaves nothing for a later wait.
-        discard(301, 0);
-        assert!(!WAITS.lock().unwrap().done.iter().any(|&(id, _)| id == 301));
+        discard(301, 7, 0);
+        assert!(!WAITS
+            .lock()
+            .unwrap()
+            .done
+            .iter()
+            .any(|&(id, _, _)| id == 301));
+    }
+
+    #[test]
+    fn a_recreated_swapchains_ids_are_not_answered_by_the_old_ones_feedback() {
+        // Swapchain 20 had id 1 pending feedback; the guest recreates it as 21,
+        // whose ids start at 1 again.
+        arm(1, 20);
+        let old = expect_feedback(1, 20);
+        committed(1, 20, crate::proxy::monotonic_ns(), false);
+        forget_swapchain(20);
+        arm(1, 21);
+        let new = expect_feedback(1, 21);
+        committed(1, 21, crate::proxy::monotonic_ns(), false);
+        // The old surface's teardown discards its feedback: the new frame
+        // stays pending.
+        feedback_discarded(old, crate::proxy::monotonic_ns());
+        assert!(!wait(1, 21, 0));
+        // And a release of the old swapchain's slot cannot answer it either.
+        complete_on_release(1, 20, crate::proxy::monotonic_ns());
+        assert!(!wait(1, 21, 0));
+        feedback_presented(new, 5);
+        assert!(wait(1, 21, 0));
     }
 }

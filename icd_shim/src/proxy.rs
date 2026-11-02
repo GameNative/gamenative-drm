@@ -679,7 +679,7 @@ unsafe fn x11_reap(sc: *mut GnSwapchain) {
             };
             drop(_g);
             if wait_id != 0 {
-                crate::present::complete_on_release(wait_id, monotonic_ns());
+                crate::present::complete_on_release(wait_id, sc as usize, monotonic_ns());
             }
             if logging {
                 N_REL.fetch_add(1, Ordering::Relaxed);
@@ -1729,7 +1729,7 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
         // to a refresh period it does not pace by.
         // The present id this commit asks gamescope's presentation feedback for,
         // 0 when none (see `crate::present`).
-        let mut feedback_id = 0u64;
+        let mut feedback_token = 0u64;
         if (*s).wait_id != 0 {
             // A guest that asked for mailbox or immediate does not wait, and
             // neither would one whose frames go out as mailbox (frame
@@ -1751,10 +1751,9 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
                 && !(*(*sc).surf).swapchain_obj.is_null()
                 && !PRESENTATION.load(Ordering::Acquire).is_null()
             {
-                feedback_id = id;
-                crate::present::expect_feedback(id);
+                feedback_token = crate::present::expect_feedback(id, sc as usize);
             }
-            crate::present::committed(id, monotonic_ns(), at_commit);
+            crate::present::committed(id, sc as usize, monotonic_ns(), at_commit);
         }
         // X11 route: the window carries its own content, so the frame is
         // presented into it (DRI3 + Present) instead of committed to a
@@ -1790,7 +1789,7 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
             crate::logf!(gndrm_obf::obf!(
                 "proxy: wl_buffer creation failed — dropping frame"
             ));
-            crate::present::cancel_feedback(feedback_id);
+            crate::present::cancel_feedback(feedback_token);
             let _g = (*sc).shared.lock().unwrap();
             (*s).in_flight = false;
             (*sc).cv_free.notify_all();
@@ -1810,10 +1809,13 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
             // Declaring the effective mode (not a hardcoded FIFO) is what
             // lets a window's fps limit, or the absence of one, be seen by
             // the compositor as the shim applies it.
-            wlproto::swapchain_set_present_mode(
-                (*(*sc).surf).swapchain_obj,
-                gamescope_present_mode(declared_present_mode(sc)),
-            );
+            // The guest-surface route has no gamescope swapchain to declare to.
+            if !(*(*sc).surf).swapchain_obj.is_null() {
+                wlproto::swapchain_set_present_mode(
+                    (*(*sc).surf).swapchain_obj,
+                    gamescope_present_mode(declared_present_mode(sc)),
+                );
+            }
             wlproto::surface_attach(parent, (*s).buf, 0, 0);
             wlproto::surface_damage_buffer(
                 parent,
@@ -1822,20 +1824,20 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
                 (*sc).extent.width as i32,
                 (*sc).extent.height as i32,
             );
-            if feedback_id != 0 {
+            if feedback_token != 0 {
                 let fb = wlproto::presentation_feedback(
                     PRESENTATION.load(Ordering::Acquire),
                     parent,
                 );
                 if fb.is_null() {
-                    crate::present::cancel_feedback(feedback_id);
+                    crate::present::cancel_feedback(feedback_token);
                 } else {
-                    // The id rides as the listener's data: no allocation to
-                    // free when the event spends the object.
+                    // The token rides as the listener's data: no allocation
+                    // to free when the event spends the object.
                     wlproto::wl_proxy_add_listener(
                         fb,
                         FEEDBACK_LISTENER.as_ptr() as *mut _,
-                        feedback_id as usize as *mut c_void,
+                        feedback_token as usize as *mut c_void,
                     );
                 }
             }
@@ -2612,7 +2614,7 @@ unsafe fn present_mailbox(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
         (*sc).cv_put.notify_one();
         drop(g);
         if replaced_id != 0 {
-            crate::present::discard(replaced_id, monotonic_ns());
+            crate::present::discard(replaced_id, sc as usize, monotonic_ns());
         }
     }
 }
@@ -2655,10 +2657,12 @@ unsafe fn present_sync_commit(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32)
             unsafe {
                 // Declare the mode in force, as on the worker path above
                 // (gamescope reads the mode once per commit).
-                wlproto::swapchain_set_present_mode(
-                    (*(*sc).surf).swapchain_obj,
-                    gamescope_present_mode(declared_present_mode(sc)),
-                );
+                if !(*(*sc).surf).swapchain_obj.is_null() {
+                    wlproto::swapchain_set_present_mode(
+                        (*(*sc).surf).swapchain_obj,
+                        gamescope_present_mode(declared_present_mode(sc)),
+                    );
+                }
                 wlproto::surface_attach(parent, (*slot).buf, 0, 0);
                 wlproto::surface_damage_buffer(
                     parent,
@@ -2799,7 +2803,7 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
             }
         };
         if stale_id != 0 {
-            crate::present::discard(stale_id, monotonic_ns());
+            crate::present::discard(stale_id, sc as usize, monotonic_ns());
         }
         if present_id != 0 {
             unsafe {
@@ -6871,7 +6875,7 @@ static PRESENTATION_LISTENER: [RawListenerFn; 1] = [unsafe {
 
 extern "C" fn feedback_sync_output(_data: *mut c_void, _fb: *mut wl_proxy, _output: *mut wl_proxy) {}
 
-/// `presented`: the frame carrying the present id in `data` was latched for
+/// `presented`: the frame whose feedback token is `data` was latched for
 /// the refresh at `tv`. The feedback object is spent either way.
 #[allow(clippy::too_many_arguments)] // the event's own arity
 extern "C" fn feedback_presented(
@@ -6885,18 +6889,18 @@ extern "C" fn feedback_presented(
     _seq_lo: u32,
     _flags: u32,
 ) {
-    let id = data as usize as u64;
+    let token = data as usize as u64;
     let ns = if PRESENTATION_CLOCK.load(Ordering::Relaxed) == libc::CLOCK_MONOTONIC as u32 {
         ((u64::from(tv_sec_hi) << 32 | u64::from(tv_sec_lo)) * 1_000_000_000)
             .saturating_add(u64::from(tv_nsec))
     } else {
         monotonic_ns()
     };
-    crate::present::feedback_presented(id, ns);
+    crate::present::feedback_presented(token, ns);
     unsafe { wlproto::wl_proxy_destroy(fb) };
 }
 
-/// `discarded`: the frame carrying the present id in `data` will never be
+/// `discarded`: the frame whose feedback token is `data` will never be
 /// shown; its wait is answered now.
 extern "C" fn feedback_discarded(data: *mut c_void, fb: *mut wl_proxy) {
     crate::present::feedback_discarded(data as usize as u64, monotonic_ns());
@@ -7094,7 +7098,7 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
         drop(_g);
         REL_ALL_N.fetch_add(1, Ordering::Relaxed);
         if wait_id != 0 {
-            crate::present::complete_on_release(wait_id, monotonic_ns());
+            crate::present::complete_on_release(wait_id, sc as usize, monotonic_ns());
         }
         if logging {
             N_REL.fetch_add(1, Ordering::Relaxed);
