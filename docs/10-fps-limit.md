@@ -104,15 +104,23 @@ divisor cap reads its target exactly.
   took the slot; a subscriber whose peer is gone is dropped there, and the
   connection currently being served stays its own loop's to close. This is what
   makes a cap change made mid-session reach an already-connected shim at all.
-- **The shim enforces it** (`icd_shim/src/scanout.rs:118-146`,
-  `next_acquire_after`): the next acquire may start no sooner than one
-  `1/target` period after the previous *deadline*, so the guest blocks in
-  `vkAcquireNextImageKHR` — the one point where waiting costs neither rendered
-  work nor display latency. The deadline, not the wake: the wait returns a hair
-  after it, and `max(prev, now) + period` made that hair part of every period
-  (a 60 cap read 59.78 on an Odin 3 menu, 60.00 once stepped from `prev`).
-  Only a guest a whole period behind is re-based on `now`, so no debt is
-  carried out of a stall.
+- **gamescope's limiter enforces it; the shim declares FIFO while it is set.** On a
+  PC, gamescope's WSI layer declares FIFO to gamescope (`gamescope_swapchain.
+  set_present_mode`) while its limiter is engaged, gamescope latches one FIFO commit per
+  limited vblank (`steamcompmgr.cpp` `handle_done_commits_xwayland`), and the client is
+  paced by `wl_buffer.release`. The shim is that layer here: on gamescope's override
+  route it declares FIFO on every commit while the daemon's `FrameCapNote` carries a
+  cap, the guest's own mode otherwise, and mailbox while frame generation runs
+  (`icd_shim/src/proxy.rs` `live_present_mode`). `MESA_VK_WSI_PRESENT_MODE`, a container
+  default for the X11 path, no longer decides that route: honouring it declared every
+  commit mailbox, which the limiter never holds, and that is why an acquire gate on the
+  shim's own clock used to stand in for the cap. That time gate
+  (`scanout::next_acquire_after`) now runs only while frame generation sets the source
+  rate, and on the opt-in X11 Present route, which has no compositor declaration.
+  gamescope's fixed-rate limiter passes every `refresh / target`-th vblank with an integer
+  divisor, so a cap that does not divide the display's rate (40 or 45 on 60 Hz, 45 or 50
+  on 120 Hz) runs at the next divisor rate above it; that is upstream gamescope's
+  behaviour and is left to it for now.
 - **`-r` is not part of it, and no launch argument carries the limit.** The app
   sends the cap to the shim's gate; `--framerate-limit` is never built.
 
