@@ -1719,79 +1719,8 @@ fn worker_main(sc: *mut GnSwapchain) {
             if lsfg_generate(sc, idx) || lsfg_queue_real(sc, idx) {
                 continue;
             }
-            let idx = hold_for_window(sc, idx);
             commit_real(sc, idx, fence_ms);
         }
-    }
-}
-
-/// Hold a ready frame to the next composite window when its own window already
-/// has a commit (`crate::vsync_gate::CommitWindow`), and return the frame to
-/// commit: `idx`, or a newer frame whose render finished while `idx` was held,
-/// which replaces it. Only while the acquire gate runs on the vblank grid (a
-/// cap with a mode gamescope's limiter does not hold); on the worker thread, so
-/// the guest's acquire and present never wait here.
-unsafe fn hold_for_window(sc: *mut GnSwapchain, idx: i32) -> i32 {
-    let crate::vsync_gate::Pacing::Grid { grid, .. } = (unsafe { acquire_pacing(sc) }) else {
-        return idx;
-    };
-    let mut idx = idx;
-    let mut held = false;
-    loop {
-        let now = monotonic_ns();
-        let Some(until) = (unsafe { (*sc).window }).hold_until(grid, now) else {
-            break;
-        };
-        if !held {
-            held = true;
-            crate::vsync_gate::note_window_hold();
-        }
-        let mut g = unsafe { (*sc).shared.lock().unwrap() };
-        if g.stopping {
-            break;
-        }
-        // A newer frame whose render is done replaces the held one, as a
-        // mailbox present replaces a pending one (`present_mailbox`).
-        let newer = g.mailbox.or_else(|| g.jobs.front().copied());
-        if let Some(newer) = newer.filter(|&n| unsafe { slot_fence_signalled(sc, n) }) {
-            if g.mailbox == Some(newer) {
-                g.mailbox = None;
-            } else {
-                g.jobs.pop_front();
-            }
-            let replaced_id = unsafe {
-                let os = (*sc).slots.as_mut_ptr().add(idx as usize);
-                (*os).in_flight = false;
-                (*os).present_id = 0;
-                (*os).acquired_ns = 0;
-                core::mem::replace(&mut (*os).wait_id, 0)
-            };
-            unsafe { (*sc).cv_free.notify_all() };
-            drop(g);
-            if replaced_id != 0 {
-                crate::present::discard(replaced_id, sc as usize, monotonic_ns());
-            }
-            crate::vsync_gate::note_window_replaced();
-            idx = newer;
-            continue;
-        }
-        // Wake at the window's end, and in between to look for a newer frame
-        // (its fence signals with no notification).
-        let wait = Duration::from_nanos(until.saturating_sub(now).min(1_000_000));
-        let (guard, _res) = unsafe { (*sc).cv_put.wait_timeout(g, wait).unwrap() };
-        drop(guard);
-    }
-    unsafe { (*sc).window.committed(grid, monotonic_ns()) };
-    idx
-}
-
-/// Whether slot `idx`'s render fence has signalled.
-unsafe fn slot_fence_signalled(sc: *mut GnSwapchain, idx: i32) -> bool {
-    let gd = unsafe { (*sc).dev };
-    let fence = unsafe { (*(*sc).slots.as_ptr().add(idx as usize)).fence };
-    match unsafe { (*gd).f.get_fence_status } {
-        Some(status) => (unsafe { status((*gd).real, fence) }) == VK_SUCCESS,
-        None => false,
     }
 }
 
@@ -2116,7 +2045,6 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         gen_no_grow: false,
         release: crate::vsync_gate::Schedule::default(),
         commit_latency_ns: AtomicU64::new(0),
-        window: crate::vsync_gate::CommitWindow::default(),
         worker: None,
         shared: Mutex::new(ScShared {
             jobs: VecDeque::with_capacity(GN_JOB_CAP),
@@ -6969,9 +6897,6 @@ pub struct GnSwapchain {
     /// (`crate::vsync_gate::smooth_latency`); 0 until one was measured. Written
     /// by the present worker, read by the acquire.
     pub commit_latency_ns: AtomicU64,
-    /// The composite window of the last commit (`hold_for_window`); the present
-    /// worker's alone.
-    pub window: crate::vsync_gate::CommitWindow,
 }
 
 // ---------------------------------------------------------------- wayland
@@ -9558,11 +9483,10 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
     let route = unsafe { !(*(*sc).surf).swapchain_obj.is_null() };
     let (presented, discarded, fallback) = crate::present::feedback_counts();
     let (late, skipped) = crate::vsync_gate::late_counts();
-    let (win_holds, win_replaced) = crate::vsync_gate::window_counts();
     // Since the last line, so each line reads one window's cadence.
     let gaps = COMMIT_GAPS.each_ref().map(|b| b.swap(0, Ordering::Relaxed));
     crate::logi!(gndrm_obf::obf!(
-        "present mode: declared={} requested={} source={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} gate_holds={} late={} skipped={} slot_waits={} commit_lat_us={} win_holds={} win_replaced={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}]",
+        "present mode: declared={} requested={} source={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} gate_holds={} late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}]",
         mode_name(unsafe { live_present_mode(sc) }),
         mode_name(unsafe { (*sc).requested_mode }),
         match unsafe { (*sc).mode_source } {
@@ -9594,8 +9518,6 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
         skipped,
         SLOT_WAIT_N.load(Ordering::Relaxed),
         unsafe { (*sc).commit_latency_ns.load(Ordering::Relaxed) } / 1_000,
-        win_holds,
-        win_replaced,
         gaps[0],
         gaps[1],
         gaps[2],

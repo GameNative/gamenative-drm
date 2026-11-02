@@ -133,11 +133,7 @@ that rate is the display's.
   the next composite. A cap at the display's rate releases every vblank, a divisor cap
   every `refresh / cap`-th, any other cap below the rate the vblank nearest each instant
   of an ideal `1e9 / cap` timeline; a frame late for its point starts at once and the
-  schedule goes on, so a guest below the cap is never quantized to a divisor; the
-  present worker keeps one commit per gamescope composite window, holding a frame
-  whose window already has one to the stamp instant that closes it (a newer ready
-  frame replaces a held one), so a guest that paces itself just below the rate with
-  some jitter is not replaced inside gamescope; a phase
+  schedule goes on, so a guest below the cap is never quantized to a divisor; a phase
   push never lets two releases into one vblank. The gate this replaces ran on the shim's
   own clock (exactly 1e9 / N ns) and beat against the display's 59.97-59.99 Hz
   (57-59 fps at a 60 cap). A cap above the rate runs on the cap's own clock
