@@ -9866,12 +9866,75 @@ unsafe extern "C" fn gn_vkCreateDevice(
     if crate::placed::faked() {
         strip.push(crate::placed::STYPE_FEATURES);
     }
+    // The create chain as the driver will see it: a `VK_ERROR_FEATURE_NOT_PRESENT`
+    // names no feature, and everything the guest asks for lives in one of these
+    // structs — sType plus the first six words says which and which bit.
+    // Built only when the trace is on: it allocates, and the answer is the same
+    // every create in a session.
+    if crate::vkshim_enabled() {
+        let mut chain: Vec<String> = Vec::new();
+        unsafe {
+            let mut w = ci2.pNext as *mut VkBaseOutStructure;
+            while !w.is_null() {
+                let words = (w as *const u32).add(2);
+                let mut s = format!("{}:", (*w).sType);
+                for k in 0..6 {
+                    s.push_str(&format!("{:x},", *words.add(k)));
+                }
+                chain.push(s);
+                w = (*w).pNext;
+            }
+        }
+        if !chain.is_empty() {
+            crate::logf!(gndrm_obf::obf!(
+                "proxy device: create chain [{}]",
+                chain.join(" ")
+            ));
+        }
+    }
+    // The feature lift is advertised to the guest, not asked of the driver
+    // (`advertise`): a driver that gates a feature it implements answers
+    // VK_ERROR_FEATURE_NOT_PRESENT for a create that requests the bit, so each
+    // lifted bit is ANDed back to the driver's own answer here — the wrapper's
+    // DISABLE_FEATURE. Restored after the call, as the unlinked structs are.
+    let base = unsafe { crate::advertise::driver_core(gi, pd) };
+    let mut masked: Vec<(*mut crate::advertise::CoreFeatures, crate::advertise::CoreFeatures)> =
+        Vec::new();
+    // No base, no masking: a driver that answers neither features query is not a
+    // driver that supports nothing, and cutting the guest's request against
+    // zeros would take bits this driver does have out of the create.
+    if let Some(base) = base.as_ref() {
+        // Before masking: the guest's request against the driver's answer, which
+        // is the bit a `VK_ERROR_FEATURE_NOT_PRESENT` create will refuse.
+        if !ci2.pEnabledFeatures.is_null() {
+            unsafe {
+                crate::advertise::request_mismatch(
+                    &*(ci2.pEnabledFeatures as *const crate::advertise::CoreFeatures),
+                    base,
+                );
+            }
+            let c = ci2.pEnabledFeatures as *mut crate::advertise::CoreFeatures;
+            let before = unsafe { *c };
+            unsafe { crate::advertise::mask(&mut *c, base) };
+            masked.push((c, before));
+        }
+    }
     let mut unlinked: Vec<(*mut VkBaseOutStructure, *mut VkBaseOutStructure)> = Vec::new();
     let mut prev: *mut VkBaseOutStructure = ptr::null_mut();
     let mut p = ci2.pNext as *mut VkBaseOutStructure;
     while !p.is_null() {
         unsafe {
             let next = (*p).pNext;
+            if let (true, Some(base)) = (
+                (*p).sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                base.as_ref(),
+            ) {
+                let c = (p as *mut u8).add(16) as *mut crate::advertise::CoreFeatures;
+                let before = *c;
+                crate::advertise::request_mismatch(&*c, base);
+                crate::advertise::mask(&mut *c, base);
+                masked.push((c, before));
+            }
             if strip.contains(&(*p).sType) {
                 if prev.is_null() {
                     ci2.pNext = next as *const c_void;
@@ -9886,10 +9949,21 @@ unsafe extern "C" fn gn_vkCreateDevice(
         }
     }
     let res = unsafe { (*gi).f.create_device.unwrap()(pd, &ci2, alloc, out) };
+    if res != VK_SUCCESS {
+        // The guest's own log hides this behind a generic E_FAIL; the driver's
+        // code names the cause (VK_ERROR_FEATURE_NOT_PRESENT, EXTENSION_NOT_PRESENT,
+        // INITIALIZATION_FAILED).
+        crate::logf!(gndrm_obf::obf!(
+            "proxy device: driver create failed res={}", res
+        ));
+    }
     for &(prev, p) in unlinked.iter().rev() {
         if !prev.is_null() {
-            unsafe { (*prev).pNext = p };
+            unsafe { (*prev).pNext = p }
         }
+    }
+    for (c, before) in masked {
+        unsafe { *c = before };
     }
     if res != VK_SUCCESS {
         return res;
