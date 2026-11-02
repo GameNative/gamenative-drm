@@ -118,13 +118,38 @@ divisor cap reads its target exactly.
   | container mode | cap | declared | what limits the rate |
   |---|---|---|---|
   | mailbox (default) | none | mailbox | nobody |
-  | mailbox | set | mailbox | the shim's acquire gate, on the display's vblank grid |
+  | mailbox | at the display's rate | fifo (`source=cap-rate`) | the shim's acquire gate, every vblank; gamescope latches one FIFO commit per vblank |
+  | mailbox | below the display's rate | mailbox | the shim's acquire gate, on the display's vblank grid |
   | fifo | none | fifo | the display (FIFO) |
   | fifo | set | fifo | gamescope's divisor limiter |
   | any, frame generation on | any | mailbox | the source-rate gate (`docs/17`) |
 
   fifo_relaxed and immediate behave as mailbox in this table. No env: the guest's
-  own mode takes the env's place.
+  own mode takes the env's place. "At the display's rate" is a cap within 0.5 %
+  of the measured rate (60 on a 59.97 Hz panel); a cap above it runs on the
+  gate's own clock under the container's mode.
+
+  **Why mailbox is not declared at the display's rate.** At that cap the panel
+  shows one frame per vblank under either mode, and under mailbox the shim has to
+  keep two commits out of one gamescope composite. It cannot see when gamescope
+  latches: gamescope takes commits at its wakeup, the target vblank minus its
+  rolling draw time and red zone (`vblankmanager.cpp` 142-199), and that draw time
+  is a peak hold that jumps on any slow draw (164-165) and decays per wakeup
+  (167); draw time runs to the page flip queued (`DRMBackend.cpp` 4465), on this
+  stack through the daemon's commit. The client sees only `presented` (stamped
+  with the wakeup's target vblank, `steamcompmgr.cpp` 8140, 8168) and `discarded`,
+  one inequality per frame. Measured on a Retroid Pocket 6 (DTD, cap 60, in-game
+  VSync off, a guest pacing itself at ~59.3 fps on a 59.98 Hz panel): mailbox with
+  the gate gave 58.3 fps on `SurfaceFlinger` with ~1 commit a second replaced in
+  gamescope's mailbox; a one-commit-per-window queue in the shim at a guessed
+  2.5 ms boundary gave 59.0 with ~0.8 a second still replaced; FIFO on master
+  gives 59.22 on the same scene. Under FIFO gamescope latches one commit per
+  vblank at its own wakeup (`steamcompmgr.cpp` 8028-8049), its limiter's divisor
+  at this cap is 1, and the gate keeps the guest from getting ahead, so the FIFO
+  queue stays about one frame deep. Below the display's rate the gate's releases
+  are at least two vblanks apart and two frames in one composite are rare, so
+  mailbox stays (FIFO with gamescope's limiter quantized a 32 fps game to 30 at a
+  60 cap on 120 Hz; mailbox with the gate did not).
 
   The gate (`icd_shim/src/vsync_gate.rs`) releases acquires on the vblank grid
   gamescope composites from, not on a clock of its own: the daemon's `VsyncNote`
@@ -153,10 +178,11 @@ divisor cap reads its target exactly.
   until it is recreated.
 
   The census reads which path ran, every 10 s while frames are presented:
-  `present mode: declared=… requested=… source=env|guest route=gamescope cap=…
+  `present mode: declared=… requested=… source=env|guest|cap-rate|cap-compat route=gamescope cap=…
   gate=vsync|clock|off … gate_holds=… late=… skipped=… slot_waits=…
-  commit_lat_us=…` (`source=cap-compat`: declared FIFO for want of the stamp
-  lead; `gate=clock` is frame generation's source rate or a cap above the
+  commit_lat_us=…` (`source=cap-rate`: declared FIFO because the cap is the
+  display's rate, with `gate=vsync`; `source=cap-compat`: declared FIFO for want
+  of the stamp lead, with `gate=off`; `gate=clock` is frame generation's source rate or a cap above the
   display's rate). The last five are cumulative except the latency:
   `gate_holds`, acquires the gate held; `late`, acquires that started after
   their release point; `skipped`, release points moved past for them;

@@ -11,9 +11,9 @@ cursor, scan-out and mode patches.
 
 | place | what it holds | set by |
 |---|---|---|
-| the shim's declared present mode | the container's `MESA_VK_WSI_PRESENT_MODE` (else the guest's mode); mailbox under frame generation | the container (`docs/10`) |
+| the shim's declared present mode | the container's `MESA_VK_WSI_PRESENT_MODE` (else the guest's mode); FIFO under a cap at the display's rate; mailbox under frame generation | the container and the cap (`docs/10`) |
 | gamescope's own limiter | `nRefreshHz / nTargetFPS`, a divisor of the mode's rate; holds FIFO commits only | `debug_set_fps_limit`, sent only when generation is off |
-| the shim's acquire gate | the cap, on the display's vblank grid, when the declared mode is not FIFO | `FrameCapNote{fps}` and `VsyncNote` from the daemon |
+| the shim's acquire gate | the cap, on the display's vblank grid, unless the container's mode is FIFO | `FrameCapNote{fps}` and `VsyncNote` from the daemon |
 | the presenter's latch grid | the display's latch points, as measured | `VsyncNote` from the daemon (`docs/17`) |
 
 Which one holds the cap follows the declared mode. Declared FIFO (the container set
@@ -21,7 +21,11 @@ fifo, or no env and a FIFO guest), gamescope's limiter passes every
 `nRefreshHz / target`-th vblank (`nVblankDivisor = nRefreshHz / min(target, nRefreshHz)`)
 and holds the guest's commits to it. Declared mailbox, immediate or FIFO-relaxed (mailbox
 is the container default), the limiter does not hold them and the shim's acquire gate
-releases the guest's frames on the display's vblank grid. Under frame generation the app
+releases the guest's frames on the display's vblank grid. A container in one of those
+modes under a cap at the display's rate is declared FIFO with the gate kept
+(`source=cap-rate`): gamescope latches one commit per vblank at its own wakeup, which the
+shim cannot see under mailbox (`docs/10`), and the gate keeps the FIFO queue about one
+frame deep. Under frame generation the app
 disarms gamescope's limiter and the shim's time gate holds the source rate instead
 (`docs/17`).
 
@@ -123,8 +127,11 @@ that rate is the display's.
   commit per limited vblank, on the display's vblank stream above, and hands the
   previous buffer back with `wl_buffer.release`, which is what frees the guest's next
   acquire; a cap that is not the display's rate over a whole number runs at gamescope's
-  next divisor rate above it. Declared anything else, gamescope takes the newest commit
-  at each composite and the shim's acquire gate is the cap (`icd_shim/src/vsync_gate.rs`).
+  next divisor rate above it. Declared FIFO because the cap is the display's rate
+  (`source=cap-rate`), the gate below also runs, so the guest starts at most one frame
+  per vblank and the FIFO list stays about one frame deep. Declared anything else,
+  gamescope takes the newest commit at each composite and the shim's acquire gate is
+  the cap (`icd_shim/src/vsync_gate.rs`).
   Its release points are the instants the flip events are stamped at: the daemon's
   latch grid (`VsyncNote` anchor and measured period) minus the stamp lead
   (`stamp_lead_ns`). gamescope wakes to composite just before each (wakeup = stamp +
@@ -154,12 +161,16 @@ that rate is the display's.
 
 ## Behaviour changes in gamescope sessions
 
-- **The container's present mode is declared, cap or no cap.**
-  `MESA_VK_WSI_PRESENT_MODE` decides the mode on the gamescope route as on the X11
-  Present route; without it the guest's own mode is declared. A container left at the
-  mailbox default runs mailbox, capped by the shim's vblank-grid gate; one set to fifo
-  runs FIFO under gamescope's limiter.
-- **A game below the cap keeps its own rate under mailbox.** Under FIFO and gamescope's
+- **The container's present mode is declared, except under a cap at the display's
+  rate.** `MESA_VK_WSI_PRESENT_MODE` decides the mode on the gamescope route as on the
+  X11 Present route; without it the guest's own mode is declared. A container left at
+  the mailbox default runs mailbox with no cap, and mailbox capped by the shim's
+  vblank-grid gate under a cap below the display's rate. Under a cap at the display's
+  rate it is declared FIFO with the gate kept (`source=cap-rate`), because the shim
+  cannot keep two mailbox commits out of one gamescope composite (`docs/10`). One set
+  to fifo runs FIFO under gamescope's limiter.
+- **A game below the cap keeps its own rate under mailbox** (caps below the display's
+  rate). Under FIFO and gamescope's
   limiter each frame is held to whole limited vblanks, so a game below the cap judders
   between divisors of the display's rate, and one that waits on every present holds at
   the next divisor below (refresh / 2 at a refresh-rate cap); the gate starts a late

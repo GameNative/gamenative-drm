@@ -212,6 +212,16 @@ pub(crate) fn late_counts() -> (u64, u64) {
     )
 }
 
+/// Whether a cap of `cap_fps` is the display's rate on `grid` (`refresh / cap`
+/// snaps to 1): the gate then releases every vblank.
+#[must_use]
+pub(crate) fn at_display_rate(cap_fps: u32, grid: Grid) -> bool {
+    matches!(
+        pacing(cap_fps, Some(grid)),
+        Pacing::Grid { interval_ns, .. } if interval_ns == grid.period_ns
+    )
+}
+
 /// A swapchain's release schedule on the grid.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Schedule {
