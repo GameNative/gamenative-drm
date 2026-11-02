@@ -19,10 +19,12 @@
 //! the retained last frame, keeping the listen sockets, the object stores and
 //! the gamescope connection alive; `nativeStop()` stays the session-exit path.
 //!
-//! The session's vblank grid is not a caller concern: it is the emulated mode's
-//! own rate, and the mode's rate is the display's. The app supplies it through
-//! `nativeSetPanelRefreshHz` before `nativeStart`, and it is what the connector
-//! advertises and what the daemon's flip timeline claims.
+//! The session's vblank grid is not a caller concern. The mode's rate is the
+//! display's: the app supplies it through `nativeSetPanelRefreshHz` before
+//! `nativeStart`, and it is what the connector advertises. The flip events'
+//! timestamps follow the display's own vsync, read from `AChoreographer` while a
+//! session runs (`choreographer.rs`), with the latch grid (`vsync.rs`) as the
+//! fallback and a walk of the mode's interval until either has reported.
 //!
 //! The mode's *size* is the other session-level input. `nativeStart` takes it
 //! from the window unless the app named one through `nativeSetScanoutGeometry`
@@ -39,6 +41,7 @@
 #![cfg(target_os = "android")]
 
 mod asc;
+mod choreographer;
 mod dump;
 pub mod ffi;
 mod foreign;
@@ -1117,6 +1120,9 @@ fn start(
         asc,
         thread: Some(handle),
     });
+    // The display's vsync, for the flip events' timestamps (see
+    // `choreographer.rs`): followed while a session runs.
+    choreographer::start();
     0
 }
 
@@ -1127,6 +1133,7 @@ fn stop() {
         .take();
     let Some(mut rt) = rt else { return };
     log_info!("{}", gndrm_obf::obf!("stopping ({})", rt.name));
+    choreographer::stop();
     // Unblock accept()/recvmsg() regardless of which phase the thread is in.
     // SAFETY: fds are valid or -1; shutdown only unblocks, the thread
     // remains the owner that closes them.

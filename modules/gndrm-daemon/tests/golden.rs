@@ -1631,7 +1631,8 @@ fn atomic_test_only_then_modeset_then_flip() {
     assert_eq!(ev.crtc_id, CRTC_ID);
     assert_eq!(ev.sequence, 1);
     // The timestamp is the vblank this frame claims, not the emit instant: the
-    // first claim is the clock's own reading (see `VblankTimeline`).
+    // first claim is the clock's own reading while no display timeline is known
+    // (see `vblank::VblankTimeline`).
     assert_eq!((ev.tv_sec, ev.tv_usec), (1000, 500));
 
     // State is already visible to queries (applied synchronously on commit).

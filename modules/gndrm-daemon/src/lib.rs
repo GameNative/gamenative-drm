@@ -25,6 +25,7 @@ mod props;
 pub mod pushes;
 pub mod scanout;
 pub mod server;
+pub mod vblank;
 
 use std::collections::{HashSet, VecDeque};
 use std::os::fd::RawFd;
@@ -2198,55 +2199,6 @@ impl Drop for CommitJob {
     }
 }
 
-/// The vblank timeline a page-flip event claims.
-///
-/// A real KMS page-flip event is delivered at the vblank the flip takes effect
-/// on, and gamescope re-anchors its entire vblank grid off that timestamp
-/// (`Backends/DRMBackend.cpp` `page_flip_handler` → `vblankmanager` `MarkVBlank`).
-/// As the display, gndrm owns that schedule: events are quantized to the mode's
-/// own rate — one interval apart while frames keep up, stepping whole intervals
-/// when one is late — which is what a real display's vblank timeline looks like.
-///
-/// Stamping the *emit* instant instead re-anchors that grid slightly early on
-/// every frame. The grid is armed early by design (its aim-early offset, so a
-/// real kernel can hold the flip to the panel cycle), so the error integrates
-/// into the grid's rate: every divisor-based fps cap then runs fast by roughly
-/// that offset over one interval — measured as +7 % on this port across four
-/// divisors (targets 20/24/30/40 → 21/26/32/43).
-struct VblankTimeline {
-    interval_ns: u64,
-    claimed_ns: u64,
-    started: bool,
-}
-
-impl VblankTimeline {
-    /// One vblank of the mode in force: the display's own period.
-    fn new() -> Self {
-        Self {
-            interval_ns: 1_000_000_000_000 / u64::from(mode_refresh_mhz()),
-            claimed_ns: 0,
-            started: false,
-        }
-    }
-
-    /// The vblank this frame lands on: the next boundary of the mode's rate at or
-    /// after `now_ns`. Never moves backwards, so a late frame skips whole vblanks
-    /// instead of claiming a time in the past.
-    fn claim(&mut self, now_ns: u64) -> u64 {
-        if !self.started {
-            self.started = true;
-            self.claimed_ns = now_ns;
-            return now_ns;
-        }
-        let mut t = self.claimed_ns + self.interval_ns;
-        while t < now_ns {
-            t += self.interval_ns;
-        }
-        self.claimed_ns = t;
-        t
-    }
-}
-
 /// The commit worker: a thin panic barrier around [`commit_worker_loop`].
 ///
 /// A panic anywhere on this worker — most plausibly inside the presenter — is
@@ -2310,8 +2262,8 @@ fn commit_worker_loop(
     // Atomics only, so this cannot perturb the flip path.
     let d = diag();
     d.set_role(Role::Commit, State::CommitWaitingJob);
-    // The vblank schedule the flip events claim (see `VblankTimeline`).
-    let mut vblank = VblankTimeline::new();
+    // The vblank schedule the flip events claim (see `vblank::VblankTimeline`).
+    let mut timeline = vblank::VblankTimeline::default();
     while let Ok(mut job) = commit_rx.recv() {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -2374,10 +2326,17 @@ fn commit_worker_loop(
         }
         if let Some(mut ev) = job.event.take() {
             // Stamp the vblank this frame lands on, not the instant the event is
-            // built or emitted (see `VblankTimeline`). Delivery stays immediate,
-            // so gamescope's present loop never waits on a display round trip.
+            // built or emitted: the display's latch deadline when its timeline
+            // is known, else a walk of the mode's interval (see
+            // `vblank::VblankTimeline`). Delivery stays immediate, so
+            // gamescope's present loop never waits on a display round trip.
             let (sec, usec) = (clock.lock().unwrap_or_else(PoisonError::into_inner))();
-            let claimed = vblank.claim(u64::from(sec) * 1_000_000_000 + u64::from(usec) * 1_000);
+            let now = u64::from(sec) * 1_000_000_000 + u64::from(usec) * 1_000;
+            let claimed = timeline.claim(
+                now,
+                vblank::display_grid(now),
+                1_000_000_000_000 / u64::from(mode_refresh_mhz()),
+            );
             ev.tv_sec = (claimed / 1_000_000_000) as u32;
             ev.tv_usec = ((claimed % 1_000_000_000) / 1_000) as u32;
             flip_queue

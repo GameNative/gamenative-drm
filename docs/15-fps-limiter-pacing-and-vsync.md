@@ -52,21 +52,81 @@ that rate is the display's.
   discarded instead of timing out.
 - **Generated frames** are committed by the shim itself on the display's latch points
   (`docs/17`); they carry no present id and no wait.
-- **The flip event** the daemon emits carries the vblank the frame lands on
-  (`VblankTimeline`, one mode period), not the instant it is built, so gamescope reads a
-  completion time rather than a delivery time.
+- **The flip event** carries the display's vsync, as a KMS driver's carries the
+  hardware vblank. gamescope re-arms its composite timer from every event (wakeup =
+  stamp + interval − draw time − red zone, `vblankmanager.cpp`), so the stamp decides
+  where in the display's cycle gamescope finishes; a timeline of its own, however
+  regular, slides against the display. The source is `AChoreographer`
+  (`gndrm-android/src/choreographer.rs`): one thread with an `ALooper` keeps a callback
+  posted per vsync while a session runs, and the daemon fits the period to the measured
+  vsync spacing over the last 32 vsyncs (`gndrm-daemon/src/vblank.rs`, `VsyncRing`). The
+  mode's integer rate never enters it: a "60 Hz" panel that latches at 59.973 Hz is
+  stamped at 59.973 Hz, and a live mode change is followed when the spacing changes.
+- **Which instant is stamped.** KMS has one instant per cycle: the vblank is both the
+  point a flip must be queued by and the point scan-out starts. Android splits it into
+  `SurfaceFlinger`'s latch and the present one or more periods later. gamescope uses
+  the stamp as the point its next commit must beat by its red zone, so the stamps sit
+  on the **latch** grid, not the present: the preferred frame timeline's deadline on
+  API 33+ (`AChoreographer_postVsyncCallback`), moved by where `SurfaceFlinger`
+  actually latched the daemon's publishes against it (`latch-after-deadline`, smoothed
+  from `ASurfaceTransactionStats_getLatchTime`). A present-time stamp would aim
+  gamescope's margin at an instant whose phase to the latch is the compositor's work
+  duration. A publish is claimed for the first latch at or after its apply returned —
+  the latch that takes it, even when that is after Choreographer's deadline; claiming
+  the next one would move gamescope's next wakeup a whole period out and leave a latch
+  with no new frame.
+- **The lead.** The stamp is that latch minus a lead. gamescope's 1.65 ms red zone was
+  sized for a kernel commit; here a commit still crosses the daemon's commit worker and
+  a binder apply, with about 1 ms of spread. Stamped on the deadline itself (Retroid
+  Pocket 6, SWD2, cap 60, 2026-11-02) the applies landed 1.0 / 2.1 / 4.5 ms (p10 / p50 /
+  p90) ahead of the latch, the tail crossed it, and SurfaceFlinger showed 58.65 fps on a
+  59.967 Hz panel. The lead moves gamescope's whole schedule earlier by the same amount.
+  It is measured, not fixed: each completed publish's margin (latch − apply) feeds a
+  quantile loop that holds the 10th percentile at 3 ms (30 % of a period on faster
+  panels), starting from 2 ms and capped at a third of a period. `GNDRM_GS_LATCH_LEAD_US`
+  in the app process's environment fixes it instead. The cost is latency: every frame
+  waits the lead longer between gamescope's commit and the latch (about 2 ms more than a
+  deadline stamp on that device). The stamps are earlier than the light by the lead plus
+  the compositor's pipeline; consumers read differences between stamps (frame time),
+  which a constant offset does not touch.
+- **Fallbacks.** On API 29-32 Choreographer reports the vsync time only
+  (`AChoreographer_postFrameCallback64`): its measured period is used with the latch
+  grid's phase (`vsync.rs`, from `ASurfaceTransactionStats_getLatchTime`), or the vsync
+  time's own phase until a latch was seen. With Choreographer silent for a second the
+  latch grid alone is followed, at the mode's period; with neither reporting yet, the
+  events walk the mode's interval from the clock.
+- **Ordering.** A claim is never earlier than the previous one and never repeats an
+  instant: a second frame inside one period claims the next instant, and a late frame
+  skips whole periods. Switching sources keeps the rule (the next claim is at least half
+  a period after the last).
 
 ## 4. What the daemon owns
 
 - The latch grid: `ASurfaceTransactionStats_getLatchTime` on every publish, the phase
   tracked in `vsync.rs`, and a `VsyncNote` (`anchor_ns, period_ns, lead_ns`) pushed
-  whenever it moves by more than 300 µs, and once on subscribe.
+  whenever its phase moves by more than 300 µs or its period by more than 1 µs, and once
+  on subscribe. Its period is the one measured from Choreographer while that is locked
+  (the mode's advertised rate otherwise), so the shim's vblank gate and frame
+  generation extrapolate the display's real rate. Its anchor is also the
+  flip timeline's phase where Choreographer gives no deadline, and its fallback.
 - The lead: how far ahead of a latch point a commit has to be made to be the frame that
   point takes, driven so the margin sits at half a period.
-- The flip event's timestamp, as above.
+- The display's vsync timeline: Choreographer's vsyncs on a thread of its own while a
+  session runs, the period fitted to their spacing, the phase from the frame deadline
+  (or the latch grid), and the flip event's timestamp on it, as above. One ungated line
+  marks each lock — `vsync: flip events on the display's vsync: source=… period=…us
+  (… Hz, mode … Hz) latch-vs-grid=…` — the first, and the first after a rate change.
+  Another, every 10 s while publishes complete, is the cross-check: `vsync: check
+  source=… period=…us (… Hz) publishes=… vsyncs=… late=… pushed=… margin
+  p10/p50/p90=…/…/… lead=… latch-after-deadline=…`. `late` counts publishes that missed
+  the latch they were aimed at; `pushed`, flip events moved past their latch by the
+  one-claim-per-instant rule; publishes below vsyncs at a cap at or above the panel's
+  rate is gamescope skipping a wakeup.
+- The stamp lead, as above.
 
-The daemon derives no rate. The launcher hands it the display's rate and the cap, and it
-reports back only what it measures.
+The daemon derives no rate for the mode. The launcher hands it the display's rate and the
+cap; the connector advertises that rate, and the daemon reports back only what it
+measures — the latch grid to the presenter, the vsync timeline in the flip events.
 
 ## 5. Measured on device
 

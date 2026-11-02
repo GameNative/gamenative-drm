@@ -88,6 +88,10 @@ pub(crate) fn now_ns() -> u64 {
 /// A phase or lead move below this is not worth a push: the shim extrapolates
 /// the grid by its period, and the margin the lead aims for is a third of one.
 const PUSH_STEP_NS: u64 = 300_000;
+/// A period move below this is not worth a push: the measured period wanders by
+/// a few microseconds between fits, and the phase push above re-anchors the
+/// shim's extrapolation long before such an error adds up.
+const PERIOD_STEP_NS: u64 = 1_000;
 /// The shortest lead worth asking for.
 const MIN_LEAD_NS: u64 = 500_000;
 /// Samples off the grid before the grid is taken to have moved.
@@ -177,7 +181,7 @@ impl Tracker {
             Some(p) => {
                 let phase =
                     wrap(note.anchor_ns as i64 - p.anchor_ns as i64, period as i64).unsigned_abs();
-                p.period_ns != note.period_ns
+                u64::from(p.period_ns.abs_diff(note.period_ns)) > PERIOD_STEP_NS
                     || phase > PUSH_STEP_NS
                     || u64::from(p.lead_ns.abs_diff(note.lead_ns)) > PUSH_STEP_NS
             }
@@ -205,11 +209,16 @@ impl Tracker {
     }
 }
 
-/// The panel period in nanoseconds from the rate the app reported, 0 when it
-/// has not. The samples cannot give the period on their own: while the daemon
-/// is the only thing publishing, their spacing is the daemon's own rate.
+/// The panel period in nanoseconds: the display's measured vsync spacing while
+/// Choreographer reports it (`gndrm_daemon::vblank`), else the rate the app
+/// reported, 0 when neither. The samples cannot give the period on their own:
+/// while the daemon is the only thing publishing, their spacing is the daemon's
+/// own rate.
 #[cfg(target_os = "android")]
-fn period_ns() -> u64 {
+fn period_ns(now_ns: u64) -> u64 {
+    if let Some(p) = gndrm_daemon::vblank::measured_period_ns(now_ns) {
+        return p;
+    }
     let mhz = crate::panel_refresh_mhz();
     if mhz == 0 {
         0
@@ -223,7 +232,7 @@ fn period_ns() -> u64 {
 /// callback, on `SurfaceFlinger`'s thread.
 #[cfg(target_os = "android")]
 pub(crate) fn sample(latch_ns: u64, applied_ns: u64) {
-    let period = period_ns();
+    let period = period_ns(latch_ns);
     if period == 0 || latch_ns == 0 {
         return;
     }
@@ -232,6 +241,8 @@ pub(crate) fn sample(latch_ns: u64, applied_ns: u64) {
         let mut t = TRACKER.lock().unwrap_or_else(|e| e.into_inner());
         let first = t.pushed.is_none();
         let note = t.track(latch_ns, applied_ns, period, pacing);
+        // The flip events' fallback timeline, and Choreographer's cross-check.
+        gndrm_daemon::vblank::note_latch_grid(t.anchor_ns, period);
         if first && note.is_some() {
             log_info!(
                 "{}",
@@ -243,6 +254,10 @@ pub(crate) fn sample(latch_ns: u64, applied_ns: u64) {
         }
         note
     };
+    // The flip events' lead and the periodic cross-check (one line per 10 s).
+    if let Some(r) = gndrm_daemon::vblank::note_publish_latch(applied_ns, latch_ns) {
+        crate::choreographer::log_report(&r);
+    }
     if note.is_some() {
         let fd = changed_fd();
         if fd >= 0 {
@@ -257,7 +272,7 @@ pub(crate) fn sample(latch_ns: u64, applied_ns: u64) {
 /// The note to hand a shim now, `None` before any latch was seen.
 #[cfg(target_os = "android")]
 pub(crate) fn note() -> Option<VsyncNote> {
-    let period = period_ns();
+    let period = period_ns(now_ns());
     TRACKER
         .lock()
         .unwrap_or_else(|e| e.into_inner())
