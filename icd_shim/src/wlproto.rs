@@ -109,6 +109,7 @@ extern "C" {
     pub static wl_subcompositor_interface: wl_interface;
     pub static wl_surface_interface: wl_interface;
     pub static wl_buffer_interface: wl_interface;
+    pub static wl_output_interface: wl_interface;
 }
 
 // ----------------------------------------------------------- core requests
@@ -359,6 +360,100 @@ pub unsafe fn swapchain_feedback(
         wl_argument { s: engine_name },
     ];
     wl_proxy_marshal_array(sc, 2, args.as_mut_ptr());
+}
+
+// ------------------------------------------------- wp_presentation statics
+// Transliterated from presentation-time.xml (stable, version 1, the version
+// gamescope advertises). gamescope sends `presented` for the commit it latched,
+// at that latch, and `discarded` for a commit it replaced or never showed.
+
+#[allow(clippy::missing_transmute_annotations)]
+mod presentation_statics {
+    use super::{wl_interface, wl_message};
+    use std::os::raw::c_char;
+
+    const fn cs(s: &'static [u8]) -> *const c_char {
+        s.as_ptr() as *const c_char
+    }
+
+    struct SyncIfaces([*const wl_interface; 3]);
+    unsafe impl Sync for SyncIfaces {}
+    // feedback args: wl_surface (object), wp_presentation_feedback (new_id);
+    // sync_output's arg: wl_output.
+    static TYPES: SyncIfaces = SyncIfaces([
+        &raw const super::wl_surface_interface,
+        &raw const WP_PRESENTATION_FEEDBACK_INTERFACE,
+        &raw const super::wl_output_interface,
+    ]);
+
+    static PRESENTATION_REQUESTS: [wl_message; 2] = [
+        wl_message {
+            name: cs(b"destroy\0"),
+            signature: cs(b"\0"),
+            types: std::ptr::null(),
+        },
+        wl_message {
+            name: cs(b"feedback\0"),
+            signature: cs(b"on\0"),
+            types: TYPES.0.as_ptr(),
+        },
+    ];
+
+    static PRESENTATION_EVENTS: [wl_message; 1] = [wl_message {
+        name: cs(b"clock_id\0"),
+        signature: cs(b"u\0"),
+        types: std::ptr::null(),
+    }];
+
+    pub static WP_PRESENTATION_INTERFACE: wl_interface = wl_interface {
+        name: cs(b"wp_presentation\0"),
+        version: 1,
+        method_count: 2,
+        methods: PRESENTATION_REQUESTS.as_ptr(),
+        event_count: 1,
+        events: PRESENTATION_EVENTS.as_ptr(),
+    };
+
+    static FEEDBACK_EVENTS: [wl_message; 3] = [
+        wl_message {
+            name: cs(b"sync_output\0"),
+            signature: cs(b"o\0"),
+            types: unsafe { TYPES.0.as_ptr().add(2) },
+        },
+        wl_message {
+            name: cs(b"presented\0"),
+            signature: cs(b"uuuuuuu\0"),
+            types: std::ptr::null(),
+        },
+        wl_message {
+            name: cs(b"discarded\0"),
+            signature: cs(b"\0"),
+            types: std::ptr::null(),
+        },
+    ];
+
+    pub static WP_PRESENTATION_FEEDBACK_INTERFACE: wl_interface = wl_interface {
+        name: cs(b"wp_presentation_feedback\0"),
+        version: 1,
+        method_count: 0,
+        methods: std::ptr::null(),
+        event_count: 3,
+        events: FEEDBACK_EVENTS.as_ptr(),
+    };
+}
+
+pub use presentation_statics::{WP_PRESENTATION_FEEDBACK_INTERFACE, WP_PRESENTATION_INTERFACE};
+
+/// wp_presentation.feedback (opcode 1): surface, new_id
+/// wp_presentation_feedback. Applies to the surface's next commit.
+pub unsafe fn presentation_feedback(pres: *mut wl_proxy, surface: *mut wl_proxy) -> *mut wl_proxy {
+    let mut args = [wl_argument { o: surface }, wl_argument { u: 0 }];
+    wl_proxy_marshal_array_constructor(
+        pres,
+        1,
+        args.as_mut_ptr(),
+        &WP_PRESENTATION_FEEDBACK_INTERFACE,
+    )
 }
 
 // ------------------------------------------- zwp_linux_dmabuf_v1 statics

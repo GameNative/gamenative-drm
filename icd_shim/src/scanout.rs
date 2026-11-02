@@ -169,6 +169,17 @@ pub(crate) fn target_fps() -> u32 {
     CAP_FPS.load(Ordering::Relaxed)
 }
 
+/// Whether the daemon's cap note sets a cap, whatever frame generation does:
+/// the value the app also hands gamescope's limiter.
+pub(crate) fn cap_in_force() -> bool {
+    CAP_FPS.load(Ordering::Relaxed) != FPS_UNCAPPED
+}
+
+/// The cap the daemon's note carries, [`FPS_UNCAPPED`] when none.
+pub(crate) fn cap_fps_note() -> u32 {
+    CAP_FPS.load(Ordering::Relaxed)
+}
+
 /// How many frame-cap notes have been adopted on this connection, for the same
 /// census.
 pub(crate) fn notes_seen() -> usize {

@@ -49,8 +49,9 @@ the app at N while keeping the grid at the mode's rate — they move together.
 
 GameNative passes no `-r`: `g_nNestedRefresh` is 0, so the grid, the app-refresh cycle
 and the divisor base all fall back to `g_nOutputRefresh` — the mode's rate. The daemon's
-flip timeline is built from that same rate (`VblankTimeline`, one mode period), so the
-timeline and the grid agree by construction.
+flip events carry the display's measured vsync, not that integer rate (`docs/15` §3), and
+gamescope re-anchors its grid on every event, so the grid follows the display's real
+period while the mode carries its advertised one.
 
 The **one** mode the connector exposes is the session's scan-out size at the display's
 rate (`PanelDesc::modeinfo`, `objects.rs:100-160`, which takes the rate in force;

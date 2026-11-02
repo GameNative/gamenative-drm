@@ -19,10 +19,12 @@
 //! the retained last frame, keeping the listen sockets, the object stores and
 //! the gamescope connection alive; `nativeStop()` stays the session-exit path.
 //!
-//! The session's vblank grid is not a caller concern: it is the emulated mode's
-//! own rate, and the mode's rate is the display's. The app supplies it through
-//! `nativeSetPanelRefreshHz` before `nativeStart`, and it is what the connector
-//! advertises and what the daemon's flip timeline claims.
+//! The session's vblank grid is not a caller concern. The mode's rate is the
+//! display's: the app supplies it through `nativeSetPanelRefreshHz` before
+//! `nativeStart`, and it is what the connector advertises. The flip events'
+//! timestamps follow the display's own vsync, read from `AChoreographer` while a
+//! session runs (`choreographer.rs`), with the latch grid (`vsync.rs`) as the
+//! fallback and a walk of the mode's interval until either has reported.
 //!
 //! The mode's *size* is the other session-level input. `nativeStart` takes it
 //! from the window unless the app named one through `nativeSetScanoutGeometry`
@@ -39,6 +41,7 @@
 #![cfg(target_os = "android")]
 
 mod asc;
+mod choreographer;
 mod dump;
 pub mod ffi;
 mod foreign;
@@ -1117,6 +1120,9 @@ fn start(
         asc,
         thread: Some(handle),
     });
+    // The display's vsync, for the flip events' timestamps (see
+    // `choreographer.rs`): followed while a session runs.
+    choreographer::start();
     0
 }
 
@@ -1127,6 +1133,7 @@ fn stop() {
         .take();
     let Some(mut rt) = rt else { return };
     log_info!("{}", gndrm_obf::obf!("stopping ({})", rt.name));
+    choreographer::stop();
     // Unblock accept()/recvmsg() regardless of which phase the thread is in.
     // SAFETY: fds are valid or -1; shutdown only unblocks, the thread
     // remains the owner that closes them.
@@ -1533,7 +1540,17 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeInjectorS
     _class: JClass,
     suspended: jboolean,
 ) {
-    let _ = std::panic::catch_unwind(|| injector::set_suspended(suspended != 0));
+    let _ = std::panic::catch_unwind(|| {
+        let suspended = suspended != 0;
+        injector::set_suspended(suspended);
+        // A suspended session draws nothing: no vsync callbacks for it. Resumed,
+        // they come back for a session that is still running.
+        if suspended {
+            choreographer::stop();
+        } else if RUNTIME.lock().is_ok_and(|rt| rt.is_some()) {
+            choreographer::start();
+        }
+    });
 }
 
 /// `GameNativeDrm.nativeGamescopeCommand(command)` — run one allowlisted
