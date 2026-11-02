@@ -11,15 +11,15 @@ cursor, scan-out and mode patches.
 
 | place | what it holds | set by |
 |---|---|---|
-| the shim's acquire gate | the user's cap, exactly | `FrameCapNote{fps}` from the daemon (`docs/19`) |
+| the shim's declared present mode | FIFO while a cap is set, so gamescope's limiter holds each frame to its limited vblank | `FrameCapNote{fps}` from the daemon (`docs/10`) |
 | gamescope's own limiter | `nRefreshHz / nTargetFPS`, a divisor of the mode's rate | `debug_set_fps_limit`, sent only when generation is off |
 | the presenter's latch grid | the display's latch points, as measured | `VsyncNote` from the daemon (`docs/17`) |
 
-They do different jobs, and only the first is a cap in the strict sense: the gate parks
-an acquire before a frame is drawn, so the guest converges on the requested rate by
-arithmetic rather than by a deadline it can miss. The second is a divisor, so with
-generation off the app hands gamescope the limit and lets it express what it can:
-`nVblankDivisor = nRefreshHz / min(target, nRefreshHz)`.
+They work together: the app hands gamescope the cap, gamescope's limiter passes every
+`nRefreshHz / target`-th vblank (`nVblankDivisor = nRefreshHz / min(target, nRefreshHz)`),
+and the shim's FIFO declaration is what makes the limiter hold the guest's commits. Under
+frame generation the app disarms gamescope's limiter and the shim's time gate holds the
+source rate instead (`docs/17`).
 
 ## 2. The mode is the display's rate
 
@@ -39,14 +39,16 @@ that rate is the display's.
 ## 3. Vsync, where it is real
 
 - **FIFO.** A present is requeued until the display releases a buffer, so the guest is
-  paced to the panel whether or not it asked to be. The shim answers
-  `vkWaitForPresentKHR` on that release, or two refresh periods after the commit when no
-  release report arrives first.
-- **Mailbox and immediate** are applied behind the guest's back by
-  `MESA_VK_WSI_PRESENT_MODE`, while the guest still believes it has FIFO and waits on
-  every frame. A guest that knew its real mode would not wait at all, so the wait is
-  answered at the commit rather than holding the guest's frame-latency loop for two
-  periods (`answers_present_wait_at_commit`).
+  paced to the panel whether or not it asked to be. On gamescope's override route the
+  mode declared per commit is FIFO while a cap is set, the guest's own otherwise, and
+  mailbox under frame generation; `MESA_VK_WSI_PRESENT_MODE` decides it only off that
+  route (`docs/10`). The shim answers `vkWaitForPresentKHR` on the release, or two
+  refresh periods after the commit when no release report arrives first.
+- **Mailbox and immediate.** A guest that asked for either does not wait, and neither
+  would one whose frames go out as mailbox (frame generation, or the env off the
+  override route while the guest believes it has FIFO), so those waits are answered at
+  the commit rather than holding the guest's frame-latency loop for two periods
+  (`answers_present_wait_at_commit`).
 - **A replaced frame.** Under mailbox a frame can be replaced before it is shown. It is
   never committed, released or latched under that id, so its wait is answered when it is
   discarded instead of timing out.
@@ -96,6 +98,15 @@ that rate is the display's.
   deadline stamp on that device). The stamps are earlier than the light by the lead plus
   the compositor's pipeline; consumers read differences between stamps (frame time),
   which a constant offset does not touch.
+- **The guest is paced by gamescope's FIFO latch, not by a gate of its own.** With a
+  cap set, the shim declares FIFO on every commit, as gamescope's WSI layer does on a PC
+  while the limiter is engaged; gamescope latches one FIFO commit per limited vblank, on
+  the display's vblank stream above, and hands the previous buffer back with
+  `wl_buffer.release`, which is what frees the guest's next acquire. A gate on the shim's
+  own clock (exactly 1e9 / N ns) beat against the display's 59.97-59.99 Hz and, with the
+  env's mailbox declaration, left no queue to absorb a late frame. A cap that is not the
+  display's rate over a whole number runs at gamescope's next divisor rate above it
+  (`docs/10`).
 - **Fallbacks.** On API 29-32 Choreographer reports the vsync time only
   (`AChoreographer_postFrameCallback64`): its measured period is used with the latch
   grid's phase (`vsync.rs`, from `ASurfaceTransactionStats_getLatchTime`), or the vsync
