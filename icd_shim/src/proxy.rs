@@ -240,6 +240,9 @@ static RATE_STALL: Mutex<Option<Instant>> = Mutex::new(None);
 static DECL_FIFO_N: AtomicUsize = AtomicUsize::new(0);
 static DECL_OTHER_N: AtomicUsize = AtomicUsize::new(0);
 static REL_ALL_N: AtomicUsize = AtomicUsize::new(0);
+// Gated acquires that found no free image once past the gate and waited on a
+// compositor release (the ungated census's `slot_waits=`).
+static SLOT_WAIT_N: AtomicUsize = AtomicUsize::new(0);
 static RATE_MODE: Mutex<Option<Instant>> = Mutex::new(None);
 const MODE_CENSUS_EVERY: Duration = Duration::from_secs(10);
 static RATE_WAIT: Mutex<Option<Instant>> = Mutex::new(None);
@@ -833,6 +836,7 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
                 acquired: false,
                 in_flight: false,
                 acq_seq: 0,
+                acquired_ns: 0,
                 ino: 0,
                 ahb: ptr::null_mut(),
             });
@@ -1709,6 +1713,16 @@ fn worker_main(sc: *mut GnSwapchain) {
 unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
     unsafe {
         let s = (*sc).slots.as_mut_ptr().add(idx as usize);
+        // How long the frame took from the gate's release to here, its render
+        // fence waited: what the gate predicts a late frame's commit by.
+        if (*s).acquired_ns != 0 {
+            let took = monotonic_ns().saturating_sub(core::mem::replace(&mut (*s).acquired_ns, 0));
+            let est = (*sc).commit_latency_ns.load(Ordering::Relaxed);
+            (*sc).commit_latency_ns.store(
+                crate::vsync_gate::smooth_latency(est, took),
+                Ordering::Relaxed,
+            );
+        }
         // Tell the daemon which present id this frame carries, before the commit
         // that names its buffer in an atomic commit. The worker may wait for an
         // allocation exchange in flight, which is bounded by that exchange's own
@@ -2009,6 +2023,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         guest_slots: 0,
         gen_no_grow: false,
         release: crate::vsync_gate::Schedule::default(),
+        commit_latency_ns: AtomicU64::new(0),
         worker: None,
         shared: Mutex::new(ScShared {
             jobs: VecDeque::with_capacity(GN_JOB_CAP),
@@ -2040,6 +2055,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             acquired: false,
             in_flight: false,
             acq_seq: 0,
+            acquired_ns: 0,
             ino: 0,
             ahb: ptr::null_mut(),
         });
@@ -2340,6 +2356,7 @@ unsafe fn gn_acquire_common(
     // was: the census reads one park per acquire, not one per wait, because a
     // wake-up that finds the deadline still ahead parks again.
     let mut hold_from: u64 = 0;
+    let mut slot_waited = false;
     {
         let mut g = (*sc).shared.lock().unwrap();
         loop {
@@ -2372,9 +2389,21 @@ unsafe fn gn_acquire_common(
                 if gated {
                     // One timeline for the whole swapchain: the next frame may
                     // not start before the release this one was booked to.
-                    (*sc).release.book_paced(monotonic_ns(), pacing);
+                    let now_ns = monotonic_ns();
+                    (*(*sc).slots.as_mut_ptr().add(idx as usize)).acquired_ns = now_ns;
+                    (*sc).release.book_paced(
+                        now_ns,
+                        pacing,
+                        (*sc).commit_latency_ns.load(Ordering::Relaxed),
+                    );
                 }
                 break;
+            }
+            if gated && !slot_waited {
+                // Past the gate with no image free: this acquire waits on the
+                // compositor's release, not on the gate.
+                slot_waited = true;
+                SLOT_WAIT_N.fetch_add(1, Ordering::Relaxed);
             }
             if g.stopping {
                 break;
@@ -6783,6 +6812,10 @@ pub struct GnSlot {
     // Guest-side trace: the acquire sequence that filled this slot, so a
     // present can be tied back to the acquire that handed the guest the image.
     pub acq_seq: u64,
+    // When the gate let the guest's acquire of this slot go, `CLOCK_MONOTONIC`
+    // ns; 0 when no gate ran. Read once at the commit, for the acquire-to-commit
+    // latency the gate books late frames by.
+    pub acquired_ns: u64,
     // The guest's present id for the frame currently in this slot, 0 when it
     // chained none: read at the commit to mark the frame for the daemon, which
     // reports it back once the transaction presenting it latched.
@@ -6843,6 +6876,10 @@ pub struct GnSwapchain {
     /// acquire. One timeline per swapchain, not per slot — a slot-local schedule
     /// would let a ring of N images run N frames back to back.
     pub release: crate::vsync_gate::Schedule,
+    /// The guest's acquire-to-commit time, smoothed over gated frames
+    /// (`crate::vsync_gate::smooth_latency`); 0 until one was measured. Written
+    /// by the present worker, read by the acquire.
+    pub commit_latency_ns: AtomicU64,
 }
 
 // ---------------------------------------------------------------- wayland
@@ -9428,8 +9465,9 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
     }
     let route = unsafe { !(*(*sc).surf).swapchain_obj.is_null() };
     let (presented, discarded, fallback) = crate::present::feedback_counts();
+    let (late, skipped) = crate::vsync_gate::late_counts();
     crate::logi!(gndrm_obf::obf!(
-        "present mode: declared={} requested={} source={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={}",
+        "present mode: declared={} requested={} source={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} gate_holds={} late={} skipped={} slot_waits={} commit_lat_us={}",
         mode_name(unsafe { live_present_mode(sc) }),
         mode_name(unsafe { (*sc).requested_mode }),
         match unsafe { (*sc).mode_source } {
@@ -9456,6 +9494,11 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
         presented,
         discarded,
         fallback,
+        GATE_HOLD_N.load(Ordering::Relaxed),
+        late,
+        skipped,
+        SLOT_WAIT_N.load(Ordering::Relaxed),
+        unsafe { (*sc).commit_latency_ns.load(Ordering::Relaxed) } / 1_000,
     ));
 }
 
