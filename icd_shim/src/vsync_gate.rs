@@ -131,9 +131,14 @@ impl Grid {
 pub(crate) enum Pacing {
     Off,
     /// One release per `period_ns` on the shim's clock.
-    Clock { period_ns: u64 },
+    Clock {
+        period_ns: u64,
+    },
     /// Releases on `grid`, spaced by `interval_ns` of the ideal timeline.
-    Grid { grid: Grid, interval_ns: u64 },
+    Grid {
+        grid: Grid,
+        interval_ns: u64,
+    },
 }
 
 impl Pacing {

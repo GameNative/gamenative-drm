@@ -1732,10 +1732,10 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
         let mut feedback_token = 0u64;
         if (*s).wait_id != 0 {
             // A guest that asked for mailbox or immediate does not wait, and
-            // neither would one whose frames go out as mailbox (frame
-            // generation): both are answered here. A FIFO guest declared FIFO
-            // keeps the release-or-grace answer.
-            let at_commit = answers_present_wait_at_commit((*sc).present_mode)
+            // neither would one whose frames go out as mailbox or immediate
+            // (the container's mode, or frame generation): both are answered
+            // here. A FIFO guest declared FIFO keeps the release-or-grace answer.
+            let at_commit = answers_present_wait_at_commit((*sc).requested_mode)
                 || answers_present_wait_at_commit(live_present_mode(sc));
             let id = if at_commit {
                 let _g = (*sc).shared.lock().unwrap();
@@ -1957,11 +1957,11 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             ));
         }
     }
-    // On gamescope's override route the guest's own mode is the one this
-    // swapchain keeps (see `effective_present_mode`); what each commit declares
-    // is decided per present (`live_present_mode`).
+    // The container's mode, else the guest's, is the one this swapchain keeps
+    // (see `effective_present_mode`); what each commit declares is decided per
+    // present (`live_present_mode`).
     let gamescope_route = unsafe { !(*surf).swapchain_obj.is_null() };
-    let mode = effective_present_mode(ci, gamescope_route);
+    let (mode, mode_source) = effective_present_mode(ci);
     // Mesa's wayland WSI derives minImageCount from the present mode
     // (wsi_common_wayland.c:1188): the extra image exists so one can be queued
     // for scan-out while the app renders the next. Mailbox therefore carries
@@ -1988,6 +1988,8 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         extent: ci.imageExtent,
         fourcc,
         present_mode: mode,
+        requested_mode: guest_present_mode(ci),
+        mode_source,
         // The slot image carries the usage the guest asked for, plus TRANSFER_SRC:
         // the engine copies the presented frame out of it, and generation can be
         // turned on after the swapchain exists.
@@ -6195,23 +6197,18 @@ mod tests {
     }
 
     #[test]
-    fn the_declared_mode_is_fifo_while_a_cap_is_set_as_gamescopes_layer_does() {
-        let (m, f, i) = (
+    fn the_declared_mode_is_the_swapchains_and_a_cap_does_not_change_it() {
+        let (m, f, i, r) = (
             VK_PRESENT_MODE_MAILBOX_KHR,
             VK_PRESENT_MODE_FIFO_KHR,
             VK_PRESENT_MODE_IMMEDIATE_KHR,
+            VK_PRESENT_MODE_FIFO_RELAXED_KHR,
         );
-        // Capped: FIFO whatever the guest asked for.
-        assert_eq!(choose_live_mode(f, false, true), f);
-        assert_eq!(choose_live_mode(m, false, true), f);
-        assert_eq!(choose_live_mode(i, false, true), f);
-        // Uncapped: the guest's own mode.
-        assert_eq!(choose_live_mode(f, false, false), f);
-        assert_eq!(choose_live_mode(m, false, false), m);
-        assert_eq!(choose_live_mode(i, false, false), i);
-        // Frame generation: mailbox, capped or not.
-        assert_eq!(choose_live_mode(f, true, true), m);
-        assert_eq!(choose_live_mode(f, true, false), m);
+        for mode in [m, f, i, r] {
+            assert_eq!(choose_live_mode(mode, false), mode);
+            // Frame generation: mailbox, whatever the mode.
+            assert_eq!(choose_live_mode(mode, true), m);
+        }
     }
 
     #[test]
@@ -6249,17 +6246,48 @@ mod tests {
         );
     }
 
+    /// The rule table of docs/10: the container's mode (else the guest's), the
+    /// mode declared, and what limits the rate, on gamescope's override route.
     #[test]
-    fn the_env_mode_does_not_decide_the_gamescope_route() {
-        // SAFETY: no other test reads this variable.
-        unsafe { std::env::set_var("MESA_VK_WSI_PRESENT_MODE", "mailbox") };
+    fn the_container_mode_decides_the_gamescope_route() {
+        use crate::vsync_gate::{GateClock, Grid};
+        let grid = Some(Grid {
+            anchor_ns: 1_000_000_000,
+            period_ns: 16_675_004,
+            clock: GateClock::Vsync,
+        });
         let mut ci: VkSwapchainCreateInfoKHR = unsafe { core::mem::zeroed() };
         ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-        assert_eq!(effective_present_mode(&ci, true), VK_PRESENT_MODE_FIFO_KHR);
-        assert_eq!(effective_present_mode(&ci, false), VK_PRESENT_MODE_MAILBOX_KHR);
-        ci.presentMode = 1000;
-        assert_eq!(effective_present_mode(&ci, true), VK_PRESENT_MODE_FIFO_KHR);
+        let row = |env: Option<&str>, cap: u32, lsfg_cap: Option<u32>| {
+            // SAFETY: no other test reads this variable.
+            match env {
+                Some(v) => unsafe { std::env::set_var("MESA_VK_WSI_PRESENT_MODE", v) },
+                None => unsafe { std::env::remove_var("MESA_VK_WSI_PRESENT_MODE") },
+            }
+            let (mode, source) = effective_present_mode(&ci);
+            let live = choose_live_mode(mode, lsfg_cap.is_some());
+            let gate = gamescope_route_pacing(live, lsfg_cap, cap, grid).clock();
+            (live, source, gate)
+        };
+        let (m, f) = (VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR);
+        use GateClock::{Clock, Off, Vsync};
+        use ModeSource::{Env, Guest};
+        // env mailbox, no cap: mailbox, nobody limits.
+        assert_eq!(row(Some("mailbox"), 0, None), (m, Env, Off));
+        // env mailbox, cap: mailbox, the gate on the vblank grid.
+        assert_eq!(row(Some("mailbox"), 60, None), (m, Env, Vsync));
+        // env fifo, no cap: fifo, the display paces.
+        assert_eq!(row(Some("fifo"), 0, None), (f, Env, Off));
+        // env fifo, cap: fifo, gamescope's limiter.
+        assert_eq!(row(Some("fifo"), 60, None), (f, Env, Off));
+        // No env: the guest's mode (here fifo).
+        assert_eq!(row(None, 60, None), (f, Guest, Off));
+        // Frame generation: mailbox, the source-rate gate on its own clock.
+        assert_eq!(row(Some("fifo"), 0, Some(40)), (m, Env, Clock));
         unsafe { std::env::remove_var("MESA_VK_WSI_PRESENT_MODE") };
+        // An unknown guest mode falls back to fifo.
+        ci.presentMode = 1000;
+        assert_eq!(guest_present_mode(&ci), f);
     }
 
     #[test]
@@ -6762,10 +6790,14 @@ pub struct GnSwapchain {
     pub extent: VkExtent2D,
     pub fourcc: u32,
     pub usage: VkImageUsageFlags,
-    /// The present mode the shim honours for this swapchain (override wins over
-    /// the app's request; see `effective_present_mode`). Read by
-    /// `present_dispatch` on every present.
+    /// The present mode the shim honours for this swapchain (the container's
+    /// override wins over the app's request; see `effective_present_mode`).
+    /// Read by `present_dispatch` on every present.
     pub present_mode: VkPresentModeKHR,
+    /// The mode the guest asked for, whatever the override says.
+    pub requested_mode: VkPresentModeKHR,
+    /// Whether `present_mode` is the container's or the guest's.
+    pub mode_source: ModeSource,
     /// Every slot the shim owns: the guest's first (`guest_slots` of them), then
     /// the generation destinations, which the guest never sees.
     pub slots: Vec<GnSlot>,
@@ -9204,29 +9236,37 @@ fn parse_present_mode_override(val: Option<&str>) -> Option<VkPresentModeKHR> {
     Some(mode)
 }
 
-/// The present mode a swapchain keeps: the guest's requested `presentMode`,
-/// falling back to fifo (mesa wsi_common.c:1521). Off gamescope's override route
-/// the MESA_VK_WSI_PRESENT_MODE override wins over it, as in Mesa.
-///
-/// On the override route the env is not consulted. There the shim is what
-/// gamescope's WSI layer is on a PC, and that layer declares the app's own mode
-/// to gamescope whatever Mesa below it was told: the env reaches only Mesa. The
-/// variable comes with every container as a default for the X11 path; honouring
-/// it here declared every commit MAILBOX, which gamescope's limiter never holds.
-fn effective_present_mode(ci: &VkSwapchainCreateInfoKHR, gamescope_route: bool) -> VkPresentModeKHR {
-    if !gamescope_route {
-        if let Some(m) =
-            parse_present_mode_override(std::env::var("MESA_VK_WSI_PRESENT_MODE").ok().as_deref())
-        {
-            return m;
-        }
-    }
+/// Where a swapchain's present mode came from, for the census.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeSource {
+    /// The container's `MESA_VK_WSI_PRESENT_MODE`.
+    Env,
+    /// The guest's `presentMode`.
+    Guest,
+}
+
+/// The guest's requested `presentMode`, falling back to fifo (mesa
+/// wsi_common.c:1521).
+fn guest_present_mode(ci: &VkSwapchainCreateInfoKHR) -> VkPresentModeKHR {
     match ci.presentMode {
         VK_PRESENT_MODE_IMMEDIATE_KHR
         | VK_PRESENT_MODE_MAILBOX_KHR
         | VK_PRESENT_MODE_FIFO_KHR
         | VK_PRESENT_MODE_FIFO_RELAXED_KHR => ci.presentMode,
         _ => VK_PRESENT_MODE_FIFO_KHR,
+    }
+}
+
+/// The present mode a swapchain keeps: the container's
+/// `MESA_VK_WSI_PRESENT_MODE` when it names one, as in Mesa, else the guest's
+/// requested mode ([`guest_present_mode`]). The same on both routes: on
+/// gamescope's override route the env is the user's present-mode preference
+/// (mailbox is the container default; fifo, fifo_relaxed and immediate are
+/// the user's choice), and it is what the shim declares to gamescope.
+fn effective_present_mode(ci: &VkSwapchainCreateInfoKHR) -> (VkPresentModeKHR, ModeSource) {
+    match parse_present_mode_override(std::env::var("MESA_VK_WSI_PRESENT_MODE").ok().as_deref()) {
+        Some(m) => (m, ModeSource::Env),
+        None => (guest_present_mode(ci), ModeSource::Guest),
     }
 }
 
@@ -9238,42 +9278,32 @@ fn answers_present_wait_at_commit(mode: VkPresentModeKHR) -> bool {
     mode == VK_PRESENT_MODE_MAILBOX_KHR || mode == VK_PRESENT_MODE_IMMEDIATE_KHR
 }
 
-/// The mode a present on `sc` runs under and declares, decided per present the
-/// way gamescope's WSI layer does on a PC: there the layer declares FIFO while
-/// gamescope's limiter is engaged and the app's own mode otherwise, and
-/// gamescope latches one FIFO commit per limited vblank, so the client is paced
-/// by `wl_buffer.release` and gamescope's limiter is the cap.
+/// The mode a present on `sc` runs under and declares, decided per present.
 ///
 /// On the override route:
-/// - frame generation on: mailbox, as before. Generated frames are committed
-///   with no declaration, and a real frame declared FIFO would queue behind
-///   them.
-/// - a cap in force (the daemon's `FrameCapNote`, the same value the app hands
-///   gamescope's limiter): FIFO.
-/// - otherwise: the guest's own mode.
+/// - frame generation on: mailbox. Generated frames are committed with no
+///   declaration, and a real frame declared FIFO would queue behind them.
+/// - otherwise: the swapchain's mode ([`effective_present_mode`]), whether or
+///   not a cap is set. A FIFO declaration is held by gamescope's limiter, one
+///   commit per limited vblank; under any other mode the acquire gate is the
+///   cap, on the display's vblank grid (`acquire_pacing`).
 ///
 /// Off the override route there is nothing to declare it to, and the mode is the
 /// one the swapchain was made with.
 pub(crate) unsafe fn live_present_mode(sc: *mut GnSwapchain) -> VkPresentModeKHR {
-    let requested = unsafe { (*sc).present_mode };
+    let mode = unsafe { (*sc).present_mode };
     if unsafe { (*(*sc).surf).swapchain_obj.is_null() } {
-        return requested;
+        return mode;
     }
-    choose_live_mode(
-        requested,
-        crate::lsfg::live().0,
-        crate::scanout::cap_in_force(),
-    )
+    choose_live_mode(mode, crate::lsfg::live().0)
 }
 
 /// [`live_present_mode`]'s rule on the override route.
-fn choose_live_mode(requested: VkPresentModeKHR, generating: bool, capped: bool) -> VkPresentModeKHR {
+fn choose_live_mode(mode: VkPresentModeKHR, generating: bool) -> VkPresentModeKHR {
     if generating {
         VK_PRESENT_MODE_MAILBOX_KHR
-    } else if capped {
-        VK_PRESENT_MODE_FIFO_KHR
     } else {
-        requested
+        mode
     }
 }
 
@@ -9352,9 +9382,13 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
     let route = unsafe { !(*(*sc).surf).swapchain_obj.is_null() };
     let (presented, discarded, fallback) = crate::present::feedback_counts();
     crate::logi!(gndrm_obf::obf!(
-        "present mode: declared={} requested={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={}",
+        "present mode: declared={} requested={} source={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={}",
         mode_name(unsafe { live_present_mode(sc) }),
-        mode_name(unsafe { (*sc).present_mode }),
+        mode_name(unsafe { (*sc).requested_mode }),
+        match unsafe { (*sc).mode_source } {
+            ModeSource::Env => "env",
+            ModeSource::Guest => "guest",
+        },
         if route { "gamescope" } else { "x11" },
         crate::scanout::cap_fps_note(),
         unsafe { acquire_pacing(sc) }.clock().name(),
@@ -9440,13 +9474,10 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfacePresentModesKHR(
         ));
         return VK_ERROR_SURFACE_LOST_KHR;
     }
-    // The env's mode leads the list only where it decides the mode
-    // (`effective_present_mode`): not on gamescope's override route.
-    let override_mode = if unsafe { (*surf).swapchain_obj.is_null() } {
-        parse_present_mode_override(std::env::var("MESA_VK_WSI_PRESENT_MODE").ok().as_deref())
-    } else {
-        None
-    };
+    // The env's mode leads the list, as in Mesa: it decides the mode on both
+    // routes (`effective_present_mode`).
+    let override_mode =
+        parse_present_mode_override(std::env::var("MESA_VK_WSI_PRESENT_MODE").ok().as_deref());
     let modes_list = offered_present_modes(&SERVED_PRESENT_MODES, override_mode);
     unsafe {
         if modes.is_null() {
