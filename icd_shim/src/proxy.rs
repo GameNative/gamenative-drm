@@ -1714,7 +1714,7 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
     unsafe {
         let s = (*sc).slots.as_mut_ptr().add(idx as usize);
         // How long the frame took from the gate's release to here, its render
-        // fence waited: what the gate predicts a late frame's commit by.
+        // fence waited, for the census.
         if (*s).acquired_ns != 0 {
             let took = monotonic_ns().saturating_sub(core::mem::replace(&mut (*s).acquired_ns, 0));
             let est = (*sc).commit_latency_ns.load(Ordering::Relaxed);
@@ -2391,11 +2391,7 @@ unsafe fn gn_acquire_common(
                     // not start before the release this one was booked to.
                     let now_ns = monotonic_ns();
                     (*(*sc).slots.as_mut_ptr().add(idx as usize)).acquired_ns = now_ns;
-                    (*sc).release.book_paced(
-                        now_ns,
-                        pacing,
-                        (*sc).commit_latency_ns.load(Ordering::Relaxed),
-                    );
+                    (*sc).release.book_paced(now_ns, pacing);
                 }
                 break;
             }
@@ -6813,8 +6809,8 @@ pub struct GnSlot {
     // present can be tied back to the acquire that handed the guest the image.
     pub acq_seq: u64,
     // When the gate let the guest's acquire of this slot go, `CLOCK_MONOTONIC`
-    // ns; 0 when no gate ran. Read once at the commit, for the acquire-to-commit
-    // latency the gate books late frames by.
+    // ns; 0 when no gate ran. Read once at the commit, for the census's
+    // acquire-to-commit latency.
     pub acquired_ns: u64,
     // The guest's present id for the frame currently in this slot, 0 when it
     // chained none: read at the commit to mark the frame for the daemon, which

@@ -28,11 +28,9 @@
 //!   on the cap's own clock ([`crate::scanout::next_acquire_after`]).
 //!
 //! A frame that arrives after its release point is not held: it starts at once,
-//! so a guest slower than the cap runs at its own rate rather than at a divisor
-//! of the display's. The release after it is placed by the composite the late
-//! frame will make, predicted from the guest's measured acquire-to-commit time,
-//! so the two never reach gamescope inside one composite (where the late one
-//! would be replaced and the panel would show the previous frame twice).
+//! and the release after it is the next point of the schedule, so a guest
+//! slower than the cap runs at its own rate rather than at a divisor of the
+//! display's.
 //!
 //! The grid exists only once the daemon has sent a note with a stamp lead
 //! ([`current_grid`]). Released on the latch points themselves (a daemon that
@@ -200,11 +198,6 @@ pub(crate) fn pacing(cap_fps: u32, grid: Option<Grid>) -> Pacing {
 /// on time: the wake-up of the gate's own wait, with room for a loaded CPU.
 const ON_TIME_NS: u64 = 500_000;
 
-/// How long before a stamp instant a frame has to be committed to make the
-/// composite gamescope runs ahead of it: its red zone (1.65 ms) plus its own
-/// composite time, which the shim does not see; ~1 ms on the devices measured.
-const COMPOSITE_MARGIN_NS: u64 = 2_500_000;
-
 /// Late starts booked by [`Schedule::book`], and the release points they moved
 /// past, for the census.
 static LATE_N: AtomicU64 = AtomicU64::new(0);
@@ -230,57 +223,38 @@ pub struct Schedule {
 
 impl Schedule {
     /// Book an acquire that started at `now_ns` (at or after `next_ns`) and
-    /// return the instant the one after it may start. `latency_ns` is how long
-    /// the guest's frames take from acquire to commit (0 when not measured
-    /// yet).
+    /// return the instant the one after it may start.
     ///
-    /// An acquire that started on time is booked to its release point, and the
-    /// schedule goes on from there: the next release is `interval` further
-    /// along the ideal timeline, on the grid instant nearest it. A late start
-    /// is never held: it goes at once. It is booked to the release point whose
-    /// composite it will make, from the measured latency: one that still
-    /// makes the same composite as an on-time frame keeps its release point,
-    /// one that will miss it is booked to the next. Booking a frame that
-    /// misses its composite to the point it missed released its successor
-    /// one period later, and both reached gamescope inside one composite: the
-    /// late frame was replaced in gamescope's mailbox and the panel showed the
-    /// previous one twice. After a late start the ideal timeline starts again
-    /// from the point it was booked to, so a stall carries no debt. The
-    /// release point is read on the grid as it is now: the daemon re-pushes
-    /// the phase as it moves, and a point booked on the old phase must not let
-    /// two releases into one period of the new one.
-    pub(crate) fn book(
-        &mut self,
-        now_ns: u64,
-        grid: Grid,
-        interval_ns: u64,
-        latency_ns: u64,
-    ) -> u64 {
+    /// An acquire that started before the grid instant after its release point
+    /// (on time, or late by less than a period) is booked to that release
+    /// point, and the schedule goes on from there: the next release is
+    /// `interval` further along the ideal timeline, on the grid instant
+    /// nearest it. A start later than that, or the first, starts the timeline
+    /// again from the grid instant at or before it, so a stall carries no debt
+    /// and a late frame is never held for a whole slot. The release point is
+    /// read on the grid as it is now: the daemon re-pushes the phase as it
+    /// moves, and a point booked on the old phase must not let two releases
+    /// into one period of the new one. Starts later than [`ON_TIME_NS`] after
+    /// their point are counted (`late`), with the points passed (`skipped`).
+    pub(crate) fn book(&mut self, now_ns: u64, grid: Grid, interval_ns: u64) -> u64 {
         if grid.period_ns == 0 {
             return self.book_clock(now_ns, interval_ns);
         }
-        let p = grid.period_ns;
+        let at = grid.at_or_before(now_ns);
         let due = (self.next_ns != 0).then(|| grid.nearest(self.next_ns));
+        if let Some(due) = due.filter(|&d| now_ns >= d.saturating_add(ON_TIME_NS)) {
+            LATE_N.fetch_add(1, Ordering::Relaxed);
+            SKIPPED_N.fetch_add(at.saturating_sub(due) / grid.period_ns, Ordering::Relaxed);
+        }
         let (slot, ideal) = match due {
-            Some(due) if now_ns < due.saturating_add(ON_TIME_NS) => (due, self.ideal_ns),
-            Some(due) => {
-                // Periods between the composite an on-time frame makes and the
-                // one this frame makes.
-                let reach = latency_ns.saturating_add(COMPOSITE_MARGIN_NS);
-                let later = (now_ns - due + reach) / p - reach / p;
-                let slot = due + later * p;
-                LATE_N.fetch_add(1, Ordering::Relaxed);
-                SKIPPED_N.fetch_add(later, Ordering::Relaxed);
-                (slot, slot)
-            }
-            None => {
-                let at = grid.at_or_before(now_ns);
-                (at, at)
-            }
+            Some(due) if at <= due => (due, self.ideal_ns),
+            _ => (at, at),
         };
         let ideal_next = ideal.saturating_add(interval_ns);
         // Never two releases on one grid instant.
-        let next = grid.nearest(ideal_next).max(slot.saturating_add(p));
+        let next = grid
+            .nearest(ideal_next)
+            .max(slot.saturating_add(grid.period_ns));
         self.ideal_ns = ideal_next;
         self.next_ns = next;
         next
@@ -296,21 +270,21 @@ impl Schedule {
 
     /// Book an acquire that started at `now_ns` under `pacing`; `next_ns` is
     /// left alone when there is no gate.
-    pub(crate) fn book_paced(&mut self, now_ns: u64, pacing: Pacing, latency_ns: u64) {
+    pub(crate) fn book_paced(&mut self, now_ns: u64, pacing: Pacing) {
         match pacing {
             Pacing::Off => {}
             Pacing::Clock { period_ns } => {
                 self.book_clock(now_ns, period_ns);
             }
             Pacing::Grid { grid, interval_ns } => {
-                self.book(now_ns, grid, interval_ns, latency_ns);
+                self.book(now_ns, grid, interval_ns);
             }
         }
     }
 }
 
-/// Fold one frame's acquire-to-commit time into a running estimate (1/8
-/// weight; the first sample is taken as it is).
+/// Fold one frame's acquire-to-commit time into a running estimate for the
+/// census (1/8 weight; the first sample is taken as it is).
 #[must_use]
 pub(crate) fn smooth_latency(estimate_ns: u64, sample_ns: u64) -> u64 {
     if estimate_ns == 0 {
@@ -349,7 +323,7 @@ mod tests {
             }
             let start = now + 50_000; // the wait returns a hair late
             out.push(start);
-            s.book(start, g, interval, 0);
+            s.book(start, g, interval);
             now = start + 1_000_000; // a frame's CPU work before the next acquire
         }
         out
@@ -425,85 +399,18 @@ mod tests {
         let iv = interval(pacing(60, Some(g)));
         let mut s = Schedule::default();
         let first = g.anchor_ns + 10_000;
-        let due = s.book(first, g, iv, 0);
+        let due = s.book(first, g, iv);
         assert_eq!(due, g.anchor_ns + P60);
         // The guest comes back 6 ms after its release point. The gate does not
         // hold it (it is past `next_ns`), and the release after it is the next
         // vblank, not a whole period from now.
         let late = due + 6_000_000;
         assert!(late >= s.next_ns);
-        assert_eq!(s.book(late, g, iv, 0), due + P60);
+        assert_eq!(s.book(late, g, iv), due + P60);
         // Late by more than a period: assigned to the vblank it is in, and the
         // next release is the one after.
         let very_late = due + P60 + 3 * P60 + 2_000_000;
-        assert_eq!(s.book(very_late, g, iv, 0), due + 5 * P60);
-    }
-
-    /// Under mailbox gamescope shows the newest commit at each composite, which
-    /// it runs `COMPOSITE_MARGIN_NS` ahead of each grid instant: two commits
-    /// inside one window and the older one is replaced, never shown.
-    fn replaced(g: Grid, commits: &[u64]) -> usize {
-        let window = |t: u64| (t + COMPOSITE_MARGIN_NS - g.anchor_ns) / g.period_ns;
-        commits
-            .windows(2)
-            .filter(|w| window(w[0]) == window(w[1]))
-            .count()
-    }
-
-    /// A guest whose frames take `latency` from acquire to commit, back for
-    /// its next acquire `cpu` after the last one started, and late by `late`
-    /// past its release point on every `every`-th frame. Returns the commits.
-    fn run_with_late_frames(g: Grid, latency: u64, late: u64, every: usize) -> Vec<u64> {
-        let iv = interval(pacing(60, Some(g)));
-        let mut s = Schedule::default();
-        let mut commits = Vec::new();
-        let mut est = 0;
-        let mut ask = g.anchor_ns;
-        for n in 0..600 {
-            let start = if s.next_ns != 0 && n % every == every - 1 {
-                s.next_ns + late
-            } else if s.next_ns != 0 && ask < s.next_ns {
-                s.next_ns + 50_000
-            } else {
-                ask
-            };
-            s.book(start, g, iv, est);
-            commits.push(start + latency);
-            est = smooth_latency(est, latency);
-            ask = start + 4_000_000;
-        }
-        commits
-    }
-
-    #[test]
-    fn a_late_frame_that_misses_its_composite_does_not_share_the_next_one() {
-        let g = grid(P60);
-        // 13 ms acquire-to-commit, 3 ms late every tenth frame: the late frame
-        // commits after the composite it was released for. Booked to the
-        // point it missed, its successor would land in the same composite.
-        let commits = run_with_late_frames(g, 13_000_000, 3_000_000, 10);
-        assert_eq!(replaced(g, &commits), 0);
-        let (late, skipped) = late_counts();
-        assert!(late > 0 && skipped > 0);
-    }
-
-    #[test]
-    fn a_late_frame_that_still_makes_its_composite_keeps_its_slot() {
-        let g = grid(P60);
-        let iv = interval(pacing(60, Some(g)));
-        let mut s = Schedule::default();
-        let due = s.book(g.anchor_ns, g, iv, 5_000_000);
-        // 3 ms late, 5 ms of work: committed 8 ms after the point, well before
-        // the composite: the successor keeps the next vblank.
-        assert_eq!(s.book(due + 3_000_000, g, iv, 5_000_000), due + P60);
-        // 2 ms late, 14 ms of work: it misses the composite, so its successor
-        // goes a vblank later.
-        let due = s.next_ns;
-        assert_eq!(s.book(due + 2_000_000, g, iv, 14_000_000), due + 2 * P60);
-        // A guest pipelined over more than a period (20 ms) a little late:
-        // the same composite as its on-time frames, so no vblank is skipped.
-        let due = s.next_ns;
-        assert_eq!(s.book(due + 1_000_000, g, iv, 20_000_000), due + P60);
+        assert_eq!(s.book(very_late, g, iv), due + 5 * P60);
     }
 
     #[test]
@@ -511,21 +418,21 @@ mod tests {
         let g = grid(P60);
         let iv = interval(pacing(60, Some(g)));
         let mut s = Schedule::default();
-        let due = s.book(g.anchor_ns + 10_000, g, iv, 0);
+        let due = s.book(g.anchor_ns + 10_000, g, iv);
         // The daemon re-anchors the grid 400 us later; the guest is released
         // on the old point, which is now just before the new one.
         let moved = Grid {
             anchor_ns: g.anchor_ns + 400_000,
             ..g
         };
-        let next = s.book(due + 20_000, moved, iv, 0);
+        let next = s.book(due + 20_000, moved, iv);
         assert_eq!(next, due + 400_000 + P60);
         // And 400 us earlier: the old point is just after the new one.
         let earlier = Grid {
             anchor_ns: g.anchor_ns - 400_000,
             ..g
         };
-        let after = s.book(next + 20_000, earlier, iv, 0);
+        let after = s.book(next + 20_000, earlier, iv);
         assert_eq!(after, next - 800_000 + P60);
     }
 
@@ -539,7 +446,7 @@ mod tests {
         let mut t = g.anchor_ns;
         for _ in 0..100 {
             assert!(s.next_ns == 0 || t >= s.next_ns, "held at {t}");
-            s.book(t, g, iv, 0);
+            s.book(t, g, iv);
             t += 20_000_000;
         }
     }
@@ -551,9 +458,9 @@ mod tests {
         let g = grid(P60);
         let iv = interval(pacing(30, Some(g)));
         let mut s = Schedule::default();
-        let due = s.book(g.anchor_ns, g, iv, 0);
+        let due = s.book(g.anchor_ns, g, iv);
         assert_eq!(due, g.anchor_ns + 2 * P60);
-        assert_eq!(s.book(due + P60 / 2, g, iv, 0), due + 2 * P60);
+        assert_eq!(s.book(due + P60 / 2, g, iv), due + 2 * P60);
     }
 
     /// One test for the process-global grid, so no other test races it.

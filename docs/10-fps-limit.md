@@ -135,10 +135,8 @@ divisor cap reads its target exactly.
   other cap below the rate, the vblank nearest each instant of an ideal
   `1e9 / cap` timeline, which averages the cap on vblank boundaries (45 on 60
   releases 3 of 4 vblanks); a cap above the rate, the cap's own clock. A frame
-  that arrives after its release point starts at once, so a game below the cap
-  keeps its own rate; the release after it is placed by the composite the late
-  frame will make (from the guest's measured acquire-to-commit time), so the two
-  never reach gamescope in one composite, where the late one would be replaced. A
+  that arrives after its release point starts at once, and the next release is
+  the next point of the schedule, so a game below the cap keeps its own rate. A
   gate on the shim's own `1e9 / N` clock, as before 7bdcbae, beat against the
   panel: 57-59 fps on `SurfaceFlinger` at a 60 cap on a 59.97 Hz panel.
 
@@ -164,7 +162,7 @@ divisor cap reads its target exactly.
   their release point; `skipped`, release points moved past for them;
   `slot_waits`, acquires that passed the gate and then waited on a compositor
   release for a free image; `commit_lat_us`, the smoothed acquire-to-commit
-  time the gate predicts by. Off the override route (the opt-in X11
+  time. Off the override route (the opt-in X11
   Present route) the env decides the mode as in Mesa and the gate runs on the
   cap's own clock, as before.
 - **`-r` is not part of it, and no launch argument carries the limit.** The app
