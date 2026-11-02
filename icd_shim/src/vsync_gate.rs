@@ -31,6 +31,15 @@
 //! and the release after it is the next point of the schedule, so a guest
 //! slower than the cap runs at its own rate rather than at a divisor of the
 //! display's.
+//!
+//! The grid exists only once the daemon has sent a note with a stamp lead
+//! ([`current_grid`]). Released on the latch points themselves (a daemon that
+//! predates the field sends 0), a frame starts ~2 ms after gamescope's wakeup
+//! and straddles the next composite: measured on a Retroid Pocket 6, 58.3 fps
+//! and 102 frames replaced in gamescope's mailbox per minute at a 60 cap on a
+//! 59.975 Hz panel, and 13 % of the daemon's publishes late at 120 Hz. Until
+//! then the shim declares FIFO under a cap and gamescope's limiter holds it
+//! (`proxy::choose_live_mode`).
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -58,23 +67,20 @@ pub(crate) fn apply_note(note: VsyncNote) {
     PERIOD_NS.store(note.period_ns, Ordering::Relaxed);
 }
 
-/// The vblank grid releases sit on: the daemon's when it has reported one,
-/// else the mode's nominal period (phase unknown), else `None`.
-pub(crate) fn current_grid(nominal_hz: u32) -> Option<Grid> {
+/// The vblank grid releases sit on: the daemon's flip-stamp grid, `None`
+/// until a note carrying a stamp lead has arrived (0 means the daemon did not
+/// say; one that measures a lead always sends at least 1 ns).
+pub(crate) fn current_grid() -> Option<Grid> {
     let period = u64::from(PERIOD_NS.load(Ordering::Relaxed));
-    if period != 0 {
-        let anchor = ANCHOR_NS.load(Ordering::Relaxed);
-        let lead = u64::from(STAMP_LEAD_NS.load(Ordering::Relaxed));
-        return Some(Grid {
-            anchor_ns: anchor.saturating_sub(lead),
-            period_ns: period,
-            clock: GateClock::Vsync,
-        });
+    let lead = u64::from(STAMP_LEAD_NS.load(Ordering::Relaxed));
+    if period == 0 || lead == 0 {
+        return None;
     }
-    (nominal_hz != 0).then(|| Grid {
-        anchor_ns: 0,
-        period_ns: NANOS_PER_SECOND / u64::from(nominal_hz),
-        clock: GateClock::Nominal,
+    let anchor = ANCHOR_NS.load(Ordering::Relaxed);
+    Some(Grid {
+        anchor_ns: anchor.saturating_sub(lead),
+        period_ns: period,
+        clock: GateClock::Vsync,
     })
 }
 
@@ -85,11 +91,9 @@ pub(crate) enum GateClock {
     Off,
     /// The display's vblank grid from the daemon's note.
     Vsync,
-    /// The mode's nominal period, the daemon not having reported a grid yet.
-    Nominal,
     /// The cap's own `1e9 / cap` clock: a cap above the display's rate, a
     /// gate that is not this module's (frame generation's source rate, the X11
-    /// Present route), or no rate known at all.
+    /// Present route), or no grid known.
     Clock,
 }
 
@@ -98,7 +102,6 @@ impl GateClock {
         match self {
             GateClock::Off => "off",
             GateClock::Vsync => "vsync",
-            GateClock::Nominal => "nominal",
             GateClock::Clock => "clock",
         }
     }
@@ -428,30 +431,25 @@ mod tests {
 
     /// One test for the process-global grid, so no other test races it.
     #[test]
-    fn the_grid_is_the_daemons_flip_stamp_grid_else_the_nominal_period() {
-        // No note yet: the mode's nominal period, phase unknown.
-        let g = current_grid(60).expect("a nominal grid");
-        assert_eq!(g.clock, GateClock::Nominal);
-        assert_eq!(g.period_ns, NANOS_PER_SECOND / 60);
-        assert_eq!(pacing(30, Some(g)).clock(), GateClock::Nominal);
-        assert_eq!(interval(pacing(30, Some(g))), 2 * (NANOS_PER_SECOND / 60));
-        // No rate known at all: the cap's own clock.
-        assert_eq!(current_grid(0), None);
-        assert_eq!(
-            pacing(30, None),
-            Pacing::Clock {
-                period_ns: NANOS_PER_SECOND / 30
-            }
-        );
-        // The daemon's note: its latch grid moved earlier by the stamp lead,
-        // the instants gamescope's vblanks are stamped at.
-        apply_note(VsyncNote {
+    fn the_grid_is_the_daemons_flip_stamp_grid_and_needs_its_lead() {
+        // No note yet: no grid.
+        assert_eq!(current_grid(), None);
+        let note = VsyncNote {
             anchor_ns: 5_000_000_000,
             period_ns: P60 as u32,
             lead_ns: 9_000_000,
+            stamp_lead_ns: 0,
+        };
+        // A note without a stamp lead (a daemon that predates it): no grid.
+        apply_note(note);
+        assert_eq!(current_grid(), None);
+        // With one: the latch grid moved earlier by the stamp lead, the
+        // instants gamescope's vblanks are stamped at.
+        apply_note(VsyncNote {
             stamp_lead_ns: 2_500_000,
+            ..note
         });
-        let g = current_grid(60).expect("the daemon's grid");
+        let g = current_grid().expect("the daemon's grid");
         assert_eq!(g.clock, GateClock::Vsync);
         assert_eq!(g.period_ns, P60);
         assert_eq!(g.anchor_ns, 5_000_000_000 - 2_500_000);
@@ -461,6 +459,13 @@ mod tests {
             lead_ns: 0,
             stamp_lead_ns: 0,
         });
+        // No grid at all: the cap's own clock.
+        assert_eq!(
+            pacing(30, None),
+            Pacing::Clock {
+                period_ns: NANOS_PER_SECOND / 30
+            }
+        );
     }
 
     #[test]

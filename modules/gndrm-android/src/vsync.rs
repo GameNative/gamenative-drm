@@ -235,10 +235,13 @@ fn period_ns(now_ns: u64) -> u64 {
 }
 
 /// How far ahead of its latch the flip events are stamped at `now_ns`, 0 while
-/// they follow no display grid (`gndrm_daemon::vblank::display_grid`).
+/// they follow no display grid (`gndrm_daemon::vblank::display_grid`). At least
+/// 1 ns while they do, so 0 always means "not known" to the shim, which does not
+/// run its vblank-grid gate without it (a fixed `GNDRM_GS_LATCH_LEAD_US=0` would
+/// otherwise read as an old daemon).
 #[cfg(target_os = "android")]
 fn stamp_lead_ns(now_ns: u64) -> u64 {
-    gndrm_daemon::vblank::display_grid(now_ns).map_or(0, |g| g.lead_ns)
+    gndrm_daemon::vblank::display_grid(now_ns).map_or(0, |g| g.lead_ns.max(1))
 }
 
 /// One publish's completion: the latch point `SurfaceFlinger` took it at and

@@ -136,9 +136,11 @@ that rate is the display's.
   schedule goes on, so a guest below the cap is never quantized to a divisor; a phase
   push never lets two releases into one vblank. The gate this replaces ran on the shim's
   own clock (exactly 1e9 / N ns) and beat against the display's 59.97-59.99 Hz
-  (57-59 fps at a 60 cap). Before the daemon's first note the grid is the mode's
-  nominal period (`gate=nominal` in the census), and with no rate known the cap's own
-  clock (`gate=clock`, also frame generation's source rate and a cap above the rate).
+  (57-59 fps at a 60 cap). A cap above the rate runs on the cap's own clock
+  (`gate=clock`, also frame generation's source rate). Without the stamp lead (no
+  note yet, or a daemon that predates it) the gate does not run: a capped swapchain is
+  declared FIFO and gamescope's limiter holds it (`source=cap-compat`), so a
+  payload-only rollout keeps today's pacing until the app ships the daemon.
 - **Fallbacks.** On API 29-32 Choreographer reports the vsync time only
   (`AChoreographer_postFrameCallback64`): its measured period is used with the latch
   grid's phase (`vsync.rs`, from `ASurfaceTransactionStats_getLatchTime`), or the vsync
@@ -183,8 +185,9 @@ that rate is the display's.
   stamp_lead_ns`) pushed whenever its phase, lead or stamp lead moves by more than
   300 µs or its period by more than 1 µs, and once on subscribe. `stamp_lead_ns` is the
   flip events' lead (below), so `anchor_ns - stamp_lead_ns` is gamescope's vblank grid,
-  the one the shim's acquire gate releases on; 0 from a daemon that predates it, and the
-  gate then releases on the latch points themselves. Its period is the one measured from Choreographer while that is locked
+  the one the shim's acquire gate releases on. The daemon sends at least 1 ns while
+  the flip events follow a grid, so 0 means "not known" (no grid, or a daemon that
+  predates the field), and the shim then declares FIFO under a cap instead of gating. Its period is the one measured from Choreographer while that is locked
   (the mode's advertised rate otherwise), so frame generation extrapolates
   the display's real rate. Its anchor is also the
   flip timeline's phase where Choreographer gives no deadline, and its fallback.

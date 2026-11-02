@@ -138,14 +138,25 @@ divisor cap reads its target exactly.
   that arrives after its release point starts at once, and the next release is
   the next point of the schedule, so a game below the cap keeps its own rate. A
   gate on the shim's own `1e9 / N` clock, as before 7bdcbae, beat against the
-  panel: 57-59 fps on `SurfaceFlinger` at a 60 cap on a 59.97 Hz panel. Until the
-  daemon's first note the grid is the mode's nominal period (phase unknown); with
-  no rate known at all, the cap's own clock.
+  panel: 57-59 fps on `SurfaceFlinger` at a 60 cap on a 59.97 Hz panel.
+
+  The gate needs the stamp lead. Until a note carrying one has arrived (no note
+  yet, or a daemon that predates the field and sends 0), a capped swapchain whose
+  mode is not FIFO is declared FIFO and gamescope's limiter is the cap, as before
+  the container's mode was honoured here; the census reads `source=cap-compat`.
+  Released on the latch points themselves, frames start ~2 ms after gamescope's
+  wakeup and straddle its composite (Retroid Pocket 6, cap 60: 58.3 fps and 102
+  frames replaced in gamescope's mailbox per minute at 60 Hz, 13 % of publishes
+  late at 120 Hz). A rollout that ships only the payload (the shim) therefore keeps
+  today's pacing until the app ships the daemon that sends the lead. A swapchain
+  created before the lead is known keeps the slot count of the guest's own request
+  until it is recreated.
 
   The census reads which path ran, every 10 s while frames are presented:
   `present mode: declared=… requested=… source=env|guest route=gamescope cap=…
-  gate=vsync|nominal|clock|off …` (`gate=clock` is frame generation's source rate
-  or a cap above the display's rate). Off the override route (the opt-in X11
+  gate=vsync|clock|off …` (`source=cap-compat`: declared FIFO for want of the
+  stamp lead; `gate=clock` is frame generation's source rate or a cap above the
+  display's rate). Off the override route (the opt-in X11
   Present route) the env decides the mode as in Mesa and the gate runs on the
   cap's own clock, as before.
 - **`-r` is not part of it, and no launch argument carries the limit.** The app
