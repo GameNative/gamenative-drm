@@ -48,8 +48,17 @@ that rate is the display's.
   `presented` (at the refresh it reports) or `discarded`. The release comes a vblank
   later under FIFO, when the next frame is latched, and a guest that waits on every
   frame (DXVK with VSync on) turned that into two vblanks per frame (35 fps at a 60
-  cap), so while a feedback is pending neither the release nor the grace answers; a
-  feedback that never comes is answered 100 ms after the commit. Without the global
+  cap), so while a feedback is pending neither the release nor the grace answers. Every
+  pending feedback is keyed by its swapchain, so a recreated swapchain, whose ids start
+  again at 1, is never answered by the old one's. gamescope answers every commit: it
+  sends `presented` each vblank for the last latched commit of *every* window, visible
+  or not ("we return presented for any window not visible … for forward progress",
+  `steamcompmgr.cpp` before `handle_presented_xwayland`), and `discarded` for a commit
+  that is replaced or destroyed (`commit_t::~commit_t`) or whose window is gone. An
+  unfocused game, or one behind a dialog, is therefore still answered once per vblank.
+  Mesa blocks until the event comes; the shim answers a feedback that never comes
+  100 ms after the commit, a backstop for a compositor fault, not a path a working
+  session takes (the census's `fallback=` counts it). Without the global
   (or off the override route) the wait is answered on the release, or two refresh
   periods after the commit when no release report arrives first.
 - **Mailbox and immediate.** A guest that asked for either does not wait, and neither
@@ -68,10 +77,16 @@ that rate is the display's.
   where in the display's cycle gamescope finishes; a timeline of its own, however
   regular, slides against the display. The source is `AChoreographer`
   (`gndrm-android/src/choreographer.rs`): one thread with an `ALooper` keeps a callback
-  posted per vsync while a session runs, and the daemon fits the period to the measured
-  vsync spacing over the last 32 vsyncs (`gndrm-daemon/src/vblank.rs`, `VsyncRing`). The
-  mode's integer rate never enters it: a "60 Hz" panel that latches at 59.973 Hz is
-  stamped at 59.973 Hz, and a live mode change is followed when the spacing changes.
+  posted per vsync while a session runs (and not while it is suspended), and the daemon
+  fits the period to the measured vsync spacing over the last 32 vsyncs
+  (`gndrm-daemon/src/vblank.rs`, `VsyncRing`). The steps are counted against the mode's
+  advertised period and a fit is accepted only within 2 % of it: a "60 Hz" panel that
+  latches at 59.973 Hz is stamped at 59.973 Hz, while a callback thread starved into
+  delivering every second vsync counts two periods per step instead of locking at twice
+  the period. A live mode change reaches the daemon as a new mode
+  (`nativeSetPanelRefreshHz`) and starts the fit again. The post functions return
+  nothing, so a callback that has not come within a second is posted once more; the
+  flip events meanwhile fall back to the latch grid on their own.
 - **Which instant is stamped.** KMS has one instant per cycle: the vblank is both the
   point a flip must be queued by and the point scan-out starts. Android splits it into
   `SurfaceFlinger`'s latch and the present one or more periods later. gamescope uses
@@ -118,6 +133,29 @@ that rate is the display's.
   instant: a second frame inside one period claims the next instant, and a late frame
   skips whole periods. Switching sources keeps the rule (the next claim is at least half
   a period after the last).
+
+## Behaviour changes in gamescope sessions
+
+- **FIFO games without a cap are vsynced.** The env's mailbox used to be declared for
+  every swapchain; now a guest that asks for FIFO gets FIFO, as on a PC.
+- **Mailbox and immediate games keep the mode they asked for** when no cap is set, and
+  are declared FIFO while one is.
+- **`MESA_VK_WSI_PRESENT_MODE` is ignored on the gamescope route** (it still applies to
+  the X11 Present route), including a value the user picked in the driver settings; on a
+  PC it reaches only Mesa below gamescope's layer.
+- **Caps that do not divide the display's rate** run at gamescope's divisor rate:
+  `floor(refresh / target)` vblanks, so 40 or 45 on 60 Hz runs at 60 and 50 on 120 Hz at
+  60.
+- **Queue latency.** Under FIFO a guest faster than the cap fills its free slots, so
+  up to `slots − 1` frames can wait in gamescope's FIFO list: at low caps that is up to
+  that many limited periods of input latency, as on a PC. A guest that uses present wait
+  is bounded by its frame latency.
+- **Frame generation turned on mid-session** switches a FIFO guest's swapchain to the
+  mailbox discipline with the slot count it was created with (`minImageCount + 1`, one
+  fewer than a swapchain created with generation on) until the guest recreates it.
+- **Toggling frame generation** sends the cap change and the generation settings
+  separately; between the two, for a moment, the guest's own mode is declared with no
+  gate, so a mailbox/immediate guest can run uncapped for a few frames.
 
 ## 4. What the daemon owns
 
