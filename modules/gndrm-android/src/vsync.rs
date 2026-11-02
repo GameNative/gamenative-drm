@@ -124,13 +124,17 @@ impl Tracker {
     /// Fold in one completion: the latch point `SurfaceFlinger` took the frame
     /// at and the instant the daemon's apply of it returned (0 when unknown).
     /// `pacing` says whether a shim is placing frames by the note, which is
-    /// when the lead can be measured. Returns the note to push when it moved.
+    /// when the lead can be measured. `stamp_lead` is how far ahead of a latch
+    /// the flip events are stamped now (0 when they follow no grid); it rides
+    /// in the note so the shim can find gamescope's vblank grid. Returns the
+    /// note to push when it moved.
     fn track(
         &mut self,
         latch_ns: u64,
         applied_ns: u64,
         period: u64,
         pacing: bool,
+        stamp_lead: u64,
     ) -> Option<VsyncNote> {
         if self.anchor_ns == 0 {
             self.anchor_ns = latch_ns;
@@ -175,6 +179,7 @@ impl Tracker {
             anchor_ns: self.anchor_ns,
             period_ns: u32::try_from(period).unwrap_or(u32::MAX),
             lead_ns: u32::try_from(self.lead_ns).unwrap_or(u32::MAX),
+            stamp_lead_ns: u32::try_from(stamp_lead).unwrap_or(u32::MAX),
         };
         let moved = match self.pushed {
             None => true,
@@ -184,6 +189,7 @@ impl Tracker {
                 u64::from(p.period_ns.abs_diff(note.period_ns)) > PERIOD_STEP_NS
                     || phase > PUSH_STEP_NS
                     || u64::from(p.lead_ns.abs_diff(note.lead_ns)) > PUSH_STEP_NS
+                    || u64::from(p.stamp_lead_ns.abs_diff(note.stamp_lead_ns)) > PUSH_STEP_NS
             }
         };
         if moved {
@@ -195,7 +201,7 @@ impl Tracker {
     }
 
     /// The current note, recorded as pushed; `None` until a latch was seen.
-    fn note(&mut self, period: u64) -> Option<VsyncNote> {
+    fn note(&mut self, period: u64, stamp_lead: u64) -> Option<VsyncNote> {
         if self.anchor_ns == 0 || period == 0 {
             return None;
         }
@@ -203,6 +209,7 @@ impl Tracker {
             anchor_ns: self.anchor_ns,
             period_ns: u32::try_from(period).unwrap_or(u32::MAX),
             lead_ns: u32::try_from(self.lead_ns).unwrap_or(u32::MAX),
+            stamp_lead_ns: u32::try_from(stamp_lead).unwrap_or(u32::MAX),
         };
         self.pushed = Some(note);
         Some(note)
@@ -227,6 +234,13 @@ fn period_ns(now_ns: u64) -> u64 {
     }
 }
 
+/// How far ahead of its latch the flip events are stamped at `now_ns`, 0 while
+/// they follow no display grid (`gndrm_daemon::vblank::display_grid`).
+#[cfg(target_os = "android")]
+fn stamp_lead_ns(now_ns: u64) -> u64 {
+    gndrm_daemon::vblank::display_grid(now_ns).map_or(0, |g| g.lead_ns)
+}
+
 /// One publish's completion: the latch point `SurfaceFlinger` took it at and
 /// the instant the daemon's apply of it returned. Called from the completion
 /// callback, on `SurfaceFlinger`'s thread.
@@ -237,10 +251,12 @@ pub(crate) fn sample(latch_ns: u64, applied_ns: u64) {
         return;
     }
     let pacing = crate::lsfg_pacing() && SUBSCRIBED.load(Ordering::Relaxed);
+    // Read before the tracker's lock: the display's state has a lock of its own.
+    let stamp_lead = stamp_lead_ns(latch_ns);
     let note = {
         let mut t = TRACKER.lock().unwrap_or_else(|e| e.into_inner());
         let first = t.pushed.is_none();
-        let note = t.track(latch_ns, applied_ns, period, pacing);
+        let note = t.track(latch_ns, applied_ns, period, pacing, stamp_lead);
         // The flip events' fallback timeline, and Choreographer's cross-check.
         gndrm_daemon::vblank::note_latch_grid(t.anchor_ns, period);
         if first && note.is_some() {
@@ -272,11 +288,13 @@ pub(crate) fn sample(latch_ns: u64, applied_ns: u64) {
 /// The note to hand a shim now, `None` before any latch was seen.
 #[cfg(target_os = "android")]
 pub(crate) fn note() -> Option<VsyncNote> {
-    let period = period_ns(now_ns());
+    let now = now_ns();
+    let period = period_ns(now);
+    let stamp_lead = stamp_lead_ns(now);
     TRACKER
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .note(period)
+        .note(period, stamp_lead)
 }
 
 #[cfg(test)]
@@ -309,7 +327,7 @@ mod tests {
     fn the_first_sample_anchors_the_grid_and_is_pushed() {
         let mut t = fresh();
         let note = t
-            .track(1_000_000_000, 0, P, false)
+            .track(1_000_000_000, 0, P, false, 0)
             .expect("first sample pushes");
         assert_eq!(note.anchor_ns, 1_000_000_000);
         assert_eq!(u64::from(note.period_ns), P);
@@ -319,12 +337,12 @@ mod tests {
     #[test]
     fn samples_on_the_grid_do_not_push_again() {
         let mut t = fresh();
-        t.track(1_000_000_000, 0, P, false);
+        t.track(1_000_000_000, 0, P, false, 0);
         for k in 1..200 {
             // Jitter of +-100 us, as `SurfaceFlinger`'s latch wakeups have.
             let jitter = if k % 2 == 0 { 100_000 } else { -100_000 };
             let latch = (1_000_000_000 + k * P) as i64 + jitter;
-            assert_eq!(t.track(latch as u64, 0, P, false), None, "sample {k}");
+            assert_eq!(t.track(latch as u64, 0, P, false, 0), None, "sample {k}");
         }
         // The anchor stayed within the jitter of the grid.
         assert!(wrap(t.anchor_ns as i64 - 1_000_000_000, P as i64).unsigned_abs() < 150_000);
@@ -333,12 +351,12 @@ mod tests {
     #[test]
     fn a_moved_latch_phase_is_adopted_after_a_run_of_samples() {
         let mut t = fresh();
-        t.track(1_000_000_000, 0, P, false);
+        t.track(1_000_000_000, 0, P, false, 0);
         // `SurfaceFlinger` moves its latch 3 ms later from now on.
         let shift = 3_000_000;
         let mut pushed = None;
         for k in 1..=REPHASE_AFTER as u64 + 1 {
-            if let Some(n) = t.track(1_000_000_000 + k * P + shift, 0, P, false) {
+            if let Some(n) = t.track(1_000_000_000 + k * P + shift, 0, P, false, 0) {
                 pushed = Some(n);
             }
         }
@@ -355,9 +373,9 @@ mod tests {
     #[test]
     fn a_single_late_sample_is_ignored() {
         let mut t = fresh();
-        t.track(1_000_000_000, 0, P, false);
-        assert_eq!(t.track(1_000_000_000 + P + 3_000_000, 0, P, false), None);
-        assert_eq!(t.track(1_000_000_000 + 2 * P, 0, P, false), None);
+        t.track(1_000_000_000, 0, P, false, 0);
+        assert_eq!(t.track(1_000_000_000 + P + 3_000_000, 0, P, false, 0), None);
+        assert_eq!(t.track(1_000_000_000 + 2 * P, 0, P, false, 0), None);
         assert_eq!(wrap(t.anchor_ns as i64 - 1_000_000_000, P as i64), 0);
     }
 
@@ -366,13 +384,13 @@ mod tests {
     /// `pipeline` later, and is taken at the first latch point after that.
     fn settle(pipeline: u64) -> u64 {
         let mut t = fresh();
-        t.track(1_000_000_000, 0, P, true);
+        t.track(1_000_000_000, 0, P, true, 0);
         for k in 1..400u64 {
             let target = 1_000_000_000 + k * P;
             let applied = target - t.lead_ns + pipeline;
             // The latch that actually takes it.
             let latch = if applied < target { target } else { target + P };
-            t.track(latch, applied, P, true);
+            t.track(latch, applied, P, true, 0);
         }
         t.lead_ns
     }
@@ -395,7 +413,7 @@ mod tests {
     #[test]
     fn the_lead_is_not_touched_while_nothing_paces_on_it() {
         let mut t = fresh();
-        t.track(1_000_000_000, 0, P, false);
+        t.track(1_000_000_000, 0, P, false, 0);
         let lead = t.lead_ns;
         for k in 1..50u64 {
             t.track(
@@ -403,17 +421,38 @@ mod tests {
                 1_000_000_000 + k * P - 100_000,
                 P,
                 false,
+                0,
             );
         }
         assert_eq!(t.lead_ns, lead);
     }
 
     #[test]
+    fn the_stamp_lead_rides_in_the_note_and_a_move_is_pushed() {
+        let mut t = fresh();
+        let first = t
+            .track(1_000_000_000, 0, P, false, 2_000_000)
+            .expect("first sample pushes");
+        assert_eq!(first.stamp_lead_ns, 2_000_000);
+        // A wander inside the push step is not worth a push.
+        assert_eq!(t.track(1_000_000_000 + P, 0, P, false, 2_200_000), None);
+        // A move past it is.
+        let moved = t
+            .track(1_000_000_000 + 2 * P, 0, P, false, 2_400_000)
+            .expect("a moved stamp lead is pushed");
+        assert_eq!(moved.stamp_lead_ns, 2_400_000);
+        assert_eq!(
+            t.note(P, 2_400_000).map(|n| n.stamp_lead_ns),
+            Some(2_400_000)
+        );
+    }
+
+    #[test]
     fn note_is_none_until_a_latch_was_seen() {
         let mut t = fresh();
-        assert_eq!(t.note(P), None);
-        t.track(1_000_000_000, 0, P, false);
-        assert!(t.note(P).is_some());
-        assert_eq!(t.note(0), None);
+        assert_eq!(t.note(P, 0), None);
+        t.track(1_000_000_000, 0, P, false, 0);
+        assert!(t.note(P, 0).is_some());
+        assert_eq!(t.note(0, 0), None);
     }
 }

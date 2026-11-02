@@ -750,16 +750,23 @@ pub const VSYNC_MAGIC: u32 = 0x474E_5653;
 /// The panel's latch grid, daemon -> shim, on the scan-out channel.
 ///
 /// Encoded little-endian, 24 bytes:
-/// `magic:u32, reserved:u32, anchor_ns:u64, period_ns:u32, lead_ns:u32`.
+/// `magic:u32, stamp_lead_ns:u32, anchor_ns:u64, period_ns:u32, lead_ns:u32`.
 ///
 /// `SurfaceFlinger` takes the newest buffer a layer holds at each of its latch
 /// points, which sit one panel period apart. `anchor_ns` is one such point in
 /// `CLOCK_MONOTONIC`, `period_ns` their spacing, and `lead_ns` how long before a
 /// latch point a frame has to be committed to the compositor to be the buffer
 /// that point takes. The daemon measures all three from its own publishes and
-/// pushes a note whenever one of them moves. The period is the panel rate the
-/// app reported; the phase and the lead are measured. A shim that never
-/// receives one paces on its own clock, as before, and beats against the panel.
+/// pushes a note whenever one of them moves. The period is the display's
+/// measured vsync spacing while the daemon has one, the rate the app reported
+/// otherwise; the phase and the lead are measured. A shim that never receives
+/// one paces on its own clock, as before, and beats against the panel.
+///
+/// `stamp_lead_ns` is how far ahead of its latch point the daemon stamps a
+/// page-flip event, the instant gamescope schedules its next composite from:
+/// `anchor_ns - stamp_lead_ns + k * period_ns` is the vblank grid gamescope
+/// sees. It sat in a reserved field, so a daemon that predates it sends 0 and
+/// a shim that predates it ignores it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VsyncNote {
     /// A latch point, `CLOCK_MONOTONIC` ns.
@@ -768,6 +775,9 @@ pub struct VsyncNote {
     pub period_ns: u32,
     /// How far ahead of a latch point a commit has to be made to land on it, ns.
     pub lead_ns: u32,
+    /// How far ahead of its latch point a flip event is stamped, ns; 0 when the
+    /// daemon does not say.
+    pub stamp_lead_ns: u32,
 }
 
 impl VsyncNote {
@@ -777,6 +787,7 @@ impl VsyncNote {
     pub fn encode(self) -> [u8; Self::LEN] {
         let mut b = [0u8; Self::LEN];
         b[0..4].copy_from_slice(&VSYNC_MAGIC.to_le_bytes());
+        b[4..8].copy_from_slice(&self.stamp_lead_ns.to_le_bytes());
         b[8..16].copy_from_slice(&self.anchor_ns.to_le_bytes());
         b[16..20].copy_from_slice(&self.period_ns.to_le_bytes());
         b[20..24].copy_from_slice(&self.lead_ns.to_le_bytes());
@@ -793,6 +804,7 @@ impl VsyncNote {
             anchor_ns: u64::from_le_bytes(b[8..16].try_into().ok()?),
             period_ns: u32::from_le_bytes(b[16..20].try_into().ok()?),
             lead_ns: u32::from_le_bytes(b[20..24].try_into().ok()?),
+            stamp_lead_ns: u32::from_le_bytes(b[4..8].try_into().ok()?),
         })
     }
 }
@@ -930,10 +942,22 @@ mod tests {
             anchor_ns: 0x0123_4567_89ab_cdef,
             period_ns: 8_333_333,
             lead_ns: 4_000_000,
+            stamp_lead_ns: 2_500_000,
         };
         let b = note.encode();
         assert_eq!(b.len(), VsyncNote::LEN);
         assert_eq!(VsyncNote::decode(&b), Some(note));
+        // A note from a daemon that predates the stamp lead: the field was
+        // reserved and zero, and reads as "not said".
+        let mut old = b;
+        old[4..8].fill(0);
+        assert_eq!(
+            VsyncNote::decode(&old),
+            Some(VsyncNote {
+                stamp_lead_ns: 0,
+                ..note
+            })
+        );
         assert_eq!(VsyncNote::decode(&b[..23]), None);
         assert_eq!(VsyncNote::decode(&FrameCapNote { fps: 60 }.encode()), None);
         assert_eq!(FrameCapNote::decode(&b), None);
