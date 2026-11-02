@@ -7,7 +7,17 @@
 //! latch time for its vsync grid already, so the answer is the panel's, not a
 //! guess made from the release fence.
 //!
-//! Only ids that were armed — seen in a present — are tracked, and both lists are
+//! On gamescope's override route the answer is gamescope's own presentation
+//! feedback, as in Mesa's Wayland WSI: the shim requests a
+//! `wp_presentation_feedback` with every commit that carries a wait, and the
+//! wait is answered on `presented` (at the presentation time it reports) or on
+//! `discarded` (the frame will never be shown under that id). While a feedback
+//! is pending for an id, the compositor's release and the two-period grace do
+//! not answer it: they are the fallback for a compositor without the global,
+//! and answering from them is a vblank late under FIFO, which a guest waiting
+//! on every frame turns into two vblanks per frame.
+//!
+//! Only ids that were armed — seen in a present — are tracked, and the lists are
 //! bounded: a guest that marks frames and never waits cannot grow them.
 
 use core::ffi::c_void;
@@ -37,6 +47,10 @@ struct Waits {
     /// Ids whose frame has been committed, with the commit time: the latest a
     /// wait on them is answered is two refresh periods after that.
     committed: Vec<(u64, u64)>,
+    /// Ids whose commit asked gamescope for presentation feedback that has not
+    /// arrived: only `presented` / `discarded` answers them (or, should it
+    /// never come, [`FEEDBACK_SAFETY_NS`] after the commit).
+    feedback: Vec<u64>,
 }
 
 /// Bound on both lists: the ids in flight are a handful of frames, so anything
@@ -47,7 +61,77 @@ static WAITS: Mutex<Waits> = Mutex::new(Waits {
     armed: Vec::new(),
     done: Vec::new(),
     committed: Vec::new(),
+    feedback: Vec::new(),
 });
+
+/// How long after its commit an id whose feedback never came is answered
+/// anyway: far beyond any presentation gamescope makes, so it never answers
+/// early, and well inside the guest's one-second bound.
+const FEEDBACK_SAFETY_NS: u64 = 100_000_000;
+
+/// Presentation feedback outcomes, and waits answered by a fallback (release,
+/// grace or the feedback safety), for the shim's ungated census.
+static PRESENTED_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DISCARDED_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FALLBACK_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `(presented, discarded, answered by a fallback)` so far.
+pub(crate) fn feedback_counts() -> (usize, usize, usize) {
+    (
+        PRESENTED_N.load(Ordering::Relaxed),
+        DISCARDED_N.load(Ordering::Relaxed),
+        FALLBACK_N.load(Ordering::Relaxed),
+    )
+}
+
+/// The commit carrying `id` asked gamescope for presentation feedback. Called
+/// before that commit is sent, so no release or grace can answer it first.
+pub(crate) fn expect_feedback(id: u64) {
+    if id == 0 {
+        return;
+    }
+    let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    if w.feedback.len() >= CAP {
+        w.feedback.remove(0);
+    }
+    w.feedback.push(id);
+}
+
+/// gamescope's `wp_presentation_feedback.presented` for the commit carrying
+/// `id`, at `present_ns`.
+pub(crate) fn feedback_presented(id: u64, present_ns: u64) {
+    PRESENTED_N.fetch_add(1, Ordering::Relaxed);
+    feedback_done(id, present_ns);
+}
+
+/// gamescope's `wp_presentation_feedback.discarded` for the commit carrying
+/// `id`: it will never be shown, and its wait is answered now.
+pub(crate) fn feedback_discarded(id: u64, now_ns: u64) {
+    DISCARDED_N.fetch_add(1, Ordering::Relaxed);
+    feedback_done(id, now_ns);
+}
+
+/// The feedback for `id` could not be requested after all: the release and the
+/// grace answer it again.
+pub(crate) fn cancel_feedback(id: u64) {
+    if id == 0 {
+        return;
+    }
+    let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    w.feedback.retain(|&f| f != id);
+}
+
+fn feedback_done(id: u64, ns: u64) {
+    {
+        let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        w.feedback.retain(|&f| f != id);
+    }
+    record(id, ns);
+}
+
+fn feedback_pending(w: &Waits, id: u64) -> bool {
+    w.feedback.contains(&id)
+}
 
 /// Two refresh periods after a commit, the frame has been latched whatever the
 /// compositor does with the buffer afterwards.
@@ -124,16 +208,20 @@ pub(crate) fn arm(id: u64, sc: usize) {
     w.armed.push((id, sc));
 }
 
-/// A completed present, reported by the daemon with the panel's latch time.
+/// A completed present: presentation feedback, the daemon's latch report, a
+/// commit under mailbox, or a fallback. An id no longer armed was answered
+/// already and is left alone, so a second answer never queues a stale one.
 pub(crate) fn record(id: u64, latch_ns: u64) {
     if id == 0 {
         return;
     }
     let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(i) = w.armed.iter().position(|&(armed, _)| armed == id) {
-        w.armed.remove(i);
-    }
+    let Some(i) = w.armed.iter().position(|&(armed, _)| armed == id) else {
+        return;
+    };
+    w.armed.remove(i);
     w.committed.retain(|&(c, _)| c != id);
+    w.feedback.retain(|&f| f != id);
     if w.done.len() >= CAP {
         w.done.remove(0);
     }
@@ -161,8 +249,18 @@ fn note_outcome(id: u64, what: &str, t0: std::time::Instant) {
 /// The compositor released the frame's buffer: it has been taken into the
 /// output, and the next refresh shows it. Answers the wait when no latch report
 /// came first; a daemon that did report is left as the authority.
+///
+/// Not while presentation feedback is pending for it: under FIFO the release of
+/// a frame comes when the next one is latched, a vblank after it was shown.
 pub(crate) fn complete_on_release(id: u64, release_ns: u64) {
-    discard(id, release_ns);
+    let answers = {
+        let w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        !feedback_pending(&w, id) && w.armed.iter().any(|&(armed, _)| armed == id)
+    };
+    if answers {
+        FALLBACK_N.fetch_add(1, Ordering::Relaxed);
+        record(id, release_ns);
+    }
 }
 
 /// The frame carrying `id` will never reach the panel under that id: a newer
@@ -223,16 +321,23 @@ pub(crate) fn wait(id: u64, sc: usize, timeout_ns: u64) -> bool {
             return true;
         }
         // A committed frame counts as latched two refresh periods after its
-        // commit, whether or not its buffer ever comes back.
+        // commit, whether or not its buffer ever comes back; one whose
+        // presentation feedback is pending only at the feedback safety.
+        let grace = if feedback_pending(&w, id) {
+            FEEDBACK_SAFETY_NS
+        } else {
+            commit_grace_ns()
+        };
         let latch_by = w
             .committed
             .iter()
             .find(|&&(c, _)| c == id)
-            .map(|&(_, ns)| ns.saturating_add(commit_grace_ns()));
+            .map(|&(_, ns)| ns.saturating_add(grace));
         if let Some(latch_ns) = latch_by {
             let now_ns = crate::proxy::monotonic_ns();
             if now_ns >= latch_ns {
                 drop(w);
+                FALLBACK_N.fetch_add(1, Ordering::Relaxed);
                 record(id, latch_ns);
                 let mut w2 = WAITS.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(i) = w2.done.iter().position(|&(done, _)| done == id) {
@@ -425,6 +530,47 @@ mod tests {
         // Answered once; nothing is left armed for the release to answer again.
         assert!(!WAITS.lock().unwrap().armed.iter().any(|&(id, _)| id == 201));
         assert!(wait(201, 6, 0));
+    }
+
+    #[test]
+    fn presentation_feedback_answers_and_the_release_does_not_preempt_it() {
+        arm(401, 8);
+        expect_feedback(401);
+        committed(401, crate::proxy::monotonic_ns().saturating_sub(50_000_000), false);
+        // The release comes first (the next frame was latched): no answer.
+        complete_on_release(401, crate::proxy::monotonic_ns());
+        // Nor does the two-period grace, 50 ms after the commit.
+        assert!(!wait(401, 8, 0));
+        feedback_presented(401, 777);
+        assert!(wait(401, 8, 0));
+        // A late duplicate from another path leaves nothing behind.
+        record(401, 1);
+        assert!(!WAITS.lock().unwrap().done.iter().any(|&(id, _)| id == 401));
+    }
+
+    #[test]
+    fn a_discarded_frame_is_answered() {
+        arm(501, 9);
+        expect_feedback(501);
+        committed(501, crate::proxy::monotonic_ns(), false);
+        feedback_discarded(501, crate::proxy::monotonic_ns());
+        assert!(wait(501, 9, 0));
+    }
+
+    #[test]
+    fn a_feedback_that_never_comes_is_answered_by_the_safety() {
+        arm(601, 10);
+        expect_feedback(601);
+        committed(601, crate::proxy::monotonic_ns().saturating_sub(FEEDBACK_SAFETY_NS + 1), false);
+        assert!(wait(601, 10, 0));
+    }
+
+    #[test]
+    fn without_feedback_the_release_still_answers() {
+        arm(701, 11);
+        committed(701, crate::proxy::monotonic_ns(), false);
+        complete_on_release(701, crate::proxy::monotonic_ns());
+        assert!(wait(701, 11, 0));
     }
 
     #[test]

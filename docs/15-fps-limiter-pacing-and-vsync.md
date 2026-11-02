@@ -42,8 +42,16 @@ that rate is the display's.
   paced to the panel whether or not it asked to be. On gamescope's override route the
   mode declared per commit is FIFO while a cap is set, the guest's own otherwise, and
   mailbox under frame generation; `MESA_VK_WSI_PRESENT_MODE` decides it only off that
-  route (`docs/10`). The shim answers `vkWaitForPresentKHR` on the release, or two
-  refresh periods after the commit when no release report arrives first.
+  route (`docs/10`). On that route the shim answers `vkWaitForPresentKHR` from
+  gamescope's presentation feedback, as Mesa's Wayland WSI does: every commit that
+  carries a wait requests a `wp_presentation_feedback`, and the wait is answered on
+  `presented` (at the refresh it reports) or `discarded`. The release comes a vblank
+  later under FIFO, when the next frame is latched, and a guest that waits on every
+  frame (DXVK with VSync on) turned that into two vblanks per frame (35 fps at a 60
+  cap), so while a feedback is pending neither the release nor the grace answers; a
+  feedback that never comes is answered 100 ms after the commit. Without the global
+  (or off the override route) the wait is answered on the release, or two refresh
+  periods after the commit when no release report arrives first.
 - **Mailbox and immediate.** A guest that asked for either does not wait, and neither
   would one whose frames go out as mailbox (frame generation, or the env off the
   override route while the guest believes it has FIFO), so those waits are answered at
