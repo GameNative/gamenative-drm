@@ -67,7 +67,7 @@ use gndrm_daemon::diag::{self, Diag, Reply, Role, Stage, State, TrackedMutex, LO
 use gndrm_daemon::scanout::{
     serves_len, Geometry, Removed, Reservation as CacheReservation, ReusePool,
 };
-use gndrm_daemon::{CursorUpdate, FrameCap, Framebuffer, PlaneState, Presenter};
+use gndrm_daemon::{CommitTiming, CursorUpdate, FrameCap, Framebuffer, PlaneState, Presenter};
 use gndrm_uapi::wire::{
     scanout_ahb_format, FrameAcquired, FrameCapSubscribe, LsfgConfig, PresentDone, PresentMark,
     ScanoutAllocReq, ScanoutAllocResp, CAP_FRAME_CAP, CAP_PRESENT_ID, CAP_VSYNC_NOTE,
@@ -255,6 +255,10 @@ struct ReleaseCtx {
     /// When the daemon's apply of the transaction this registration was last
     /// published in returned, `CLOCK_MONOTONIC` ns; 0 before the first.
     applied_ns: AtomicU64,
+    /// Where the commit last published through this registration spent its
+    /// time, `CLOCK_MONOTONIC` ns (see [`Stamp`]), read by the completion to
+    /// explain a commit that was held or missed its latch.
+    stamps: [AtomicU64; STAMPS],
     /// The guest's present id for the frame currently in this registration, 0
     /// when the app did not chain one. Written by the publish path, consumed by
     /// the completion callback, which reports it with the latch time.
@@ -271,6 +275,84 @@ struct ReleaseCtx {
 // the callback thread.
 unsafe impl Send for ReleaseCtx {}
 unsafe impl Sync for ReleaseCtx {}
+
+/// The per-commit stamps a registration carries to its completion: indexes into
+/// [`ReleaseCtx::stamps`]. All are `CLOCK_MONOTONIC` ns except [`Stamp::FenceWait`],
+/// a duration.
+#[derive(Clone, Copy)]
+enum Stamp {
+    /// The serve thread began the atomic commit ioctl.
+    Received,
+    /// The serve thread queued the commit for the worker.
+    Queued,
+    /// The commit worker took it.
+    Pickup,
+    /// The worker held the presenter's state lock.
+    StateLocked,
+    /// The pool lock's map work was done.
+    PoolDone,
+    /// The retired buffers were released (gralloc).
+    Retired,
+    /// How long the previous release fence of this buffer was waited on.
+    FenceWait,
+    /// The transaction apply started.
+    ApplyStart,
+}
+const STAMPS: usize = 8;
+
+/// A commit whose apply started this long after the serve thread queued it is
+/// reported (see [`log_commit_timing`]).
+const HELD_NS: u64 = 2_000_000;
+
+/// One line, ungated and at most once a second, for a commit the daemon held
+/// more than [`HELD_NS`] or that missed the latch it was due for (the first
+/// latch after it was queued): every stage's time from the ioctl, so a trace
+/// names what the commit waited on.
+fn log_commit_timing(ctx: &ReleaseCtx, latch_ns: u64) {
+    let st = |k: Stamp| ctx.stamps[k as usize].load(Ordering::Relaxed);
+    let (rx, queued, apply) = (st(Stamp::Received), st(Stamp::Queued), st(Stamp::ApplyStart));
+    if rx == 0 || queued == 0 || apply == 0 || latch_ns == 0 {
+        return;
+    }
+    let held = apply.saturating_sub(queued) > HELD_NS;
+    let missed = gndrm_daemon::vblank::display_grid(latch_ns).map_or(0, |g| {
+        let due = gndrm_daemon::vblank::Grid { lead_ns: 0, ..g }.at_or_after(queued);
+        (latch_ns.saturating_sub(due) + g.period_ns / 2) / g.period_ns.max(1)
+    });
+    if !held && missed == 0 {
+        return;
+    }
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let last = LAST.load(Ordering::Relaxed);
+    if last != 0 && latch_ns.saturating_sub(last) < 1_000_000_000 {
+        return;
+    }
+    LAST.store(latch_ns, Ordering::Relaxed);
+    let us = |t: u64| -> i64 {
+        if t == 0 {
+            -1
+        } else {
+            (t as i64 - rx as i64) / 1000
+        }
+    };
+    crate::log_always!(
+        "{}",
+        gndrm_obf::obf!(
+            "commit timing (us from ioctl): queued={} pickup={} state_lock={} pool={} retired={} fence_wait={} apply_start={} apply_ret={} latch={} held={} missed_latches={}",
+            us(queued),
+            us(st(Stamp::Pickup)),
+            us(st(Stamp::StateLocked)),
+            us(st(Stamp::PoolDone)),
+            us(st(Stamp::Retired)),
+            st(Stamp::FenceWait) / 1000,
+            us(apply),
+            us(ctx.applied_ns.load(Ordering::Relaxed)),
+            us(latch_ns),
+            u8::from(held),
+            missed
+        )
+    );
+}
 
 // ---------------------------------------------------------------- present ids
 //
@@ -444,6 +526,7 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
         if latch > 0 {
             latch_ns = latch as u64;
             crate::vsync::sample(latch_ns, ctx.applied_ns.load(Ordering::Relaxed));
+            log_commit_timing(ctx, latch_ns);
         }
     }
     note_present_done(ctx.present_id.swap(0, Ordering::AcqRel), latch_ns);
@@ -855,6 +938,7 @@ fn new_release_ctx(api: &ffi::ScApi) -> (*mut ReleaseCtx, Arc<AtomicBool>) {
         release_fd: AtomicI32::new(-1),
         latch_time: api.st_stats_latch_time,
         applied_ns: AtomicU64::new(0),
+        stamps: [const { AtomicU64::new(0) }; STAMPS],
         present_id: AtomicU64::new(0),
         latched: Arc::clone(&latched),
     }));
@@ -1010,6 +1094,13 @@ pub struct AscState {
     last_publish: Option<LastPublish>,
     frames: u64,
     warned_fence_timeout: bool,
+    /// The daemon stamps of the commit being published and the stages this
+    /// presenter adds (state lock, pool, retire, fence wait), copied into the
+    /// registration at the apply (see [`Stamp`]).
+    commit_stamps: [u64; STAMPS],
+    /// When the last publish's apply started, taken by the commit worker for
+    /// the flip event's stamp.
+    last_apply_start: Option<u64>,
     /// Inodes already reported as having no registered buffer (log once each).
     logged_unregistered: Vec<u64>,
     /// Inodes already reported as re-publishing a stale buffer (log once each).
@@ -1122,6 +1213,8 @@ impl AscState {
             last_publish: None,
             frames: 0,
             warned_fence_timeout: false,
+            commit_stamps: [0; STAMPS],
+            last_apply_start: None,
             logged_unregistered: Vec::new(),
             logged_stale: Vec::new(),
             last_rect_log: None,
@@ -1320,12 +1413,14 @@ impl AscState {
             };
             (pooled, stale, removed, pool.pool_misses())
         };
+        self.commit_stamps[Stamp::PoolDone as usize] = crate::vsync::now_ns();
 
         // Retain the retired buffers whose flip event has been reported for
         // reuse, and release the rest: a gralloc call with no latency bound,
         // explicitly outside the pool lock.
         let released = retire_to_release(&removed);
         release_retired(&released);
+        self.commit_stamps[Stamp::Retired as usize] = crate::vsync::now_ns();
         self.retire_foreign(live_inos, keep);
 
         // A buffer the pool does not own is copied into one the presenter
@@ -1423,8 +1518,13 @@ impl AscState {
                 }
                 // SAFETY: `ctx` points at the leaked mailbox of this slot.
                 let pending = unsafe { (*ctx).release_fd.swap(-1, Ordering::AcqRel) };
+                self.commit_stamps[Stamp::FenceWait as usize] = 0;
                 if pending >= 0 {
-                    if wait_fence(pending) && !self.warned_fence_timeout {
+                    let t_fence = crate::vsync::now_ns();
+                    let timed_out = wait_fence(pending);
+                    self.commit_stamps[Stamp::FenceWait as usize] =
+                        crate::vsync::now_ns().saturating_sub(t_fence);
+                    if timed_out && !self.warned_fence_timeout {
                         self.warned_fence_timeout = true;
                         log_warn!("{}", gndrm_obf::obf!(
                             "asc: previous release fence timed out; reusing buffer anyway (logged once)"
@@ -1573,7 +1673,18 @@ impl AscState {
                     }
                     match build_show(&api, self.sc, ahb, ctx, rect, fence) {
                         Some(tx) => {
+                            let apply_start = crate::vsync::now_ns();
+                            self.commit_stamps[Stamp::ApplyStart as usize] = apply_start;
+                            // SAFETY: `ctx` is the leaked mailbox of this slot;
+                            // the stamps are written before the apply, so the
+                            // completion it causes reads this commit's.
+                            unsafe {
+                                for (k, v) in self.commit_stamps.iter().enumerate() {
+                                    (*ctx).stamps[k].store(*v, Ordering::Relaxed);
+                                }
+                            }
                             apply_transaction(&api, tx);
+                            self.last_apply_start = Some(apply_start);
                             // SAFETY: `ctx` is the leaked mailbox of this slot.
                             unsafe {
                                 (*ctx)
@@ -2408,12 +2519,20 @@ impl Drop for AscState {
 /// The presenter the daemon drives: a handle onto the shared [`AscState`].
 pub struct AscPresenter {
     state: Arc<Mutex<AscState>>,
+    /// The daemon stamps of the commit about to be published.
+    timing: CommitTiming,
+    /// The last publish's apply start, for the flip event.
+    apply_start: Option<u64>,
 }
 
 impl AscPresenter {
     #[must_use]
     pub fn new(state: Arc<Mutex<AscState>>) -> Self {
-        Self { state }
+        Self {
+            state,
+            timing: CommitTiming::default(),
+            apply_start: None,
+        }
     }
 
     /// The lock cannot be left poisoned: the presenter runs under
@@ -2445,12 +2564,30 @@ impl Presenter for AscPresenter {
         live_inos: &HashSet<u64>,
         fence: Option<RawFd>,
     ) {
-        self.lock()
-            .publish(fb, plane, ino, src_fd, live_inos, fence);
+        let timing = core::mem::take(&mut self.timing);
+        let mut st = self.lock();
+        st.commit_stamps = [0; STAMPS];
+        st.commit_stamps[Stamp::Received as usize] = timing.received_ns;
+        st.commit_stamps[Stamp::Queued as usize] = timing.queued_ns;
+        st.commit_stamps[Stamp::Pickup as usize] = timing.pickup_ns;
+        st.commit_stamps[Stamp::StateLocked as usize] = crate::vsync::now_ns();
+        st.last_apply_start = None;
+        st.publish(fb, plane, ino, src_fd, live_inos, fence);
+        let apply_start = st.last_apply_start.take();
+        drop(st);
+        self.apply_start = apply_start;
     }
 
     fn publish_cursor(&mut self, cursor: &CursorUpdate, src_fd: Option<RawFd>) {
         self.lock().publish_cursor(cursor, src_fd);
+    }
+
+    fn note_commit_timing(&mut self, timing: CommitTiming) {
+        self.timing = timing;
+    }
+
+    fn take_apply_start_ns(&mut self) -> Option<u64> {
+        self.apply_start.take()
     }
 }
 

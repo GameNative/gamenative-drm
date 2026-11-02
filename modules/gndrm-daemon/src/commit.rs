@@ -49,6 +49,7 @@ impl Device {
         payload: &[u8],
         mut fd_in: Option<RawFd>,
     ) -> DispatchResult {
+        self.atomic_rx_ns = crate::mono_ns();
         let Some(a) = pod_read::<DrmModeAtomic>(payload) else {
             return DispatchResult::err(errno::EINVAL);
         };
@@ -585,6 +586,8 @@ impl Device {
             event,
             cursor,
             cursor_src_fd,
+            received_ns: self.atomic_rx_ns,
+            queued_ns: crate::mono_ns(),
         });
     }
 

@@ -354,6 +354,20 @@ enum AppCall {
     Failed,
 }
 
+/// The calling thread's kernel name (`comm`, at most 15 bytes).
+fn thread_comm() -> Option<[u8; 16]> {
+    let mut buf = [0u8; 16];
+    // SAFETY: PR_GET_NAME writes at most 16 bytes, NUL-terminated, into `buf`.
+    let rc = unsafe { libc::prctl(libc::PR_GET_NAME, buf.as_mut_ptr()) };
+    (rc == 0 && buf[0] != 0).then_some(buf)
+}
+
+/// Set the calling thread's kernel name back to `name` (from [`thread_comm`]).
+fn set_thread_comm(name: &[u8; 16]) {
+    // SAFETY: `name` is NUL-terminated within 16 bytes, as PR_SET_NAME reads.
+    unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) };
+}
+
 /// Attach the calling thread (kept attached — a per-frame caller keeps one
 /// attachment instead of re-attaching each call, and the thread dies with the
 /// session), call a no-arg static method on `GameNativeDrm`. The class must be
@@ -374,7 +388,15 @@ fn call_app_static(method: &str) -> AppCall {
         );
         return AppCall::Failed;
     };
-    let mut env = match vm.attach_current_thread_permanently() {
+    // ART names a thread it attaches without a name `Thread-N` and renames the
+    // native thread to match, so the presenter's threads read as `Thread-72` in
+    // `ps`/`top`. Keep the name the thread had.
+    let keep_name = vm.get_env().is_err().then(thread_comm).flatten();
+    let attached = vm.attach_current_thread_permanently();
+    if let Some(name) = keep_name {
+        set_thread_comm(&name);
+    }
+    let mut env = match attached {
         Ok(env) => env,
         Err(e) => {
             log_warn!(

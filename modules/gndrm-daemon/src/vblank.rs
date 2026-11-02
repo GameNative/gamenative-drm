@@ -603,10 +603,12 @@ pub fn display_grid(now_ns: u64) -> Option<Grid> {
 ///
 /// gamescope re-anchors its whole vblank schedule on each event's timestamp, so
 /// the timestamp is the latch the frame lands on — the first latch instant of
-/// the display's [`Grid`] at or after the publish returned — moved earlier by
+/// the display's [`Grid`] at or after the publish's apply started — moved earlier by
 /// the grid's lead (see [`LeadLoop`]). A frame published between the deadline
 /// Choreographer predicted and the latch `SurfaceFlinger` actually took is
-/// claimed for that latch, not the next: claiming the next would push
+/// claimed for that latch, not the next, and so is one whose apply returned
+/// after the latch because the worker was preempted inside or after it: SurfaceFlinger
+/// already had the transaction. Claiming the next would push
 /// gamescope's next wakeup a whole period out and leave one latch with no new
 /// frame. While no grid is known the timeline walks the mode's advertised
 /// interval from the clock, as before any source reported.
@@ -915,6 +917,30 @@ mod tests {
         assert_eq!(tl.claim(T0, None, i), T0);
         assert_eq!(tl.claim(T0, None, i), T0 + i);
         assert_eq!(tl.claim(T0 + 3 * i + 5, None, i), T0 + 4 * i);
+    }
+
+    #[test]
+    fn a_worker_preempted_past_the_latch_still_claims_the_latch_it_made() {
+        // 18.42 s in the SWD2 trace: the apply started 0.85 ms before the latch,
+        // the worker returned 6 ms after it. Stamped from the apply start, the
+        // event names the latch SurfaceFlinger used; from the return, the next.
+        let grid = Grid {
+            anchor_ns: T0,
+            period_ns: P,
+            source: GridSource::ChoreographerDeadline,
+            lead_ns: 2_000_000,
+        };
+        let latch = T0 + 10 * P;
+        let mut from_start = VblankTimeline::default();
+        let mut from_return = VblankTimeline::default();
+        assert_eq!(
+            from_start.claim(latch - 850_000, Some(grid), 16_666_666),
+            latch - 2_000_000
+        );
+        assert_eq!(
+            from_return.claim(latch + 6_000_000, Some(grid), 16_666_666),
+            latch + P - 2_000_000
+        );
     }
 
     #[test]
