@@ -109,6 +109,7 @@ pub fn vkshim_enabled() -> bool {
     }
 }
 
+pub mod advertise;
 pub mod divisor;
 pub mod export;
 pub mod placed;

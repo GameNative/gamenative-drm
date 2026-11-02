@@ -164,6 +164,10 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceFeatures2(pd: VkPhysicalDevice, f
     if !f.is_null() {
         unsafe { crate::present::features2((*(f as *mut BaseOut)).pNext) };
     }
+    // The wrapper's feature lift, masked back to the driver at create time
+    // (`advertise`): a gamescope guest reads this shim where an X11 guest reads
+    // the wrapper, and the driver's gated zeros cost DXVK the feature level.
+    unsafe { crate::advertise::features(f) };
     if !enabled() || f.is_null() {
         return;
     }

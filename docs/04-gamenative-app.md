@@ -194,6 +194,37 @@ runnable as the session guest via `GUEST_PROGRAM_LAUNCHER_COMMAND`:
 log each presented frame to logcat (`System.out`). Colors on screen = the
 corresponding path works end to end.
 
+**Feature lift.** A container's X11 ICD is the wrapper (`libvulkan_wrapper.so`),
+which reports a fixed set of `VkPhysicalDeviceFeatures` whatever the driver
+answers and then ANDs each one back to the driver's own answer at
+`vkCreateDevice` (`wrapper_physical_device.c`: `supported_features->dualSrcBlend
+= true; // Missing on G715 r38p1`; `wrapper_device.c`: `DISABLE_FEATURE`). Both
+halves are the mechanism — a driver that gates a feature it implements refuses a
+create that requests the bit (`VK_ERROR_FEATURE_NOT_PRESENT`), so advertising
+alone turns a higher D3D feature level into a failed device. A gamescope guest
+has this shim as its ICD instead, so the shim carries the same pair
+(`icd_shim/src/advertise.rs`): `geometryShader`, `multiViewport`, `depthClamp`,
+`depthBiasClamp`, `fillModeNonSolid`, `shaderClipDistance`, `shaderCullDistance`,
+`dualSrcBlend`, `multiDrawIndirect` and `vertexPipelineStoresAndAtomics` are
+reported as supported in `vkGetPhysicalDeviceFeatures2`, and at create each is
+masked back to the driver's answer on both ways a guest can ask — the 1.0
+`pEnabledFeatures` and a `VkPhysicalDeviceFeatures2` in the create's `pNext`.
+Without it a Turnip build that misdetects the chip reports those bits as zero,
+DXVK answers `D3D_FEATURE_LEVEL_0`, and the game exits with "Minimum required
+feature level D3D_FEATURE_LEVEL_10_0 not supported" — under X11 the same driver
+and container reach 11_1 through the wrapper. `textureCompressionBC` is
+deliberately not lifted: the wrapper backs that bit with real BCN decoding
+(`bcdec.c`, the bc6/bc7 compute shaders) and this shim has no such path, so
+advertising it would trade a clean unsupported-format for corrupt textures.
+`logicOp` and `variableMultisampleRate` stay the driver's answer, as in the
+wrapper.
+
+Two lines under `GNDRM_LOG_VKSHIM=1` carry the diagnosis: `wrapper-style feature
+lift over the driver's zeros: <bits>` names what was raised, and `feature lift
+masked back to the driver's answer: <bits>` names what the driver will not
+actually have enabled — the calibration fact when a guest misbehaves under a
+lift the driver gated.
+
 ### 3.5 Desktop naming: `/desktop=gamescope`, never `shell`
 
 GameScope game launches run `wine explorer /desktop=gamescope,<WxH> …`:
