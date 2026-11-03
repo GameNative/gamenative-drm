@@ -11,15 +11,23 @@ cursor, scan-out and mode patches.
 
 | place | what it holds | set by |
 |---|---|---|
-| the shim's declared present mode | FIFO while a cap is set, so gamescope's limiter holds each frame to its limited vblank | `FrameCapNote{fps}` from the daemon (`docs/10`) |
-| gamescope's own limiter | `nRefreshHz / nTargetFPS`, a divisor of the mode's rate | `debug_set_fps_limit`, sent only when generation is off |
+| the shim's declared present mode | the container's `MESA_VK_WSI_PRESENT_MODE` (else the guest's mode); with no cap, a guest's FIFO request over a non-FIFO env; FIFO under a cap at the display's rate; mailbox under frame generation | the container, the guest and the cap (`docs/10`) |
+| gamescope's own limiter | `nRefreshHz / nTargetFPS`, a divisor of the mode's rate; holds FIFO commits only | `debug_set_fps_limit`, sent only when generation is off |
+| the shim's acquire gate | the cap, on the display's vblank grid, unless the container's mode is FIFO | `FrameCapNote{fps}` and `VsyncNote` from the daemon |
 | the presenter's latch grid | the display's latch points, as measured | `VsyncNote` from the daemon (`docs/17`) |
 
-They work together: the app hands gamescope the cap, gamescope's limiter passes every
-`nRefreshHz / target`-th vblank (`nVblankDivisor = nRefreshHz / min(target, nRefreshHz)`),
-and the shim's FIFO declaration is what makes the limiter hold the guest's commits. Under
-frame generation the app disarms gamescope's limiter and the shim's time gate holds the
-source rate instead (`docs/17`).
+Which one holds the cap follows the declared mode. Declared FIFO (the container set
+fifo, or no env and a FIFO guest), gamescope's limiter passes every
+`nRefreshHz / target`-th vblank (`nVblankDivisor = nRefreshHz / min(target, nRefreshHz)`)
+and holds the guest's commits to it. Declared mailbox, immediate or FIFO-relaxed (mailbox
+is the container default), the limiter does not hold them and the shim's acquire gate
+releases the guest's frames on the display's vblank grid. A container in one of those
+modes under a cap at the display's rate is declared FIFO with the gate kept
+(`source=cap-rate`): gamescope latches one commit per vblank at its own wakeup, which the
+shim cannot see under mailbox (`docs/10`), and the gate keeps the FIFO queue about one
+frame deep. Under frame generation the app
+disarms gamescope's limiter and the shim's time gate holds the source rate instead
+(`docs/17`).
 
 ## 2. The mode is the display's rate
 
@@ -40,9 +48,9 @@ that rate is the display's.
 
 - **FIFO.** A present is requeued until the display releases a buffer, so the guest is
   paced to the panel whether or not it asked to be. On gamescope's override route the
-  mode declared per commit is FIFO while a cap is set, the guest's own otherwise, and
-  mailbox under frame generation; `MESA_VK_WSI_PRESENT_MODE` decides it only off that
-  route (`docs/10`). On that route the shim answers `vkWaitForPresentKHR` from
+  mode declared per commit is the container's `MESA_VK_WSI_PRESENT_MODE` (the guest's
+  own without it), cap or no cap, and mailbox under frame generation (`docs/10`). On
+  that route the shim answers `vkWaitForPresentKHR` from
   gamescope's presentation feedback, as Mesa's Wayland WSI does: every commit that
   carries a wait requests a `wp_presentation_feedback`, and the wait is answered on
   `presented` (at the refresh it reports) or `discarded`. The release comes a vblank
@@ -58,12 +66,12 @@ that rate is the display's.
   unfocused game, or one behind a dialog, is therefore still answered once per vblank.
   Mesa blocks until the event comes; the shim answers a feedback that never comes
   100 ms after the commit, a backstop for a compositor fault, not a path a working
-  session takes (the census's `fallback=` counts it). Without the global
+  session takes (the `fallback=` counter of the periodic `present mode:` line counts it; that line repeats with `GNDRM_LOG_VKSHIM=1`, while the ungated one prints at session start and on a change of the declared mode, its source, the cap or the gate, `docs/10`). Without the global
   (or off the override route) the wait is answered on the release, or two refresh
   periods after the commit when no release report arrives first.
 - **Mailbox and immediate.** A guest that asked for either does not wait, and neither
-  would one whose frames go out as mailbox (frame generation, or the env off the
-  override route while the guest believes it has FIFO), so those waits are answered at
+  would one whose frames go out as mailbox or immediate (frame generation, or the
+  container's env while the guest believes it has FIFO), so those waits are answered at
   the commit rather than holding the guest's frame-latency loop for two periods
   (`answers_present_wait_at_commit`).
 - **A replaced frame.** Under mailbox a frame can be replaced before it is shown. It is
@@ -114,15 +122,32 @@ that rate is the display's.
   deadline stamp on that device). The stamps are earlier than the light by the lead plus
   the compositor's pipeline; consumers read differences between stamps (frame time),
   which a constant offset does not touch.
-- **The guest is paced by gamescope's FIFO latch, not by a gate of its own.** With a
-  cap set, the shim declares FIFO on every commit, as gamescope's WSI layer does on a PC
-  while the limiter is engaged; gamescope latches one FIFO commit per limited vblank, on
-  the display's vblank stream above, and hands the previous buffer back with
-  `wl_buffer.release`, which is what frees the guest's next acquire. A gate on the shim's
-  own clock (exactly 1e9 / N ns) beat against the display's 59.97-59.99 Hz and, with the
-  env's mailbox declaration, left no queue to absorb a late frame. A cap that is not the
-  display's rate over a whole number runs at gamescope's next divisor rate above it
-  (`docs/10`).
+- **Under FIFO the guest is paced by gamescope's FIFO latch; otherwise by a gate on
+  the display's vblank grid.** Declared FIFO with a cap set, gamescope latches one FIFO
+  commit per limited vblank, on the display's vblank stream above, and hands the
+  previous buffer back with `wl_buffer.release`, which is what frees the guest's next
+  acquire; a cap that is not the display's rate over a whole number runs at gamescope's
+  next divisor rate above it. Declared FIFO because the cap is the display's rate
+  (`source=cap-rate`), the gate below also runs, so the guest starts at most one frame
+  per vblank and the FIFO list stays about one frame deep. Declared anything else,
+  gamescope takes the newest commit at each composite and the shim's acquire gate is
+  the cap (`icd_shim/src/vsync_gate.rs`).
+  Its release points are the instants the flip events are stamped at: the daemon's
+  latch grid (`VsyncNote` anchor and measured period) minus the stamp lead
+  (`stamp_lead_ns`). gamescope wakes to composite just before each (wakeup = stamp +
+  interval − draw time − red zone), so a frame released there starts right after
+  gamescope took the previous one and has the period, less gamescope's margin, to reach
+  the next composite. A cap at the display's rate releases every vblank, a divisor cap
+  every `refresh / cap`-th, any other cap below the rate the vblank nearest each instant
+  of an ideal `1e9 / cap` timeline; a frame late for its point starts at once and the
+  schedule goes on, so a guest below the cap is never quantized to a divisor; a phase
+  push never lets two releases into one vblank. The gate this replaces ran on the shim's
+  own clock (exactly 1e9 / N ns) and beat against the display's 59.97-59.99 Hz
+  (57-59 fps at a 60 cap). A cap above the rate runs on the cap's own clock
+  (`gate=clock`, also frame generation's source rate). Without the stamp lead (no
+  note yet, or a daemon that predates it) the gate does not run: a capped swapchain is
+  declared FIFO and gamescope's limiter holds it (`source=cap-compat`), so a
+  payload-only rollout keeps today's pacing until the app ships the daemon.
 - **Fallbacks.** On API 29-32 Choreographer reports the vsync time only
   (`AChoreographer_postFrameCallback64`): its measured period is used with the latch
   grid's phase (`vsync.rs`, from `ASurfaceTransactionStats_getLatchTime`), or the vsync
@@ -136,16 +161,24 @@ that rate is the display's.
 
 ## Behaviour changes in gamescope sessions
 
-- **FIFO games without a cap are vsynced.** The env's mailbox used to be declared for
-  every swapchain; now a guest that asks for FIFO gets FIFO, as on a PC.
-- **Mailbox and immediate games keep the mode they asked for** when no cap is set, and
-  are declared FIFO while one is.
-- **`MESA_VK_WSI_PRESENT_MODE` is ignored on the gamescope route** (it still applies to
-  the X11 Present route), including a value the user picked in the driver settings; on a
-  PC it reaches only Mesa below gamescope's layer.
-- **Caps that do not divide the display's rate** run at gamescope's divisor rate:
-  `floor(refresh / target)` vblanks, so 40 or 45 on 60 Hz runs at 60 and 50 on 120 Hz at
-  60.
+- **The container's present mode is declared, except under a cap at the display's
+  rate.** `MESA_VK_WSI_PRESENT_MODE` decides the mode on the gamescope route as on the
+  X11 Present route; without it the guest's own mode is declared. A container left at
+  the mailbox default runs, with no cap, FIFO for a guest that asked for FIFO (its
+  own VSync, `source=guest`) and mailbox for any other guest, and mailbox capped by the shim's
+  vblank-grid gate under a cap below the display's rate. Under a cap at the display's
+  rate it is declared FIFO with the gate kept (`source=cap-rate`), because the shim
+  cannot keep two mailbox commits out of one gamescope composite (`docs/10`). One set
+  to fifo runs FIFO under gamescope's limiter.
+- **A game below the cap keeps its own rate under mailbox** (caps below the display's
+  rate). Under FIFO and gamescope's
+  limiter each frame is held to whole limited vblanks, so a game below the cap judders
+  between divisors of the display's rate, and one that waits on every present holds at
+  the next divisor below (refresh / 2 at a refresh-rate cap); the gate starts a late
+  frame at once instead.
+- **Caps that do not divide the display's rate** run at gamescope's divisor rate under
+  FIFO: `floor(refresh / target)` vblanks, so 40 or 45 on 60 Hz runs at 60 and 50 on
+  120 Hz at 60. Under mailbox the gate averages them on vblanks.
 - **Queue latency.** Under FIFO a guest faster than the cap fills its free slots, so
   up to `slots − 1` frames can wait in gamescope's FIFO list: at low caps that is up to
   that many limited periods of input latency, as on a PC. A guest that uses present wait
@@ -154,15 +187,19 @@ that rate is the display's.
   mailbox discipline with the slot count it was created with (`minImageCount + 1`, one
   fewer than a swapchain created with generation on) until the guest recreates it.
 - **Toggling frame generation** sends the cap change and the generation settings
-  separately; between the two, for a moment, the guest's own mode is declared with no
-  gate, so a mailbox/immediate guest can run uncapped for a few frames.
+  separately; between the two, for a moment, the swapchain's mode is declared with no
+  cap, so a mailbox/immediate swapchain can run uncapped for a few frames.
 
 ## 4. What the daemon owns
 
 - The latch grid: `ASurfaceTransactionStats_getLatchTime` on every publish, the phase
-  tracked in `vsync.rs`, and a `VsyncNote` (`anchor_ns, period_ns, lead_ns`) pushed
-  whenever its phase moves by more than 300 µs or its period by more than 1 µs, and once
-  on subscribe. Its period is the one measured from Choreographer while that is locked
+  tracked in `vsync.rs`, and a `VsyncNote` (`anchor_ns, period_ns, lead_ns,
+  stamp_lead_ns`) pushed whenever its phase, lead or stamp lead moves by more than
+  300 µs or its period by more than 1 µs, and once on subscribe. `stamp_lead_ns` is the
+  flip events' lead (below), so `anchor_ns - stamp_lead_ns` is gamescope's vblank grid,
+  the one the shim's acquire gate releases on. The daemon sends at least 1 ns while
+  the flip events follow a grid, so 0 means "not known" (no grid, or a daemon that
+  predates the field), and the shim then declares FIFO under a cap instead of gating. Its period is the one measured from Choreographer while that is locked
   (the mode's advertised rate otherwise), so frame generation extrapolates
   the display's real rate. Its anchor is also the
   flip timeline's phase where Choreographer gives no deadline, and its fallback.
@@ -187,11 +224,26 @@ measures — the latch grid to the presenter, the vsync timeline in the flip eve
 
 ## 5. Measured on device
 
-Retroid Pocket Nova (120 Hz panel, a 60 Hz mode available), Hades II, Vulkan through
-zink:
+Retroid Pocket 6 (59.97-59.98 Hz), DTD title scene, cap 60, against master's FIFO
+declaration on the same scene (59.22 fps, 1.3 % doubles):
 
-- **The gate holds the cap.** Cap 40: 40.2 acquires a second over 30 s, 0.1 skipped
-  batches a second, `gate_avg_us` ≈ 22 ms against a 25 ms period.
+- **A cap at the display's rate, declared FIFO with the vblank-grid gate**
+  (`source=cap-rate gate=vsync`): in-game VSync off, 59.199 fps on `SurfaceFlinger`
+  and 1.3 % doubles over 60 s, shim commits equal to the daemon's publishes within
+  0-2 per 10 s (the guest paces itself at ~59.3); VSync on, 59.983 fps and no
+  doubles.
+- **The same cap declared mailbox with the gate** lost ~1 commit a second inside
+  gamescope's mailbox (58.3 fps, 2.8 % doubles), which is why it is declared FIFO
+  (`docs/10`).
+
+Retroid Pocket Nova (120 Hz panel, a 60 Hz mode available), Hades II, Vulkan through
+zink, measured before the vblank-grid gate, when the acquire gate ran on the cap's
+own clock for every capped session (it now does so only for frame generation's
+source rate, a cap above the display's rate and the X11 Present route; a capped
+gamescope session is held as in §3):
+
+- **The clock gate held the cap.** Cap 40: 40.2 acquires a second over 30 s, 0.1
+  skipped batches a second, `gate_avg_us` ≈ 22 ms against a 25 ms period.
 - **Generation follows the multiplier, the display does not.** Cap 40 with frame
   generation at x2 / x3 / x4 produces and counts 80 / 120 / 160 frames a second, while
   the mode stays at the display's rate (120 Hz, or 60 Hz on a 60 Hz panel).
