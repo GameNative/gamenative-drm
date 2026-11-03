@@ -245,14 +245,19 @@ impl Schedule {
     /// read on the grid as it is now: the daemon re-pushes the phase as it
     /// moves, and a point booked on the old phase must not let two releases
     /// into one period of the new one. Starts later than [`ON_TIME_NS`] after
-    /// their point are counted (`gate_late`), with the points passed (`skipped`).
+    /// their point are counted (`gate_late`), with the points passed (`skipped`),
+    /// and the release after a late start is never more than one grid instant
+    /// after it.
     pub(crate) fn book(&mut self, now_ns: u64, grid: Grid, interval_ns: u64) -> u64 {
         if grid.period_ns == 0 {
             return self.book_clock(now_ns, interval_ns);
         }
         let at = grid.at_or_before(now_ns);
         let due = (self.next_ns != 0).then(|| grid.nearest(self.next_ns));
-        if let Some(due) = due.filter(|&d| now_ns >= d.saturating_add(ON_TIME_NS)) {
+        // Late against the instant the acquire was released for, which after a
+        // clock booking is off the grid.
+        let late = due.filter(|_| now_ns >= self.next_ns.saturating_add(ON_TIME_NS));
+        if let Some(due) = late {
             LATE_N.fetch_add(1, Ordering::Relaxed);
             SKIPPED_N.fetch_add(at.saturating_sub(due) / grid.period_ns, Ordering::Relaxed);
         }
@@ -262,9 +267,17 @@ impl Schedule {
         };
         let ideal_next = ideal.saturating_add(interval_ns);
         // Never two releases on one grid instant.
-        let next = grid
+        let mut next = grid
             .nearest(ideal_next)
             .max(slot.saturating_add(grid.period_ns));
+        let mut ideal_next = ideal_next;
+        if late.is_some() && next > at.saturating_add(grid.period_ns) {
+            // A late start already cost the guest time: the release after it
+            // is the next grid instant after it, never a whole slot further,
+            // and the timeline goes on from there.
+            next = at.saturating_add(grid.period_ns);
+            ideal_next = next;
+        }
         self.ideal_ns = ideal_next;
         self.next_ns = next;
         next
@@ -510,15 +523,44 @@ mod tests {
     }
 
     #[test]
-    fn a_late_frame_on_a_divisor_cap_waits_for_no_more_than_the_schedule() {
-        // 30 on 60, the guest late by most of a vblank: it starts at once, and
-        // the one after it is due at the slot after the one it was given.
+    fn a_late_frame_on_a_divisor_cap_waits_for_no_more_than_the_next_grid_instant() {
+        // 30 on 60, the guest late by half a vblank: it starts at once, and the
+        // release after it is the next grid instant, not a whole slot later.
         let g = grid(P60);
         let iv = interval(pacing(30, Some(g)));
         let mut s = Schedule::default();
         let due = s.book(g.anchor_ns, g, iv);
         assert_eq!(due, g.anchor_ns + 2 * P60);
-        assert_eq!(s.book(due + P60 / 2, g, iv), due + 2 * P60);
+        assert_eq!(s.book(due + P60 / 2, g, iv), due + P60);
+        // An on-time guest is still held to every second vblank.
+        let next = s.next_ns;
+        assert_eq!(s.book(next + 50_000, g, iv), next + 2 * P60);
+    }
+
+    #[test]
+    fn a_guest_with_16_ms_of_work_is_never_skipped() {
+        // 16 ms from acquire to the next acquire on a 59.97 Hz grid, and every
+        // seventh frame 1.5 ms slower (late for its point): the late frames
+        // start at once, the release after each is the next grid instant, and
+        // every vblank gets a start.
+        let g = grid(P60);
+        let iv = interval(pacing(60, Some(g)));
+        let mut s = Schedule::default();
+        let mut t = g.anchor_ns;
+        let mut starts = Vec::new();
+        for n in 0..600 {
+            if s.next_ns != 0 && t < s.next_ns {
+                t = s.next_ns + 50_000;
+            }
+            starts.push(t);
+            s.book(t, g, iv);
+            t += if n % 7 == 6 { 17_500_000 } else { 16_000_000 };
+        }
+        let v = vblanks(g, &starts);
+        assert!(
+            v.windows(2).all(|w| w[1] == w[0] + 1),
+            "a vblank was skipped"
+        );
     }
 
     /// One test for the process-global grid, so no other test races it.
