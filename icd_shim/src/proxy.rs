@@ -233,10 +233,10 @@ const X11_TRACE_N: usize = 24;
 /// so it is bounded to the first few presents only.
 const X11_VIEW_N: u32 = 3;
 static RATE_STALL: Mutex<Option<Instant>> = Mutex::new(None);
-// The ungated present-mode census (see `mode_census`): commits declared to
-// gamescope as FIFO and as anything else, and every compositor release. Kept
-// apart from the gated WSI census, whose counters only move while
-// `GNDRM_LOG_VKSHIM` is set.
+// The present-mode census's counters (see `mode_census`): commits declared to
+// gamescope as FIFO and as anything else, and every compositor release. They
+// count whether or not `GNDRM_LOG_VKSHIM` is set, unlike the WSI census's, so
+// the periodic line reads the session from its start when the switch is on.
 static DECL_FIFO_N: AtomicUsize = AtomicUsize::new(0);
 static DECL_OTHER_N: AtomicUsize = AtomicUsize::new(0);
 static REL_ALL_N: AtomicUsize = AtomicUsize::new(0);
@@ -6287,47 +6287,47 @@ mod tests {
         for mode in [m, i, r] {
             // No cap: the swapchain's mode, lead or no lead.
             assert_eq!(
-                choose_live_mode(mode, ModeSource::Guest, mode, false, 0, g60, false),
+                choose_live_mode(mode, ModeSource::Guest, mode, false, 0, g60),
                 (mode, Declared::Mode)
             );
             assert_eq!(
-                choose_live_mode(mode, ModeSource::Guest, mode, false, 0, None, false),
+                choose_live_mode(mode, ModeSource::Guest, mode, false, 0, None),
                 (mode, Declared::Mode)
             );
             // A cap at the display's rate: FIFO.
             assert_eq!(
-                choose_live_mode(mode, ModeSource::Guest, mode, false, 60, g60, false),
+                choose_live_mode(mode, ModeSource::Guest, mode, false, 60, g60),
                 (f, Declared::CapRate)
             );
             // A cap below it: the swapchain's mode.
             assert_eq!(
-                choose_live_mode(mode, ModeSource::Guest, mode, false, 60, g120, false),
+                choose_live_mode(mode, ModeSource::Guest, mode, false, 60, g120),
                 (mode, Declared::Mode)
             );
             assert_eq!(
-                choose_live_mode(mode, ModeSource::Guest, mode, false, 30, g60, false),
+                choose_live_mode(mode, ModeSource::Guest, mode, false, 30, g60),
                 (mode, Declared::Mode)
             );
             // Capped without the lead: FIFO, gamescope's limiter.
             assert_eq!(
-                choose_live_mode(mode, ModeSource::Guest, mode, false, 60, None, false),
+                choose_live_mode(mode, ModeSource::Guest, mode, false, 60, None),
                 (f, Declared::CapCompat)
             );
         }
         // A FIFO swapchain: FIFO, whatever the cap or the lead.
         for (cap, grid) in [(0, g60), (60, g60), (30, g60), (60, None)] {
             assert_eq!(
-                choose_live_mode(f, ModeSource::Guest, f, false, cap, grid, false),
+                choose_live_mode(f, ModeSource::Guest, f, false, cap, grid),
                 (f, Declared::Mode)
             );
         }
         // Frame generation: mailbox, whatever the mode.
         assert_eq!(
-            choose_live_mode(f, ModeSource::Guest, f, true, 60, g60, false),
+            choose_live_mode(f, ModeSource::Guest, f, true, 60, g60),
             (m, Declared::Generating)
         );
         assert_eq!(
-            choose_live_mode(m, ModeSource::Guest, m, true, 0, None, false),
+            choose_live_mode(m, ModeSource::Guest, m, true, 0, None),
             (m, Declared::Generating)
         );
     }
@@ -6380,63 +6380,6 @@ mod tests {
         );
     }
 
-    /// The mailbox-at-display-rate test switch: only the cap-at-rate case
-    /// changes, to the swapchain's mode with the vblank-grid gate kept.
-    #[test]
-    fn the_mailbox_at_rate_switch_keeps_the_mode_and_the_gate_at_the_display_rate() {
-        use crate::vsync_gate::Pacing;
-        let (m, f, i) = (
-            VK_PRESENT_MODE_MAILBOX_KHR,
-            VK_PRESENT_MODE_FIFO_KHR,
-            VK_PRESENT_MODE_IMMEDIATE_KHR,
-        );
-        let g = test_grid(16_675_004); // 59.97 Hz
-        let g60 = Some(g);
-        let g120 = Some(test_grid(8_333_333));
-        for mode in [m, i] {
-            // Cap at the display's rate: the mode stays, the gate every vblank.
-            let choice = choose_live_mode(mode, ModeSource::Guest, mode, false, 60, g60, true);
-            assert_eq!(choice, (mode, Declared::EnvAtRate));
-            assert_eq!(
-                gamescope_route_pacing(choice, None, 60, g60),
-                Pacing::Grid {
-                    grid: g,
-                    interval_ns: 16_675_004
-                }
-            );
-            // Everything else is the default rule.
-            for (cap, grid) in [(0, g60), (60, g120), (30, g60), (60, None)] {
-                assert_eq!(
-                    choose_live_mode(mode, ModeSource::Guest, mode, false, cap, grid, true),
-                    choose_live_mode(mode, ModeSource::Guest, mode, false, cap, grid, false)
-                );
-            }
-        }
-        // A FIFO swapchain and frame generation are untouched.
-        assert_eq!(
-            choose_live_mode(f, ModeSource::Guest, f, false, 60, g60, true),
-            (f, Declared::Mode)
-        );
-        assert_eq!(
-            choose_live_mode(m, ModeSource::Guest, m, true, 60, g60, true),
-            (m, Declared::Generating)
-        );
-        // Precedence: the property when it reads 0/1, else the env, else off.
-        assert_eq!(resolve_mailbox_at_rate(None, None), (false, "default"));
-        assert_eq!(resolve_mailbox_at_rate(None, Some("1")), (true, "env"));
-        assert_eq!(resolve_mailbox_at_rate(Some("1"), None), (true, "prop"));
-        assert_eq!(
-            resolve_mailbox_at_rate(Some("0"), Some("1")),
-            (false, "prop")
-        );
-        assert_eq!(resolve_mailbox_at_rate(Some(""), Some("1")), (true, "env"));
-        assert_eq!(
-            resolve_mailbox_at_rate(Some("yes"), Some("0")),
-            (false, "env")
-        );
-        assert_eq!(resolve_mailbox_at_rate(None, Some("x")), (false, "default"));
-    }
-
     /// The rule table of docs/10: the container's mode (else the guest's), the
     /// mode declared and why, and what limits the rate, on gamescope's
     /// override route.
@@ -6463,19 +6406,10 @@ mod tests {
             ci.presentMode = guest;
             let (mode, source) = effective_present_mode(&ci);
             let requested = guest_present_mode(&ci);
-            let choice = choose_live_mode(
-                mode,
-                source,
-                requested,
-                lsfg_cap.is_some(),
-                cap,
-                grid,
-                false,
-            );
+            let choice = choose_live_mode(mode, source, requested, lsfg_cap.is_some(), cap, grid);
             let label = match (choice.1, source) {
                 (Declared::CapCompat, _) => "cap-compat",
                 (Declared::CapRate, _) => "cap-rate",
-                (Declared::EnvAtRate, _) => "env-at-rate",
                 (Declared::GuestVsync, _) => "guest",
                 (_, ModeSource::Env) => "env",
                 (_, ModeSource::Guest) => "guest",
@@ -9488,9 +9422,13 @@ fn parse_present_mode_override(val: Option<&str>) -> Option<VkPresentModeKHR> {
         "mailbox" => VK_PRESENT_MODE_MAILBOX_KHR,
         "immediate" => VK_PRESENT_MODE_IMMEDIATE_KHR,
         _ => {
-            // Ungated: the env is the user's present-mode control, and a typo
-            // must show in a shipped session's log.
-            crate::logi!(gndrm_obf::obf!("Invalid MESA_VK_WSI_PRESENT_MODE value!"));
+            // Ungated and once: the env is the user's present-mode control, and
+            // a typo must show in a shipped session's log without repeating on
+            // every query.
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                crate::logi!(gndrm_obf::obf!("Invalid MESA_VK_WSI_PRESENT_MODE value!"));
+            }
             return None;
         }
     };
@@ -9550,74 +9488,9 @@ enum Declared {
     CapCompat,
     /// FIFO because the cap is the display's rate (`source=cap-rate`).
     CapRate,
-    /// Test switch ([`mailbox_at_rate`]): the swapchain's mode at a cap at the
-    /// display's rate, with the vblank-grid gate kept (`source=env-at-rate`).
-    EnvAtRate,
     /// No cap and a guest that asked for FIFO or FIFO-relaxed: its own mode
     /// over the container's non-FIFO default (`source=guest`).
     GuestVsync,
-}
-
-/// Test switch for the mailbox-at-display-rate study (gamenative-drm PR #46):
-/// with it on, a cap at the display's rate declares the swapchain's mode
-/// (the container's mailbox) with the vblank-grid gate kept, instead of FIFO,
-/// so a gamescope that holds a second mailbox commit for the next vblank can
-/// be measured against the FIFO declaration. Off by default; the default rule
-/// is unchanged. Read once per process: the Android property
-/// `debug.gndrm.mailbox_at_rate` (0/1) wins when set, else the env
-/// `GNDRM_MAILBOX_AT_RATE` (0/1). The effective value is logged once, right
-/// after the ICD loaded line.
-pub(crate) fn mailbox_at_rate() -> bool {
-    static AT_RATE: OnceLock<bool> = OnceLock::new();
-    *AT_RATE.get_or_init(|| {
-        let (on, source) = resolve_mailbox_at_rate(
-            system_property("debug.gndrm.mailbox_at_rate").as_deref(),
-            std::env::var("GNDRM_MAILBOX_AT_RATE").ok().as_deref(),
-        );
-        crate::logi!(gndrm_obf::obf!(
-            "mailbox_at_rate={} source={}",
-            u8::from(on),
-            source
-        ));
-        on
-    })
-}
-
-/// [`mailbox_at_rate`]'s precedence: the property when it reads 0 or 1, else
-/// the env when it does, else off.
-fn resolve_mailbox_at_rate(prop: Option<&str>, env: Option<&str>) -> (bool, &'static str) {
-    let parse = |v: &str| match v.trim() {
-        "1" => Some(true),
-        "0" => Some(false),
-        _ => None,
-    };
-    if let Some(on) = prop.and_then(parse) {
-        (on, "prop")
-    } else if let Some(on) = env.and_then(parse) {
-        (on, "env")
-    } else {
-        (false, "default")
-    }
-}
-
-/// An Android system property, `None` when unset (or off Android).
-fn system_property(name: &str) -> Option<String> {
-    #[cfg(target_os = "android")]
-    {
-        let name = CString::new(name).ok()?;
-        let mut value = [0u8; 92];
-        // SAFETY: `name` is NUL-terminated and `value` is PROP_VALUE_MAX bytes.
-        let n = unsafe {
-            libc::__system_property_get(name.as_ptr(), value.as_mut_ptr().cast::<c_char>())
-        };
-        let n = usize::try_from(n).unwrap_or(0).min(value.len());
-        (n > 0).then(|| String::from_utf8_lossy(&value[..n]).trim().to_owned())
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = name;
-        None
-    }
 }
 
 /// The mode a present on `sc` runs under and declares, decided per present.
@@ -9670,14 +9543,12 @@ unsafe fn live_choice(sc: *mut GnSwapchain) -> (VkPresentModeKHR, Declared) {
         crate::lsfg::live().0,
         crate::scanout::cap_fps_note(),
         crate::vsync_gate::current_grid(),
-        mailbox_at_rate(),
     )
 }
 
 /// [`live_present_mode`]'s rule on the override route, for the swapchain's
 /// `mode` and where it came from, the guest's `requested` mode, the daemon's
-/// cap, the display's vblank grid (`None` without the stamp lead) and the
-/// [`mailbox_at_rate`] test switch.
+/// cap and the display's vblank grid (`None` without the stamp lead).
 ///
 /// With no cap a guest that asked for FIFO (or FIFO-relaxed) gets it even when
 /// the container's env names another mode: every container carries
@@ -9694,7 +9565,6 @@ fn choose_live_mode(
     generating: bool,
     cap_fps: u32,
     grid: Option<crate::vsync_gate::Grid>,
-    at_rate_keeps_mode: bool,
 ) -> (VkPresentModeKHR, Declared) {
     let capped = cap_fps != gndrm_uapi::wire::FPS_UNCAPPED;
     let vsync_request =
@@ -9713,11 +9583,7 @@ fn choose_live_mode(
         match grid {
             None => (VK_PRESENT_MODE_FIFO_KHR, Declared::CapCompat),
             Some(g) if crate::vsync_gate::at_display_rate(cap_fps, g) => {
-                if at_rate_keeps_mode {
-                    (mode, Declared::EnvAtRate)
-                } else {
-                    (VK_PRESENT_MODE_FIFO_KHR, Declared::CapRate)
-                }
+                (VK_PRESENT_MODE_FIFO_KHR, Declared::CapRate)
             }
             Some(_) => (mode, Declared::Mode),
         }
@@ -9793,35 +9659,79 @@ fn mode_name(mode: VkPresentModeKHR) -> &'static str {
     }
 }
 
-/// Ungated, every 10 s while frames are presented: the mode declared to
-/// gamescope and why, and the counts a device run checks the pacing against.
-/// The launcher does not pass the container's environment to gamescope's
-/// clients, so a gated line could not be read there.
+/// What the ungated `present mode:` line reports: the mode declared to
+/// gamescope and why, the cap and what holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModeLine {
+    declared: VkPresentModeKHR,
+    requested: VkPresentModeKHR,
+    source: &'static str,
+    gamescope_route: bool,
+    cap: u32,
+    gate: &'static str,
+    lsfg: bool,
+}
+
+/// The last [`ModeLine`] printed.
+static MODE_LINE: Mutex<Option<ModeLine>> = Mutex::new(None);
+
+/// The `present mode:` census.
+///
+/// Ungated, once when frames first flow and again whenever the declared mode,
+/// its source, the cap or the gate changes: a shipped session's log says which
+/// path ran without repeating it. The counters a device run checks the pacing
+/// against repeat every 10 s with `GNDRM_LOG_VKSHIM=1`, as the shim's stats
+/// line does.
 unsafe fn mode_census(sc: *mut GnSwapchain) {
-    if !rate_ok(&RATE_MODE, MODE_CENSUS_EVERY) {
-        return;
-    }
     let route = unsafe { !(*(*sc).surf).swapchain_obj.is_null() };
-    let (presented, discarded, fallback) = crate::present::feedback_counts();
-    let (late, skipped) = crate::vsync_gate::late_counts();
-    // Since the last line, so each line reads one window's cadence.
-    let gaps = COMMIT_GAPS.each_ref().map(|b| b.swap(0, Ordering::Relaxed));
-    crate::logi!(gndrm_obf::obf!(
-        "present mode: declared={} requested={} source={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}]",
-        mode_name(unsafe { live_present_mode(sc) }),
-        mode_name(unsafe { (*sc).requested_mode }),
-        match (unsafe { live_choice(sc) }.1, unsafe { (*sc).mode_source }) {
+    let (declared, why) = unsafe { live_choice(sc) };
+    let line = ModeLine {
+        declared,
+        requested: unsafe { (*sc).requested_mode },
+        source: match (why, unsafe { (*sc).mode_source }) {
             (Declared::CapCompat, _) => "cap-compat",
             (Declared::CapRate, _) => "cap-rate",
-            (Declared::EnvAtRate, _) => "env-at-rate",
             (Declared::GuestVsync, _) => "guest",
             (_, ModeSource::Env) => "env",
             (_, ModeSource::Guest) => "guest",
         },
+        gamescope_route: route,
+        cap: crate::scanout::cap_fps_note(),
+        gate: unsafe { acquire_pacing(sc) }.clock().name(),
+        lsfg: crate::lsfg::live().0,
+    };
+    {
+        let mut last = MODE_LINE.lock().unwrap_or_else(|e| e.into_inner());
+        if *last != Some(line) {
+            *last = Some(line);
+            crate::logi!(gndrm_obf::obf!(
+                "present mode: declared={} requested={} source={} route={} cap={} gate={} lsfg={}",
+                mode_name(line.declared),
+                mode_name(line.requested),
+                line.source,
+                if route { "gamescope" } else { "x11" },
+                line.cap,
+                line.gate,
+                u8::from(line.lsfg),
+            ));
+        }
+    }
+    if !crate::vkshim_enabled() || !rate_ok(&RATE_MODE, MODE_CENSUS_EVERY) {
+        return;
+    }
+    let (presented, discarded, fallback) = crate::present::feedback_counts();
+    let (late, skipped) = crate::vsync_gate::late_counts();
+    // Since the last line, so each line reads one window's cadence.
+    let gaps = COMMIT_GAPS.each_ref().map(|b| b.swap(0, Ordering::Relaxed));
+    crate::logf!(gndrm_obf::obf!(
+        "present mode: declared={} requested={} source={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}]",
+        mode_name(line.declared),
+        mode_name(line.requested),
+        line.source,
         if route { "gamescope" } else { "x11" },
-        crate::scanout::cap_fps_note(),
-        unsafe { acquire_pacing(sc) }.clock().name(),
-        u8::from(crate::lsfg::live().0),
+        line.cap,
+        line.gate,
+        u8::from(line.lsfg),
         N_ACQ.load(Ordering::Relaxed),
         N_COMMIT_OK.load(Ordering::Relaxed),
         DECL_FIFO_N.load(Ordering::Relaxed),

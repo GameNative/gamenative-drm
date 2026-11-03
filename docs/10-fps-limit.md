@@ -199,21 +199,27 @@ divisor cap reads its target exactly.
   created before the lead is known keeps the slot count of the guest's own request
   until it is recreated.
 
-  The census reads which path ran, every 10 s while frames are presented:
-  `present mode: declared=… requested=… source=env|guest|cap-rate|cap-compat route=gamescope cap=…
-  gate=vsync|clock|off … gate_holds=… gate_late=… skipped=… slot_waits=…
-  commit_lat_us=…` (`source=cap-rate`: declared FIFO because the cap is the
-  display's rate, with `gate=vsync`; `source=cap-compat`: declared FIFO for want
-  of the stamp lead, with `gate=off`; `gate=clock` is frame generation's source rate or a cap above the
-  display's rate). The last five are cumulative except the latency:
-  `gate_holds`, acquires the gate held; `gate_late`, acquires that started after
-  their release point (not the daemon's `late=` on its `vsync: check` line, which
-  counts publishes that missed their latch); `skipped`, release points moved past for them;
+  The census says which path ran. Ungated, once when frames first flow and again
+  whenever the declared mode, its source, the cap or the gate changes:
+  `present mode: declared=… requested=… source=env|guest|cap-rate|cap-compat
+  route=gamescope cap=… gate=vsync|clock|off lsfg=…` (`source=guest`: the guest's
+  own mode, no env or a FIFO request with no cap; `source=cap-rate`: declared FIFO
+  because the cap is the display's rate, with `gate=vsync`; `source=cap-compat`:
+  declared FIFO for want of the stamp lead, with `gate=off`; `gate=clock` is frame
+  generation's source rate or a cap above the display's rate). With
+  `GNDRM_LOG_VKSHIM=1` the same line repeats every 10 s with the counters a device
+  run checks the pacing against: `acquires= commits= declared_fifo=
+  declared_other= releases= feedback= presented= discarded= fallback=
+  gate_holds= gate_late= skipped= slot_waits= commit_lat_us= spacing=[…]`. They
+  are cumulative except the latency and the spacing: `gate_holds`, acquires the
+  gate held; `gate_late`, acquires that started after their release point (not
+  the daemon's `late=` on its `vsync: check` line, which counts publishes that
+  missed their latch); `skipped`, release points moved past for them;
   `slot_waits`, acquires that passed the gate and then waited on a compositor
-  release for a free image; `commit_lat_us`, the smoothed acquire-to-commit
-  time. Then `spacing=[<15:… 15-16.2:… 16.2-17.2:… 17.2-20:… >20:…]`, the
-  spacing of consecutive commits in ms since the last line: the game's own
-  cadence as it reaches gamescope. Off the override route (the opt-in X11
+  release for a free image; `commit_lat_us`, the smoothed acquire-to-commit time;
+  `spacing=[<15:… 15-16.2:… 16.2-17.2:… 17.2-20:… >20:…]`, the spacing of
+  consecutive commits in ms since the last line, the game's own cadence as it
+  reaches gamescope. Off the override route (the opt-in X11
   Present route) the env decides the mode as in Mesa and the gate runs on the
   cap's own clock, as before.
 - **`-r` is not part of it, and no launch argument carries the limit.** The app

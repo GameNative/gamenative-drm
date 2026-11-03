@@ -66,7 +66,7 @@ that rate is the display's.
   unfocused game, or one behind a dialog, is therefore still answered once per vblank.
   Mesa blocks until the event comes; the shim answers a feedback that never comes
   100 ms after the commit, a backstop for a compositor fault, not a path a working
-  session takes (the census's `fallback=` counts it). Without the global
+  session takes (the `fallback=` counter of the periodic `present mode:` line counts it; that line repeats with `GNDRM_LOG_VKSHIM=1`, while the ungated one prints at session start and on a change of the declared mode, its source, the cap or the gate, `docs/10`). Without the global
   (or off the override route) the wait is answered on the release, or two refresh
   periods after the commit when no release report arrives first.
 - **Mailbox and immediate.** A guest that asked for either does not wait, and neither

@@ -154,8 +154,6 @@ fn announce(entry: &str) {
             comm.trim_end(),
             entry
         ));
-        // The mailbox-at-display-rate test switch, logged once at load.
-        proxy::mailbox_at_rate();
     });
 }
 
