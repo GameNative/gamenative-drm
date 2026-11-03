@@ -149,10 +149,15 @@ that rate is the display's.
   gamescope took the previous one and has the period, less gamescope's margin, to reach
   the next composite. A cap at the display's rate releases every vblank, a divisor cap
   every `refresh / cap`-th, any other cap below the rate the vblank nearest each instant
-  of an ideal `1e9 / cap` timeline; a frame late for its point starts at once and the
-  release after it is never more than one grid instant later, so a guest below the cap
-  is never quantized to a divisor; a phase
-  push never lets two releases into one vblank. The gate this replaces ran on the shim's
+  of an ideal `1e9 / cap` timeline; a frame late for its point starts at once and keeps
+  its slot's timeline (the release after it is where the cap puts it, at most the rest of
+  the slot away; only a start past the whole slot restarts the timeline, so a stall
+  carries no debt), so a guest below the cap is never quantized to a divisor; a phase
+  push never lets two releases into one vblank. The release after a late start is never
+  shortened to the next grid instant: that rule (the first shim of payload 20261103.4)
+  made every guest slower than one period plus 0.5 ms late for every release, and a cap
+  below the display's rate stopped holding at all (cap 20 on a 120 Hz panel ran at the
+  guest's own 40-55 fps, `gate_holds` frozen and `gate_late` up by one per frame). The gate this replaces ran on the shim's
   own clock (exactly 1e9 / N ns) and beat against the display's 59.97-59.99 Hz
   (57-59 fps at a 60 cap). A cap above the rate runs on the cap's own clock
   (`gate=clock`, also frame generation's source rate). Without the stamp lead (no

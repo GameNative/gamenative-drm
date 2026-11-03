@@ -239,15 +239,24 @@ impl Schedule {
     /// (on time, or late by less than a period) is booked to that release
     /// point, and the schedule goes on from there: the next release is
     /// `interval` further along the ideal timeline, on the grid instant
-    /// nearest it. A start later than that, or the first, starts the timeline
-    /// again from the grid instant at or before it, so a stall carries no debt
-    /// and a late frame is never held for a whole slot. The release point is
-    /// read on the grid as it is now: the daemon re-pushes the phase as it
-    /// moves, and a point booked on the old phase must not let two releases
-    /// into one period of the new one. Starts later than [`ON_TIME_NS`] after
-    /// their point are counted (`gate_late`), with the points passed (`skipped`),
-    /// and the release after a late start is never more than one grid instant
-    /// after it.
+    /// nearest it. A start later than that but still inside its slot (before
+    /// `interval` has passed on the ideal timeline) is booked to the grid
+    /// instant it is in and keeps the slot's timeline, so the release after it
+    /// is at most the rest of the slot away and the cap holds on average. A
+    /// start past the whole slot, or the first, starts the timeline again from
+    /// the grid instant at or before it, so a stall carries no debt. The
+    /// release point is read on the grid as it is now: the daemon re-pushes
+    /// the phase as it moves, and a point booked on the old phase must not let
+    /// two releases into one period of the new one. Starts later than
+    /// [`ON_TIME_NS`] after their point are counted (`gate_late`), with the
+    /// points passed (`skipped`).
+    ///
+    /// The release after a late start is never shortened to the next grid
+    /// instant: that rule (the first shim of payload 20261103.4) let a guest
+    /// whose frame outlasts one grid period plus [`ON_TIME_NS`] arrive late for
+    /// every release, so a cap below the display's rate stopped holding at all
+    /// (cap 20 on a 120 Hz panel ran at the guest's own 40-55 fps; at 60 Hz
+    /// only a guest faster than ~58 fps recovered).
     pub(crate) fn book(&mut self, now_ns: u64, grid: Grid, interval_ns: u64) -> u64 {
         if grid.period_ns == 0 {
             return self.book_clock(now_ns, interval_ns);
@@ -263,21 +272,17 @@ impl Schedule {
         }
         let (slot, ideal) = match due {
             Some(due) if at <= due => (due, self.ideal_ns),
+            // Late by a period or more but still inside its slot: the slot's
+            // timeline goes on, so the frame after this one is due where the
+            // cap says, not a whole interval after a late start.
+            Some(_) if now_ns < self.ideal_ns.saturating_add(interval_ns) => (at, self.ideal_ns),
             _ => (at, at),
         };
         let ideal_next = ideal.saturating_add(interval_ns);
         // Never two releases on one grid instant.
-        let mut next = grid
+        let next = grid
             .nearest(ideal_next)
             .max(slot.saturating_add(grid.period_ns));
-        let mut ideal_next = ideal_next;
-        if late.is_some() && next > at.saturating_add(grid.period_ns) {
-            // A late start already cost the guest time: the release after it
-            // is the next grid instant after it, never a whole slot further,
-            // and the timeline goes on from there.
-            next = at.saturating_add(grid.period_ns);
-            ideal_next = next;
-        }
         self.ideal_ns = ideal_next;
         self.next_ns = next;
         next
@@ -523,18 +528,80 @@ mod tests {
     }
 
     #[test]
-    fn a_late_frame_on_a_divisor_cap_waits_for_no_more_than_the_next_grid_instant() {
+    fn a_late_frame_on_a_divisor_cap_keeps_its_slots_timeline() {
         // 30 on 60, the guest late by half a vblank: it starts at once, and the
-        // release after it is the next grid instant, not a whole slot later.
+        // release after it is where the cap puts it, two vblanks after the
+        // point this one was released for.
         let g = grid(P60);
         let iv = interval(pacing(30, Some(g)));
         let mut s = Schedule::default();
         let due = s.book(g.anchor_ns, g, iv);
         assert_eq!(due, g.anchor_ns + 2 * P60);
-        assert_eq!(s.book(due + P60 / 2, g, iv), due + P60);
+        assert_eq!(s.book(due + P60 / 2, g, iv), due + 2 * P60);
+        // Late by a whole vblank, still inside the slot: the release after it
+        // is still the slot's, so the hold is the rest of the slot, not a
+        // whole slot from the late start.
+        let next = s.next_ns;
+        assert_eq!(s.book(next + P60 + 100_000, g, iv), next + 2 * P60);
+        // Past the whole slot: the timeline restarts from the start, no debt.
+        let next = s.next_ns;
+        assert_eq!(s.book(next + 2 * P60 + 100_000, g, iv), next + 4 * P60);
         // An on-time guest is still held to every second vblank.
         let next = s.next_ns;
         assert_eq!(s.book(next + 50_000, g, iv), next + 2 * P60);
+    }
+
+    /// Releases of a guest whose acquire-to-acquire time is `frame_ns`, with
+    /// its wait returning `wake_ns` late, under `cap` on `g`, for `n` frames
+    /// with one `hitch_ns` stall at frame 100: the gaps, in vblanks, between
+    /// consecutive releases.
+    fn gaps_of_a_slow_guest(g: Grid, cap: u32, frame_ns: u64, wake_ns: u64, hitch_ns: u64, n: usize) -> Vec<u64> {
+        let iv = interval(pacing(cap, Some(g)));
+        let mut s = Schedule::default();
+        let mut t = g.anchor_ns;
+        let mut starts = Vec::new();
+        for i in 0..n {
+            if s.next_ns != 0 && t < s.next_ns {
+                t = s.next_ns + wake_ns;
+            }
+            starts.push(t);
+            s.book(t, g, iv);
+            t += frame_ns + if i == 100 { hitch_ns } else { 0 };
+        }
+        vblanks(g, &starts).windows(2).map(|w| w[1] - w[0]).collect()
+    }
+
+    /// `gaps` holds the cap's cadence `every` vblanks, except the release after
+    /// the hitch at index 100 and the two after it, which catch the slot's
+    /// timeline up (a start inside its slot keeps the timeline); over the whole
+    /// run there are never more releases than the cap allows.
+    fn assert_cadence(gaps: &[u64], every: u64) {
+        let off: Vec<usize> = gaps
+            .iter()
+            .enumerate()
+            .filter(|&(i, &gap)| gap != every && !(100..103).contains(&i))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(off.is_empty(), "releases off the {every}-vblank cadence at {off:?}: {gaps:?}");
+        assert!(gaps[100] > every, "the hitch frame was not late: {:?}", &gaps[98..104]);
+        let total: u64 = gaps.iter().sum();
+        assert!(total >= every * gaps.len() as u64, "more releases than the cap: {:?}", &gaps[98..104]);
+    }
+
+    #[test]
+    fn a_guest_slower_than_a_vblank_is_held_to_a_cap_below_the_rate() {
+        // Cap 20 on a 120 Hz grid, 18 ms frames (the guest alone would run at
+        // 55 fps), every wake-up 1 ms late (late for its point) and one 80 ms
+        // hitch: the releases stay on every sixth vblank, and the cadence is
+        // back within three releases of the hitch. On the first shim of
+        // payload 20261103.4 the first late start was followed at the next
+        // vblank, the 18 ms frame was late for that too, and the cap never
+        // held again (the guest ran at its own rate).
+        let gaps = gaps_of_a_slow_guest(grid(P120), 20, 18_000_000, 1_000_000, 80_000_000, 600);
+        assert_cadence(&gaps, 6);
+        // 22 ms frames at 60 Hz under cap 20: every third vblank.
+        let gaps = gaps_of_a_slow_guest(grid(P60), 20, 22_000_000, 1_000_000, 80_000_000, 600);
+        assert_cadence(&gaps, 3);
     }
 
     #[test]
