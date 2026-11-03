@@ -119,7 +119,7 @@ divisor cap reads its target exactly.
   |---|---|---|---|
   | mailbox (default) | none, guest asked for FIFO (in-game VSync on) | fifo (`source=guest`) | the display (FIFO) |
   | mailbox (default) | none, guest asked for mailbox or immediate | mailbox | nobody |
-  | mailbox | at the display's rate | fifo (`source=cap-rate`) | the shim's acquire gate, every vblank; gamescope latches one FIFO commit per vblank |
+  | mailbox | at the display's rate | fifo (`source=cap-rate`) | gamescope's limiter (divisor 1), one FIFO commit per vblank; no gate, as on master |
   | mailbox | below the display's rate | mailbox | the shim's acquire gate, on the display's vblank grid |
   | fifo | none | fifo | the display (FIFO) |
   | fifo | set | fifo | gamescope's divisor limiter |
@@ -166,9 +166,14 @@ divisor cap reads its target exactly.
   gamescope's mailbox; a one-commit-per-window queue in the shim at a guessed
   2.5 ms boundary gave 59.0 with ~0.8 a second still replaced; FIFO on master
   gives 59.22 on the same scene. Under FIFO gamescope latches one commit per
-  vblank at its own wakeup (`steamcompmgr.cpp` 8028-8049), its limiter's divisor
-  at this cap is 1, and the gate keeps the guest from getting ahead, so the FIFO
-  queue stays about one frame deep. Below the display's rate the gate's releases
+  vblank at its own wakeup (`steamcompmgr.cpp` 8028-8049) and its limiter's
+  divisor at this cap is 1, which is master's behaviour in this cell. The
+  vblank-grid gate is not kept on top of it: FIFO's back-pressure already holds
+  the guest, and the two stacked turned a guest whose acquire-to-commit grew
+  past a period into a 40 fps session on a 60 Hz panel (DTD on a 1280x960
+  device after a live 120 to 60 Hz switch: `gate_holds` 0, `gate_late` 400 and
+  `skipped` 200 per 10 s, commit latency 24 ms, 400/600 publishes). Below the
+  display's rate the gate's releases
   are at least two vblanks apart and two frames in one composite are rare, so
   mailbox stays (FIFO with gamescope's limiter quantized a 32 fps game to 30 at a
   60 cap on 120 Hz; mailbox with the gate did not).
@@ -182,8 +187,9 @@ divisor cap reads its target exactly.
   other cap below the rate, the vblank nearest each instant of an ideal
   `1e9 / cap` timeline, which averages the cap on vblank boundaries (45 on 60
   releases 3 of 4 vblanks); a cap above the rate, the cap's own clock. A frame
-  that arrives after its release point starts at once, and the next release is
-  the next point of the schedule, so a game below the cap keeps its own rate. A
+  that arrives after its release point starts at once, and the release after it
+  is never more than one grid instant after it, so a game below the cap keeps its
+  own rate. A
   gate on the shim's own `1e9 / N` clock, as before 7bdcbae, beat against the
   panel: 57-59 fps on `SurfaceFlinger` at a 60 cap on a 59.97 Hz panel.
 
@@ -204,7 +210,7 @@ divisor cap reads its target exactly.
   `present mode: declared=… requested=… source=env|guest|cap-rate|cap-compat
   route=gamescope cap=… gate=vsync|clock|off lsfg=…` (`source=guest`: the guest's
   own mode, no env or a FIFO request with no cap; `source=cap-rate`: declared FIFO
-  because the cap is the display's rate, with `gate=vsync`; `source=cap-compat`:
+  because the cap is the display's rate, with `gate=off`; `source=cap-compat`:
   declared FIFO for want of the stamp lead, with `gate=off`; `gate=clock` is frame
   generation's source rate or a cap above the display's rate). With
   `GNDRM_LOG_VKSHIM=1` the same line repeats every 10 s with the counters a device

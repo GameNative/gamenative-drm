@@ -22,10 +22,10 @@ fifo, or no env and a FIFO guest), gamescope's limiter passes every
 and holds the guest's commits to it. Declared mailbox, immediate or FIFO-relaxed (mailbox
 is the container default), the limiter does not hold them and the shim's acquire gate
 releases the guest's frames on the display's vblank grid. A container in one of those
-modes under a cap at the display's rate is declared FIFO with the gate kept
-(`source=cap-rate`): gamescope latches one commit per vblank at its own wakeup, which the
-shim cannot see under mailbox (`docs/10`), and the gate keeps the FIFO queue about one
-frame deep. Under frame generation the app
+modes under a cap at the display's rate is declared FIFO with no gate
+(`source=cap-rate`), as on master: gamescope latches one commit per vblank at its own
+wakeup, which the shim cannot see under mailbox, and its limiter (divisor 1) paces the
+guest (`docs/10`). Under frame generation the app
 disarms gamescope's limiter and the shim's time gate holds the source rate instead
 (`docs/17`).
 
@@ -128,8 +128,8 @@ that rate is the display's.
   previous buffer back with `wl_buffer.release`, which is what frees the guest's next
   acquire; a cap that is not the display's rate over a whole number runs at gamescope's
   next divisor rate above it. Declared FIFO because the cap is the display's rate
-  (`source=cap-rate`), the gate below also runs, so the guest starts at most one frame
-  per vblank and the FIFO list stays about one frame deep. Declared anything else,
+  (`source=cap-rate`), no gate runs either: gamescope's FIFO latch alone paces it.
+  Declared anything else,
   gamescope takes the newest commit at each composite and the shim's acquire gate is
   the cap (`icd_shim/src/vsync_gate.rs`).
   Its release points are the instants the flip events are stamped at: the daemon's
@@ -140,7 +140,8 @@ that rate is the display's.
   the next composite. A cap at the display's rate releases every vblank, a divisor cap
   every `refresh / cap`-th, any other cap below the rate the vblank nearest each instant
   of an ideal `1e9 / cap` timeline; a frame late for its point starts at once and the
-  schedule goes on, so a guest below the cap is never quantized to a divisor; a phase
+  release after it is never more than one grid instant later, so a guest below the cap
+  is never quantized to a divisor; a phase
   push never lets two releases into one vblank. The gate this replaces ran on the shim's
   own clock (exactly 1e9 / N ns) and beat against the display's 59.97-59.99 Hz
   (57-59 fps at a 60 cap). A cap above the rate runs on the cap's own clock
@@ -167,7 +168,7 @@ that rate is the display's.
   the mailbox default runs, with no cap, FIFO for a guest that asked for FIFO (its
   own VSync, `source=guest`) and mailbox for any other guest, and mailbox capped by the shim's
   vblank-grid gate under a cap below the display's rate. Under a cap at the display's
-  rate it is declared FIFO with the gate kept (`source=cap-rate`), because the shim
+  rate it is declared FIFO with no gate (`source=cap-rate`), because the shim
   cannot keep two mailbox commits out of one gamescope composite (`docs/10`). One set
   to fifo runs FIFO under gamescope's limiter.
 - **A game below the cap keeps its own rate under mailbox** (caps below the display's
@@ -227,8 +228,9 @@ measures — the latch grid to the presenter, the vsync timeline in the flip eve
 Retroid Pocket 6 (59.97-59.98 Hz), DTD title scene, cap 60, against master's FIFO
 declaration on the same scene (59.22 fps, 1.3 % doubles):
 
-- **A cap at the display's rate, declared FIFO with the vblank-grid gate**
-  (`source=cap-rate gate=vsync`): in-game VSync off, 59.199 fps on `SurfaceFlinger`
+- **A cap at the display's rate, declared FIFO** (measured with the vblank-grid gate
+  kept, `source=cap-rate gate=vsync`, before the gate was dropped from this cell;
+  without it the cell is master's FIFO path): in-game VSync off, 59.199 fps on `SurfaceFlinger`
   and 1.3 % doubles over 60 s, shim commits equal to the daemon's publishes within
   0-2 per 10 s (the guest paces itself at ~59.3); VSync on, 59.983 fps and no
   doubles.
