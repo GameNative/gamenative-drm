@@ -179,7 +179,12 @@ divisor cap reads its target exactly.
   (`source=cap-rate-vsync`): its wait is answered when it queues the present
   (`docs/15`), the gate paces it,
   and the swapchain keeps the mailbox image count (Retroid Pocket 6, DTD,
-  VSync on, cap 60: 59.983 fps, no doubles). The
+  VSync on, cap 60: 59.983 fps, no doubles; with the wait answered at queue,
+  42 fps before and 60.0 after in a GPU-heavy 1080p scene). This is the only
+  case answered at queue; every other mailbox or immediate presentation is
+  answered at the commit, as on master. A container set to
+  `MESA_VK_WSI_PRESENT_MODE=fifo` never reaches it, so setting a game's
+  container to fifo restores master's behaviour for that game. The
   vblank-grid gate is not kept on top of it: FIFO's back-pressure already holds
   the guest, and the two stacked turned a guest whose acquire-to-commit grew
   past a period into a 40 fps session on a 60 Hz panel (DTD on a 1280x960

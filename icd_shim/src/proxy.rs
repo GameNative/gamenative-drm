@@ -1770,14 +1770,15 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
             // neither would one whose frames go out as mailbox or immediate
             // (the container's mode, or frame generation): both are answered
             // here. A FIFO guest declared FIFO keeps the release-or-grace answer.
-            // On gamescope's route a mailbox or immediate frame's wait was
-            // answered when the guest queued it (`present_dispatch`), so a wait
-            // still on the slot here is one whose mode changed since; it is
-            // answered now.
+            // A cap-rate-vsync frame's wait was answered when the guest queued
+            // it (`present_dispatch`), so one still on the slot here is a frame
+            // whose declaration changed since; it is answered now.
+            let (live, why) = live_choice(sc);
             let at_commit = present_wait_answer(
                 !(*(*sc).surf).swapchain_obj.is_null(),
+                why,
                 (*sc).requested_mode,
-                live_present_mode(sc),
+                live,
             ) != WaitAnswer::Later;
             let id = if at_commit {
                 let _g = (*sc).shared.lock().unwrap();
@@ -2768,28 +2769,28 @@ enum WaitAnswer {
 }
 
 /// [`WaitAnswer`] for a frame of a swapchain the guest made for `requested`
-/// that goes out as `live`.
+/// that goes out as `live`, declared for the reason `why`.
 ///
-/// A guest that asked for mailbox or immediate does not wait, and neither would
-/// one whose frames go out as mailbox or immediate (the container's mode, or
-/// frame generation). On gamescope's route that wait is answered when the guest
-/// queues the present, before the frame's render fence, as the X11 route does
-/// (its X server sends PresentCompleteNotify while handling the PresentPixmap
-/// request): DXVK's frame-latency wait then lets the CPU of the next frame run
-/// while the GPU renders this one, and the acquire gate, not the wait, holds the
-/// rate. Off that route the answer stays at the commit. FIFO and FIFO-relaxed
-/// are answered by the compositor.
+/// One case is answered when the guest queues the present, before the frame's
+/// render fence: gamescope's route, a cap at the display's rate and a guest
+/// that asked for FIFO declared the container's mailbox with the vblank-grid
+/// gate (`Declared::CapRateVsync`). That guest waits on every frame (DXVK with
+/// VSync on), and answered after the fence its CPU and GPU alternated; at queue,
+/// as the X11 route answers (its X server sends PresentCompleteNotify while
+/// handling the PresentPixmap request), they overlap and the gate holds the
+/// rate. Everything else keeps the answer it had: a frame going out as mailbox
+/// or immediate, or from a guest that asked for either, at the commit; FIFO and
+/// FIFO-relaxed by the compositor.
 fn present_wait_answer(
     gamescope_route: bool,
+    why: Declared,
     requested: VkPresentModeKHR,
     live: VkPresentModeKHR,
 ) -> WaitAnswer {
-    if answers_present_wait_at_commit(requested) || answers_present_wait_at_commit(live) {
-        if gamescope_route {
-            WaitAnswer::AtQueue
-        } else {
-            WaitAnswer::AtCommit
-        }
+    if gamescope_route && why == Declared::CapRateVsync {
+        WaitAnswer::AtQueue
+    } else if answers_present_wait_at_commit(requested) || answers_present_wait_at_commit(live) {
+        WaitAnswer::AtCommit
     } else {
         WaitAnswer::Later
     }
@@ -2798,10 +2799,12 @@ fn present_wait_answer(
 /// Route a present to the discipline its effective present mode names.
 unsafe fn present_dispatch(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
     mode_census(sc);
+    let (live, why) = unsafe { live_choice(sc) };
     let answer = present_wait_answer(
         unsafe { !(*(*sc).surf).swapchain_obj.is_null() },
+        why,
         unsafe { (*sc).requested_mode },
-        unsafe { live_present_mode(sc) },
+        live,
     );
     if answer == WaitAnswer::AtQueue {
         // Taken off the slot, so neither the commit, a replacement nor the
@@ -6574,29 +6577,54 @@ mod tests {
             VK_PRESENT_MODE_IMMEDIATE_KHR,
             VK_PRESENT_MODE_FIFO_RELAXED_KHR,
         );
-        // gamescope's route: mailbox or immediate going out (the container's
-        // mode, cap-rate-vsync, frame generation) is answered when queued,
-        // whatever the guest asked for.
-        for live in [m, i] {
-            for requested in [f, r, m, i] {
+        use Declared::{CapCompat, CapRate, CapRateVsync, Generating, GuestVsync, Mode};
+        // The one case answered at queue: cap-rate-vsync on gamescope's route.
+        for requested in [f, r] {
+            assert_eq!(
+                present_wait_answer(true, CapRateVsync, requested, m),
+                WaitAnswer::AtQueue
+            );
+        }
+        // Every other mailbox or immediate presentation keeps master's answer
+        // at the commit: below-rate caps and no cap (the container's mode),
+        // frame generation, and a guest that asked for mailbox or immediate
+        // (declared FIFO under cap-rate or cap-compat).
+        for requested in [f, r, m, i] {
+            for live in [m, i] {
                 assert_eq!(
-                    present_wait_answer(true, requested, live),
-                    WaitAnswer::AtQueue
+                    present_wait_answer(true, Mode, requested, live),
+                    WaitAnswer::AtCommit
+                );
+            }
+            assert_eq!(
+                present_wait_answer(true, Generating, requested, m),
+                WaitAnswer::AtCommit
+            );
+        }
+        for requested in [m, i] {
+            for why in [CapRate, CapCompat] {
+                assert_eq!(
+                    present_wait_answer(true, why, requested, f),
+                    WaitAnswer::AtCommit
                 );
             }
         }
-        // A guest that asked for mailbox or immediate is answered when queued
-        // even while its frames go out FIFO (cap-rate, cap-compat).
-        assert_eq!(present_wait_answer(true, i, f), WaitAnswer::AtQueue);
-        assert_eq!(present_wait_answer(true, m, f), WaitAnswer::AtQueue);
         // FIFO and FIFO-relaxed out of a FIFO guest: the compositor answers.
-        assert_eq!(present_wait_answer(true, f, f), WaitAnswer::Later);
-        assert_eq!(present_wait_answer(true, r, r), WaitAnswer::Later);
-        assert_eq!(present_wait_answer(true, f, r), WaitAnswer::Later);
-        // Off gamescope's route the unpaced modes stay answered at the commit.
-        assert_eq!(present_wait_answer(false, f, m), WaitAnswer::AtCommit);
-        assert_eq!(present_wait_answer(false, i, i), WaitAnswer::AtCommit);
-        assert_eq!(present_wait_answer(false, f, f), WaitAnswer::Later);
+        assert_eq!(present_wait_answer(true, Mode, f, f), WaitAnswer::Later);
+        assert_eq!(
+            present_wait_answer(true, GuestVsync, f, f),
+            WaitAnswer::Later
+        );
+        assert_eq!(present_wait_answer(true, CapRate, f, f), WaitAnswer::Later);
+        assert_eq!(
+            present_wait_answer(true, CapCompat, r, f),
+            WaitAnswer::Later
+        );
+        assert_eq!(present_wait_answer(true, Mode, r, r), WaitAnswer::Later);
+        // Off gamescope's route: as on master.
+        assert_eq!(present_wait_answer(false, Mode, f, m), WaitAnswer::AtCommit);
+        assert_eq!(present_wait_answer(false, Mode, i, i), WaitAnswer::AtCommit);
+        assert_eq!(present_wait_answer(false, Mode, f, f), WaitAnswer::Later);
     }
 
     #[test]
