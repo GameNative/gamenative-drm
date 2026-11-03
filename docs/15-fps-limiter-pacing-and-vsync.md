@@ -22,8 +22,10 @@ fifo, or no env and a FIFO guest), gamescope's limiter passes every
 and holds the guest's commits to it. Declared mailbox, immediate or FIFO-relaxed (mailbox
 is the container default), the limiter does not hold them and the shim's acquire gate
 releases the guest's frames on the display's vblank grid. A container in one of those
-modes under a cap at the display's rate is declared FIFO with no gate
-(`source=cap-rate`), as on master: gamescope latches one commit per vblank at its own
+modes under a cap at the display's rate is declared FIFO with no gate when the guest
+asked for mailbox or immediate (`source=cap-rate`), as on master, and keeps its mode with
+the gate every vblank when the guest asked for FIFO (`source=cap-rate-vsync`, `docs/10`).
+For the former: gamescope latches one commit per vblank at its own
 wakeup, which the shim cannot see under mailbox, and its limiter (divisor 1) paces the
 guest (`docs/10`). Under frame generation the app
 disarms gamescope's limiter and the shim's time gate holds the source rate instead

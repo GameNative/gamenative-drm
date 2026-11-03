@@ -119,7 +119,8 @@ divisor cap reads its target exactly.
   |---|---|---|---|
   | mailbox (default) | none, guest asked for FIFO (in-game VSync on) | fifo (`source=guest`) | the display (FIFO) |
   | mailbox (default) | none, guest asked for mailbox or immediate | mailbox | nobody |
-  | mailbox | at the display's rate | fifo (`source=cap-rate`) | gamescope's limiter (divisor 1), one FIFO commit per vblank; no gate, as on master |
+  | mailbox | at the display's rate, guest asked for FIFO (in-game VSync on) | mailbox (`source=cap-rate-vsync`) | the shim's acquire gate, every vblank; the present wait is answered at commit |
+  | mailbox | at the display's rate, guest asked for mailbox or immediate | fifo (`source=cap-rate`) | gamescope's limiter (divisor 1), one FIFO commit per vblank; no gate, as on master |
   | mailbox | below the display's rate | mailbox | the shim's acquire gate, on the display's vblank grid |
   | fifo | none | fifo | the display (FIFO) |
   | fifo | set | fifo | gamescope's divisor limiter |
@@ -167,7 +168,17 @@ divisor cap reads its target exactly.
   2.5 ms boundary gave 59.0 with ~0.8 a second still replaced; FIFO on master
   gives 59.22 on the same scene. Under FIFO gamescope latches one commit per
   vblank at its own wakeup (`steamcompmgr.cpp` 8028-8049) and its limiter's
-  divisor at this cap is 1, which is master's behaviour in this cell. The
+  divisor at this cap is 1, which is master's behaviour in this cell. That holds
+  for a guest that asked for mailbox or immediate, which paces itself. A guest
+  that asked for FIFO (in-game VSync on) waits on each frame's presentation
+  before starting the next; declared FIFO, that wait is gamescope's `presented`
+  at its latch, so the whole frame has to fit between two latches, and with
+  ~16 ms of work and three images it fell to 40 fps at 60 Hz (a 1280x960
+  device, DTD in game: 400 commits per 10 s, 400/600 publishes). That guest is
+  declared the container's mode with the gate every vblank instead
+  (`source=cap-rate-vsync`): its wait is answered at commit, the gate paces it,
+  and the swapchain keeps the mailbox image count (Retroid Pocket 6, DTD,
+  VSync on, cap 60: 59.983 fps, no doubles). The
   vblank-grid gate is not kept on top of it: FIFO's back-pressure already holds
   the guest, and the two stacked turned a guest whose acquire-to-commit grew
   past a period into a 40 fps session on a 60 Hz panel (DTD on a 1280x960
@@ -210,7 +221,9 @@ divisor cap reads its target exactly.
   `present mode: declared=… requested=… source=env|guest|cap-rate|cap-compat
   route=gamescope cap=… gate=vsync|clock|off lsfg=…` (`source=guest`: the guest's
   own mode, no env or a FIFO request with no cap; `source=cap-rate`: declared FIFO
-  because the cap is the display's rate, with `gate=off`; `source=cap-compat`:
+  because the cap is the display's rate and the guest paces itself, with
+  `gate=off`; `source=cap-rate-vsync`: the container's mode with `gate=vsync`
+  because the cap is the display's rate and the guest asked for FIFO; `source=cap-compat`:
   declared FIFO for want of the stamp lead, with `gate=off`; `gate=clock` is frame
   generation's source rate or a cap above the display's rate). With
   `GNDRM_LOG_VKSHIM=1` the same line repeats every 10 s with the counters a device
@@ -221,8 +234,9 @@ divisor cap reads its target exactly.
   gate held; `gate_late`, acquires that started after their release point (not
   the daemon's `late=` on its `vsync: check` line, which counts publishes that
   missed their latch); `skipped`, release points moved past for them;
-  `slot_waits`, acquires that passed the gate and then waited on a compositor
-  release for a free image; `commit_lat_us`, the smoothed acquire-to-commit time;
+  `slot_waits`, acquires that passed the gate (if any) and then waited on a
+  compositor release for a free image; `commit_lat_us`, the smoothed
+  acquire-to-commit time (both counted whether or not the gate runs);
   `spacing=[<15:… 15-16.2:… 16.2-17.2:… 17.2-20:… >20:…]`, the spacing of
   consecutive commits in ms since the last line, the game's own cadence as it
   reaches gamescope. Off the override route (the opt-in X11
