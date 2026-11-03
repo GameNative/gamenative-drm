@@ -90,7 +90,11 @@ drifting pattern. Three rules keep one frame per period, in order:
   64 fps on 120 Hz, flips between x2 and none from batch to batch), and the
   display never reshapes it: a 40 cap runs 40 acquires a second on a 60 Hz panel
   as much as on a 120 Hz one, and the multiplier decides what is generated on
-  top. The panel's rate is the one the app reported (`LsfgConfig.refresh_mhz`),
+  top. The source rate is held by the acquire gate on the cap's own clock
+  (`scanout::next_acquire_after`, `gate=clock` in the census), not on the
+  display's vblank grid: the vblank-grid gate of `docs/10` covers a cap without
+  frame generation only, and generated frames are placed on the latch grid
+  below. The panel's rate is the one the app reported (`LsfgConfig.refresh_mhz`),
   not a measurement: while the daemon is the only thing publishing, the latch
   samples are spaced by its own rate, so a panel SurfaceFlinger runs below that
   rate (an LTPO panel that dropped to 60 Hz) is still paced at the reported rate

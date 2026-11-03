@@ -108,7 +108,7 @@ divisor cap reads its target exactly.
   On gamescope's override route the shim declares to gamescope, per commit
   (`gamescope_swapchain.set_present_mode`), the container's
   `MESA_VK_WSI_PRESENT_MODE` (mailbox is the container default; the user may set
-  fifo, fifo_relaxed or immediate), or the guest's own mode when the env is absent
+  fifo, relaxed or immediate), or the guest's own mode when the env is absent
   (`icd_shim/src/proxy.rs` `effective_present_mode`, `live_present_mode`).
   gamescope's limiter holds only commits declared FIFO (`wlserver_surface_is_fifo`):
   it latches one per limited vblank (`steamcompmgr.cpp` `handle_done_commits_xwayland`)
@@ -124,10 +124,20 @@ divisor cap reads its target exactly.
   | fifo | set | fifo | gamescope's divisor limiter |
   | any, frame generation on | any | mailbox | the source-rate gate (`docs/17`) |
 
-  fifo_relaxed and immediate behave as mailbox in this table. No env: the guest's
+  FIFO-relaxed (`relaxed`) and immediate behave as mailbox in this table. No env: the guest's
   own mode takes the env's place. "At the display's rate" is a cap within 0.5 %
   of the measured rate (60 on a 59.97 Hz panel); a cap above it runs on the
   gate's own clock under the container's mode.
+
+  **The user's control is `MESA_VK_WSI_PRESENT_MODE`.** It sits in the container's
+  environment, written from the driver's present-mode setting, and takes Mesa's
+  names: `fifo`, `relaxed` (FIFO-relaxed), `mailbox`, `immediate`. Anything else,
+  `fifo_relaxed` included, is rejected as Mesa rejects it, the guest's own mode is
+  used, and the shim logs `Invalid MESA_VK_WSI_PRESENT_MODE value!` whether or not
+  `GNDRM_LOG_VKSHIM` is set, so a typo shows in a shipped session. It is
+  overridden in one case: a non-FIFO value under a cap at the display's rate is
+  declared FIFO (`source=cap-rate`, below). Mesa reads the same variable, so it
+  also sets the mode a zink guest's own swapchain asks for below the shim.
 
   **Why mailbox is not declared at the display's rate.** At that cap the panel
   shows one frame per vblank under either mode, and under mailbox the shim has to
@@ -179,13 +189,14 @@ divisor cap reads its target exactly.
 
   The census reads which path ran, every 10 s while frames are presented:
   `present mode: declared=… requested=… source=env|guest|cap-rate|cap-compat route=gamescope cap=…
-  gate=vsync|clock|off … gate_holds=… late=… skipped=… slot_waits=…
+  gate=vsync|clock|off … gate_holds=… gate_late=… skipped=… slot_waits=…
   commit_lat_us=…` (`source=cap-rate`: declared FIFO because the cap is the
   display's rate, with `gate=vsync`; `source=cap-compat`: declared FIFO for want
   of the stamp lead, with `gate=off`; `gate=clock` is frame generation's source rate or a cap above the
   display's rate). The last five are cumulative except the latency:
-  `gate_holds`, acquires the gate held; `late`, acquires that started after
-  their release point; `skipped`, release points moved past for them;
+  `gate_holds`, acquires the gate held; `gate_late`, acquires that started after
+  their release point (not the daemon's `late=` on its `vsync: check` line, which
+  counts publishes that missed their latch); `skipped`, release points moved past for them;
   `slot_waits`, acquires that passed the gate and then waited on a compositor
   release for a free image; `commit_lat_us`, the smoothed acquire-to-commit
   time. Then `spacing=[<15:… 15-16.2:… 16.2-17.2:… 17.2-20:… >20:…]`, the

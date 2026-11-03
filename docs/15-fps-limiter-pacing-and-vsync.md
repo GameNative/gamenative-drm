@@ -223,11 +223,26 @@ measures — the latch grid to the presenter, the vsync timeline in the flip eve
 
 ## 5. Measured on device
 
-Retroid Pocket Nova (120 Hz panel, a 60 Hz mode available), Hades II, Vulkan through
-zink:
+Retroid Pocket 6 (59.97-59.98 Hz), DTD title scene, cap 60, against master's FIFO
+declaration on the same scene (59.22 fps, 1.3 % doubles):
 
-- **The gate holds the cap.** Cap 40: 40.2 acquires a second over 30 s, 0.1 skipped
-  batches a second, `gate_avg_us` ≈ 22 ms against a 25 ms period.
+- **A cap at the display's rate, declared FIFO with the vblank-grid gate**
+  (`source=cap-rate gate=vsync`): in-game VSync off, 59.199 fps on `SurfaceFlinger`
+  and 1.3 % doubles over 60 s, shim commits equal to the daemon's publishes within
+  0-2 per 10 s (the guest paces itself at ~59.3); VSync on, 59.983 fps and no
+  doubles.
+- **The same cap declared mailbox with the gate** lost ~1 commit a second inside
+  gamescope's mailbox (58.3 fps, 2.8 % doubles), which is why it is declared FIFO
+  (`docs/10`).
+
+Retroid Pocket Nova (120 Hz panel, a 60 Hz mode available), Hades II, Vulkan through
+zink, measured before the vblank-grid gate, when the acquire gate ran on the cap's
+own clock for every capped session (it now does so only for frame generation's
+source rate, a cap above the display's rate and the X11 Present route; a capped
+gamescope session is held as in §3):
+
+- **The clock gate held the cap.** Cap 40: 40.2 acquires a second over 30 s, 0.1
+  skipped batches a second, `gate_avg_us` ≈ 22 ms against a 25 ms period.
 - **Generation follows the multiplier, the display does not.** Cap 40 with frame
   generation at x2 / x3 / x4 produces and counts 80 / 120 / 160 frames a second, while
   the mode stays at the display's rate (120 Hz, or 60 Hz on a 60 Hz panel).

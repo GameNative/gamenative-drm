@@ -9446,7 +9446,9 @@ fn parse_present_mode_override(val: Option<&str>) -> Option<VkPresentModeKHR> {
         "mailbox" => VK_PRESENT_MODE_MAILBOX_KHR,
         "immediate" => VK_PRESENT_MODE_IMMEDIATE_KHR,
         _ => {
-            crate::logf!(gndrm_obf::obf!("Invalid MESA_VK_WSI_PRESENT_MODE value!"));
+            // Ungated: the env is the user's present-mode control, and a typo
+            // must show in a shipped session's log.
+            crate::logi!(gndrm_obf::obf!("Invalid MESA_VK_WSI_PRESENT_MODE value!"));
             return None;
         }
     };
@@ -9735,7 +9737,7 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
     // Since the last line, so each line reads one window's cadence.
     let gaps = COMMIT_GAPS.each_ref().map(|b| b.swap(0, Ordering::Relaxed));
     crate::logi!(gndrm_obf::obf!(
-        "present mode: declared={} requested={} source={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} gate_holds={} late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}]",
+        "present mode: declared={} requested={} source={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}]",
         mode_name(unsafe { live_present_mode(sc) }),
         mode_name(unsafe { (*sc).requested_mode }),
         match (unsafe { live_choice(sc) }.1, unsafe { (*sc).mode_source }) {

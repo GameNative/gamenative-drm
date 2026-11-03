@@ -245,7 +245,7 @@ impl Schedule {
     /// read on the grid as it is now: the daemon re-pushes the phase as it
     /// moves, and a point booked on the old phase must not let two releases
     /// into one period of the new one. Starts later than [`ON_TIME_NS`] after
-    /// their point are counted (`late`), with the points passed (`skipped`).
+    /// their point are counted (`gate_late`), with the points passed (`skipped`).
     pub(crate) fn book(&mut self, now_ns: u64, grid: Grid, interval_ns: u64) -> u64 {
         if grid.period_ns == 0 {
             return self.book_clock(now_ns, interval_ns);
