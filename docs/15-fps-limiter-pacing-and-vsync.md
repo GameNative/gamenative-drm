@@ -22,8 +22,10 @@ fifo, or no env and a FIFO guest), gamescope's limiter passes every
 and holds the guest's commits to it. Declared mailbox, immediate or FIFO-relaxed (mailbox
 is the container default), the limiter does not hold them and the shim's acquire gate
 releases the guest's frames on the display's vblank grid. A container in one of those
-modes under a cap at the display's rate is declared FIFO with no gate
-(`source=cap-rate`), as on master: gamescope latches one commit per vblank at its own
+modes under a cap at the display's rate is declared FIFO with no gate when the guest
+asked for mailbox or immediate (`source=cap-rate`), as on master, and keeps its mode with
+the gate every vblank when the guest asked for FIFO (`source=cap-rate-vsync`, `docs/10`).
+For the former: gamescope latches one commit per vblank at its own
 wakeup, which the shim cannot see under mailbox, and its limiter (divisor 1) paces the
 guest (`docs/10`). Under frame generation the app
 disarms gamescope's limiter and the shim's time gate holds the source rate instead
@@ -71,9 +73,17 @@ that rate is the display's.
   periods after the commit when no release report arrives first.
 - **Mailbox and immediate.** A guest that asked for either does not wait, and neither
   would one whose frames go out as mailbox or immediate (frame generation, or the
-  container's env while the guest believes it has FIFO), so those waits are answered at
-  the commit rather than holding the guest's frame-latency loop for two periods
-  (`answers_present_wait_at_commit`).
+  container's env while the guest believes it has FIFO), so those waits are not held for
+  the compositor: they are answered at the commit, after the frame's render fence
+  (`present_wait_answer`). One case is answered earlier, when the guest queues the
+  present: `source=cap-rate-vsync` (a cap at the display's rate, a container mode other
+  than FIFO, a guest that asked for FIFO, declared mailbox with the vblank-grid gate).
+  That guest waits on every frame, and answered after the fence a latency-1 guest
+  alternated CPU and GPU: Retroid Pocket 6, DTD at 1080p, cap 60, VSync on, 60 Hz, 42 fps
+  with 23 ms from acquire to commit, the GPU at 65-69 % busy and 550 MHz because its
+  governor saw the bubbles. Answered at queue, as the X11 route's X server answers
+  PresentCompleteNotify at the PresentPixmap request, CPU and GPU overlap and the gate
+  holds the rate (60.0 fps there, 14.3 ms; `at_queue=` in the periodic census).
 - **A replaced frame.** Under mailbox a frame can be replaced before it is shown. It is
   never committed, released or latched under that id, so its wait is answered when it is
   discarded instead of timing out.

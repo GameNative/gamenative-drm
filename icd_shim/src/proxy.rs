@@ -1770,8 +1770,16 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
             // neither would one whose frames go out as mailbox or immediate
             // (the container's mode, or frame generation): both are answered
             // here. A FIFO guest declared FIFO keeps the release-or-grace answer.
-            let at_commit = answers_present_wait_at_commit((*sc).requested_mode)
-                || answers_present_wait_at_commit(live_present_mode(sc));
+            // A cap-rate-vsync frame's wait was answered when the guest queued
+            // it (`present_dispatch`), so one still on the slot here is a frame
+            // whose declaration changed since; it is answered now.
+            let (live, why) = live_choice(sc);
+            let at_commit = present_wait_answer(
+                !(*(*sc).surf).swapchain_obj.is_null(),
+                why,
+                (*sc).requested_mode,
+                live,
+            ) != WaitAnswer::Later;
             let id = if at_commit {
                 let _g = (*sc).shared.lock().unwrap();
                 core::mem::replace(&mut (*s).wait_id, 0)
@@ -2012,7 +2020,9 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     // than its own mode (no stamp lead yet, a cap at the display's rate, a
     // guest's FIFO request with no cap), the guest's own request decides the
     // count too, as on master: a spare image would only deepen gamescope's FIFO
-    // queue.
+    // queue. A cap at the display's rate with a guest's FIFO request declares
+    // the container's mode with the gate (`Declared::CapRateVsync`), and keeps
+    // that mode's count, the spare image included.
     let declared_at_creation = choose_live_mode(
         mode,
         mode_source,
@@ -2425,18 +2435,19 @@ unsafe fn gn_acquire_common(
             }
             unsafe { acquire_take_free(sc, &mut idx) };
             if idx >= 0 {
+                let now_ns = monotonic_ns();
+                // For the census's acquire-to-commit time, gated or not.
+                (*(*sc).slots.as_mut_ptr().add(idx as usize)).acquired_ns = now_ns;
                 if gated {
                     // One timeline for the whole swapchain: the next frame may
                     // not start before the release this one was booked to.
-                    let now_ns = monotonic_ns();
-                    (*(*sc).slots.as_mut_ptr().add(idx as usize)).acquired_ns = now_ns;
                     (*sc).release.book_paced(now_ns, pacing);
                 }
                 break;
             }
-            if gated && !slot_waited {
-                // Past the gate with no image free: this acquire waits on the
-                // compositor's release, not on the gate.
+            if !slot_waited {
+                // Past the gate (if any) with no image free: this acquire waits
+                // on the compositor's release.
                 slot_waited = true;
                 SLOT_WAIT_N.fetch_add(1, Ordering::Relaxed);
             }
@@ -2746,9 +2757,67 @@ unsafe fn present_sync_commit(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32)
     }
 }
 
+/// When a present wait on a frame is answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitAnswer {
+    /// When the guest queues the present (`present_dispatch`).
+    AtQueue,
+    /// When the frame is committed, its render fence waited (`commit_real`).
+    AtCommit,
+    /// By the compositor: presentation feedback, the release, or the grace.
+    Later,
+}
+
+/// [`WaitAnswer`] for a frame of a swapchain the guest made for `requested`
+/// that goes out as `live`, declared for the reason `why`.
+///
+/// One case is answered when the guest queues the present, before the frame's
+/// render fence: gamescope's route, a cap at the display's rate and a guest
+/// that asked for FIFO declared the container's mailbox with the vblank-grid
+/// gate (`Declared::CapRateVsync`). That guest waits on every frame (DXVK with
+/// VSync on), and answered after the fence its CPU and GPU alternated; at queue,
+/// as the X11 route answers (its X server sends PresentCompleteNotify while
+/// handling the PresentPixmap request), they overlap and the gate holds the
+/// rate. Everything else keeps the answer it had: a frame going out as mailbox
+/// or immediate, or from a guest that asked for either, at the commit; FIFO and
+/// FIFO-relaxed by the compositor.
+fn present_wait_answer(
+    gamescope_route: bool,
+    why: Declared,
+    requested: VkPresentModeKHR,
+    live: VkPresentModeKHR,
+) -> WaitAnswer {
+    if gamescope_route && why == Declared::CapRateVsync {
+        WaitAnswer::AtQueue
+    } else if answers_present_wait_at_commit(requested) || answers_present_wait_at_commit(live) {
+        WaitAnswer::AtCommit
+    } else {
+        WaitAnswer::Later
+    }
+}
+
 /// Route a present to the discipline its effective present mode names.
 unsafe fn present_dispatch(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
     mode_census(sc);
+    let (live, why) = unsafe { live_choice(sc) };
+    let answer = present_wait_answer(
+        unsafe { !(*(*sc).surf).swapchain_obj.is_null() },
+        why,
+        unsafe { (*sc).requested_mode },
+        live,
+    );
+    if answer == WaitAnswer::AtQueue {
+        // Taken off the slot, so neither the commit, a replacement nor the
+        // release answers it again; the daemon's later latch report finds it
+        // no longer armed.
+        let id = {
+            let _g = unsafe { (*sc).shared.lock().unwrap() };
+            unsafe { core::mem::replace(&mut (*slot).wait_id, 0) }
+        };
+        if id != 0 {
+            crate::present::answered_at_queue(id, sc as usize, monotonic_ns());
+        }
+    }
     match unsafe { live_present_mode(sc) } {
         VK_PRESENT_MODE_IMMEDIATE_KHR => unsafe { present_immediate(sc, slot, idx) },
         VK_PRESENT_MODE_MAILBOX_KHR => unsafe { present_mailbox(sc, slot, idx) },
@@ -6299,10 +6368,17 @@ mod tests {
                 choose_live_mode(mode, ModeSource::Guest, mode, false, 0, None),
                 (mode, Declared::Mode)
             );
-            // A cap at the display's rate: FIFO.
+            // A cap at the display's rate: FIFO for a guest that asked for
+            // mailbox or immediate, the swapchain's mode (with the gate) for
+            // one that asked for FIFO-relaxed.
+            let at_rate = if mode == r {
+                (r, Declared::CapRateVsync)
+            } else {
+                (f, Declared::CapRate)
+            };
             assert_eq!(
                 choose_live_mode(mode, ModeSource::Guest, mode, false, 60, g60),
-                (f, Declared::CapRate)
+                at_rate
             );
             // A cap below it: the swapchain's mode.
             assert_eq!(
@@ -6413,6 +6489,7 @@ mod tests {
             let label = match (choice.1, source) {
                 (Declared::CapCompat, _) => "cap-compat",
                 (Declared::CapRate, _) => "cap-rate",
+                (Declared::CapRateVsync, _) => "cap-rate-vsync",
                 (Declared::GuestVsync, _) => "guest",
                 (_, ModeSource::Env) => "env",
                 (_, ModeSource::Guest) => "guest",
@@ -6431,13 +6508,27 @@ mod tests {
             interval_ns: n * g.unwrap().period_ns,
         };
         let off = Pacing::Off;
-        // Capped, env mailbox, whatever the guest asked for:
-        for guest in [f, m, i] {
-            // 60 on 59.97 Hz: FIFO, no gate (gamescope's limiter).
+        // Cap at the display's rate (60 on 59.97 Hz), env mailbox: a guest
+        // that asked for FIFO (VSync on) or FIFO-relaxed gets mailbox with the
+        // gate every vblank, its present wait answered at commit; one that asked
+        // for mailbox or immediate (self-paced) gets FIFO with no gate.
+        assert_eq!(
+            row(Some("mailbox"), f, 60, None, g60),
+            (m, "cap-rate-vsync", every(g60, 1))
+        );
+        assert_eq!(
+            row(Some("mailbox"), r, 60, None, g60),
+            (m, "cap-rate-vsync", every(g60, 1))
+        );
+        for guest in [m, i] {
             assert_eq!(
                 row(Some("mailbox"), guest, 60, None, g60),
                 (f, "cap-rate", off)
             );
+        }
+        // Capped below the display's rate, env mailbox, whatever the guest
+        // asked for:
+        for guest in [f, m, i] {
             // 60 on 120 Hz, 30 on 60: mailbox, the gate every second vblank.
             assert_eq!(
                 row(Some("mailbox"), guest, 60, None, g120),
@@ -6478,6 +6569,64 @@ mod tests {
         ci.presentMode = 1000;
         assert_eq!(guest_present_mode(&ci), f);
     }
+    #[test]
+    fn the_present_wait_answer_point_follows_the_declaration() {
+        let (m, f, i, r) = (
+            VK_PRESENT_MODE_MAILBOX_KHR,
+            VK_PRESENT_MODE_FIFO_KHR,
+            VK_PRESENT_MODE_IMMEDIATE_KHR,
+            VK_PRESENT_MODE_FIFO_RELAXED_KHR,
+        );
+        use Declared::{CapCompat, CapRate, CapRateVsync, Generating, GuestVsync, Mode};
+        // The one case answered at queue: cap-rate-vsync on gamescope's route.
+        for requested in [f, r] {
+            assert_eq!(
+                present_wait_answer(true, CapRateVsync, requested, m),
+                WaitAnswer::AtQueue
+            );
+        }
+        // Every other mailbox or immediate presentation keeps master's answer
+        // at the commit: below-rate caps and no cap (the container's mode),
+        // frame generation, and a guest that asked for mailbox or immediate
+        // (declared FIFO under cap-rate or cap-compat).
+        for requested in [f, r, m, i] {
+            for live in [m, i] {
+                assert_eq!(
+                    present_wait_answer(true, Mode, requested, live),
+                    WaitAnswer::AtCommit
+                );
+            }
+            assert_eq!(
+                present_wait_answer(true, Generating, requested, m),
+                WaitAnswer::AtCommit
+            );
+        }
+        for requested in [m, i] {
+            for why in [CapRate, CapCompat] {
+                assert_eq!(
+                    present_wait_answer(true, why, requested, f),
+                    WaitAnswer::AtCommit
+                );
+            }
+        }
+        // FIFO and FIFO-relaxed out of a FIFO guest: the compositor answers.
+        assert_eq!(present_wait_answer(true, Mode, f, f), WaitAnswer::Later);
+        assert_eq!(
+            present_wait_answer(true, GuestVsync, f, f),
+            WaitAnswer::Later
+        );
+        assert_eq!(present_wait_answer(true, CapRate, f, f), WaitAnswer::Later);
+        assert_eq!(
+            present_wait_answer(true, CapCompat, r, f),
+            WaitAnswer::Later
+        );
+        assert_eq!(present_wait_answer(true, Mode, r, r), WaitAnswer::Later);
+        // Off gamescope's route: as on master.
+        assert_eq!(present_wait_answer(false, Mode, f, m), WaitAnswer::AtCommit);
+        assert_eq!(present_wait_answer(false, Mode, i, i), WaitAnswer::AtCommit);
+        assert_eq!(present_wait_answer(false, Mode, f, f), WaitAnswer::Later);
+    }
+
     #[test]
     fn present_wait_is_answered_at_commit_only_for_unpaced_modes() {
         assert!(answers_present_wait_at_commit(VK_PRESENT_MODE_MAILBOX_KHR));
@@ -9489,8 +9638,13 @@ enum Declared {
     Generating,
     /// FIFO for want of the daemon's stamp lead (`source=cap-compat`).
     CapCompat,
-    /// FIFO because the cap is the display's rate (`source=cap-rate`).
+    /// FIFO because the cap is the display's rate and the guest asked for
+    /// mailbox or immediate (`source=cap-rate`).
     CapRate,
+    /// The container's mode with the vblank-grid gate because the cap is the
+    /// display's rate and the guest asked for FIFO or FIFO-relaxed
+    /// (`source=cap-rate-vsync`).
+    CapRateVsync,
     /// No cap and a guest that asked for FIFO or FIFO-relaxed: its own mode
     /// over the container's non-FIFO default (`source=guest`).
     GuestVsync,
@@ -9507,8 +9661,16 @@ enum Declared {
 ///   vblank-grid gate is not run without the lead: released on the latch
 ///   points themselves, frames straddle gamescope's composite and are
 ///   replaced in its mailbox. The census reads `source=cap-compat`.
-/// - a cap at the display's rate and a mode other than FIFO: FIFO, with no
-///   acquire gate (`source=cap-rate`), as on master. At that cap one
+/// - a cap at the display's rate, a mode other than FIFO and a guest that
+///   asked for FIFO or FIFO-relaxed (in-game VSync on): the swapchain's mode
+///   with the vblank-grid gate, one release per vblank (`source=cap-rate-vsync`).
+///   The guest's present wait is then answered at commit and the gate paces
+///   it. Declared FIFO it was serialised behind gamescope's `presented` for
+///   each frame, and with ~16 ms of work per frame and three images it fell
+///   to 40 fps at 60 Hz.
+/// - a cap at the display's rate, a mode other than FIFO and a guest that
+///   asked for mailbox or immediate (self-paced): FIFO, with no acquire gate
+///   (`source=cap-rate`), as on master. At that cap one
 ///   frame per vblank is all the panel shows under either mode, and under
 ///   mailbox the shim would have to keep two commits out of one gamescope
 ///   composite without knowing when gamescope latches: its wakeup moves with
@@ -9588,7 +9750,11 @@ fn choose_live_mode(
         match grid {
             None => (VK_PRESENT_MODE_FIFO_KHR, Declared::CapCompat),
             Some(g) if crate::vsync_gate::at_display_rate(cap_fps, g) => {
-                (VK_PRESENT_MODE_FIFO_KHR, Declared::CapRate)
+                if vsync_request {
+                    (mode, Declared::CapRateVsync)
+                } else {
+                    (VK_PRESENT_MODE_FIFO_KHR, Declared::CapRate)
+                }
             }
             Some(_) => (mode, Declared::Mode),
         }
@@ -9692,6 +9858,7 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
         source: match (why, unsafe { (*sc).mode_source }) {
             (Declared::CapCompat, _) => "cap-compat",
             (Declared::CapRate, _) => "cap-rate",
+            (Declared::CapRateVsync, _) => "cap-rate-vsync",
             (Declared::GuestVsync, _) => "guest",
             (_, ModeSource::Env) => "env",
             (_, ModeSource::Guest) => "guest",
@@ -9725,7 +9892,7 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
     // Since the last line, so each line reads one window's cadence.
     let gaps = COMMIT_GAPS.each_ref().map(|b| b.swap(0, Ordering::Relaxed));
     crate::logf!(gndrm_obf::obf!(
-        "present mode: declared={} requested={} source={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}]",
+        "present mode: declared={} requested={} source={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} at_queue={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}]",
         mode_name(line.declared),
         mode_name(line.requested),
         line.source,
@@ -9742,6 +9909,7 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
         presented,
         discarded,
         fallback,
+        crate::present::at_queue_count(),
         GATE_HOLD_N.load(Ordering::Relaxed),
         late,
         skipped,
