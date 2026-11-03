@@ -274,7 +274,10 @@ impl Schedule {
     /// ([`crate::scanout::next_acquire_after`]).
     pub(crate) fn book_clock(&mut self, now_ns: u64, period_ns: u64) -> u64 {
         self.next_ns = crate::scanout::next_acquire_after(self.next_ns, now_ns, period_ns);
-        self.ideal_ns = 0;
+        // `book` reads `ideal_ns` as an absolute instant: leaving it at 0
+        // resolves `nearest(ideal_ns + interval)` near CLOCK_MONOTONIC zero and
+        // the schedule collapses to one release per vblank.
+        self.ideal_ns = self.next_ns;
         self.next_ns
     }
 
@@ -421,6 +424,51 @@ mod tests {
         // next release is the one after.
         let very_late = due + P60 + 3 * P60 + 2_000_000;
         assert_eq!(s.book(very_late, g, iv), due + 5 * P60);
+    }
+
+    /// A guest that is always ready, booked under `first` for `n_first`
+    /// frames, then under a 30 cap on a 60 Hz grid: the gaps, in vblanks,
+    /// between the grid releases.
+    fn gaps_after(first: Pacing, n_first: usize) -> Vec<u64> {
+        let g = grid(16_666_667);
+        let then = pacing(30, Some(g));
+        let mut s = Schedule::default();
+        let mut now = g.anchor_ns + 1_000_000;
+        for _ in 0..n_first {
+            now = now.max(s.next_ns);
+            s.book_paced(now, first);
+            now += 1_000_000;
+        }
+        let mut starts = Vec::new();
+        for _ in 0..7 {
+            now = now.max(s.next_ns) + 50_000;
+            starts.push(now);
+            s.book_paced(now, then);
+            now += 1_000_000;
+        }
+        vblanks(g, &starts)
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .collect()
+    }
+
+    #[test]
+    fn a_grid_cap_binds_after_frames_booked_on_the_clock() {
+        // The first grid release follows the clock's last due point, which is
+        // off the grid, so it may land a vblank later; every one after it is
+        // two vblanks apart. Before the fix the gaps were [0, 1, 1, 1, 1, 1].
+        let check = |gaps: Vec<u64>| {
+            assert!((2..=3).contains(&gaps[0]), "{gaps:?}");
+            assert_eq!(gaps[1..], [2, 2, 2, 2, 2], "{gaps:?}");
+        };
+        // Frame generation turned off at a cap below the display's rate: the
+        // source-rate gate's clock (40 fps) first, then 30 on 60.
+        check(gaps_after(Pacing::on_clock(40), 10));
+        // A cap moved from above the panel's rate (90 on 60, the cap's own
+        // clock) to below it.
+        check(gaps_after(Pacing::on_clock(90), 10));
+        // And with no clock booking at all.
+        assert_eq!(gaps_after(Pacing::Off, 0), [2, 2, 2, 2, 2, 2]);
     }
 
     #[test]
