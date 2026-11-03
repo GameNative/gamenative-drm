@@ -117,7 +117,8 @@ divisor cap reads its target exactly.
 
   | container mode | cap | declared | what limits the rate |
   |---|---|---|---|
-  | mailbox (default) | none | mailbox | nobody |
+  | mailbox (default) | none, guest asked for FIFO (in-game VSync on) | fifo (`source=guest`) | the display (FIFO) |
+  | mailbox (default) | none, guest asked for mailbox or immediate | mailbox | nobody |
   | mailbox | at the display's rate | fifo (`source=cap-rate`) | the shim's acquire gate, every vblank; gamescope latches one FIFO commit per vblank |
   | mailbox | below the display's rate | mailbox | the shim's acquire gate, on the display's vblank grid |
   | fifo | none | fifo | the display (FIFO) |
@@ -128,6 +129,17 @@ divisor cap reads its target exactly.
   own mode takes the env's place. "At the display's rate" is a cap within 0.5 %
   of the measured rate (60 on a 59.97 Hz panel); a cap above it runs on the
   gate's own clock under the container's mode.
+
+  **With no cap a guest's FIFO request wins over the container's default.** Every
+  container carries `MESA_VK_WSI_PRESENT_MODE=mailbox` as a stamped default the user
+  did not choose. With no cap, honouring it turned a game's own VSync (a FIFO
+  request) into an uncapped mailbox session, which is neither master's behaviour nor
+  what the user asked for. A FIFO request (FIFO-relaxed too) is a specific wish and
+  is declared as asked (`source=guest`); a mailbox or immediate request means "do not
+  make me wait", and the container's mailbox is the substitute, as on the X11 route
+  (an uncapped immediate guest gets mailbox, not tearing). An env of `fifo` is an
+  explicit wish and wins in every case. Under a cap the table above applies whatever
+  the guest asked for.
 
   **The user's control is `MESA_VK_WSI_PRESENT_MODE`.** It sits in the container's
   environment, written from the driver's present-mode setting, and takes Mesa's

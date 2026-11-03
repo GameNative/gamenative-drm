@@ -11,7 +11,7 @@ cursor, scan-out and mode patches.
 
 | place | what it holds | set by |
 |---|---|---|
-| the shim's declared present mode | the container's `MESA_VK_WSI_PRESENT_MODE` (else the guest's mode); FIFO under a cap at the display's rate; mailbox under frame generation | the container and the cap (`docs/10`) |
+| the shim's declared present mode | the container's `MESA_VK_WSI_PRESENT_MODE` (else the guest's mode); with no cap, a guest's FIFO request over a non-FIFO env; FIFO under a cap at the display's rate; mailbox under frame generation | the container, the guest and the cap (`docs/10`) |
 | gamescope's own limiter | `nRefreshHz / nTargetFPS`, a divisor of the mode's rate; holds FIFO commits only | `debug_set_fps_limit`, sent only when generation is off |
 | the shim's acquire gate | the cap, on the display's vblank grid, unless the container's mode is FIFO | `FrameCapNote{fps}` and `VsyncNote` from the daemon |
 | the presenter's latch grid | the display's latch points, as measured | `VsyncNote` from the daemon (`docs/17`) |
@@ -164,7 +164,8 @@ that rate is the display's.
 - **The container's present mode is declared, except under a cap at the display's
   rate.** `MESA_VK_WSI_PRESENT_MODE` decides the mode on the gamescope route as on the
   X11 Present route; without it the guest's own mode is declared. A container left at
-  the mailbox default runs mailbox with no cap, and mailbox capped by the shim's
+  the mailbox default runs, with no cap, FIFO for a guest that asked for FIFO (its
+  own VSync, `source=guest`) and mailbox for any other guest, and mailbox capped by the shim's
   vblank-grid gate under a cap below the display's rate. Under a cap at the display's
   rate it is declared FIFO with the gate kept (`source=cap-rate`), because the shim
   cannot keep two mailbox commits out of one gamescope composite (`docs/10`). One set
