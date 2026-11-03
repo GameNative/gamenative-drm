@@ -199,6 +199,22 @@ pub(crate) fn committed(id: u64, sc: usize, commit_ns: u64, answer_now: bool) {
     }
 }
 
+/// Waits answered when the guest queued the present (mailbox or immediate on
+/// gamescope's route), for the census.
+static AT_QUEUE_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A wait on `id` answered when the guest queued its present, before the
+/// frame's render fence (see `proxy::present_wait_answer`).
+pub(crate) fn answered_at_queue(id: u64, sc: usize, ns: u64) {
+    AT_QUEUE_N.fetch_add(1, Ordering::Relaxed);
+    record_for(id, sc, ns);
+}
+
+/// How many waits were answered at queue.
+pub(crate) fn at_queue_count() -> usize {
+    AT_QUEUE_N.load(Ordering::Relaxed)
+}
+
 /// Whether the guest enabled each feature. The shim serves both, so the answer
 /// is whichever the guest asked for at device creation.
 static ID_ENABLED: AtomicBool = AtomicBool::new(false);

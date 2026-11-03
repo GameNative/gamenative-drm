@@ -1770,8 +1770,15 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
             // neither would one whose frames go out as mailbox or immediate
             // (the container's mode, or frame generation): both are answered
             // here. A FIFO guest declared FIFO keeps the release-or-grace answer.
-            let at_commit = answers_present_wait_at_commit((*sc).requested_mode)
-                || answers_present_wait_at_commit(live_present_mode(sc));
+            // On gamescope's route a mailbox or immediate frame's wait was
+            // answered when the guest queued it (`present_dispatch`), so a wait
+            // still on the slot here is one whose mode changed since; it is
+            // answered now.
+            let at_commit = present_wait_answer(
+                !(*(*sc).surf).swapchain_obj.is_null(),
+                (*sc).requested_mode,
+                live_present_mode(sc),
+            ) != WaitAnswer::Later;
             let id = if at_commit {
                 let _g = (*sc).shared.lock().unwrap();
                 core::mem::replace(&mut (*s).wait_id, 0)
@@ -2749,9 +2756,65 @@ unsafe fn present_sync_commit(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32)
     }
 }
 
+/// When a present wait on a frame is answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitAnswer {
+    /// When the guest queues the present (`present_dispatch`).
+    AtQueue,
+    /// When the frame is committed, its render fence waited (`commit_real`).
+    AtCommit,
+    /// By the compositor: presentation feedback, the release, or the grace.
+    Later,
+}
+
+/// [`WaitAnswer`] for a frame of a swapchain the guest made for `requested`
+/// that goes out as `live`.
+///
+/// A guest that asked for mailbox or immediate does not wait, and neither would
+/// one whose frames go out as mailbox or immediate (the container's mode, or
+/// frame generation). On gamescope's route that wait is answered when the guest
+/// queues the present, before the frame's render fence, as the X11 route does
+/// (its X server sends PresentCompleteNotify while handling the PresentPixmap
+/// request): DXVK's frame-latency wait then lets the CPU of the next frame run
+/// while the GPU renders this one, and the acquire gate, not the wait, holds the
+/// rate. Off that route the answer stays at the commit. FIFO and FIFO-relaxed
+/// are answered by the compositor.
+fn present_wait_answer(
+    gamescope_route: bool,
+    requested: VkPresentModeKHR,
+    live: VkPresentModeKHR,
+) -> WaitAnswer {
+    if answers_present_wait_at_commit(requested) || answers_present_wait_at_commit(live) {
+        if gamescope_route {
+            WaitAnswer::AtQueue
+        } else {
+            WaitAnswer::AtCommit
+        }
+    } else {
+        WaitAnswer::Later
+    }
+}
+
 /// Route a present to the discipline its effective present mode names.
 unsafe fn present_dispatch(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
     mode_census(sc);
+    let answer = present_wait_answer(
+        unsafe { !(*(*sc).surf).swapchain_obj.is_null() },
+        unsafe { (*sc).requested_mode },
+        unsafe { live_present_mode(sc) },
+    );
+    if answer == WaitAnswer::AtQueue {
+        // Taken off the slot, so neither the commit, a replacement nor the
+        // release answers it again; the daemon's later latch report finds it
+        // no longer armed.
+        let id = {
+            let _g = unsafe { (*sc).shared.lock().unwrap() };
+            unsafe { core::mem::replace(&mut (*slot).wait_id, 0) }
+        };
+        if id != 0 {
+            crate::present::answered_at_queue(id, sc as usize, monotonic_ns());
+        }
+    }
     match unsafe { live_present_mode(sc) } {
         VK_PRESENT_MODE_IMMEDIATE_KHR => unsafe { present_immediate(sc, slot, idx) },
         VK_PRESENT_MODE_MAILBOX_KHR => unsafe { present_mailbox(sc, slot, idx) },
@@ -6504,6 +6567,39 @@ mod tests {
         assert_eq!(guest_present_mode(&ci), f);
     }
     #[test]
+    fn the_present_wait_answer_point_follows_the_declaration() {
+        let (m, f, i, r) = (
+            VK_PRESENT_MODE_MAILBOX_KHR,
+            VK_PRESENT_MODE_FIFO_KHR,
+            VK_PRESENT_MODE_IMMEDIATE_KHR,
+            VK_PRESENT_MODE_FIFO_RELAXED_KHR,
+        );
+        // gamescope's route: mailbox or immediate going out (the container's
+        // mode, cap-rate-vsync, frame generation) is answered when queued,
+        // whatever the guest asked for.
+        for live in [m, i] {
+            for requested in [f, r, m, i] {
+                assert_eq!(
+                    present_wait_answer(true, requested, live),
+                    WaitAnswer::AtQueue
+                );
+            }
+        }
+        // A guest that asked for mailbox or immediate is answered when queued
+        // even while its frames go out FIFO (cap-rate, cap-compat).
+        assert_eq!(present_wait_answer(true, i, f), WaitAnswer::AtQueue);
+        assert_eq!(present_wait_answer(true, m, f), WaitAnswer::AtQueue);
+        // FIFO and FIFO-relaxed out of a FIFO guest: the compositor answers.
+        assert_eq!(present_wait_answer(true, f, f), WaitAnswer::Later);
+        assert_eq!(present_wait_answer(true, r, r), WaitAnswer::Later);
+        assert_eq!(present_wait_answer(true, f, r), WaitAnswer::Later);
+        // Off gamescope's route the unpaced modes stay answered at the commit.
+        assert_eq!(present_wait_answer(false, f, m), WaitAnswer::AtCommit);
+        assert_eq!(present_wait_answer(false, i, i), WaitAnswer::AtCommit);
+        assert_eq!(present_wait_answer(false, f, f), WaitAnswer::Later);
+    }
+
+    #[test]
     fn present_wait_is_answered_at_commit_only_for_unpaced_modes() {
         assert!(answers_present_wait_at_commit(VK_PRESENT_MODE_MAILBOX_KHR));
         assert!(answers_present_wait_at_commit(VK_PRESENT_MODE_IMMEDIATE_KHR));
@@ -9768,7 +9864,7 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
     // Since the last line, so each line reads one window's cadence.
     let gaps = COMMIT_GAPS.each_ref().map(|b| b.swap(0, Ordering::Relaxed));
     crate::logf!(gndrm_obf::obf!(
-        "present mode: declared={} requested={} source={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}]",
+        "present mode: declared={} requested={} source={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} at_queue={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}]",
         mode_name(line.declared),
         mode_name(line.requested),
         line.source,
@@ -9785,6 +9881,7 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
         presented,
         discarded,
         fallback,
+        crate::present::at_queue_count(),
         GATE_HOLD_N.load(Ordering::Relaxed),
         late,
         skipped,

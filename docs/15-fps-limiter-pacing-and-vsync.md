@@ -73,9 +73,16 @@ that rate is the display's.
   periods after the commit when no release report arrives first.
 - **Mailbox and immediate.** A guest that asked for either does not wait, and neither
   would one whose frames go out as mailbox or immediate (frame generation, or the
-  container's env while the guest believes it has FIFO), so those waits are answered at
-  the commit rather than holding the guest's frame-latency loop for two periods
-  (`answers_present_wait_at_commit`).
+  container's env while the guest believes it has FIFO), so those waits are not held for
+  the compositor (`present_wait_answer`). On gamescope's route they are answered when the
+  guest queues the present, before the frame's render fence, as the X11 route's X server
+  answers PresentCompleteNotify at the PresentPixmap request: DXVK's frame-latency wait
+  then lets the CPU of the next frame run while the GPU renders this one, and the acquire
+  gate holds the rate (`at_queue=` in the periodic census). Answered after the fence, a
+  latency-1 guest alternated CPU and GPU: Retroid Pocket 6, DTD at 1080p, cap 60, VSync
+  on, 60 Hz, 42 fps with 23 ms from acquire to commit, the GPU at 65-69 % busy and
+  550 MHz because its governor saw the bubbles. Off that route they are answered at the
+  commit.
 - **A replaced frame.** Under mailbox a frame can be replaced before it is shown. It is
   never committed, released or latched under that id, so its wait is answered when it is
   discarded instead of timing out.

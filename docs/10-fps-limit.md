@@ -119,7 +119,7 @@ divisor cap reads its target exactly.
   |---|---|---|---|
   | mailbox (default) | none, guest asked for FIFO (in-game VSync on) | fifo (`source=guest`) | the display (FIFO) |
   | mailbox (default) | none, guest asked for mailbox or immediate | mailbox | nobody |
-  | mailbox | at the display's rate, guest asked for FIFO (in-game VSync on) | mailbox (`source=cap-rate-vsync`) | the shim's acquire gate, every vblank; the present wait is answered at commit |
+  | mailbox | at the display's rate, guest asked for FIFO (in-game VSync on) | mailbox (`source=cap-rate-vsync`) | the shim's acquire gate, every vblank; the present wait is answered when the guest queues the present |
   | mailbox | at the display's rate, guest asked for mailbox or immediate | fifo (`source=cap-rate`) | gamescope's limiter (divisor 1), one FIFO commit per vblank; no gate, as on master |
   | mailbox | below the display's rate | mailbox | the shim's acquire gate, on the display's vblank grid |
   | fifo | none | fifo | the display (FIFO) |
@@ -176,7 +176,8 @@ divisor cap reads its target exactly.
   ~16 ms of work and three images it fell to 40 fps at 60 Hz (a 1280x960
   device, DTD in game: 400 commits per 10 s, 400/600 publishes). That guest is
   declared the container's mode with the gate every vblank instead
-  (`source=cap-rate-vsync`): its wait is answered at commit, the gate paces it,
+  (`source=cap-rate-vsync`): its wait is answered when it queues the present
+  (`docs/15`), the gate paces it,
   and the swapchain keeps the mailbox image count (Retroid Pocket 6, DTD,
   VSync on, cap 60: 59.983 fps, no doubles). The
   vblank-grid gate is not kept on top of it: FIFO's back-pressure already holds
