@@ -5881,8 +5881,9 @@ pub fn serve_unlisted(
     // without this a client still receives `vkWaitForPresentKHR` from the
     // driver with a shim swapchain handle the driver has never seen. vkd3d-proton
     // takes that pointer, budgets its frame latency on it, and its present task
-    // then iterates without ever presenting.
-    if unimplemented_wsi_ext(name) {
+    // then iterates without ever presenting. Which commands those are is the
+    // WSI policy's (`crate::wsi_policy`): the hidden extensions' commands.
+    if crate::wsi_policy::refused_command(name) {
         return None;
     }
     let raw = raw?;
@@ -5955,9 +5956,9 @@ pub static GIPA_MISSED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Record an unresolvable entry point asked through the instance or
 /// physical-device path. Names the shim masks deliberately are not misses —
-/// they are refusals, and `unimplemented_wsi_ext` already says why.
+/// they are refusals, and `crate::wsi_policy` already says why.
 pub fn note_instance_miss(name: &CStr, driver_has_none: bool) {
-    if !driver_has_none || unimplemented_wsi_ext(name) {
+    if !driver_has_none || crate::wsi_policy::refused_command(name) {
         return;
     }
     if let Ok(mut missed) = GIPA_MISSED.lock() {
@@ -5977,13 +5978,15 @@ unsafe extern "C" fn gn_vkGetDeviceProcAddr(
     name: *const c_char,
 ) -> PFN_vkVoidFunction {
     let name = unsafe { CStr::from_ptr(name) };
-    if unimplemented_wsi_ext(name) {
-        // The proxy owns the swapchain: never hand the driver one of these with
-        // a shim swapchain handle it has never seen.
-        return None;
-    }
     if let Some(f) = device_func(name) {
         return Some(f);
+    }
+    if crate::wsi_policy::refused_command(name) {
+        // The proxy owns the swapchain: never hand the driver one of these with
+        // a shim swapchain handle it has never seen. A hidden extension's
+        // command the shim intercepts itself (the WSI dispatch-coverage set)
+        // was answered above, as before.
+        return None;
     }
     // Never the hooks' vkGetDeviceProcAddr (see gn_real_device_proc). The
     // loader will call whatever we return with the shim's wrapper handle, so
@@ -6976,6 +6979,11 @@ static FAKE_ROBUSTNESS2: AtomicBool = AtomicBool::new(false);
 /// with the driver choice; see [`device_prereqs`]).
 static AHB_IMPORT_ALLOWED: AtomicBool = AtomicBool::new(false);
 static AHB_MODE_LOGGED: AtomicBool = AtomicBool::new(false);
+/// The WSI policy's line, once per process for devices and for instances.
+/// Printed whatever `GNDRM_LOG_VKSHIM` says (`logi!`), like the
+/// driver-selection lines: the gamescope session never carries that variable.
+static WSI_DEVICE_LOGGED: AtomicBool = AtomicBool::new(false);
+static WSI_INSTANCE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 static ROBUSTNESS2_FAKED: AtomicBool = AtomicBool::new(false);
 
@@ -6991,44 +6999,6 @@ pub fn set_hide_device_drm(on: bool) {
 
 pub fn set_fake_robustness2(on: bool) {
     FAKE_ROBUSTNESS2.store(on, Ordering::Relaxed);
-}
-
-/// The WSI surface the proxy does not implement, by extension name and by the
-/// command names those extensions add.
-///
-/// Both forms are needed because the same predicate guards two different
-/// questions: which extensions to enumerate (`vkEnumerate*ExtensionProperties`,
-/// extension names) and which entry points `vkGetDeviceProcAddr` may resolve
-/// (command names). Testing extension names alone left the commands resolvable,
-/// so the guest got `vkWaitForPresentKHR` from the driver together with a shim
-/// swapchain handle the driver has never seen — vkd3d-proton asks for it
-/// whenever it resolves, which is why DX12 titles stalled in their present task
-/// while DXVK titles, which never call it, presented normally.
-///
-/// `vkWaitForPresentKHR` is no longer on the list: the shim serves it from its
-/// own swapchain (`gn_vkWaitForPresentKHR`). Refusing a command while advertising
-/// its extension handed the guest a NULL entry point; DXVK's frame thread called
-/// it and spun in exception dispatch. So every name here is one whose extension
-/// is hidden too: the v2 present id/wait pair, which the shim does not serve (the
-/// guest falls back to the v1 pair it does, see `crate::maint1`).
-fn unimplemented_wsi_ext(name: &CStr) -> bool {
-    name == c"VK_KHR_present_id2"
-        || name == c"VK_KHR_present_wait2"
-        || name == c"vkWaitForPresent2KHR"
-}
-
-/// WSI extensions the shim serves from its own swapchain. The driver's copies are
-/// hidden from the guest's list and the shim's advertised instead, the names are
-/// masked at device creation (the driver has no swapchain to apply them to) and
-/// their feature structs are stripped from the driver's create chain; the entry
-/// points are the shim's (`gn_vkWaitForPresentKHR`,
-/// `gn_vkReleaseSwapchainImagesKHR`, the present-fence path of
-/// `gn_vkQueuePresentKHR`).
-fn shim_served_wsi_ext(name: &CStr) -> bool {
-    name == crate::present::EXT_PRESENT_ID
-        || name == crate::present::EXT_PRESENT_WAIT
-        || name == crate::maint1::EXT_SWAPCHAIN_MAINTENANCE1_KHR
-        || name == crate::maint1::EXT_SWAPCHAIN_MAINTENANCE1_EXT
 }
 
 // ---------------------------------------------------------------- objects
@@ -8656,15 +8626,22 @@ unsafe extern "C" fn gn_vkCreateInstance(
         )
     };
     let mut exts: Vec<*const c_char> = vec![ptr::null(); names.len() + 16];
+    let real_exts = real_instance_exts(gipa);
+    if !WSI_INSTANCE_LOGGED.swap(true, Ordering::Relaxed) {
+        crate::logi!(gndrm_obf::obf!(
+            "proxy instance: WSI extensions hidden from the guest: [{}] requested and masked: [{}]",
+            crate::wsi_policy::hidden_names(
+                real_exts.iter().flatten().map(|e| e.as_c_str())
+            ),
+            crate::wsi_policy::hidden_names(names.iter().map(|&o| unsafe { CStr::from_ptr(o) }))
+        ));
+    }
     for &name in names {
         let n_ = unsafe { CStr::from_ptr(name) };
-        if n_ == c"VK_KHR_wayland_surface"
-            || n_ == c"VK_KHR_xlib_surface"
-            || n_ == c"VK_KHR_xcb_surface"
-            || n_ == crate::maint1::EXT_SURFACE_MAINTENANCE1_KHR
-            || n_ == crate::maint1::EXT_SURFACE_MAINTENANCE1_EXT
-        {
-            continue; // proxied, not real
+        // Proxied, not real (the shim's surfaces), or hidden by the WSI
+        // policy (`crate::wsi_policy`).
+        if crate::wsi_policy::driver_copy_hidden(n_) {
+            continue;
         }
         if n < exts.len() {
             exts[n] = name;
@@ -8675,7 +8652,6 @@ unsafe extern "C" fn gn_vkCreateInstance(
     // itself (or a layer the outer loader knows and the system one does not)
     // would make it refuse the whole instance.
     let wanted: Vec<&CStr> = exts[..n].iter().map(|&e| unsafe { CStr::from_ptr(e) }).collect();
-    let real_exts = real_instance_exts(gipa);
     let (fwd_exts, dropped_exts) = split_known(&wanted, real_exts.as_deref());
     let layers: Vec<&CStr> = unsafe {
         slice_or_empty(ci.ppEnabledLayerNames, ci.enabledLayerCount as usize)
@@ -8858,63 +8834,70 @@ unsafe extern "C" fn gn_vkEnumerateInstanceExtensionProperties(
     let Some(real_enum) = real_enum else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
-    // Extensions the proxy answers itself. The three surface extensions are
-    // always hidden from the real driver; `VK_EXT_swapchain_colorspace` is added
-    // in an HDR session because it defines the PQ colourspace the surface
-    // formats advertise, and a client that does not see the extension must
-    // ignore it.
-    // The surface-maintenance pair is what `VK_KHR_swapchain_maintenance1`
-    // depends on; the shim's own surface-capability query answers its structs
-    // (`crate::maint1::surface_caps2`).
-    let names: [&[u8]; 6] = [
-        b"VK_KHR_wayland_surface\0",
-        b"VK_KHR_xlib_surface\0",
-        b"VK_KHR_xcb_surface\0",
-        b"VK_KHR_surface_maintenance1\0",
-        b"VK_EXT_surface_maintenance1\0",
-        b"VK_EXT_swapchain_colorspace\0",
-    ];
-    let extra: u32 = 5;
+    // Extensions the proxy answers itself (`crate::wsi_policy`): the three
+    // surface extensions — winewayland clients use the wayland one, winex11
+    // clients (the gamescope path) the xlib one, and Mesa's zink WSI the xcb
+    // one — and the surface-maintenance pair `VK_KHR_swapchain_maintenance1`
+    // depends on (the shim's own surface-capability query answers its structs,
+    // `crate::maint1::surface_caps2`). The real driver never sees them; its
+    // copies are dropped, together with every WSI extension the policy hides.
+    // `VK_EXT_swapchain_colorspace` is the driver's copy only, never added: it
+    // defines the PQ colourspace the surface formats advertise in an HDR
+    // session, but exposing the shim's copy made vkd3d-proton titles present
+    // once per swapchain and then stop, while the PQ surface format alone is
+    // enough for DXVK to report an HDR10 output.
+    let added: Vec<(&CStr, u32)> =
+        crate::wsi_policy::shim_advertised(crate::vk_dispatch_gen::ExtKind::Instance).collect();
     unsafe {
-        if pProps.is_null() {
-            let mut n: u32 = 0;
-            let res = real_enum(layer, &mut n, ptr::null_mut());
-            if res != VK_SUCCESS {
-                return res;
-            }
-            *pCount = n + extra;
-            return VK_SUCCESS;
+        let mut n: u32 = 0;
+        let res = real_enum(layer, &mut n, ptr::null_mut());
+        if res != VK_SUCCESS {
+            return res;
         }
-        let cap = *pCount;
-        if cap == 0 {
-            *pCount = 0;
-            return VK_INCOMPLETE;
-        }
-        let mut n = cap.saturating_sub(extra);
-        let res = real_enum(layer, &mut n, pProps);
+        let mut buf = vec![
+            VkExtensionProperties {
+                extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
+                specVersion: 0,
+            };
+            n as usize + added.len()
+        ];
+        let mut got = n;
+        let res = real_enum(layer, &mut got, buf.as_mut_ptr());
         if res != VK_SUCCESS && res != VK_INCOMPLETE {
             return res;
         }
-        let total = n + extra;
-        if cap >= total {
-            // All three surface extensions are proxied: winewayland clients use
-            // the wayland one, winex11 clients (the gamescope path) the xlib
-            // one, and Mesa's zink WSI the xcb one — the real driver never sees
-            // them, nor the surface-maintenance pair. `VK_EXT_swapchain_colorspace`
-            // is NOT advertised: exposing it made vkd3d-proton titles present once
-            // per swapchain and then stop, while the PQ surface format alone is
-            // enough for DXVK to report an HDR10 output.
-            for (i, name) in names[..extra as usize].iter().enumerate() {
-                let slot = &mut *pProps.add(n as usize + i);
-                slot.specVersion = 6;
-                slot.extensionName[..name.len()]
-                    .copy_from_slice(std::mem::transmute::<&[u8], &[c_char]>(*name));
+        let mut kept = 0usize;
+        for i in 0..(got as usize).min(n as usize) {
+            let name = CStr::from_ptr(buf[i].extensionName.as_ptr());
+            if crate::wsi_policy::driver_copy_hidden(name) {
+                continue;
             }
-            *pCount = total;
+            buf[kept] = buf[i];
+            kept += 1;
+        }
+        for (name, spec) in &added {
+            let mut prop = VkExtensionProperties {
+                extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
+                specVersion: *spec,
+            };
+            for (j, b) in name.to_bytes().iter().enumerate() {
+                prop.extensionName[j] = *b as c_char;
+            }
+            buf[kept] = prop;
+            kept += 1;
+        }
+        if pProps.is_null() {
+            *pCount = kept as u32;
             return VK_SUCCESS;
         }
-        *pCount = total;
-        VK_INCOMPLETE
+        let n_copy = (*pCount as usize).min(kept);
+        ptr::copy_nonoverlapping(buf.as_ptr(), pProps, n_copy);
+        *pCount = n_copy as u32;
+        if n_copy < kept {
+            VK_INCOMPLETE
+        } else {
+            VK_SUCCESS
+        }
     }
 }
 
@@ -8949,14 +8932,16 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
         }
         // Spare slots: the proxy appends `VK_EXT_hdr_metadata` and, for
         // gamescope, `VK_EXT_robustness2` when the driver does not list them,
-        // plus the WSI extensions it serves itself (`shim_served_wsi_ext`) and
+        // plus the WSI extensions it serves itself (`crate::wsi_policy`) and
         // the placed-memory and divisor names.
+        let shim_wsi: Vec<(&CStr, u32)> =
+            crate::wsi_policy::shim_advertised(crate::vk_dispatch_gen::ExtKind::Device).collect();
         let mut buf = vec![
             VkExtensionProperties {
                 extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
                 specVersion: 0,
             };
-            n as usize + 8
+            n as usize + 4 + shim_wsi.len()
         ];
         let mut got = n;
         let res = real(pd, layer, &mut got, buf.as_mut_ptr());
@@ -8967,13 +8952,13 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
         let mut has_hdr_metadata = false;
         let mut has_robustness2 = false;
         let mut has_placed = false;
-        let mut has_present_id = false;
-        let mut has_present_wait = false;
         let mut has_divisor_ext = false;
         let mut has_divisor_khr = false;
         for i in 0..got as usize {
             let name = CStr::from_ptr(buf[i].extensionName.as_ptr());
-            if unimplemented_wsi_ext(name) || shim_served_wsi_ext(name) {
+            // The WSI policy: hidden names, and the driver's copies of the
+            // names the shim advertises itself.
+            if crate::wsi_policy::driver_copy_hidden(name) {
                 continue;
             }
             if name == c"VK_EXT_physical_device_drm" && HIDE_DEVICE_DRM.load(Ordering::Relaxed) {
@@ -8990,12 +8975,6 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
             }
             if name == crate::placed::EXT_NAME {
                 has_placed = true;
-            }
-            if name == crate::present::EXT_PRESENT_ID {
-                has_present_id = true;
-            }
-            if name == crate::present::EXT_PRESENT_WAIT {
-                has_present_wait = true;
             }
             if name == crate::divisor::EXT_NAME {
                 has_divisor_ext = true;
@@ -9047,13 +9026,8 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
         // shim for its own swapchain: the driver's swapchain is not the one the
         // guest presents through, so its support says nothing. The driver's
         // copies were skipped above; the shim's are advertised here.
-        for (flag, name, spec) in [
-            (has_present_id, crate::present::EXT_PRESENT_ID, 1u32),
-            (has_present_wait, crate::present::EXT_PRESENT_WAIT, 1u32),
-            (false, crate::maint1::EXT_SWAPCHAIN_MAINTENANCE1_KHR, 1u32),
-            (false, crate::maint1::EXT_SWAPCHAIN_MAINTENANCE1_EXT, 1u32),
-        ] {
-            if flag || !layer.is_null() {
+        for &(name, spec) in &shim_wsi {
+            if !layer.is_null() {
                 continue;
             }
             let mut prop = VkExtensionProperties {
@@ -10543,9 +10517,17 @@ unsafe extern "C" fn gn_vkCreateDevice(
         (api >> 22) & 0x7F,
         (api >> 12) & 0x3FF
     ));
+    if !WSI_DEVICE_LOGGED.swap(true, Ordering::Relaxed) {
+        crate::logi!(gndrm_obf::obf!(
+            "proxy device: WSI extensions hidden from the guest: [{}] requested and masked: [{}]",
+            crate::wsi_policy::hidden_names(have.iter().map(|h| h.as_c_str())),
+            crate::wsi_policy::hidden_names(names.iter().map(|&o| unsafe { CStr::from_ptr(o) }))
+        ));
+    }
     for &name in names {
-        // The guest must never enable a WSI extension the proxy cannot honour
-        // (see `unimplemented_wsi_ext`); drop it before the driver sees it.
+        // The guest must never enable a WSI extension the proxy cannot honour,
+        // nor hand the driver one the shim serves itself (`crate::wsi_policy`);
+        // drop it before the driver sees it.
         let n_ = unsafe { CStr::from_ptr(name) };
         if crate::placed::faked() && n_ == crate::placed::EXT_NAME {
             crate::placed::note_requested();
@@ -10560,8 +10542,7 @@ unsafe extern "C" fn gn_vkCreateDevice(
             }
             continue;
         }
-        if unimplemented_wsi_ext(n_)
-            || shim_served_wsi_ext(n_)
+        if crate::wsi_policy::driver_copy_hidden(n_)
             || (n_ == c"VK_EXT_hdr_metadata"
                 && !have.is_empty()
                 && !have.iter().any(|h| h.as_c_str() == n_))
@@ -10665,15 +10646,14 @@ unsafe extern "C" fn gn_vkCreateDevice(
         .any(|&o| unsafe { CStr::from_ptr(o) } == crate::present::EXT_PRESENT_WAIT);
     crate::present::note_enabled(guest_id, guest_wait);
 
-    let mut strip: Vec<VkStructureType> = vec![
-        crate::present::STYPE_PRESENT_ID_FEATURES as VkStructureType,
-        crate::present::STYPE_PRESENT_WAIT_FEATURES as VkStructureType,
-        // Swapchain maintenance is the shim's too (`crate::maint1`); the v2
-        // present features are masked from the list, so a conforming guest
-        // never chains them, and one that does is refused by the driver as
-        // it would be on a driver without them.
-        crate::maint1::STYPE_FEATURES as VkStructureType,
-    ];
+    // Swapchain maintenance is the shim's too (`crate::maint1`). The policy
+    // (`crate::wsi_policy`) strips the feature struct of every WSI extension
+    // whose driver copy the guest does not see: the shim's own features are its
+    // answer, and a hidden extension's struct (the v2 present pair, present
+    // timing, ...) names a feature the driver must not be asked for.
+    let mut strip: Vec<VkStructureType> = crate::wsi_policy::stripped_feature_stypes()
+        .map(|s| s as VkStructureType)
+        .collect();
     if strip_robustness2 {
         strip.push(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
     }

@@ -29,13 +29,13 @@ the EXT name and were never affected.
 
 | Part | Where | Answer |
 |---|---|---|
-| Extension names | `gn_vkEnumerateDeviceExtensionProperties`, `gn_vkEnumerateInstanceExtensionProperties` | The driver's copies are hidden, the shim's advertised (`shim_served_wsi_ext`); masked at device and instance creation, so the driver never sees a name it has no swapchain for. |
+| Extension names | `gn_vkEnumerateDeviceExtensionProperties`, `gn_vkEnumerateInstanceExtensionProperties` | The driver's copies are hidden, the shim's advertised (`wsi_policy::SERVED`); masked at device and instance creation, so the driver never sees a name it has no swapchain for. |
 | `swapchainMaintenance1` feature | `gn_vkGetPhysicalDeviceFeatures2`, device creation | Reported true; the struct is stripped from the driver's create chain like the present-id/wait ones. |
 | Present fences (`VkSwapchainPresentFenceInfo`) | `gn_vkQueuePresentKHR` | The present's own submit (the one that consumes the guest's wait semaphores) also signals the slot's `fence_sem`; a second empty submit waits it and carries the guest's fence. The fence signals once the wait semaphores are free, which is its contract. The census prints `maint1=[fences=N ...]`. |
 | Surface capabilities (`VkSurfacePresentScalingCapabilities`, `VkSurfacePresentModeCompatibility`) | `gn_vkGetPhysicalDeviceSurfaceCapabilities2KHR` | No scaling (the swapchain is presented at its own extent; gamescope scales the layer); the compatible list is the one mode the query named. |
 | Creation (`VkSwapchainPresentModesCreateInfo`, `VkSwapchainPresentScalingCreateInfo`, the deferred-allocation flag) | `gn_vkCreateSwapchainKHR` | Accepted and logged under `GNDRM_LOG_VKSHIM`; every slot is still allocated at creation, which the flag allows. |
 | `vkReleaseSwapchainImagesKHR` / `EXT` | `gn_vkReleaseSwapchainImagesKHR` | Acquired, unpresented slots go back to the free list. The acquire gate's booking for them stands (a released image is a frame the guest chose not to show). |
-| `VK_KHR_present_id2` / `VK_KHR_present_wait2` | `unimplemented_wsi_ext`, `maint1::features2` | Hidden and reported false: both guests fall back to the v1 pair the shim serves (`docs/15`). |
+| `VK_KHR_present_id2` / `VK_KHR_present_wait2` | `wsi_policy::HIDDEN`, `maint1::features2` | Hidden and reported false: both guests fall back to the v1 pair the shim serves (`docs/15`). |
 
 DXVK and vkd3d-proton gain what they have on X11: no `vkQueueWaitIdle` or device
 idle when a swapchain is recreated or destroyed, and their newest releases run
@@ -60,3 +60,5 @@ present wait and the cap gate, which were already served.
   seen to prefer them in a way v1 cannot express (`VkSurfaceCapabilitiesPresentWait2KHR`).
 - **Scaling capabilities.** `VK_PRESENT_SCALING_STRETCH_BIT_KHR` and the gravity
   bits could be honoured by the layer placement gamescope already does.
+
+The naming policy for every WSI extension, served or hidden, is `docs/21-wsi-extension-policy.md`.

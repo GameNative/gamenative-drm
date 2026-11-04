@@ -307,7 +307,7 @@ def build(xml_path):
             if e:
                 nested[n] = e
 
-    return hdr, sha, entries, aliases, nested
+    return hdr, sha, entries, aliases, nested, build_wsi(root)
 
 
 def emit_path(elem):
@@ -456,6 +456,224 @@ def render(xml_path, hdr, sha, entries, aliases, nested):
     return b.getvalue()
 
 
+# ---------------------------------------------------------------- WSI scope
+#
+# Under gamescope the shim owns the swapchain and the surfaces, so every
+# extension whose subject is a surface, a swapchain or a present is a question
+# about the shim, not about the driver. Which extensions those are is a
+# property of the registry; `wsi_policy.rs` decides, per name, whether the shim
+# serves it or hides it, and a test fails when the registry gains a WSI-scoped
+# name the policy does not classify.
+
+# The WSI roots: an extension that depends on one of these (directly, or
+# through another WSI-scoped extension) is WSI-scoped.
+WSI_ROOTS = {
+    "VK_KHR_surface",
+    "VK_KHR_swapchain",
+    "VK_KHR_display",
+    "VK_KHR_get_surface_capabilities2",
+}
+# Structures whose extension structs only say something about a surface, a
+# swapchain or a present. An extension with a struct that extends nothing but
+# these is WSI-scoped. A struct that also extends a non-WSI structure
+# (VkImageCompressionControlEXT extends VkImageCreateInfo too) does not count:
+# its extension is about images and only touches swapchains on the side.
+WSI_STRUCTS = {
+    "VkPresentInfoKHR",
+    "VkSwapchainCreateInfoKHR",
+    "VkSurfaceCapabilities2KHR",
+    "VkPhysicalDeviceSurfaceInfo2KHR",
+    "VkAcquireNextImageInfoKHR",
+}
+# Name tokens: `_present` matches present_id and shared_presentable_image but
+# not representative_fragment_test.
+WSI_NAME = re.compile(r"_(surface|swapchain|present|display)", re.I)
+# Platforms an extension can exist on here: Android drivers (android), and the
+# three surface platforms the shim proxies for its guests. The rest (win32,
+# metal, fuchsia, ...) are never listed by a driver on this device.
+WSI_PLATFORMS = {None, "android", "xlib", "xcb", "wayland"}
+
+
+def stype_values(root):
+    """VK_STRUCTURE_TYPE_* name -> value, core and extension-defined."""
+    vals = {}
+    aliases = {}
+    for en in root.findall("enums"):
+        if en.get("name") != "VkStructureType":
+            continue
+        for e in en.findall("enum"):
+            if e.get("value") is not None:
+                vals[e.get("name")] = int(e.get("value"), 0)
+            elif e.get("alias"):
+                aliases[e.get("name")] = e.get("alias")
+
+    def ext_enum(e, extnumber):
+        if e.get("extends") != "VkStructureType":
+            return
+        n = e.get("name")
+        if e.get("offset") is not None:
+            num = int(e.get("extnumber") or extnumber)
+            v = 1_000_000_000 + (num - 1) * 1000 + int(e.get("offset"))
+            vals[n] = -v if e.get("dir") == "-" else v
+        elif e.get("value") is not None:
+            vals[n] = int(e.get("value"), 0)
+        elif e.get("alias"):
+            aliases[n] = e.get("alias")
+
+    for x in root.findall("extensions/extension"):
+        for r in x.findall("require"):
+            for e in r.findall("enum"):
+                ext_enum(e, x.get("number"))
+    for f in root.findall("feature"):
+        for r in f.findall("require"):
+            for e in r.findall("enum"):
+                ext_enum(e, None if e.get("extnumber") is None else e.get("extnumber"))
+    for n, a in aliases.items():
+        seen = set()
+        while a in aliases and a not in seen:
+            seen.add(a)
+            a = aliases[a]
+        if a in vals:
+            vals[n] = vals[a]
+    return vals
+
+
+def build_wsi(root):
+    """The WSI-scoped extensions: `(name, type, [(feature sType, leading
+    VkBool32 count)], [command])`, sorted by name. Commands are the ones only
+    WSI-scoped extensions require; a command a core version or a non-WSI
+    extension also requires (vkAcquireNextImage2KHR, for VK_KHR_device_group)
+    is not the WSI extension's to refuse."""
+    types = {t.get("name"): t for t in root.findall("types/type") if t.get("name")}
+    stypes = stype_values(root)
+    exts = {}
+    for x in root.findall("extensions/extension"):
+        if "vulkan" not in (x.get("supported") or "").split(","):
+            continue
+        exts[x.get("name")] = x
+
+    def own_types(x):
+        # Types of the extension proper: a require block with a `depends` is
+        # an interaction with another extension, not the extension's subject.
+        for r in x.findall("require"):
+            if r.get("depends"):
+                continue
+            for t in r.findall("type"):
+                yield t.get("name")
+
+    def direct(n, x):
+        if n in WSI_ROOTS or WSI_NAME.search(n[2:]):
+            return True
+        for tn in own_types(x):
+            t = types.get(tn)
+            ext = set(filter(None, (t.get("structextends") or "").split(","))) if t is not None else set()
+            if ext and ext <= WSI_STRUCTS:
+                return True
+        return False
+
+    wsi = {n for n, x in exts.items() if direct(n, x)}
+    grew = True
+    while grew:
+        grew = False
+        for n, x in exts.items():
+            if n not in wsi and set(re.findall(r"VK_\w+", x.get("depends") or "")) & wsi:
+                wsi.add(n)
+                grew = True
+    wsi = {n for n in wsi if exts[n].get("platform") in WSI_PLATFORMS}
+
+    # Every command a core version or a non-WSI extension requires.
+    shared = set()
+    for f in root.findall("feature"):
+        for r in f.findall("require"):
+            for c in r.findall("command"):
+                shared.add(c.get("name"))
+    for n, x in exts.items():
+        if n in wsi:
+            continue
+        for r in x.findall("require"):
+            for c in r.findall("command"):
+                shared.add(c.get("name"))
+
+    def resolve_struct(tn):
+        t = types.get(tn)
+        seen = set()
+        while t is not None and t.get("alias") and tn not in seen:
+            seen.add(tn)
+            tn = t.get("alias")
+            t = types.get(tn)
+        return t
+
+    out = []
+    for n in sorted(wsi):
+        x = exts[n]
+        feats = []
+        cmds = []
+        for r in x.findall("require"):
+            for tr in r.findall("type"):
+                t = resolve_struct(tr.get("name"))
+                if t is None or t.get("category") != "struct":
+                    continue
+                if "VkPhysicalDeviceFeatures2" not in (t.get("structextends") or "").split(","):
+                    continue
+                st = None
+                bools = 0
+                for m in t.findall("member"):
+                    mn = m.find("name").text
+                    mt = m.find("type").text
+                    if mn == "sType":
+                        st = stypes.get(m.get("values"))
+                    elif mn == "pNext":
+                        continue
+                    elif mt == "VkBool32" and "*" not in "".join(m.itertext()):
+                        bools += 1
+                    else:
+                        break
+                if st is not None and (st, bools) not in feats:
+                    feats.append((st, bools))
+            for c in r.findall("command"):
+                cn = c.get("name")
+                if cn not in shared and cn not in cmds:
+                    cmds.append(cn)
+        out.append((n, x.get("type"), sorted(feats), sorted(cmds)))
+    return out
+
+
+def render_wsi(wsi):
+    b = io.StringIO()
+    w = b.write
+    w("\n")
+    w("/// Whether a WSI-scoped extension is enumerated per instance or per device.\n")
+    w("#[derive(Clone, Copy, PartialEq, Eq, Debug)]\n")
+    w("pub enum ExtKind {\n")
+    w("    Instance,\n")
+    w("    Device,\n")
+    w("}\n\n")
+    w("/// One WSI-scoped extension: its name, kind, feature structs\n")
+    w("/// `(sType, leading VkBool32 members)` and the commands only WSI-scoped\n")
+    w("/// extensions require.\n")
+    w("pub type WsiExt = (\n")
+    w("    &'static str,\n")
+    w("    ExtKind,\n")
+    w("    &'static [(i32, u32)],\n")
+    w("    &'static [&'static str],\n")
+    w(");\n\n")
+    w("// WSI-scoped extensions, sorted by name: an extension whose `depends`\n")
+    w("// names VK_KHR_surface, VK_KHR_swapchain, VK_KHR_display or\n")
+    w("// VK_KHR_get_surface_capabilities2 (transitively through other WSI-scoped\n")
+    w("// extensions), one with a struct extending only present/swapchain/surface\n")
+    w("// structures, or one named for a surface, swapchain, present or display;\n")
+    w("// platform-specific ones only for android/xlib/xcb/wayland.\n")
+    w("#[rustfmt::skip]\n")
+    w("pub static VK_WSI_EXTENSIONS: &[WsiExt] = &[\n")
+    for n, kind, feats, cmds in wsi:
+        k = "Instance" if kind == "instance" else "Device"
+        fs = ", ".join(f"({s}, {c})" for s, c in feats)
+        cs = ", ".join(f'"{c}"' for c in cmds)
+        w(f'    ("{n}", ExtKind::{k}, &[{fs}], &[{cs}]),\n')
+    w("];\n")
+    return b.getvalue()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--xml", default=DEFAULT_XML)
@@ -464,8 +682,8 @@ def main():
                     help="verify the committed output is up to date; do not write")
     args = ap.parse_args()
 
-    hdr, sha, entries, aliases, nested = build(args.xml)
-    text = render(args.xml, hdr, sha, entries, aliases, nested)
+    hdr, sha, entries, aliases, nested, wsi = build(args.xml)
+    text = render(args.xml, hdr, sha, entries, aliases, nested) + render_wsi(wsi)
 
     if args.check:
         try:
@@ -478,13 +696,15 @@ def main():
                   f"run tools/gen-vk-dispatch.py", file=sys.stderr)
             sys.exit(1)
         print(f"gen-vk-dispatch: {args.out} up to date "
-              f"({len(entries)} commands, {len(aliases)} aliases)")
+              f"({len(entries)} commands, {len(aliases)} aliases, "
+              f"{len(wsi)} WSI extensions)")
         return
 
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(text)
     print(f"gen-vk-dispatch: wrote {args.out} "
-          f"({len(entries)} commands, {len(aliases)} aliases, VK_HEADER_VERSION {hdr})")
+          f"({len(entries)} commands, {len(aliases)} aliases, {len(wsi)} WSI extensions, "
+          f"VK_HEADER_VERSION {hdr})")
 
 
 if __name__ == "__main__":

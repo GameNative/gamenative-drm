@@ -1101,3 +1101,72 @@ pub fn nested_handles(name: &str) -> &'static [NestedHandle] {
         Err(_) => &[],
     }
 }
+
+/// Whether a WSI-scoped extension is enumerated per instance or per device.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExtKind {
+    Instance,
+    Device,
+}
+
+/// One WSI-scoped extension: its name, kind, feature structs
+/// `(sType, leading VkBool32 members)` and the commands only WSI-scoped
+/// extensions require.
+pub type WsiExt = (
+    &'static str,
+    ExtKind,
+    &'static [(i32, u32)],
+    &'static [&'static str],
+);
+
+// WSI-scoped extensions, sorted by name: an extension whose `depends`
+// names VK_KHR_surface, VK_KHR_swapchain, VK_KHR_display or
+// VK_KHR_get_surface_capabilities2 (transitively through other WSI-scoped
+// extensions), one with a struct extending only present/swapchain/surface
+// structures, or one named for a surface, swapchain, present or display;
+// platform-specific ones only for android/xlib/xcb/wayland.
+#[rustfmt::skip]
+pub static VK_WSI_EXTENSIONS: &[WsiExt] = &[
+    ("VK_AMD_display_native_hdr", ExtKind::Device, &[], &["vkSetLocalDimmingAMD"]),
+    ("VK_EXT_acquire_drm_display", ExtKind::Instance, &[], &["vkAcquireDrmDisplayEXT", "vkGetDrmDisplayEXT"]),
+    ("VK_EXT_direct_mode_display", ExtKind::Instance, &[], &["vkReleaseDisplayEXT"]),
+    ("VK_EXT_display_control", ExtKind::Device, &[], &["vkDisplayPowerControlEXT", "vkGetSwapchainCounterEXT", "vkRegisterDeviceEventEXT", "vkRegisterDisplayEventEXT"]),
+    ("VK_EXT_display_surface_counter", ExtKind::Instance, &[], &["vkGetPhysicalDeviceSurfaceCapabilities2EXT"]),
+    ("VK_EXT_hdr_metadata", ExtKind::Device, &[], &["vkSetHdrMetadataEXT"]),
+    ("VK_EXT_headless_surface", ExtKind::Instance, &[], &["vkCreateHeadlessSurfaceEXT"]),
+    ("VK_EXT_image_compression_control_swapchain", ExtKind::Device, &[(1000437000, 1)], &[]),
+    ("VK_EXT_multisampled_render_to_swapchain", ExtKind::Device, &[(1000616000, 1)], &[]),
+    ("VK_EXT_present_mode_fifo_latest_ready", ExtKind::Device, &[(1000361000, 1)], &[]),
+    ("VK_EXT_present_timing", ExtKind::Device, &[(1000208000, 3)], &["vkGetPastPresentationTimingEXT", "vkGetSwapchainTimeDomainPropertiesEXT", "vkGetSwapchainTimingPropertiesEXT", "vkSetSwapchainPresentTimingQueueSizeEXT"]),
+    ("VK_EXT_surface_maintenance1", ExtKind::Instance, &[], &[]),
+    ("VK_EXT_swapchain_colorspace", ExtKind::Instance, &[], &[]),
+    ("VK_EXT_swapchain_maintenance1", ExtKind::Device, &[(1000275000, 1)], &["vkReleaseSwapchainImagesEXT"]),
+    ("VK_GOOGLE_display_timing", ExtKind::Device, &[], &["vkGetPastPresentationTimingGOOGLE", "vkGetRefreshCycleDurationGOOGLE"]),
+    ("VK_GOOGLE_surfaceless_query", ExtKind::Instance, &[], &[]),
+    ("VK_HUAWEI_hdr_vivid", ExtKind::Device, &[(1000590000, 1)], &[]),
+    ("VK_KHR_android_surface", ExtKind::Instance, &[], &["vkCreateAndroidSurfaceKHR"]),
+    ("VK_KHR_display", ExtKind::Instance, &[], &["vkCreateDisplayModeKHR", "vkCreateDisplayPlaneSurfaceKHR", "vkGetDisplayModePropertiesKHR", "vkGetDisplayPlaneCapabilitiesKHR", "vkGetDisplayPlaneSupportedDisplaysKHR", "vkGetPhysicalDeviceDisplayPlanePropertiesKHR", "vkGetPhysicalDeviceDisplayPropertiesKHR"]),
+    ("VK_KHR_display_swapchain", ExtKind::Device, &[], &["vkCreateSharedSwapchainsKHR"]),
+    ("VK_KHR_get_display_properties2", ExtKind::Instance, &[], &["vkGetDisplayModeProperties2KHR", "vkGetDisplayPlaneCapabilities2KHR", "vkGetPhysicalDeviceDisplayPlaneProperties2KHR", "vkGetPhysicalDeviceDisplayProperties2KHR"]),
+    ("VK_KHR_get_surface_capabilities2", ExtKind::Instance, &[], &["vkGetPhysicalDeviceSurfaceCapabilities2KHR", "vkGetPhysicalDeviceSurfaceFormats2KHR"]),
+    ("VK_KHR_incremental_present", ExtKind::Device, &[], &[]),
+    ("VK_KHR_present_id", ExtKind::Device, &[(1000294001, 1)], &[]),
+    ("VK_KHR_present_id2", ExtKind::Device, &[(1000479002, 1)], &[]),
+    ("VK_KHR_present_mode_fifo_latest_ready", ExtKind::Device, &[(1000361000, 1)], &[]),
+    ("VK_KHR_present_wait", ExtKind::Device, &[(1000248000, 1)], &["vkWaitForPresentKHR"]),
+    ("VK_KHR_present_wait2", ExtKind::Device, &[(1000480001, 1)], &["vkWaitForPresent2KHR"]),
+    ("VK_KHR_shared_presentable_image", ExtKind::Device, &[], &["vkGetSwapchainStatusKHR"]),
+    ("VK_KHR_surface", ExtKind::Instance, &[], &["vkDestroySurfaceKHR", "vkGetPhysicalDeviceSurfaceCapabilitiesKHR", "vkGetPhysicalDeviceSurfaceFormatsKHR", "vkGetPhysicalDeviceSurfacePresentModesKHR", "vkGetPhysicalDeviceSurfaceSupportKHR"]),
+    ("VK_KHR_surface_maintenance1", ExtKind::Instance, &[], &[]),
+    ("VK_KHR_surface_protected_capabilities", ExtKind::Instance, &[], &[]),
+    ("VK_KHR_swapchain", ExtKind::Device, &[], &["vkAcquireNextImageKHR", "vkCreateSwapchainKHR", "vkDestroySwapchainKHR", "vkGetSwapchainImagesKHR", "vkQueuePresentKHR"]),
+    ("VK_KHR_swapchain_maintenance1", ExtKind::Device, &[(1000275000, 1)], &["vkReleaseSwapchainImagesKHR"]),
+    ("VK_KHR_swapchain_mutable_format", ExtKind::Device, &[], &[]),
+    ("VK_KHR_wayland_surface", ExtKind::Instance, &[], &["vkCreateWaylandSurfaceKHR", "vkGetPhysicalDeviceWaylandPresentationSupportKHR"]),
+    ("VK_KHR_xcb_surface", ExtKind::Instance, &[], &["vkCreateXcbSurfaceKHR", "vkGetPhysicalDeviceXcbPresentationSupportKHR"]),
+    ("VK_KHR_xlib_surface", ExtKind::Instance, &[], &["vkCreateXlibSurfaceKHR", "vkGetPhysicalDeviceXlibPresentationSupportKHR"]),
+    ("VK_NV_display_stereo", ExtKind::Instance, &[], &[]),
+    ("VK_NV_low_latency2", ExtKind::Device, &[], &["vkGetLatencyTimingsNV", "vkLatencySleepNV", "vkQueueNotifyOutOfBandNV", "vkSetLatencyMarkerNV", "vkSetLatencySleepModeNV"]),
+    ("VK_NV_present_barrier", ExtKind::Device, &[(1000292000, 1)], &[]),
+    ("VK_NV_present_metering", ExtKind::Device, &[(1000613001, 1)], &[]),
+];
