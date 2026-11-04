@@ -10517,6 +10517,21 @@ unsafe extern "C" fn gn_vkCreateDevice(
         (api >> 22) & 0x7F,
         (api >> 12) & 0x3FF
     ));
+    // The names, once per device and never gated: a guest that enables one
+    // extension more than a working device does (and then calls a function of
+    // it that resolves to NULL) is only diagnosable from this list, and a
+    // reporter's default log has no GNDRM_LOG_VKSHIM.
+    {
+        let guest: Vec<&CStr> = names
+            .iter()
+            .filter(|p| !p.is_null())
+            .map(|&p| unsafe { CStr::from_ptr(p) })
+            .collect();
+        crate::logi!(gndrm_obf::obf!(
+            "proxy device: guest extensions [{}]",
+            join_names(&guest)
+        ));
+    }
     if !WSI_DEVICE_LOGGED.swap(true, Ordering::Relaxed) {
         crate::logi!(gndrm_obf::obf!(
             "proxy device: WSI extensions hidden from the guest: [{}] requested and masked: [{}]",
