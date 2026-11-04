@@ -6980,6 +6980,8 @@ static FAKE_ROBUSTNESS2: AtomicBool = AtomicBool::new(false);
 static AHB_IMPORT_ALLOWED: AtomicBool = AtomicBool::new(false);
 static AHB_MODE_LOGGED: AtomicBool = AtomicBool::new(false);
 /// The WSI policy's line, once per process for devices and for instances.
+/// Printed whatever `GNDRM_LOG_VKSHIM` says (`logi!`), like the
+/// driver-selection lines: the gamescope session never carries that variable.
 static WSI_DEVICE_LOGGED: AtomicBool = AtomicBool::new(false);
 static WSI_INSTANCE_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -8626,7 +8628,7 @@ unsafe extern "C" fn gn_vkCreateInstance(
     let mut exts: Vec<*const c_char> = vec![ptr::null(); names.len() + 16];
     let real_exts = real_instance_exts(gipa);
     if !WSI_INSTANCE_LOGGED.swap(true, Ordering::Relaxed) {
-        crate::logf!(gndrm_obf::obf!(
+        crate::logi!(gndrm_obf::obf!(
             "proxy instance: WSI extensions hidden from the guest: [{}] requested and masked: [{}]",
             crate::wsi_policy::hidden_names(
                 real_exts.iter().flatten().map(|e| e.as_c_str())
@@ -10516,7 +10518,7 @@ unsafe extern "C" fn gn_vkCreateDevice(
         (api >> 12) & 0x3FF
     ));
     if !WSI_DEVICE_LOGGED.swap(true, Ordering::Relaxed) {
-        crate::logf!(gndrm_obf::obf!(
+        crate::logi!(gndrm_obf::obf!(
             "proxy device: WSI extensions hidden from the guest: [{}] requested and masked: [{}]",
             crate::wsi_policy::hidden_names(have.iter().map(|h| h.as_c_str())),
             crate::wsi_policy::hidden_names(names.iter().map(|&o| unsafe { CStr::from_ptr(o) }))
