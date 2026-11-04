@@ -3,6 +3,7 @@ name = "mock-freedreno"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 description = "Host-test fixture: mock_vkdriver built under the payload fallback SONAME"
 publish = false
 

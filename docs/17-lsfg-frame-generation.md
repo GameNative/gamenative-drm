@@ -156,7 +156,7 @@ per-container config wins over the environment when present.
 | DXBC → SPIR-V | `lsfg/dxbc/` + `lsfg/thirdparty/dxbc` (dxvk `dxbc` v2.6.2) | C++; no Rust equivalent. |
 | `Lossless.dll` | the user's own Lossless Scaling install, installed by `LsfgVkManager` into `<container>/.local/share/lsfg-vk/` | Read by the shim at create. Never shipped or redistributed. |
 | Cache | `lossless_{fp16,fp32}.lsfgcache` beside the DLL | Rebuilt only when the source hash or variant changes. |
-| Licensing | engine GPL-3.0-or-later, dxvk `dxbc` zlib | Attribution in `THIRD_PARTY_NOTICES`; this repo's own code stays MIT. |
+| Licensing | engine GPL-3.0-or-later, dxvk `dxbc` zlib | Attribution in `THIRD_PARTY_NOTICES`; this repo's own code is GPL-3.0-or-later too. |
 
 fp16 is chosen only when the **guest** enabled `shaderFloat16` on the device
 being created — the feature has to be on the device the pipelines are built on.

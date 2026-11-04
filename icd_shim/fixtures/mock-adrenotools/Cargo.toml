@@ -3,6 +3,7 @@ name = "mock-adrenotools"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 description = "Host-test fixture: fake libadrenotools.so for the icd_shim integration tests"
 publish = false
 

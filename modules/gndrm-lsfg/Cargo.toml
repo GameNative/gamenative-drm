@@ -3,6 +3,7 @@ name = "gndrm-lsfg"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 description = "LSFG frame-generation support for gndrm: Lossless.dll reader, shader cache, C ABI"
 
 # A library, not a cdylib: the six `lsfg_*` entry points `lsfg_dll.h` declares are

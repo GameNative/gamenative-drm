@@ -3,6 +3,7 @@ name = "adrenotools_gamescope"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 description = "Passthrough-or-proxy Vulkan ICD for GameNative's GameScope mode"
 
 # NEEDEDs are libc/libdl/libwayland-client plus the X11 present set

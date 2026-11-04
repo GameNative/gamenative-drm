@@ -4,6 +4,7 @@ description = "In-app daemon: JNI entry points, SEQPACKET server, native Surface
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 
 # System.loadLibrary("gamenative_drm") -> libgamenative_drm.so
 [lib]
