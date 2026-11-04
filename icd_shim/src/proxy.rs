@@ -6983,6 +6983,8 @@ static AHB_MODE_LOGGED: AtomicBool = AtomicBool::new(false);
 /// Printed whatever `GNDRM_LOG_VKSHIM` says (`logi!`), like the
 /// driver-selection lines: the gamescope session never carries that variable.
 static WSI_DEVICE_LOGGED: AtomicBool = AtomicBool::new(false);
+/// The resolve probe's create-time masking line, once per process.
+static RESOLVE_MASK_LOGGED: AtomicBool = AtomicBool::new(false);
 static WSI_INSTANCE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 static ROBUSTNESS2_FAKED: AtomicBool = AtomicBool::new(false);
@@ -8049,6 +8051,18 @@ unsafe fn find_swapchain(sc: VkSwapchainKHR) -> *mut GnSwapchain {
     ptr::null_mut()
 }
 
+/// The existence gate every device-level lookup goes through: the real
+/// instance's `vkGetDeviceProcAddr` on the real device. NULL here is NULL to
+/// the guest. The resolve probe (`crate::resolve_probe`) asks the same gate on
+/// its own device, so what it finds missing is what the guest would.
+pub(crate) unsafe fn device_gate(
+    gdp: PFN_vkGetDeviceProcAddr,
+    dev: VkDevice,
+    name: &CStr,
+) -> PFN_vkVoidFunction {
+    unsafe { gdp(dev, name.as_ptr()) }
+}
+
 pub(crate) unsafe fn gn_real_device_proc(gd: *mut GnDevice, name: &CStr) -> PFN_vkVoidFunction {
     let (handle, gipa, inst) = {
         let g = G.lock().unwrap();
@@ -8086,7 +8100,7 @@ pub(crate) unsafe fn gn_real_device_proc(gd: *mut GnDevice, name: &CStr) -> PFN_
         let mut from_device = None;
         if !gd.is_null() {
             if let Some(gdp) = unsafe { (*(*gd).inst).f.gdp } {
-                from_device = unsafe { gdp((*gd).real, n.as_ptr()) };
+                from_device = unsafe { device_gate(gdp, (*gd).real, n) };
                 if from_device.is_none() {
                     return (None, "miss");
                 }
@@ -8115,19 +8129,21 @@ pub(crate) unsafe fn gn_real_device_proc(gd: *mut GnDevice, name: &CStr) -> PFN_
         (None, "miss")
     };
     let (mut fnptr, mut via) = lookup(name);
-    // Core names the driver only exports under an extension spelling. One
-    // hop only: alias_of maps both ways, so recursing ping-pongs forever when
-    // neither spelling resolves.
+    // Core names the driver only exports under an extension spelling, and the
+    // reverse. The registry's alias group, one level (the registry has no
+    // alias chains): `alias_of` first, as always, then the other spellings
+    // (vkCmdSetLineStipple has a KHR and an EXT one). Never recursive:
+    // alias_of maps both ways, so recursing ping-pongs forever when no
+    // spelling resolves.
     if fnptr.is_none() {
-        if let Some(alias) = name
-            .to_str()
-            .ok()
-            .and_then(crate::vk_dispatch_gen::alias_of)
-        {
-            let c = std::ffi::CString::new(alias).unwrap();
-            fnptr = lookup(&c).0;
-            if fnptr.is_some() {
-                via = "alias";
+        if let Ok(n) = name.to_str() {
+            for alias in crate::resolve_probe::other_spellings(n) {
+                let c = std::ffi::CString::new(alias).unwrap();
+                fnptr = lookup(&c).0;
+                if fnptr.is_some() {
+                    via = "alias";
+                    break;
+                }
             }
         }
     }
@@ -8236,6 +8252,12 @@ static G_CHAIN_DEV_LINK: SyncLink<VkLayerDeviceLink> = SyncLink(VkLayerDeviceLin
         >(gn_chain_gdpa)
     }),
 });
+
+/// The chain link the guest's device creates carry to the hooks (see
+/// `G_CHAIN_DEV_LINK`); the resolve probe's device carries the same one.
+pub(crate) fn chain_dev_link() -> *mut VkLayerDeviceLink {
+    &raw const G_CHAIN_DEV_LINK.0 as *mut _
+}
 
 unsafe fn slice_or_empty<'a, T>(p: *const T, n: usize) -> &'a [T] {
     if p.is_null() || n == 0 {
@@ -8948,6 +8970,13 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
         if res != VK_SUCCESS && res != VK_INCOMPLETE {
             return res;
         }
+        // Extensions whose commands do not resolve on this device
+        // (`crate::resolve_probe`): never promised to the guest.
+        let resolve = if layer.is_null() {
+            crate::resolve_probe::for_pd(pd)
+        } else {
+            None
+        };
         let mut kept = 0usize;
         let mut has_hdr_metadata = false;
         let mut has_robustness2 = false;
@@ -8959,6 +8988,9 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
             // The WSI policy: hidden names, and the driver's copies of the
             // names the shim advertises itself.
             if crate::wsi_policy::driver_copy_hidden(name) {
+                continue;
+            }
+            if resolve.as_ref().is_some_and(|r| r.hides(name)) {
                 continue;
             }
             if name == c"VK_EXT_physical_device_drm" && HIDE_DEVICE_DRM.load(Ordering::Relaxed) {
@@ -10405,7 +10437,7 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceWaylandPresentationSupportKHR(
 // ------------------------------------------------------- device functions
 
 /// The driver's own device extension names for `pd`, unfiltered.
-unsafe fn driver_device_exts(gi: *mut GnInstance, pd: VkPhysicalDevice) -> Vec<std::ffi::CString> {
+pub(crate) unsafe fn driver_device_exts(gi: *mut GnInstance, pd: VkPhysicalDevice) -> Vec<std::ffi::CString> {
     let Some(gipa) = G.lock().unwrap().real_gipa else {
         return Vec::new();
     };
@@ -10524,6 +10556,21 @@ unsafe extern "C" fn gn_vkCreateDevice(
             crate::wsi_policy::hidden_names(names.iter().map(|&o| unsafe { CStr::from_ptr(o) }))
         ));
     }
+    // A guest that names an extension the resolve probe hid (from an older
+    // list, or without enumerating) gets it masked, named once per process.
+    let resolve = unsafe { crate::resolve_probe::for_pd(pd) };
+    let unresolvable: Vec<&str> = names
+        .iter()
+        .map(|&o| unsafe { CStr::from_ptr(o) })
+        .filter(|n| resolve.as_ref().is_some_and(|r| r.hides(n)))
+        .filter_map(|n| n.to_str().ok())
+        .collect();
+    if !unresolvable.is_empty() && !RESOLVE_MASK_LOGGED.swap(true, Ordering::Relaxed) {
+        crate::logi!(gndrm_obf::obf!(
+            "proxy device: extensions whose commands do not resolve requested and masked: [{}]",
+            unresolvable.join(", ")
+        ));
+    }
     for &name in names {
         // The guest must never enable a WSI extension the proxy cannot honour,
         // nor hand the driver one the shim serves itself (`crate::wsi_policy`);
@@ -10543,6 +10590,7 @@ unsafe extern "C" fn gn_vkCreateDevice(
             continue;
         }
         if crate::wsi_policy::driver_copy_hidden(n_)
+            || unresolvable.iter().any(|u| u.as_bytes() == n_.to_bytes())
             || (n_ == c"VK_EXT_hdr_metadata"
                 && !have.is_empty()
                 && !have.iter().any(|h| h.as_c_str() == n_))

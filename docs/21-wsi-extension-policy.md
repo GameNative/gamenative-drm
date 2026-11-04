@@ -76,3 +76,7 @@ names every WSI-scoped extension in neither table. For each:
 The other tests pin that no name is in both tables, that the names appended to
 the guest's lists are the served `Shim` ones in their historical order, and that a
 hidden feature struct never shares an `sType` with a served one.
+
+Non-WSI extensions are filtered by a second rule, not this table: an extension
+whose commands do not resolve on the device is hidden too
+(`docs/22-unresolvable-extensions.md`).

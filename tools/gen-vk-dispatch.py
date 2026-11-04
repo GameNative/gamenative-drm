@@ -307,7 +307,8 @@ def build(xml_path):
             if e:
                 nested[n] = e
 
-    return hdr, sha, entries, aliases, nested, build_wsi(root)
+    levels = {n: lv for n, lv, _ in entries}
+    return hdr, sha, entries, aliases, nested, build_wsi(root), build_resolve(root, levels)
 
 
 def emit_path(elem):
@@ -538,6 +539,47 @@ def stype_values(root):
     return vals
 
 
+def resolve_struct(types, tn):
+    """The registry type `tn`, following struct aliases."""
+    t = types.get(tn)
+    seen = set()
+    while t is not None and t.get("alias") and tn not in seen:
+        seen.add(tn)
+        tn = t.get("alias")
+        t = types.get(tn)
+    return t
+
+
+def struct_feature(t, stypes):
+    """`(sType, leading VkBool32 count)` of a feature struct, or None."""
+    if t is None or t.get("category") != "struct":
+        return None
+    if "VkPhysicalDeviceFeatures2" not in (t.get("structextends") or "").split(","):
+        return None
+    st = None
+    bools = 0
+    for m in t.findall("member"):
+        mn = m.find("name").text
+        mt = m.find("type").text
+        if mn == "sType":
+            st = stypes.get(m.get("values"))
+        elif mn == "pNext":
+            continue
+        elif mt == "VkBool32" and "*" not in "".join(m.itertext()):
+            bools += 1
+        else:
+            break
+    return None if st is None else (st, bools)
+
+
+def require_features(r, types, stypes):
+    """The feature structs a <require> block names."""
+    for tr in r.findall("type"):
+        f = struct_feature(resolve_struct(types, tr.get("name")), stypes)
+        if f is not None:
+            yield f
+
+
 def build_wsi(root):
     """The WSI-scoped extensions: `(name, type, [(feature sType, leading
     VkBool32 count)], [command])`, sorted by name. Commands are the ones only
@@ -594,42 +636,15 @@ def build_wsi(root):
             for c in r.findall("command"):
                 shared.add(c.get("name"))
 
-    def resolve_struct(tn):
-        t = types.get(tn)
-        seen = set()
-        while t is not None and t.get("alias") and tn not in seen:
-            seen.add(tn)
-            tn = t.get("alias")
-            t = types.get(tn)
-        return t
-
     out = []
     for n in sorted(wsi):
         x = exts[n]
         feats = []
         cmds = []
         for r in x.findall("require"):
-            for tr in r.findall("type"):
-                t = resolve_struct(tr.get("name"))
-                if t is None or t.get("category") != "struct":
-                    continue
-                if "VkPhysicalDeviceFeatures2" not in (t.get("structextends") or "").split(","):
-                    continue
-                st = None
-                bools = 0
-                for m in t.findall("member"):
-                    mn = m.find("name").text
-                    mt = m.find("type").text
-                    if mn == "sType":
-                        st = stypes.get(m.get("values"))
-                    elif mn == "pNext":
-                        continue
-                    elif mt == "VkBool32" and "*" not in "".join(m.itertext()):
-                        bools += 1
-                    else:
-                        break
-                if st is not None and (st, bools) not in feats:
-                    feats.append((st, bools))
+            for f in require_features(r, types, stypes):
+                if f not in feats:
+                    feats.append(f)
             for c in r.findall("command"):
                 cn = c.get("name")
                 if cn not in shared and cn not in cmds:
@@ -674,6 +689,116 @@ def render_wsi(wsi):
     return b.getvalue()
 
 
+# ------------------------------------------------------------ resolve probe
+#
+# The shim must not advertise a device extension, or a core version, whose
+# commands it cannot resolve on the guest's device (`resolve_probe.rs`,
+# docs/22-unresolvable-extensions.md). Which commands those are is the
+# registry's: per device extension the device-level commands of its own
+# require blocks, per core version the device-level commands of its feature
+# blocks. Feature structs ride along so a hidden name's features read false.
+
+RESOLVE_PLATFORMS = {None, "android"}
+CORE_VERSION = re.compile(r"^VK_(?:BASE_|COMPUTE_|GRAPHICS_)?VERSION_1_(\d+)$")
+
+
+def api_has(elem, api="vulkan"):
+    a = elem.get("api")
+    return a is None or api in a.split(",")
+
+
+def own_require(r):
+    """A require block of the extension proper: no `depends` on another
+    extension (a version-only `depends` is still the extension's own), and not
+    Vulkan SC only."""
+    if not api_has(r):
+        return False
+    deps = r.get("depends") or ""
+    return not any(not t.startswith("VK_VERSION_") for t in re.findall(r"VK_\w+", deps))
+
+
+def build_resolve(root, levels):
+    """`(exts, cores)`: exts = `[(name, [device command], [(sType, bools)])]`
+    sorted by name; cores = `[(minor, [device command], [(sType, bools)])]`
+    for VK_VERSION_1_1 and up."""
+    types = {t.get("name"): t for t in root.findall("types/type") if t.get("name")}
+    stypes = stype_values(root)
+    exts = []
+    for x in root.findall("extensions/extension"):
+        if "vulkan" not in (x.get("supported") or "").split(","):
+            continue
+        if x.get("type") != "device" or x.get("platform") not in RESOLVE_PLATFORMS:
+            continue
+        cmds = []
+        feats = []
+        for r in x.findall("require"):
+            if not own_require(r):
+                continue
+            for c in r.findall("command"):
+                cn = c.get("name")
+                if levels.get(cn) == "Device" and cn not in cmds:
+                    cmds.append(cn)
+            for f in require_features(r, types, stypes):
+                if f not in feats:
+                    feats.append(f)
+        exts.append((x.get("name"), sorted(cmds), sorted(feats)))
+    exts.sort()
+    cores = {}
+    for f in root.findall("feature"):
+        m = CORE_VERSION.match(f.get("name") or "")
+        if not m or not api_has(f) or int(m.group(1)) < 1:
+            continue
+        minor = int(m.group(1))
+        cmds, feats = cores.setdefault(minor, ([], []))
+        for r in f.findall("require"):
+            if not api_has(r):
+                continue
+            for c in r.findall("command"):
+                cn = c.get("name")
+                if levels.get(cn) == "Device" and cn not in cmds:
+                    cmds.append(cn)
+            for ft in require_features(r, types, stypes):
+                if ft not in feats:
+                    feats.append(ft)
+    return exts, [(k, sorted(v[0]), sorted(v[1])) for k, v in sorted(cores.items())]
+
+
+def render_resolve(resolve):
+    exts, cores = resolve
+    b = io.StringIO()
+    w = b.write
+    w("\n")
+    w("/// One device extension for the resolve probe: its name, the device-level\n")
+    w("/// commands of its own require blocks (none qualified by another\n")
+    w("/// extension) and its feature structs `(sType, leading VkBool32 members)`.\n")
+    w("pub type DeviceExtCommands = (\n")
+    w("    &'static str,\n")
+    w("    &'static [&'static str],\n")
+    w("    &'static [(i32, u32)],\n")
+    w(");\n\n")
+    w("// Device extensions (platform none or android), sorted by name.\n")
+    w("#[rustfmt::skip]\n")
+    w("pub static VK_DEVICE_EXTENSION_COMMANDS: &[DeviceExtCommands] = &[\n")
+    for n, cmds, feats in exts:
+        cs = ", ".join(f'"{c}"' for c in cmds)
+        fs = ", ".join(f"({s}, {c})" for s, c in feats)
+        w(f'    ("{n}", &[{cs}], &[{fs}]),\n')
+    w("];\n\n")
+    w("/// One core version for the resolve probe: `VK_API_VERSION_1_x`, the\n")
+    w("/// device-level commands it adds and the feature structs it adds.\n")
+    w("pub type CoreCommands = (u32, &'static [&'static str], &'static [(i32, u32)]);\n\n")
+    w("// VK_VERSION_1_1 and up, ascending; each version's base, compute and\n")
+    w("// graphics feature blocks folded in.\n")
+    w("#[rustfmt::skip]\n")
+    w("pub static VK_CORE_DEVICE_COMMANDS: &[CoreCommands] = &[\n")
+    for minor, cmds, feats in cores:
+        cs = ", ".join(f'"{c}"' for c in cmds)
+        fs = ", ".join(f"({s}, {c})" for s, c in feats)
+        w(f"    ((1 << 22) | ({minor} << 12), &[{cs}], &[{fs}]),\n")
+    w("];\n")
+    return b.getvalue()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--xml", default=DEFAULT_XML)
@@ -682,8 +807,12 @@ def main():
                     help="verify the committed output is up to date; do not write")
     args = ap.parse_args()
 
-    hdr, sha, entries, aliases, nested, wsi = build(args.xml)
-    text = render(args.xml, hdr, sha, entries, aliases, nested) + render_wsi(wsi)
+    hdr, sha, entries, aliases, nested, wsi, resolve = build(args.xml)
+    text = (
+        render(args.xml, hdr, sha, entries, aliases, nested)
+        + render_wsi(wsi)
+        + render_resolve(resolve)
+    )
 
     if args.check:
         try:
@@ -697,13 +826,14 @@ def main():
             sys.exit(1)
         print(f"gen-vk-dispatch: {args.out} up to date "
               f"({len(entries)} commands, {len(aliases)} aliases, "
-              f"{len(wsi)} WSI extensions)")
+              f"{len(wsi)} WSI extensions, {len(resolve[0])} device extensions)")
         return
 
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(text)
     print(f"gen-vk-dispatch: wrote {args.out} "
           f"({len(entries)} commands, {len(aliases)} aliases, {len(wsi)} WSI extensions, "
+          f"{len(resolve[0])} device extensions, "
           f"VK_HEADER_VERSION {hdr})")
 
 

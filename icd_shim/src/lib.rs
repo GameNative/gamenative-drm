@@ -117,6 +117,7 @@ pub mod present;
 pub mod lsfg;
 pub mod maint1;
 pub mod proxy;
+pub mod resolve_probe;
 pub mod scanout;
 pub mod segv;
 pub mod thunk;
