@@ -163,6 +163,9 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceFeatures2(pd: VkPhysicalDevice, f
     // swapchain the guest will present through.
     if !f.is_null() {
         unsafe { crate::present::features2((*(f as *mut BaseOut)).pNext) };
+        // Swapchain maintenance is served the same way; the v2 present waits
+        // are refused, whatever the driver says about them.
+        unsafe { crate::maint1::features2((*(f as *mut BaseOut)).pNext) };
     }
     // The wrapper's feature lift, masked back to the driver at create time
     // (`advertise`): a gamescope guest reads this shim where an X11 guest reads
