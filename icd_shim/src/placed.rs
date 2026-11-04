@@ -169,6 +169,11 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceFeatures2(pd: VkPhysicalDevice, f
         // Every other WSI extension the policy hides reads false too
         // (`crate::wsi_policy`): its name is not in the guest's list.
         unsafe { crate::wsi_policy::zero_hidden_features((*(f as *mut BaseOut)).pNext) };
+        // So do the extensions and core versions whose commands do not resolve
+        // on this device (`crate::resolve_probe`).
+        if let Some(r) = unsafe { crate::resolve_probe::for_pd(pd) } {
+            unsafe { r.zero_features((*(f as *mut BaseOut)).pNext) };
+        }
     }
     // The wrapper's feature lift, masked back to the driver at create time
     // (`advertise`): a gamescope guest reads this shim where an X11 guest reads
@@ -203,9 +208,9 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceProperties2(pd: VkPhysicalDevice,
     };
     unsafe { crate::divisor::properties2(p, &|q| real(pd, q)) };
     if !p.is_null() {
-        unsafe {
-            spoof_identity(&mut *(p.cast::<u8>().add(16) as *mut VkPhysicalDeviceProperties))
-        };
+        let props = unsafe { &mut *(p.cast::<u8>().add(16) as *mut VkPhysicalDeviceProperties) };
+        clamp_api(pd, props);
+        spoof_identity(props);
     }
     if !enabled() || p.is_null() {
         return;
@@ -228,7 +233,17 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceProperties(
     };
     unsafe { real(pd, p) };
     if !p.is_null() {
-        unsafe { spoof_identity(&mut *p) };
+        let props = unsafe { &mut *p };
+        clamp_api(pd, props);
+        spoof_identity(props);
+    }
+}
+
+/// The apiVersion the guest sees: the highest core version whose commands
+/// resolve on this device (`crate::resolve_probe`), the driver's patch kept.
+fn clamp_api(pd: VkPhysicalDevice, p: &mut VkPhysicalDeviceProperties) {
+    if let Some(r) = unsafe { crate::resolve_probe::for_pd(pd) } {
+        r.clamp(&mut p.apiVersion);
     }
 }
 

@@ -193,6 +193,17 @@ fn hidden_features() -> impl Iterator<Item = (i32, u32)> {
 /// `p_next` must be the chain head of a `VkPhysicalDeviceFeatures2` the shim is
 /// about to return to the guest.
 pub unsafe fn zero_hidden_features(p_next: *mut c_void) {
+    let bools = |s: i32| hidden_features().find(|f| f.0 == s).map(|f| f.1);
+    unsafe { zero_features_in(p_next, &bools) }
+}
+
+/// Zero the leading `VkBool32` members of every struct in a features chain
+/// for which `bools` names a count.
+///
+/// # Safety
+/// `p_next` must be a valid Vulkan structure chain the shim may write to, and
+/// `bools` must never name more members than the struct's leading VkBool32s.
+pub unsafe fn zero_features_in(p_next: *mut c_void, bools: &dyn Fn(i32) -> Option<u32>) {
     /// The two leading members every Vulkan structure shares.
     #[repr(C)]
     struct Head {
@@ -206,7 +217,7 @@ pub unsafe fn zero_hidden_features(p_next: *mut c_void) {
         }
         // SAFETY: `head` is a structure in the guest's chain.
         let node = unsafe { &*head };
-        if let Some((_, bools)) = hidden_features().find(|f| f.0 == node.s_type) {
+        if let Some(bools) = bools(node.s_type) {
             // SAFETY: the structure declares this type, so its first `bools`
             // members after the header are VkBool32s.
             let first = unsafe { head.add(1).cast::<u32>() };
