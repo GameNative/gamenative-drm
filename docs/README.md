@@ -49,6 +49,7 @@ winlator X11 path (which remains the default for normal launches).
 17. [17-lsfg-frame-generation.md](17-lsfg-frame-generation.md) — plan for a `gamenative_drm` LSFG backend: the app's own engine inside the ICD shim, reading the container's `Lossless.dll` and building its own shader cache, reusing `LsfgVkManager` and the quick-menu tab, with the artifacts and the measurements that decide it.
 18. [18-lsfg-driver-facts.md](18-lsfg-driver-facts.md) — the properties the LSFG presenter rests on, each one silent when broken: queue-family matching, the engine writing only into its own images, the blit capture, destination depth, guest-only release pacing, the `Rgba8` storage binding, and the settings channel that carries the DLL path.
 19. [19-fps-limiter-acquire-rework.md](19-fps-limiter-acquire-rework.md) — plan for the limiter rework: cap at acquire instead of at release, park A34 (split from its `-r` mode fix), and count acquisitions for the app's frame ring.
+20. [20-swapchain-maintenance1.md](20-swapchain-maintenance1.md) — `VK_KHR_swapchain_maintenance1` served by the ICD shim: present fences, surface-maintenance capabilities, image release; why the leaked KHR name froze DX12 titles; the per-present mode switch left for a follow-up.
 
 ## One-paragraph summary
 

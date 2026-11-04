@@ -412,12 +412,14 @@ fn counters() -> String {
     format!(
         "{}",
         gndrm_obf::obf!(
-            "acq={} pres={} rel={} commit={} starved={} acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} acq_fps={:.2}]",
+            "acq={} pres={} rel={} commit={} starved={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} acq_fps={:.2}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
             N_COMMIT_OK.load(Ordering::Relaxed),
             N_STARVE.load(Ordering::Relaxed),
+            N_PRESENT_FENCE.load(Ordering::Relaxed),
+            N_RELEASED_IMAGES.load(Ordering::Relaxed),
                 ACQ_US_N.load(Ordering::Relaxed),
                 ACQ_US_SUM.load(Ordering::Relaxed),
                 ACQ_US_MAX.load(Ordering::Relaxed),
@@ -846,9 +848,10 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
                 xpix: 0,
                 xfence: 0,
                 present_id: 0,
-            wait_id: 0,
+                wait_id: 0,
                 fence: 0,
                 sem: 0,
+                fence_sem: 0,
                 acquired: false,
                 in_flight: false,
                 acq_seq: 0,
@@ -1937,6 +1940,21 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     if gd.is_null() || surf.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+    // `VK_KHR_swapchain_maintenance1` creation structs (`crate::maint1`): the
+    // modes list is accepted (a switch to another listed mode is not served
+    // yet, see the module's TODO), the scaling struct too (no scaling is
+    // offered, so a conforming guest passes zeros), and the deferred-allocation
+    // bit is a hint the shim ignores: every slot is allocated here.
+    {
+        let modes = unsafe { crate::maint1::create_modes(ci.pNext) };
+        let scaling = unsafe { crate::maint1::create_scaling(ci.pNext) };
+        let deferred = ci.flags & crate::maint1::CREATE_DEFERRED_MEMORY_ALLOCATION_BIT != 0;
+        if modes.is_some() || scaling.is_some() || deferred {
+            crate::logf!(gndrm_obf::obf!(
+                "proxy swapchain create: maintenance1 modes={modes:?} scaling={scaling:?} deferred_alloc={deferred}"
+            ));
+        }
+    }
     let fourcc = vk_format_to_fourcc(ci.imageFormat);
     if fourcc == 0 {
         crate::logf!(gndrm_obf::obf!(
@@ -2101,6 +2119,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             wait_id: 0,
             fence: 0,
             sem: 0,
+            fence_sem: 0,
             acquired: false,
             in_flight: false,
             acq_seq: 0,
@@ -2857,6 +2876,64 @@ fn log_present_chain_once(p_next: *const c_void, id: u64) {
     ));
 }
 
+/// Logged once per process: a maintenance1 mode switch the shim does not serve.
+static MODE_SWITCH_NOTED: AtomicBool = AtomicBool::new(false);
+/// Present fences signalled (`VkSwapchainPresentFenceInfo`), for the census.
+static N_PRESENT_FENCE: AtomicUsize = AtomicUsize::new(0);
+/// Images handed back by `vkReleaseSwapchainImagesKHR`, for the census.
+static N_RELEASED_IMAGES: AtomicUsize = AtomicUsize::new(0);
+
+/// `vkReleaseSwapchainImagesKHR` (`VK_KHR_swapchain_maintenance1`): the guest
+/// hands back images it acquired and will not present. Each goes straight back
+/// to the free list; the semaphore and fence of its acquire were signalled at
+/// the acquire (`gn_acquire_common`), and the extension makes the guest wait
+/// for them before calling this.
+///
+/// The acquire gate booked a frame for each of these acquires
+/// (`Schedule::book_paced`); the booking stands, so a guest that releases
+/// instead of presenting has spent that period. That is the cap doing its job
+/// (a released image is a frame the guest chose not to show), not a gap.
+unsafe extern "C" fn gn_vkReleaseSwapchainImagesKHR(
+    _device: VkDevice,
+    info: *const c_void,
+) -> VkResult {
+    let (swapchain, indices) = unsafe { crate::maint1::release_info(info) };
+    let sc = unsafe { find_swapchain(swapchain) };
+    if sc.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let mut freed = 0usize;
+    {
+        let _g = unsafe { (*sc).shared.lock().unwrap() };
+        for &i in &indices {
+            if i >= unsafe { (*sc).guest_slots } {
+                continue;
+            }
+            let s = unsafe { (*sc).slots.as_mut_ptr().add(i as usize) };
+            // Only a slot the guest holds: one in flight was presented, and a
+            // free one is not the guest's to release.
+            if unsafe { (*s).acquired && !(*s).in_flight } {
+                unsafe {
+                    (*s).acquired = false;
+                    (*s).acquired_ns = 0;
+                }
+                freed += 1;
+            }
+        }
+        if freed > 0 {
+            unsafe { (*sc).cv_free.notify_all() };
+        }
+    }
+    if crate::vkshim_enabled() {
+        N_RELEASED_IMAGES.fetch_add(freed, Ordering::Relaxed);
+        crate::logf!(gndrm_obf::obf!(
+            "proxy release images: sc={sc:?} asked={:?} freed={freed}",
+            indices
+        ));
+    }
+    VK_SUCCESS
+}
+
 unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentInfoKHR) -> VkResult {
     // The WSI census exists to be read under `GNDRM_LOG_VKSHIM`, and every line
     // that prints it is gated the same way, so its accounting is skipped when
@@ -2928,6 +3005,24 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
         if i == 0 {
             log_present_chain_once(pi.pNext, present_id);
         }
+        // The guest's present fence for this swapchain, if any
+        // (`VkSwapchainPresentFenceInfo`): signalled once the wait semaphores
+        // below have been consumed, which is what the fence promises.
+        let guest_fence = unsafe { crate::maint1::present_fence(pi.pNext, i) };
+        if let Some(mode) = unsafe { crate::maint1::present_mode_request(pi.pNext, i) } {
+            // TODO(maintenance1 follow-up): per-present mode switching. The
+            // compatibility answer lists one mode, so a conforming guest never
+            // names another; one that does is noted once and keeps the
+            // swapchain's mode (`crate::maint1`).
+            if mode != unsafe { (*sc).requested_mode }
+                && !MODE_SWITCH_NOTED.swap(true, Ordering::Relaxed)
+            {
+                crate::logf!(gndrm_obf::obf!(
+                    "proxy present: maintenance1 mode switch to {mode} requested (swapchain created with {}); not served, mode kept",
+                    unsafe { (*sc).requested_mode }
+                ));
+            }
+        }
         // A slot presented again while it still carries an armed id: that
         // frame will never be committed, released or latched under its id
         // now, so the wait on it is answered first.
@@ -2964,6 +3059,19 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
         if n_waits as usize > GN_MAX_PRESENT {
             n_waits = GN_MAX_PRESENT as u32;
         }
+        // Signals: the chain semaphore when a later present waits it, and the
+        // slot's fence semaphore when the guest chained a present fence. Both
+        // are binary and each is waited exactly once.
+        let mut signals: [VkSemaphore; 2] = [0; 2];
+        let mut n_signals = 0u32;
+        if signal_chain {
+            signals[n_signals as usize] = unsafe { (*slot).sem };
+            n_signals += 1;
+        }
+        if guest_fence != 0 {
+            signals[n_signals as usize] = unsafe { (*slot).fence_sem };
+            n_signals += 1;
+        }
         let si = VkSubmitInfo {
             sType: VK_STRUCTURE_TYPE_SUBMIT_INFO,
             pNext: ptr::null(),
@@ -2972,16 +3080,45 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
             pWaitDstStageMask: wait_stages.as_mut_ptr(),
             commandBufferCount: 0,
             pCommandBuffers: ptr::null(),
-            signalSemaphoreCount: if signal_chain { 1 } else { 0 },
-            pSignalSemaphores: if signal_chain {
-                unsafe { &(*slot).sem }
+            signalSemaphoreCount: n_signals,
+            pSignalSemaphores: if n_signals > 0 {
+                signals.as_ptr()
             } else {
                 ptr::null()
             },
         };
+        // The guest's present fence rides on a second, empty submit that waits
+        // the fence semaphore: it completes once the present's wait semaphores
+        // have been consumed and no sooner, which is the fence's contract
+        // (`VK_KHR_swapchain_maintenance1`: the wait semaphores may be reused or
+        // destroyed once it signals). The slot's own fence stays on the first
+        // submit for the present worker.
+        let fence_stage = [VK_PIPELINE_STAGE_ALL_COMMANDS_BIT];
+        let fence_si = VkSubmitInfo {
+            sType: VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            pNext: ptr::null(),
+            waitSemaphoreCount: 1,
+            pWaitSemaphores: unsafe { &(*slot).fence_sem },
+            pWaitDstStageMask: fence_stage.as_ptr(),
+            commandBufferCount: 0,
+            pCommandBuffers: ptr::null(),
+            signalSemaphoreCount: 0,
+            pSignalSemaphores: ptr::null(),
+        };
         let res = {
             let _submit = SUBMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            unsafe { (*gd).f.submit.unwrap()(real_q, 1, &si, (*slot).fence) }
+            let res = unsafe { (*gd).f.submit.unwrap()(real_q, 1, &si, (*slot).fence) };
+            if res == VK_SUCCESS && guest_fence != 0 {
+                let r2 = unsafe { (*gd).f.submit.unwrap()(real_q, 1, &fence_si, guest_fence) };
+                if r2 != VK_SUCCESS {
+                    crate::logf!(gndrm_obf::obf!(
+                        "proxy: present fence submit failed: {r2}"
+                    ));
+                } else if crate::vkshim_enabled() {
+                    N_PRESENT_FENCE.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            res
         };
         if res != VK_SUCCESS {
             crate::logf!(gndrm_obf::obf!("proxy: present wait submit failed: {res}"));
@@ -4917,6 +5054,18 @@ static SHIM_HANDLERS: &[(&CStr, HandlerScope, PFN_vkVoidFunction)] = &[
         std::mem::transmute(
             gn_vkWaitForPresentKHR
                 as unsafe extern "C" fn(VkDevice, VkSwapchainKHR, u64, u64) -> VkResult,
+        )
+    }),
+    (c"vkReleaseSwapchainImagesKHR", HandlerScope::Always, unsafe {
+        std::mem::transmute(
+            gn_vkReleaseSwapchainImagesKHR
+                as unsafe extern "C" fn(VkDevice, *const c_void) -> VkResult,
+        )
+    }),
+    (c"vkReleaseSwapchainImagesEXT", HandlerScope::Always, unsafe {
+        std::mem::transmute(
+            gn_vkReleaseSwapchainImagesKHR
+                as unsafe extern "C" fn(VkDevice, *const c_void) -> VkResult,
         )
     }),
     (c"vkWaitSemaphoresKHR", HandlerScope::Always, unsafe {
@@ -6857,16 +7006,29 @@ pub fn set_fake_robustness2(on: bool) {
 /// while DXVK titles, which never call it, presented normally.
 ///
 /// `vkWaitForPresentKHR` is no longer on the list: the shim serves it from its
-/// own swapchain (`gn_vkWaitForPresentKHR`), and the extension names stay here
-/// only so the driver's copies are hidden and the shim's are advertised instead.
-/// Refusing the command while advertising the extension handed the guest a NULL
-/// entry point; DXVK's frame thread called it and spun in exception dispatch.
+/// own swapchain (`gn_vkWaitForPresentKHR`). Refusing a command while advertising
+/// its extension handed the guest a NULL entry point; DXVK's frame thread called
+/// it and spun in exception dispatch. So every name here is one whose extension
+/// is hidden too: the v2 present id/wait pair, which the shim does not serve (the
+/// guest falls back to the v1 pair it does, see `crate::maint1`).
 fn unimplemented_wsi_ext(name: &CStr) -> bool {
-    name == c"VK_KHR_present_wait"
-        || name == c"VK_KHR_present_id"
-        || name == c"VK_EXT_swapchain_maintenance1"
+    name == c"VK_KHR_present_id2"
+        || name == c"VK_KHR_present_wait2"
         || name == c"vkWaitForPresent2KHR"
-        || name == c"vkReleaseSwapchainImagesEXT"
+}
+
+/// WSI extensions the shim serves from its own swapchain. The driver's copies are
+/// hidden from the guest's list and the shim's advertised instead, the names are
+/// masked at device creation (the driver has no swapchain to apply them to) and
+/// their feature structs are stripped from the driver's create chain; the entry
+/// points are the shim's (`gn_vkWaitForPresentKHR`,
+/// `gn_vkReleaseSwapchainImagesKHR`, the present-fence path of
+/// `gn_vkQueuePresentKHR`).
+fn shim_served_wsi_ext(name: &CStr) -> bool {
+    name == crate::present::EXT_PRESENT_ID
+        || name == crate::present::EXT_PRESENT_WAIT
+        || name == crate::maint1::EXT_SWAPCHAIN_MAINTENANCE1_KHR
+        || name == crate::maint1::EXT_SWAPCHAIN_MAINTENANCE1_EXT
 }
 
 // ---------------------------------------------------------------- objects
@@ -7088,7 +7250,10 @@ pub struct GnSlot {
     pub xfence: u32,        // X11 route: Present idle fence, made once per slot
     pub fence: VkFence,
     pub sem: VkSemaphore, // chains multi-swapchain presents
-    pub acquired: bool,   // owned by the app (acquire -> present)
+    // Signalled by the present's own submit and waited by the one that signals
+    // the guest's present fence (`VkSwapchainPresentFenceInfo`, `crate::maint1`).
+    pub fence_sem: VkSemaphore,
+    pub acquired: bool, // owned by the app (acquire -> present)
     pub in_flight: bool,  // committed, awaiting wl_buffer.release
     // Guest-side trace: the acquire sequence that filled this slot, so a
     // present can be tied back to the acquire that handed the guest the image.
@@ -8496,6 +8661,8 @@ unsafe extern "C" fn gn_vkCreateInstance(
         if n_ == c"VK_KHR_wayland_surface"
             || n_ == c"VK_KHR_xlib_surface"
             || n_ == c"VK_KHR_xcb_surface"
+            || n_ == crate::maint1::EXT_SURFACE_MAINTENANCE1_KHR
+            || n_ == crate::maint1::EXT_SURFACE_MAINTENANCE1_EXT
         {
             continue; // proxied, not real
         }
@@ -8696,13 +8863,18 @@ unsafe extern "C" fn gn_vkEnumerateInstanceExtensionProperties(
     // in an HDR session because it defines the PQ colourspace the surface
     // formats advertise, and a client that does not see the extension must
     // ignore it.
-    let names: [&[u8]; 4] = [
+    // The surface-maintenance pair is what `VK_KHR_swapchain_maintenance1`
+    // depends on; the shim's own surface-capability query answers its structs
+    // (`crate::maint1::surface_caps2`).
+    let names: [&[u8]; 6] = [
         b"VK_KHR_wayland_surface\0",
         b"VK_KHR_xlib_surface\0",
         b"VK_KHR_xcb_surface\0",
+        b"VK_KHR_surface_maintenance1\0",
+        b"VK_EXT_surface_maintenance1\0",
         b"VK_EXT_swapchain_colorspace\0",
     ];
-    let extra: u32 = 3;
+    let extra: u32 = 5;
     unsafe {
         if pProps.is_null() {
             let mut n: u32 = 0;
@@ -8728,7 +8900,7 @@ unsafe extern "C" fn gn_vkEnumerateInstanceExtensionProperties(
             // All three surface extensions are proxied: winewayland clients use
             // the wayland one, winex11 clients (the gamescope path) the xlib
             // one, and Mesa's zink WSI the xcb one — the real driver never sees
-            // them. `VK_EXT_swapchain_colorspace`
+            // them, nor the surface-maintenance pair. `VK_EXT_swapchain_colorspace`
             // is NOT advertised: exposing it made vkd3d-proton titles present once
             // per swapchain and then stop, while the PQ surface format alone is
             // enough for DXVK to report an HDR10 output.
@@ -8776,13 +8948,15 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
             return res;
         }
         // Spare slots: the proxy appends `VK_EXT_hdr_metadata` and, for
-        // gamescope, `VK_EXT_robustness2` when the driver does not list them.
+        // gamescope, `VK_EXT_robustness2` when the driver does not list them,
+        // plus the WSI extensions it serves itself (`shim_served_wsi_ext`) and
+        // the placed-memory and divisor names.
         let mut buf = vec![
             VkExtensionProperties {
                 extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
                 specVersion: 0,
             };
-            n as usize + 6
+            n as usize + 8
         ];
         let mut got = n;
         let res = real(pd, layer, &mut got, buf.as_mut_ptr());
@@ -8799,7 +8973,7 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
         let mut has_divisor_khr = false;
         for i in 0..got as usize {
             let name = CStr::from_ptr(buf[i].extensionName.as_ptr());
-            if unimplemented_wsi_ext(name) {
+            if unimplemented_wsi_ext(name) || shim_served_wsi_ext(name) {
                 continue;
             }
             if name == c"VK_EXT_physical_device_drm" && HIDE_DEVICE_DRM.load(Ordering::Relaxed) {
@@ -8869,13 +9043,15 @@ unsafe extern "C" fn gn_vkEnumerateDeviceExtensionProperties(
                 ));
             }
         }
-        // Present ids and present waits are served by the shim for its own
-        // swapchain: the driver's swapchain is not the one the guest presents
-        // through, so its support says nothing. Advertised whenever the driver
-        // does not already list them.
+        // Present ids, present waits and swapchain maintenance are served by the
+        // shim for its own swapchain: the driver's swapchain is not the one the
+        // guest presents through, so its support says nothing. The driver's
+        // copies were skipped above; the shim's are advertised here.
         for (flag, name, spec) in [
-            (has_present_id, c"VK_KHR_present_id", 1u32),
-            (has_present_wait, c"VK_KHR_present_wait", 1u32),
+            (has_present_id, crate::present::EXT_PRESENT_ID, 1u32),
+            (has_present_wait, crate::present::EXT_PRESENT_WAIT, 1u32),
+            (false, crate::maint1::EXT_SWAPCHAIN_MAINTENANCE1_KHR, 1u32),
+            (false, crate::maint1::EXT_SWAPCHAIN_MAINTENANCE1_EXT, 1u32),
         ] {
             if flag || !layer.is_null() {
                 continue;
@@ -9302,9 +9478,10 @@ static CAPS_COMPARE_LOGGED: AtomicBool = AtomicBool::new(false);
 /// which is how a D3D12 title died at surface-capability negotiation. The values
 /// come from the same source as the plain KHR query: the proxy owns the wayland
 /// presentation contract, so there is no delegate surface to forward from. Only
-/// `surfaceCapabilities` is written; any further structure a caller chains is left
-/// untouched, which is the contract for structures an implementation does not
-/// support.
+/// `surfaceCapabilities` is written, plus the surface-maintenance structs the
+/// shim serves (`crate::maint1::surface_caps2`); any other structure a caller
+/// chains is left untouched, which is the contract for structures an
+/// implementation does not support.
 unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilities2KHR(
     pd: VkPhysicalDevice,
     info: *const VkPhysicalDeviceSurfaceInfo2KHR,
@@ -9318,13 +9495,25 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilities2KHR(
     // SAFETY: `info` is the caller's in-structure and `caps` its out-structure;
     // the KHR handler writes exactly the field handed to it, and both pointers
     // are checked non-null above.
-    unsafe {
+    let res = unsafe {
         gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
             pd,
             (*info).surface,
             &mut (*caps).surfaceCapabilities,
         )
+    };
+    if res == VK_SUCCESS {
+        // SAFETY: both chains are the caller's, live for the call.
+        unsafe {
+            crate::maint1::surface_caps2(
+                (*info).pNext,
+                (*caps).pNext,
+                (*caps).surfaceCapabilities.minImageExtent,
+                (*caps).surfaceCapabilities.maxImageExtent,
+            )
+        };
     }
+    res
 }
 
 /// The guest's own window size for a surface, or `None` when the surface has
@@ -10372,6 +10561,7 @@ unsafe extern "C" fn gn_vkCreateDevice(
             continue;
         }
         if unimplemented_wsi_ext(n_)
+            || shim_served_wsi_ext(n_)
             || (n_ == c"VK_EXT_hdr_metadata"
                 && !have.is_empty()
                 && !have.iter().any(|h| h.as_c_str() == n_))
@@ -10478,6 +10668,11 @@ unsafe extern "C" fn gn_vkCreateDevice(
     let mut strip: Vec<VkStructureType> = vec![
         crate::present::STYPE_PRESENT_ID_FEATURES as VkStructureType,
         crate::present::STYPE_PRESENT_WAIT_FEATURES as VkStructureType,
+        // Swapchain maintenance is the shim's too (`crate::maint1`); the v2
+        // present features are masked from the list, so a conforming guest
+        // never chains them, and one that does is refused by the driver as
+        // it would be on a driver without them.
+        crate::maint1::STYPE_FEATURES as VkStructureType,
     ];
     if strip_robustness2 {
         strip.push(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
@@ -11006,6 +11201,11 @@ unsafe fn slot_release(sc: *mut GnSwapchain, s: *mut GnSlot) {
                 f((*gd).real, (*s).sem, ptr::null());
             }
         }
+        if (*s).fence_sem != 0 {
+            if let Some(f) = (*gd).f.destroy_sem {
+                f((*gd).real, (*s).fence_sem, ptr::null());
+            }
+        }
         if (*s).image != 0 {
             if let Some(f) = (*gd).f.destroy_image {
                 f((*gd).real, (*s).image, ptr::null());
@@ -11097,6 +11297,9 @@ unsafe fn slot_init_sync(sc: *mut GnSwapchain, s: *mut GnSlot) -> VkResult {
     let mut res = unsafe { f.create_fence.unwrap()(dev, &fci, ptr::null(), &mut (*s).fence) };
     if res == VK_SUCCESS {
         res = unsafe { f.create_sem.unwrap()(dev, &sci, ptr::null(), &mut (*s).sem) };
+    }
+    if res == VK_SUCCESS {
+        res = unsafe { f.create_sem.unwrap()(dev, &sci, ptr::null(), &mut (*s).fence_sem) };
     }
     res
 }
