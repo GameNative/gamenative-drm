@@ -166,6 +166,9 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceFeatures2(pd: VkPhysicalDevice, f
         // Swapchain maintenance is served the same way; the v2 present waits
         // are refused, whatever the driver says about them.
         unsafe { crate::maint1::features2((*(f as *mut BaseOut)).pNext) };
+        // Every other WSI extension the policy hides reads false too
+        // (`crate::wsi_policy`): its name is not in the guest's list.
+        unsafe { crate::wsi_policy::zero_hidden_features((*(f as *mut BaseOut)).pNext) };
     }
     // The wrapper's feature lift, masked back to the driver at create time
     // (`advertise`): a gamescope guest reads this shim where an X11 guest reads

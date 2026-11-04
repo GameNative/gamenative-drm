@@ -123,6 +123,7 @@ pub mod thunk;
 pub mod vk;
 pub mod vk_dispatch_gen;
 pub mod vsync_gate;
+pub mod wsi_policy;
 pub mod wlproto;
 pub mod x11;
 
