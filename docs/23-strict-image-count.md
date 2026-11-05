@@ -18,8 +18,10 @@ own, so Mesa never sees it, and the shim carries the list in
   shim's floor of 2 and `WRAPPER_MAX_IMAGE_COUNT` still apply.
 - There is no spare image for mailbox or frame generation. Generation's own
   destination images are separate slots and stay.
-- Hades also reports a minimum of 3, Mesa's `vk_x11_override_min_image_count`.
-  Rainbow Six's value of 2 is what the shim already reports.
+- They report a minimum of 3 instead of the shim's 2, which is Mesa's X11
+  default. Rainbow Six reports 2, Mesa's `vk_x11_override_min_image_count` for it.
+  The minimum matters because a game tends to ask for it: DOOM asks for 2 when
+  told 2, and with no spare image it runs at 30 fps once a frame misses a vblank.
 - The shim logs `strict image count on` and each swapchain's requested and
   created counts, whatever `GNDRM_LOG_VKSHIM` says.
 
