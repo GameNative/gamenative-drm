@@ -903,7 +903,7 @@ pub struct SpareCopy {
 /// reads the guest's image itself and has its own destinations, so a strict game
 /// that turns it on is back on the direct path until it turns it off.
 unsafe fn spare_in_use(sc: *mut GnSwapchain) -> bool {
-    unsafe { (*sc).spare_slots != 0 } && !crate::lsfg::live().0
+    unsafe { (*sc).spare_slots != 0 && !crate::lsfg::live().0 }
 }
 
 /// The pool and command buffers for a queue of `family`, made at the swapchain's
