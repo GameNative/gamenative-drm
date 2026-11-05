@@ -169,7 +169,7 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceFeatures2(pd: VkPhysicalDevice, f
         // Every other WSI extension the policy hides reads false too
         // (`crate::wsi_policy`): its name is not in the guest's list.
         unsafe { crate::wsi_policy::zero_hidden_features((*(f as *mut BaseOut)).pNext) };
-        // So do the extensions and core versions whose commands do not resolve
+        // So do the core versions above the one whose commands all resolve
         // on this device (`crate::resolve_probe`).
         if let Some(r) = unsafe { crate::resolve_probe::for_pd(pd) } {
             unsafe { r.zero_features((*(f as *mut BaseOut)).pNext) };
