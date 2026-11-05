@@ -14,16 +14,55 @@ own, so Mesa never sees it, and the shim carries the list in
 
 ## What changes for a listed game
 
-- The swapchain has exactly `minImageCount` images, in every present mode. The
+- The guest sees exactly `minImageCount` images, in every present mode. The
   shim's floor of 2 and `WRAPPER_MAX_IMAGE_COUNT` still apply.
-- There is no spare image for mailbox or frame generation. Generation's own
-  destination images are separate slots and stay.
 - Hades also reports a minimum of 3, Mesa's `vk_x11_override_min_image_count`.
   Rainbow Six's value of 2 is what the shim already reports.
 - The shim logs `strict image count on` and each swapchain's requested and
   created counts, whatever `GNDRM_LOG_VKSHIM` says.
 
 Every other game keeps the count it had.
+
+## Hidden slots
+
+DOOM always asks for 2 images. On gamescope's route a slot comes back only on
+`wl_buffer.release`, and the compositor keeps the frame on screen until the next
+one is latched. So one of the two images is always away, and DOOM can't start a
+frame until the last one has finished and been latched. Measured on the Odin 3 in
+the same area and equally hot, it holds exactly 30.0 fps, where X11 FIFO runs at
+about 51 with about the same GPU time per frame. That this is the reason is
+inferred.
+
+A listed game on that route therefore gets hidden slots behind its images:
+
+- The present's submit waits the guest's semaphores, then copies the frame to a
+  hidden slot. The guest's image comes back when that submit's fence signals, and
+  the hidden slot is what the compositor gets and later releases. Present ids and
+  waits move with the frame to the hidden slot.
+- There are `minImageCount + 2` of them: the frame on screen, the one committed
+  behind it, and one for each frame the guest can have between its present and the
+  commit. `hidden_slot_count` holds the rule.
+- A frame that finds no hidden slot free goes out on the guest's own image, as it
+  would without any. The guest then waits at its next acquire until the compositor
+  releases it, so the compositor can slow the guest but not lose a frame or
+  deadlock it.
+- These frames go to the worker in present order in every mode, because a copy
+  under way can't be replaced. gamescope replaces a committed frame it hasn't
+  latched, so mailbox still behaves as mailbox. FIFO can queue as many frames as
+  there are hidden slots.
+- Frame generation reads the guest's image and has its own destinations, after the
+  hidden slots. While it is on, frames take the direct path and no copy is made.
+- The worker frees the guest's image, and the destroy joins the worker before it
+  frees anything, so neither can overtake a copy.
+- A present on a queue of another family than the swapchain's first present goes
+  out directly: the guest's image belongs to that family and the copy's command
+  buffers can only run on the first.
+
+The shim logs the slot count once per swapchain, and every 600 frames
+`strict hidden slots: N frames, M had no free slot`, whatever `GNDRM_LOG_VKSHIM`
+says. A high `M` means the slots are too few or the compositor is holding them.
+
+The X11 route has no hidden slots.
 
 ## Matching
 

@@ -826,7 +826,7 @@ unsafe fn lsfg_session(gd: *mut GnDevice) -> *mut crate::lsfg::Session {
 /// `guest_slots`, which is what makes this safe to do from the present worker
 /// while the guest is acquiring.
 unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
-    let guest = unsafe { (*sc).guest_slots as usize };
+    let guest = unsafe { gen_first_slot(sc) };
     if unsafe { (*sc).gen_no_grow } {
         return unsafe { (*sc).slots.len() } > guest;
     }
@@ -858,6 +858,7 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
                 acquired_ns: 0,
                 ino: 0,
                 ahb: ptr::null_mut(),
+                spare: NO_SPARE,
             });
         }
         let res =
@@ -876,6 +877,277 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
         }
     }
     true
+}
+
+/// The first slot generation may use: the guest's images and a strict game's
+/// hidden slots come before it.
+unsafe fn gen_first_slot(sc: *mut GnSwapchain) -> usize {
+    unsafe { ((*sc).guest_slots + (*sc).spare_slots) as usize }
+}
+
+/// A guest slot whose frame goes out as it is, without a hidden copy.
+const NO_SPARE: i32 = -1;
+
+/// The command buffers that copy a strict game's frames to its hidden slots, one
+/// per guest image. Used by the guest's present and by the destroy, which the
+/// guest must already synchronise, so nothing locks them.
+pub struct SpareCopy {
+    pool: VkCommandPool,
+    family: u32,
+    cmds: Vec<VkCommandBuffer>,
+    begin: unsafe extern "C" fn(VkCommandBuffer, *const VkCommandBufferBeginInfo) -> VkResult,
+    end: unsafe extern "C" fn(VkCommandBuffer) -> VkResult,
+}
+
+/// Frames of swapchains with hidden slots, and how many found none free.
+static SPARE_FRAMES: AtomicUsize = AtomicUsize::new(0);
+static SPARE_NO_FREE: AtomicUsize = AtomicUsize::new(0);
+/// Frames between two lines of those counts: about ten seconds at 60 fps.
+const SPARE_LOG_EVERY: usize = 600;
+
+/// Whether this swapchain's frames go through its hidden slots now. Generation
+/// reads the guest's image itself and has its own destinations, so a strict game
+/// that turns it on is back on the direct path until it turns it off.
+unsafe fn spare_in_use(sc: *mut GnSwapchain) -> bool {
+    spare_path(unsafe { (*sc).spare_slots }, crate::lsfg::live().0)
+}
+
+fn spare_path(spare_slots: u32, generating: bool) -> bool {
+    spare_slots != 0 && !generating
+}
+
+/// The pool and command buffers for a queue of `family`, made at the swapchain's
+/// first present because only then is the present queue known. A queue of another
+/// family later gets `None`: a guest image is owned by its present queue's family
+/// and these buffers can only run there.
+unsafe fn spare_copy_state(sc: *mut GnSwapchain, family: u32) -> Option<*const SpareCopy> {
+    if let Some(copy) = unsafe { (*sc).spare.as_ref() } {
+        return (copy.family == family).then_some(copy as *const SpareCopy);
+    }
+    let gd = unsafe { (*sc).dev };
+    let f = unsafe { (*gd).f };
+    let begin = unsafe { gn_real_device_proc(gd, c"vkBeginCommandBuffer") }?;
+    let end = unsafe { gn_real_device_proc(gd, c"vkEndCommandBuffer") }?;
+    let mut pci: VkCommandPoolCreateInfo = unsafe { std::mem::zeroed() };
+    pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pci.queueFamilyIndex = family;
+    let mut pool: VkCommandPool = 0;
+    if unsafe { f.create_cmd_pool?((*gd).real, &pci, ptr::null(), &mut pool) } != VK_SUCCESS {
+        return None;
+    }
+    let count = unsafe { (*sc).guest_slots };
+    let mut cmds = vec![ptr::null_mut(); count as usize];
+    let mut cbi: VkCommandBufferAllocateInfo = unsafe { std::mem::zeroed() };
+    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbi.commandPool = pool;
+    cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbi.commandBufferCount = count;
+    if unsafe { f.alloc_cmd?((*gd).real, &cbi, cmds.as_mut_ptr()) } != VK_SUCCESS {
+        if let Some(destroy) = f.destroy_cmd_pool {
+            unsafe { destroy((*gd).real, pool, ptr::null()) };
+        }
+        return None;
+    }
+    let copy = SpareCopy {
+        pool,
+        family,
+        cmds,
+        begin: unsafe { std::mem::transmute(begin) },
+        end: unsafe { std::mem::transmute(end) },
+    };
+    Some(unsafe { (*sc).spare.insert(copy) } as *const SpareCopy)
+}
+
+/// Record the copy of a presented guest image to a hidden slot. It rides on the
+/// present's own submit, after the guest's wait semaphores, so `cmd` runs with
+/// the frame finished. Everything the guest submitted earlier without a semaphore
+/// is covered by the first barrier's source stage.
+unsafe fn spare_record(
+    sc: *mut GnSwapchain,
+    copy: *const SpareCopy,
+    cmd: VkCommandBuffer,
+    guest: VkImage,
+    hidden: VkImage,
+) -> bool {
+    let f = unsafe { (*(*sc).dev).f };
+    let (Some(barrier), Some(copy_image)) = (f.cmd_pipeline_barrier, f.cmd_copy_image) else {
+        return false;
+    };
+    let mut bi: VkCommandBufferBeginInfo = unsafe { std::mem::zeroed() };
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if unsafe { ((*copy).begin)(cmd, &bi) } != VK_SUCCESS {
+        return false;
+    }
+    let before = [
+        lsfg_barrier(
+            guest,
+            VK_ACCESS_MEMORY_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        ),
+        lsfg_barrier(
+            hidden,
+            0,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        ),
+    ];
+    unsafe {
+        barrier(
+            cmd,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0,
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            2,
+            before.as_ptr(),
+        )
+    };
+    let mut region: VkImageCopy = unsafe { std::mem::zeroed() };
+    region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.srcSubresource.layerCount = 1;
+    region.dstSubresource = region.srcSubresource;
+    region.extent = VkExtent3D {
+        width: unsafe { (*sc).extent.width },
+        height: unsafe { (*sc).extent.height },
+        depth: 1,
+    };
+    unsafe {
+        copy_image(
+            cmd,
+            guest,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            hidden,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &region,
+        )
+    };
+    let after = [
+        lsfg_barrier(
+            guest,
+            0,
+            0,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        ),
+        lsfg_barrier(
+            hidden,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            0,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        ),
+    ];
+    unsafe {
+        barrier(
+            cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0,
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            2,
+            after.as_ptr(),
+        )
+    };
+    unsafe { ((*copy).end)(cmd) == VK_SUCCESS }
+}
+
+/// Claim a hidden slot for the frame in guest slot `idx` and record its copy, the
+/// command buffer for the present's submit. Null when the frame goes out directly
+/// on the guest's image: the slot then returns on the compositor's release, so a
+/// compositor holding every hidden slot makes the guest wait at its next acquire,
+/// as it would with no hidden slots at all, and no frame is lost.
+unsafe fn spare_begin(
+    sc: *mut GnSwapchain,
+    slot: *mut GnSlot,
+    idx: usize,
+    queue: *mut GnQueue,
+) -> VkCommandBuffer {
+    unsafe { (*slot).spare = NO_SPARE };
+    if !unsafe { spare_in_use(sc) } || queue.is_null() {
+        return ptr::null_mut();
+    }
+    // The worker frees the guest's image once this fence wait returns.
+    if unsafe { (*(*sc).dev).f.wait_fences }.is_none() {
+        return ptr::null_mut();
+    }
+    let Some(copy) = (unsafe { spare_copy_state(sc, (*queue).family) }) else {
+        return ptr::null_mut();
+    };
+    let first = unsafe { (*sc).guest_slots as usize };
+    let hidden = {
+        let _g = unsafe { (*sc).shared.lock().unwrap() };
+        let free = (first..unsafe { gen_first_slot(sc) })
+            .find(|&i| !unsafe { (*(*sc).slots.as_ptr().add(i)).in_flight });
+        if let Some(i) = free {
+            unsafe { (*(*sc).slots.as_mut_ptr().add(i)).in_flight = true };
+        }
+        free
+    };
+    if hidden.is_none() {
+        SPARE_NO_FREE.fetch_add(1, Ordering::Relaxed);
+    }
+    let frames = SPARE_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    if frames.is_multiple_of(SPARE_LOG_EVERY) {
+        crate::logi!(gndrm_obf::obf!(
+            "strict hidden slots: {frames} frames, {} had no free slot",
+            SPARE_NO_FREE.load(Ordering::Relaxed)
+        ));
+    }
+    let Some(hidden) = hidden else {
+        return ptr::null_mut();
+    };
+    let cmd = unsafe { (&(*copy).cmds)[idx] };
+    let hidden_image = unsafe { (*(*sc).slots.as_ptr().add(hidden)).image };
+    if !unsafe { spare_record(sc, copy, cmd, (*slot).image, hidden_image) } {
+        unsafe { spare_unclaim(sc, hidden) };
+        return ptr::null_mut();
+    }
+    unsafe { (*slot).spare = hidden as i32 };
+    cmd
+}
+
+unsafe fn spare_unclaim(sc: *mut GnSwapchain, hidden: usize) {
+    let _g = unsafe { (*sc).shared.lock().unwrap() };
+    unsafe {
+        (*(*sc).slots.as_mut_ptr().add(hidden)).in_flight = false;
+        (*sc).cv_free.notify_all();
+    }
+}
+
+/// The copy in guest slot `idx` has finished: the guest gets its image back and
+/// the frame's identity moves to the hidden slot, which is what the compositor
+/// will see and release. Returns that slot.
+unsafe fn spare_handover(sc: *mut GnSwapchain, idx: usize) -> usize {
+    let slots = unsafe { (*sc).slots.as_mut_ptr() };
+    let guest = unsafe { slots.add(idx) };
+    let g = unsafe { (*sc).shared.lock().unwrap() };
+    let hidden = unsafe { core::mem::replace(&mut (*guest).spare, NO_SPARE) } as usize;
+    let dest = unsafe { slots.add(hidden) };
+    let stale_id = unsafe {
+        (*dest).present_id = core::mem::replace(&mut (*guest).present_id, 0);
+        (*dest).acquired_ns = core::mem::replace(&mut (*guest).acquired_ns, 0);
+        (*guest).in_flight = false;
+        (*sc).cv_free.notify_all();
+        core::mem::replace(&mut (*dest).wait_id, core::mem::replace(&mut (*guest).wait_id, 0))
+    };
+    drop(g);
+    // Left by a frame on this slot that could not be committed.
+    if stale_id != 0 {
+        crate::present::discard(stale_id, sc as usize, monotonic_ns());
+    }
+    hidden
 }
 
 /// Serialises every submit the shim makes or forwards on the queues it shares
@@ -1079,7 +1351,7 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
     // history is built by `process` — so the capture runs on every presented
     // frame and only generation and blit are gated on the plan.
     let planned = unsafe { (*session).plan(capacity) };
-    let guest = unsafe { (*sc).guest_slots as usize };
+    let guest = unsafe { gen_first_slot(sc) };
     // A destination is free once the compositor has released it and nothing
     // queued still points at it.
     let free: Vec<usize> = (guest..unsafe { (*sc).slots.len() })
@@ -1714,6 +1986,11 @@ fn worker_main(sc: *mut GnSwapchain) {
                 }
             }
             let fence_ms = t0.elapsed().as_millis();
+            if (*s).spare != NO_SPARE {
+                let hidden = spare_handover(sc, idx as usize);
+                commit_real(sc, hidden as i32, fence_ms);
+                continue;
+            }
             // Before the commit, so the capture reads the frame the guest just
             // finished while the slot is still ours. When the frame's generations
             // were queued, the frame itself is queued behind them; a frame that
@@ -2102,6 +2379,8 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         usage: ci.imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         slots: Vec::new(),
         guest_slots: 0,
+        spare_slots: 0,
+        spare: None,
         gen_no_grow: false,
         release: crate::vsync_gate::Schedule::default(),
         commit_latency_ns: AtomicU64::new(0),
@@ -2140,6 +2419,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             acquired_ns: 0,
             ino: 0,
             ahb: ptr::null_mut(),
+            spare: NO_SPARE,
         });
     }
     for inited in 0..n_slots as usize {
@@ -2166,6 +2446,17 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     // frame or two. So: room for every destination the cap allows, and the
     // destinations themselves created up front, before the first present.
     sc.guest_slots = n_slots;
+    // Hidden slots only on gamescope's route, the one where a slot comes back on
+    // the compositor's release. The guest never sees them (`spare_begin`).
+    if strict_count && gamescope_route {
+        let hidden = crate::image_count::hidden_slot_count(n_slots) as usize;
+        unsafe { lsfg_destinations(scp, hidden) };
+        sc.spare_slots = (sc.slots.len() - n_slots as usize) as u32;
+        crate::logi!(gndrm_obf::obf!(
+            "proxy swapchain create: strict image count: {} hidden slots behind {n_slots} images",
+            sc.spare_slots
+        ));
+    }
     let capacity = crate::lsfg::wanted().unwrap_or(1).saturating_sub(1);
     let dest_cap = if capacity == 0 {
         0
@@ -2212,7 +2503,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         .name("gn-present".into())
         .spawn(move || worker_main(sc_addr as *mut GnSwapchain));
     let Ok(worker) = worker else {
-        for j in 0..n_slots as usize {
+        for j in 0..sc.slots.len() {
             unsafe { slot_release(scp, sc.slots.as_mut_ptr().add(j)) };
         }
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -2345,6 +2636,13 @@ unsafe extern "C" fn gn_vkDestroySwapchainKHR(
     }
     if let Some(worker) = unsafe { (*sc).worker.take() } {
         let _ = worker.join();
+    }
+    // The worker waited every queued frame's fence, so no copy is still running.
+    if let Some(copy) = unsafe { (*sc).spare.take() } {
+        let gd = unsafe { (*sc).dev };
+        if let Some(destroy) = unsafe { (*gd).f.destroy_cmd_pool } {
+            unsafe { destroy((*gd).real, copy.pool, ptr::null()) };
+        }
     }
     for i in 0..unsafe { (*sc).slots.len() } {
         unsafe { slot_release(sc, (*sc).slots.as_mut_ptr().add(i)) };
@@ -2851,6 +3149,13 @@ unsafe fn present_dispatch(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
             crate::present::answered_at_queue(id, sc as usize, monotonic_ns());
         }
     }
+    // In present order, whatever the mode: a copy under way cannot be replaced,
+    // and at most `guest_slots` frames can wait. gamescope reads the declared mode
+    // and replaces a frame it has not latched, so mailbox still means mailbox.
+    if unsafe { (*sc).spare_slots != 0 && ((*slot).spare != NO_SPARE || spare_in_use(sc)) } {
+        unsafe { present_immediate(sc, slot, idx) };
+        return;
+    }
     match unsafe { live_present_mode(sc) } {
         VK_PRESENT_MODE_IMMEDIATE_KHR => unsafe { present_immediate(sc, slot, idx) },
         VK_PRESENT_MODE_MAILBOX_KHR => unsafe { present_mailbox(sc, slot, idx) },
@@ -3086,14 +3391,19 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
             signals[n_signals as usize] = unsafe { (*slot).fence_sem };
             n_signals += 1;
         }
+        let spare_cmd = if unsafe { (*sc).spare_slots } == 0 {
+            ptr::null_mut()
+        } else {
+            unsafe { spare_begin(sc, slot, indices[i] as usize, gq) }
+        };
         let si = VkSubmitInfo {
             sType: VK_STRUCTURE_TYPE_SUBMIT_INFO,
             pNext: ptr::null(),
             waitSemaphoreCount: n_waits,
             pWaitSemaphores: waits,
             pWaitDstStageMask: wait_stages.as_mut_ptr(),
-            commandBufferCount: 0,
-            pCommandBuffers: ptr::null(),
+            commandBufferCount: u32::from(!spare_cmd.is_null()),
+            pCommandBuffers: &spare_cmd,
             signalSemaphoreCount: n_signals,
             pSignalSemaphores: if n_signals > 0 {
                 signals.as_ptr()
@@ -3136,6 +3446,10 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
         };
         if res != VK_SUCCESS {
             crate::logf!(gndrm_obf::obf!("proxy: present wait submit failed: {res}"));
+            let hidden = unsafe { core::mem::replace(&mut (*slot).spare, NO_SPARE) };
+            if hidden != NO_SPARE {
+                unsafe { spare_unclaim(sc, hidden as usize) };
+            }
             return res;
         }
         if signal_chain {
@@ -6028,6 +6342,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hidden_slots_stand_aside_for_generation_and_other_games() {
+        assert!(spare_path(4, false));
+        assert!(!spare_path(4, true));
+        assert!(!spare_path(0, false));
+    }
+
+    #[test]
     fn other_spellings_cover_the_whole_alias_group() {
         let mut s: Vec<&str> = other_spellings("vkCmdSetLineStipple").collect();
         s.sort_unstable();
@@ -7277,6 +7598,10 @@ pub struct GnSlot {
     // The slot's `AHardwareBuffer` reference on a device that imports through
     // `VK_ANDROID_external_memory_android_hardware_buffer`, null otherwise.
     pub ahb: *mut c_void,
+
+    // The hidden slot this guest slot's frame is being copied to, `NO_SPARE` when
+    // none. Set by the present, cleared by the worker when the copy has finished.
+    pub spare: i32,
 }
 
 pub struct ScShared {
@@ -7303,10 +7628,15 @@ pub struct GnSwapchain {
     /// Whether `present_mode` is the container's or the guest's.
     pub mode_source: ModeSource,
     /// Every slot the shim owns: the guest's first (`guest_slots` of them), then
-    /// the generation destinations, which the guest never sees.
+    /// a strict game's hidden slots (`spare_slots`), then the generation
+    /// destinations. The guest sees only its own.
     pub slots: Vec<GnSlot>,
     /// How many leading entries of `slots` are the guest's swapchain images.
     pub guest_slots: u32,
+    /// How many hidden slots follow them (`crate::image_count::hidden_slot_count`).
+    pub spare_slots: u32,
+    /// Made at the first present of a swapchain with hidden slots.
+    pub spare: Option<SpareCopy>,
     pub worker: Option<std::thread::JoinHandle<()>>,
     pub shared: Mutex<ScShared>,
     pub cv_put: Condvar,
@@ -7649,13 +7979,13 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
         // A release only frees the slot: the cap is applied when the guest asks
         // for the image again, so nothing here can delay a frame that is already
         // on its way to the panel.
-        let guest_slot = {
-            let guest = (*sc).guest_slots as usize;
+        let generated = {
+            let first = gen_first_slot(sc);
             let slots = (*sc).slots.as_ptr();
-            ((slot as usize - slots as usize) / core::mem::size_of::<GnSlot>()) < guest
+            ((slot as usize - slots as usize) / core::mem::size_of::<GnSlot>()) >= first
         };
         let _g = (*sc).shared.lock().unwrap();
-        if logging && !guest_slot {
+        if logging && generated {
             GEN_RELEASES.fetch_add(1, Ordering::Relaxed);
         }
         (*slot).in_flight = false;
