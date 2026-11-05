@@ -54,6 +54,18 @@ static STRICT_GAMES: &[StrictGame] = &[
     listed(Match::AppName("DetroitBecomeHuman")),
 ];
 
+/// The hidden slots behind a strict game's swapchain. A swapchain of 3 or more
+/// already has an image to spare, so it gets none. Below that it gets the frame on
+/// screen, the one committed behind it, and one for each of the two frames the guest
+/// can have between its present and the commit.
+pub fn hidden_slot_count(guest_slots: u32) -> u32 {
+    if guest_slots < 3 {
+        4
+    } else {
+        0
+    }
+}
+
 /// The kernel keeps 15 bytes of a process name.
 const COMM_LEN: usize = 15;
 
@@ -160,6 +172,12 @@ mod tests {
         assert!(ue(23).is_some());
         assert_eq!(ue(24), None);
         assert_eq!(find_strict_game("game", None, Some("DXVK"), 0), None);
+    }
+
+    #[test]
+    fn only_a_swapchain_with_no_image_to_spare_gets_hidden_slots() {
+        assert_eq!(hidden_slot_count(2), 4);
+        assert_eq!(hidden_slot_count(3), 0);
     }
 
     #[test]

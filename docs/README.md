@@ -52,7 +52,7 @@ winlator X11 path (which remains the default for normal launches).
 20. [20-swapchain-maintenance1.md](20-swapchain-maintenance1.md) — `VK_KHR_swapchain_maintenance1` served by the ICD shim: present fences, surface-maintenance capabilities, image release; why the leaked KHR name froze DX12 titles; the per-present mode switch left for a follow-up.
 21. [21-wsi-extension-policy.md](21-wsi-extension-policy.md) — which surface, swapchain and present extensions the guest sees under the WSI proxy: the registry-derived WSI scope, the served/hidden table in `wsi_policy.rs`, the per-process log line, and how to classify a new extension.
 22. [22-unresolvable-extensions.md](22-unresolvable-extensions.md) — the resolve probe: the reported apiVersion is clamped below the first core version whose commands do not resolve by exact name on the guest's instance (its Vulkan1xFeatures read false); the Honor GT 1.4 case, the probe line with its cost, the 1.0-instance skip, `GN_VKSHIM_NO_RESOLVE_PROBE=1`; extension hiding removed.
-23. [23-strict-image-count.md](23-strict-image-count.md) — the games that fail unless the swapchain has exactly the image count they asked for: Mesa's strict list carried by the shim, what changes for them and how to keep the list in step.
+23. [23-strict-image-count.md](23-strict-image-count.md) — the games that fail unless the swapchain has exactly the image count they asked for: Mesa's strict list carried by the shim, what changes for them, the hidden slots behind their images and how to keep the list in step.
 
 ## One-paragraph summary
 
