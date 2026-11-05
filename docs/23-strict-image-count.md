@@ -33,15 +33,16 @@ the same area and equally hot, it holds exactly 30.0 fps, where X11 FIFO runs at
 about 51 with about the same GPU time per frame. That this is the reason is
 inferred.
 
-A listed game on that route therefore gets hidden slots behind its images:
+A listed game on that route whose swapchain has fewer than 3 images therefore gets
+hidden slots behind them. With 3 or more it already has an image to spare, so it
+gets its exact count and no copy.
 
 - The present's submit waits the guest's semaphores, then copies the frame to a
   hidden slot. The guest's image comes back when that submit's fence signals, and
   the hidden slot is what the compositor gets and later releases. Present ids and
   waits move with the frame to the hidden slot.
-- There are `minImageCount + 2` of them: the frame on screen, the one committed
-  behind it, and one for each frame the guest can have between its present and the
-  commit. `hidden_slot_count` holds the rule.
+- There are 4 of them: the frame on screen, the one committed behind it, and one
+  for each of the two frames the guest can have between its present and the commit.
 - A frame that finds no hidden slot free goes out on the guest's own image, as it
   would without any. The guest then waits at its next acquire until the compositor
   releases it, so the compositor can slow the guest but not lose a frame or
@@ -58,9 +59,7 @@ A listed game on that route therefore gets hidden slots behind its images:
   out directly: the guest's image belongs to that family and the copy's command
   buffers can only run on the first.
 
-The shim logs the slot count once per swapchain, and every 600 frames
-`strict hidden slots: N frames, M had no free slot`, whatever `GNDRM_LOG_VKSHIM`
-says. A high `M` means the slots are too few or the compositor is holding them.
+The shim logs the slot count once per swapchain, whatever `GNDRM_LOG_VKSHIM` says.
 
 The X11 route has no hidden slots.
 

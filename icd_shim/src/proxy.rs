@@ -899,21 +899,11 @@ pub struct SpareCopy {
     end: unsafe extern "C" fn(VkCommandBuffer) -> VkResult,
 }
 
-/// Frames of swapchains with hidden slots, and how many found none free.
-static SPARE_FRAMES: AtomicUsize = AtomicUsize::new(0);
-static SPARE_NO_FREE: AtomicUsize = AtomicUsize::new(0);
-/// Frames between two lines of those counts: about ten seconds at 60 fps.
-const SPARE_LOG_EVERY: usize = 600;
-
 /// Whether this swapchain's frames go through its hidden slots now. Generation
 /// reads the guest's image itself and has its own destinations, so a strict game
 /// that turns it on is back on the direct path until it turns it off.
 unsafe fn spare_in_use(sc: *mut GnSwapchain) -> bool {
-    spare_path(unsafe { (*sc).spare_slots }, crate::lsfg::live().0)
-}
-
-fn spare_path(spare_slots: u32, generating: bool) -> bool {
-    spare_slots != 0 && !generating
+    unsafe { (*sc).spare_slots != 0 } && !crate::lsfg::live().0
 }
 
 /// The pool and command buffers for a queue of `family`, made at the swapchain's
@@ -1078,10 +1068,6 @@ unsafe fn spare_begin(
     if !unsafe { spare_in_use(sc) } || queue.is_null() {
         return ptr::null_mut();
     }
-    // The worker frees the guest's image once this fence wait returns.
-    if unsafe { (*(*sc).dev).f.wait_fences }.is_none() {
-        return ptr::null_mut();
-    }
     let Some(copy) = (unsafe { spare_copy_state(sc, (*queue).family) }) else {
         return ptr::null_mut();
     };
@@ -1095,16 +1081,6 @@ unsafe fn spare_begin(
         }
         free
     };
-    if hidden.is_none() {
-        SPARE_NO_FREE.fetch_add(1, Ordering::Relaxed);
-    }
-    let frames = SPARE_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-    if frames.is_multiple_of(SPARE_LOG_EVERY) {
-        crate::logi!(gndrm_obf::obf!(
-            "strict hidden slots: {frames} frames, {} had no free slot",
-            SPARE_NO_FREE.load(Ordering::Relaxed)
-        ));
-    }
     let Some(hidden) = hidden else {
         return ptr::null_mut();
     };
@@ -2448,8 +2424,8 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     sc.guest_slots = n_slots;
     // Hidden slots only on gamescope's route, the one where a slot comes back on
     // the compositor's release. The guest never sees them (`spare_begin`).
-    if strict_count && gamescope_route {
-        let hidden = crate::image_count::hidden_slot_count(n_slots) as usize;
+    let hidden = crate::image_count::hidden_slot_count(n_slots) as usize;
+    if strict_count && gamescope_route && hidden != 0 {
         unsafe { lsfg_destinations(scp, hidden) };
         sc.spare_slots = (sc.slots.len() - n_slots as usize) as u32;
         crate::logi!(gndrm_obf::obf!(
@@ -3152,7 +3128,7 @@ unsafe fn present_dispatch(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
     // In present order, whatever the mode: a copy under way cannot be replaced,
     // and at most `guest_slots` frames can wait. gamescope reads the declared mode
     // and replaces a frame it has not latched, so mailbox still means mailbox.
-    if unsafe { (*sc).spare_slots != 0 && ((*slot).spare != NO_SPARE || spare_in_use(sc)) } {
+    if unsafe { (*slot).spare != NO_SPARE || spare_in_use(sc) } {
         unsafe { present_immediate(sc, slot, idx) };
         return;
     }
@@ -6342,13 +6318,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hidden_slots_stand_aside_for_generation_and_other_games() {
-        assert!(spare_path(4, false));
-        assert!(!spare_path(4, true));
-        assert!(!spare_path(0, false));
-    }
-
-    #[test]
     fn other_spellings_cover_the_whole_alias_group() {
         let mut s: Vec<&str> = other_spellings("vkCmdSetLineStipple").collect();
         s.sort_unstable();
@@ -7979,13 +7948,13 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
         // A release only frees the slot: the cap is applied when the guest asks
         // for the image again, so nothing here can delay a frame that is already
         // on its way to the panel.
-        let generated = {
-            let first = gen_first_slot(sc);
+        let guest_slot = {
+            let guest = (*sc).guest_slots as usize;
             let slots = (*sc).slots.as_ptr();
-            ((slot as usize - slots as usize) / core::mem::size_of::<GnSlot>()) >= first
+            ((slot as usize - slots as usize) / core::mem::size_of::<GnSlot>()) < guest
         };
         let _g = (*sc).shared.lock().unwrap();
-        if logging && generated {
+        if logging && !guest_slot {
             GEN_RELEASES.fetch_add(1, Ordering::Relaxed);
         }
         (*slot).in_flight = false;

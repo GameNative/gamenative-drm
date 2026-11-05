@@ -54,16 +54,16 @@ static STRICT_GAMES: &[StrictGame] = &[
     listed(Match::AppName("DetroitBecomeHuman")),
 ];
 
-/// Buffers the compositor can hold at once while frames keep coming: the one on
-/// screen and the one committed behind it, which replaces it at the next latch.
-const COMPOSITOR_HELD: u32 = 2;
-
-/// The hidden slots behind a strict game's swapchain: what the compositor holds,
-/// and one for every frame the guest can have between its present and the commit,
-/// which is one per image. With fewer a frame sometimes goes out on the guest's own
-/// image and the guest waits on the compositor again.
+/// The hidden slots behind a strict game's swapchain. A swapchain of 3 or more
+/// already has an image to spare, so it gets none. Below that it gets the frame on
+/// screen, the one committed behind it, and one for each of the two frames the guest
+/// can have between its present and the commit.
 pub fn hidden_slot_count(guest_slots: u32) -> u32 {
-    guest_slots + COMPOSITOR_HELD
+    if guest_slots < 3 {
+        4
+    } else {
+        0
+    }
 }
 
 /// The kernel keeps 15 bytes of a process name.
@@ -175,9 +175,9 @@ mod tests {
     }
 
     #[test]
-    fn hidden_slots_cover_the_compositor_and_every_guest_frame() {
+    fn only_a_swapchain_with_no_image_to_spare_gets_hidden_slots() {
         assert_eq!(hidden_slot_count(2), 4);
-        assert_eq!(hidden_slot_count(3), 5);
+        assert_eq!(hidden_slot_count(3), 0);
     }
 
     #[test]
