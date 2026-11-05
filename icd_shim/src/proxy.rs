@@ -2062,12 +2062,26 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     let extra_slot = u32::from(
         slot_mode == VK_PRESENT_MODE_MAILBOX_KHR || (gamescope_route && crate::lsfg::live().0),
     );
-    let mut n_slots = ci.minImageCount + 1 + extra_slot;
+    // A game on Mesa's strict list fails when it gets more images than it asked
+    // for (`crate::image_count`), so it gets its own count and no spare.
+    let strict_count = crate::image_count::strict();
+    let mut n_slots = if strict_count {
+        ci.minImageCount
+    } else {
+        ci.minImageCount + 1 + extra_slot
+    };
     if n_slots < 2 {
         n_slots = 2;
     }
     if n_slots > max_swapchain_images() {
         n_slots = max_swapchain_images();
+    }
+    if strict_count {
+        crate::logi!(gndrm_obf::obf!(
+            "proxy swapchain create: strict image count: requested {} gives {n_slots} images, mode={}",
+            ci.minImageCount,
+            ci.presentMode
+        ));
     }
     let mut sc = Box::new(GnSwapchain {
         surf,
@@ -8738,6 +8752,7 @@ unsafe extern "C" fn gn_vkCreateInstance(
     } else {
         unsafe { (*ci.pApplicationInfo).apiVersion }
     };
+    unsafe { crate::image_count::note_instance(ci.pApplicationInfo) };
     let loader_api = real_instance_version(gipa);
     let fwd_api = forward_api_version(app_api, loader_api);
     let app2;
@@ -9585,7 +9600,7 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     // surfaces with no guest window (the wayland route).
     let window_extent = unsafe { surface_extent(s) };
     let out = VkSurfaceCapabilitiesKHR {
-        minImageCount: 2,
+        minImageCount: crate::image_count::min_image_count().unwrap_or(2),
         maxImageCount: max_swapchain_images(),
         currentExtent: match window_extent {
             Some((w, h)) => VkExtent2D {
