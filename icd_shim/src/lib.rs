@@ -112,6 +112,7 @@ pub fn vkshim_enabled() -> bool {
 pub mod advertise;
 pub mod divisor;
 pub mod export;
+pub mod image_count;
 pub mod placed;
 pub mod present;
 pub mod lsfg;
