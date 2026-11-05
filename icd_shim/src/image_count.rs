@@ -25,32 +25,26 @@ enum Match {
 #[derive(Debug, PartialEq)]
 struct StrictGame {
     game: Match,
-    /// The minimum reported to the game: Mesa's X11 default unless the entry has
-    /// a `vk_x11_override_min_image_count`. The game tends to ask for this, and
-    /// with no spare image it decides how far ahead the game can render.
-    min_image_count: u32,
+    /// Mesa's `vk_x11_override_min_image_count`, where it differs from the
+    /// minimum the shim already reports.
+    min_image_count: Option<u32>,
 }
-
-const MESA_X11_MIN_IMAGE_COUNT: u32 = 3;
 
 const fn listed(game: Match) -> StrictGame {
     StrictGame {
         game,
-        min_image_count: MESA_X11_MIN_IMAGE_COUNT,
+        min_image_count: None,
     }
 }
 
 /// Every `vk_x11_strict_image_count` entry of Mesa's `00-mesa-defaults.conf`.
 static STRICT_GAMES: &[StrictGame] = &[
+    listed(Match::Exe("RainbowSix_Vulkan.exe")),
+    listed(Match::Exe("R6-Extraction.exe")),
     StrictGame {
-        game: Match::Exe("RainbowSix_Vulkan.exe"),
-        min_image_count: 2,
+        game: Match::Exe("Hades.exe"),
+        min_image_count: Some(3),
     },
-    StrictGame {
-        game: Match::Exe("R6-Extraction.exe"),
-        min_image_count: 2,
-    },
-    listed(Match::Exe("Hades.exe")),
     listed(Match::Engine("UnrealEngine4", 23)),
     listed(Match::Exe("DOOMx64vk.exe")),
     listed(Match::Exe("Youngblood_x64vk.exe")),
@@ -117,7 +111,7 @@ pub fn strict() -> bool {
 }
 
 pub fn min_image_count() -> Option<u32> {
-    MATCHED.get().map(|g| g.min_image_count)
+    MATCHED.get().and_then(|g| g.min_image_count)
 }
 
 #[cfg(test)]
@@ -169,11 +163,12 @@ mod tests {
     }
 
     #[test]
-    fn listed_games_report_mesas_minimum() {
-        let min = |comm| exe(comm).unwrap().min_image_count;
-        assert_eq!(min("DOOMx64vk.exe"), 3);
-        assert_eq!(min("Hades.exe"), 3);
-        assert_eq!(min("RainbowSix_Vulk"), 2);
-        assert_eq!(min("R6-Extraction.e"), 2);
+    fn only_hades_changes_the_reported_minimum() {
+        let raised: Vec<_> = STRICT_GAMES
+            .iter()
+            .filter(|g| g.min_image_count.is_some())
+            .map(|g| g.game)
+            .collect();
+        assert_eq!(raised, [Match::Exe("Hades.exe")]);
     }
 }
