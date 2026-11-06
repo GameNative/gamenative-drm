@@ -43,13 +43,21 @@ export ANDROID_NDK_HOME="$NDK"
 # registry) out of the shipped binary, so it carries no build-machine layout.
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-args=-Wl,-z,max-page-size=16384 --remap-path-prefix=$ROOT=/build/gamenative-drm --remap-path-prefix=$HOME/.cargo/registry=/build/cargo-registry"
 # rust-std component for the tier-2 target must be installed (rustup).
-cargo build $PROFILE --target aarch64-linux-android -p gndrm-android
-
-# ICD shim + smoke-test clients (gamescope/android C sources, ported):
+#
+# One invocation for all three packages. The profile is `lto = "fat"` with
+# `codegen-units = 1`, so each cdylib ends in a serial whole-program pass; two
+# sequential cargo builds pay for them one after the other, while a single
+# invocation runs them side by side (16-core host: 25-31 s against 29 s + 27 s).
+# The shim's .so is byte-identical either way; the daemon's .text moves by 8
+# bytes, with .rodata, .data.rel.ro and the export set unchanged and each shape
+# reproducible, so that is codegen scheduling rather than a feature difference.
+#
+# The shim and smoke-test clients are the gamescope/android C sources, ported:
 # libadrenotools_gamescope.so links libwayland-client from the gamescope termux
 # prefix (build.rs reads GAMESCOPE_TERMUX_PREFIX); the test binaries also
 # link libvulkan from there.
-cargo build $PROFILE --target aarch64-linux-android -p adrenotools_gamescope -p gn-utils
+cargo build $PROFILE --target aarch64-linux-android \
+    -p gndrm-android -p adrenotools_gamescope -p gn-utils
 
 # Export drift guard: the dynamic export set of each shipped library must match
 # its allowlist (tools/exports/*.map), so a dropped JNI/ICD symbol or a newly
