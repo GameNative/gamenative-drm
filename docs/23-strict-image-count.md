@@ -5,23 +5,37 @@ for. DOOM (2016) is the known case on gamescope: it stops at startup with
 `FATAL ERROR: getSwapchainImagesKHR failed with error (VK_SUCCESS)`. The call
 succeeded; the game rejected the result.
 
-The Vulkan spec lets a swapchain have more images than `minImageCount`. The
-shim uses that: it allocates `minImageCount + 1`, and one more for mailbox. On
-real Linux, Mesa's X11 WSI keeps a list of these games under
-`vk_x11_strict_image_count`. Under the WSI proxy the swapchain is the shim's
-own, so Mesa never sees it, and the shim carries the list in
-`icd_shim/src/image_count.rs`.
+The Vulkan spec lets a swapchain have more images than `minImageCount`, and
+creation raises the count for mailbox and for frame generation. On real Linux,
+Mesa's X11 WSI keeps a list of these games under `vk_x11_strict_image_count`.
+Under the WSI proxy the swapchain is the shim's own, so Mesa never sees it, and
+the shim carries the list in `icd_shim/src/image_count.rs`.
+
+Creation otherwise follows Mesa's convention (`proxy::swapchain_slots`): the
+surface capabilities advertise `SC_DEFAULT_IMAGES` (3, Mesa's
+`WSI_WL_DEFAULT_NUM_IMAGES`), the ask is honoured exactly, and the only bump is
+mailbox to `SC_MAILBOX_IMAGES` (4, Mesa's `WSI_WL_BUMPED_NUM_IMAGES`). A guest
+that sizes its per-image state from `vkGetSwapchainImagesKHR` therefore gets its
+own number back, which is what the listed games above reject.
 
 ## What changes for a listed game
 
-- The guest sees exactly `minImageCount` images, in every present mode. The
-  shim's floor of 2 and `WRAPPER_MAX_IMAGE_COUNT` still apply.
-- Hades also reports a minimum of 3, Mesa's `vk_x11_override_min_image_count`.
-  Rainbow Six's value of 2 is what the shim already reports.
+- The guest sees exactly `minImageCount` images, in every present mode and with
+  no bump of any kind — the mailbox floor and the frame-generation floor
+  included. The shim's floor of 2 and `WRAPPER_MAX_IMAGE_COUNT` still apply.
+- With frame generation on, a listed game therefore has no source image to
+  spare, and its hidden slots are idle while generation runs (`spare_in_use` is
+  off with generation on, by design): the session paces at whatever two source
+  images allow. Generation is left enabled rather than refused, because refusing
+  it would change the mode the guest was promised.
+- No listed game changes the advertised minimum any more: Mesa's
+  `vk_x11_override_min_image_count` (Hades, 3) has nothing to override, because
+  every surface already advertises 3.
 - The shim logs `strict image count on` and each swapchain's requested and
   created counts, whatever `GNDRM_LOG_VKSHIM` says.
 
-Every other game keeps the count it had.
+Every other guest gets what it asked for, which for a conforming one is the
+advertised 3 and for DXVK (which asks `minImageCount + 1`) 4.
 
 ## Hidden slots
 

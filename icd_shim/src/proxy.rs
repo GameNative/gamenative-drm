@@ -2276,58 +2276,29 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     // present (`live_present_mode`).
     let gamescope_route = unsafe { !(*surf).swapchain_obj.is_null() };
     let (mode, mode_source) = effective_present_mode(ci);
-    // Mesa's wayland WSI derives minImageCount from the present mode
-    // (wsi_common_wayland.c:1188): the extra image exists so one can be queued
-    // for scan-out while the app renders the next. Mailbox therefore carries
-    // one more slot than fifo; fifo keeps its existing count. Frame generation
-    // presents as mailbox, so a swapchain made while it runs keeps that count.
-    // On the override route the container's mode decides the count only when
-    // the daemon's stamp lead is already known; before that a capped swapchain
-    // is declared FIFO (`live_present_mode`), so the guest's own request
-    // decides it, as it did before the container's mode was honoured there. A
-    // lead that arrives later changes the declaration on the next present but
-    // not the count, which holds until the guest recreates the swapchain.
-    // Whenever the swapchain is declared FIFO at creation for another reason
-    // than its own mode (no stamp lead yet, a cap at the display's rate, a
-    // guest's FIFO request with no cap), the guest's own request decides the
-    // count too, as on master: a spare image would only deepen gamescope's FIFO
-    // queue. A cap at the display's rate with a guest's FIFO request declares
-    // the container's mode with the gate (`Declared::CapRateVsync`), and keeps
-    // that mode's count, the spare image included.
-    let declared_at_creation = choose_live_mode(
-        mode,
-        mode_source,
-        guest_present_mode(ci),
-        crate::lsfg::live().0,
-        crate::scanout::cap_fps_note(),
-        crate::vsync_gate::current_grid(),
-    )
-    .1;
-    let slot_mode = if gamescope_route
-        && matches!(
-            declared_at_creation,
-            Declared::CapCompat | Declared::CapRate | Declared::GuestVsync
-        ) {
-        guest_present_mode(ci)
-    } else {
-        mode
-    };
-    let extra_slot = u32::from(
-        slot_mode == VK_PRESENT_MODE_MAILBOX_KHR || (gamescope_route && crate::lsfg::live().0),
-    );
-    // A game on Mesa's strict list fails when it gets more images than it asked
-    // for (`crate::image_count`), so it gets its own count and no spare.
+    // The count is the guest's, on Mesa's convention: the capabilities carry
+    // the depth ([`SC_DEFAULT_IMAGES`]) and creation honours the ask, with the
+    // mailbox floor as the only bump ([`swapchain_slots`]). What a commit
+    // declares per present (`live_present_mode`) is pacing and does not move
+    // the count, so there is nothing to resolve here about the container's
+    // mode: a swapchain made at one count keeps it until the guest recreates it.
+    //
+    // A game on Mesa's strict list gets exactly its ask and no bump at all —
+    // the mailbox floor included — because any image it did not ask for is what
+    // it fails on (`crate::image_count`).
     let strict_count = crate::image_count::strict();
+    let ceiling = max_swapchain_images();
     let mut n_slots = if strict_count {
-        ci.minImageCount
+        ci.minImageCount.clamp(2, ceiling.max(2))
     } else {
-        ci.minImageCount + 1 + extra_slot
+        swapchain_slots(ci.minImageCount, ceiling, mode)
     };
-    if n_slots < 2 {
-        n_slots = 2;
-    }
-    if n_slots > max_swapchain_images() {
-        n_slots = max_swapchain_images();
+    // Frame generation commits the source frame from the guest's own slot while
+    // its generated frames latch: a guest that asked for two has nothing left
+    // to render the next source frame into, so it gets the floor. Never for a
+    // strict game, which cannot be given a slot it did not ask for.
+    if !strict_count && crate::lsfg::live().0 {
+        n_slots = n_slots.max(SC_FRAMEGEN_IMAGES.min(ceiling.max(2)));
     }
     if strict_count {
         crate::logi!(gndrm_obf::obf!(
@@ -6314,6 +6285,57 @@ unsafe extern "C" fn gn_vkGetDeviceProcAddr(
 }
 
 #[cfg(test)]
+mod swapchain_slots_tests {
+    use super::*;
+
+    /// The ask is honoured: this is the whole point of the convention, and what
+    /// a guest that sizes its per-image state from it depends on.
+    #[test]
+    fn the_ask_is_the_count() {
+        assert_eq!(swapchain_slots(2, 8, VK_PRESENT_MODE_FIFO_KHR), 2);
+        assert_eq!(swapchain_slots(3, 8, VK_PRESENT_MODE_FIFO_KHR), 3);
+        assert_eq!(swapchain_slots(4, 8, VK_PRESENT_MODE_FIFO_RELAXED_KHR), 4);
+        assert_eq!(swapchain_slots(5, 8, VK_PRESENT_MODE_IMMEDIATE_KHR), 5);
+    }
+
+    /// Mailbox is the one bump, and it is a floor, not an addend: a guest that
+    /// already asked for four does not become five.
+    #[test]
+    fn mailbox_is_a_floor_of_four() {
+        assert_eq!(swapchain_slots(2, 8, VK_PRESENT_MODE_MAILBOX_KHR), 4);
+        assert_eq!(swapchain_slots(3, 8, VK_PRESENT_MODE_MAILBOX_KHR), 4);
+        assert_eq!(swapchain_slots(4, 8, VK_PRESENT_MODE_MAILBOX_KHR), 4);
+        assert_eq!(swapchain_slots(6, 8, VK_PRESENT_MODE_MAILBOX_KHR), 6);
+    }
+
+    /// Two is the floor and the ceiling is the ceiling, whatever the ask.
+    #[test]
+    fn stays_inside_two_and_the_ceiling() {
+        assert_eq!(swapchain_slots(0, 8, VK_PRESENT_MODE_FIFO_KHR), 2);
+        assert_eq!(swapchain_slots(1, 8, VK_PRESENT_MODE_MAILBOX_KHR), 4);
+        assert_eq!(swapchain_slots(9, 8, VK_PRESENT_MODE_FIFO_KHR), 8);
+        // A ceiling under the mailbox floor cannot be honoured; the guest gets
+        // the ceiling rather than an image count the surface refused.
+        assert_eq!(swapchain_slots(2, 3, VK_PRESENT_MODE_MAILBOX_KHR), 3);
+        assert_eq!(swapchain_slots(2, 1, VK_PRESENT_MODE_FIFO_KHR), 2);
+    }
+
+    /// The advertised minimum is the default, so a conforming guest and the
+    /// create path agree on 3 without any bump carrying the depth.
+    #[test]
+    fn the_advertised_minimum_is_the_default() {
+        assert_eq!(SC_DEFAULT_IMAGES, 3);
+        assert_eq!(
+            swapchain_slots(SC_DEFAULT_IMAGES, 8, VK_PRESENT_MODE_FIFO_KHR),
+            SC_DEFAULT_IMAGES
+        );
+        // The floor cannot exceed the advertised depth, or a conforming guest
+        // asking for the minimum would be bumped into a count it never chose.
+        const { assert!(SC_FRAMEGEN_IMAGES <= SC_DEFAULT_IMAGES) };
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -7259,6 +7281,43 @@ use std::time::{Duration, Instant};
 pub const GN_MAX_SC_IMAGES: usize = 8;
 pub const GN_MAX_PRESENT: usize = 8; // swapchainCount handled per vkQueuePresentKHR
 pub const GN_JOB_CAP: usize = 16;
+
+/// What the surface capabilities advertise as `minImageCount`, so a guest that
+/// honours them asks for a count with the depth it needs and reads back exactly
+/// that. Mesa's Wayland WSI: "3 images is a sound default for everything except
+/// MAILBOX" (`WSI_WL_DEFAULT_NUM_IMAGES`).
+pub const SC_DEFAULT_IMAGES: u32 = 3;
+/// Mesa's `WSI_WL_BUMPED_NUM_IMAGES`: "For true mailbox mode, we need at least
+/// 4 images: one to scan out from, one queued for scan-out, one held by the
+/// compositor, one to render to." Creation raises a mailbox swapchain to this.
+pub const SC_MAILBOX_IMAGES: u32 = 4;
+/// The source images frame generation needs when the guest asks for fewer than
+/// this: the source frame is committed from the guest's own slot while its
+/// generated frames latch, so that slot, the one being recorded and the one the
+/// compositor holds are all away at once. Generous against the measured case —
+/// generation ran at 5 slots before this rule existed.
+pub const SC_FRAMEGEN_IMAGES: u32 = 3;
+
+/// The images a swapchain gets for a guest that asked `asked`, kept legal (at
+/// least two) and inside `ceiling`.
+///
+/// Mesa's convention, followed here because the shim is the one writing the
+/// capabilities: the depth lives in `minImageCount` ([`SC_DEFAULT_IMAGES`]) and
+/// creation honours the ask. The only bump is the mailbox one
+/// ([`SC_MAILBOX_IMAGES`]) — Mesa makes exactly that one, and only when its
+/// wayland FIFO manager is present, which is the case its own create path
+/// matches. A guest that sizes its per-image state from the ask therefore gets
+/// its own number back from `vkGetSwapchainImagesKHR`; that mismatch is what
+/// Mesa's `vk_x11_strict_image_count` list exists to avoid, and it is why the
+/// count is no longer asked-for-plus-one.
+fn swapchain_slots(asked: u32, ceiling: u32, mode: VkPresentModeKHR) -> u32 {
+    let base = asked.clamp(2, ceiling.max(2));
+    if mode == VK_PRESENT_MODE_MAILBOX_KHR {
+        base.max(SC_MAILBOX_IMAGES.min(ceiling.max(2)))
+    } else {
+        base
+    }
+}
 
 pub const fn gn_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
@@ -9899,7 +9958,7 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     // surfaces with no guest window (the wayland route).
     let window_extent = unsafe { surface_extent(s) };
     let out = VkSurfaceCapabilitiesKHR {
-        minImageCount: crate::image_count::min_image_count().unwrap_or(2),
+        minImageCount: SC_DEFAULT_IMAGES,
         maxImageCount: max_swapchain_images(),
         currentExtent: match window_extent {
             Some((w, h)) => VkExtent2D {

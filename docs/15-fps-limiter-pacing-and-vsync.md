@@ -200,8 +200,9 @@ that rate is the display's.
   that many limited periods of input latency, as on a PC. A guest that uses present wait
   is bounded by its frame latency.
 - **Frame generation turned on mid-session** switches a FIFO guest's swapchain to the
-  mailbox discipline with the slot count it was created with (`minImageCount + 1`, one
-  fewer than a swapchain created with generation on) until the guest recreates it.
+  mailbox discipline with the slot count it was created with (the ask, floored at 4 by
+  the mailbox rule; and no frame-generation floor, since that only applies when the
+  swapchain is created with generation already on) until the guest recreates it.
 - **Toggling frame generation** sends the cap change and the generation settings
   separately; between the two, for a moment, the swapchain's mode is declared with no
   cap, so a mailbox/immediate swapchain can run uncapped for a few frames.
