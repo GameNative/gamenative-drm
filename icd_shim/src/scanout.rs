@@ -17,9 +17,9 @@
 //! pre-existing behaviour rather than a broken one.
 
 use gndrm_uapi::wire::{
-    scanout_ahb_format, FrameCapNote, FrameCapSubscribe, LsfgConfig, ScanoutAllocReq,
-    ScanoutAllocResp, ScanoutLayout, VsyncNote, CAP_FRAME_CAP, CAP_PRESENT_ID, CAP_VSYNC_NOTE,
-    FPS_UNCAPPED, SCANOUT_LAYOUT_ENV, SCANOUT_REQ_AHB_HANDLE,
+    scanout_ahb_format, FrameCapNote, FrameCapSubscribe, LsfgConfig, ReleaseFence, ScanoutAllocReq,
+    ScanoutAllocResp, ScanoutLayout, VsyncNote, CAP_FRAME_CAP, CAP_PRESENT_ID, CAP_RELEASE_FENCE,
+    CAP_VSYNC_NOTE, FPS_UNCAPPED, SCANOUT_LAYOUT_ENV, SCANOUT_REQ_AHB_HANDLE,
 };
 use std::ffi::c_void;
 use std::os::fd::RawFd;
@@ -427,7 +427,7 @@ fn connect(path: &str) -> RawFd {
         if !send_frame(
             fd,
             &FrameCapSubscribe {
-                caps: CAP_FRAME_CAP | CAP_VSYNC_NOTE | CAP_PRESENT_ID,
+                caps: CAP_FRAME_CAP | CAP_VSYNC_NOTE | CAP_PRESENT_ID | CAP_RELEASE_FENCE,
             }
             .encode(),
         ) {
@@ -559,6 +559,14 @@ fn exchange_req(fd: RawFd, req: ScanoutAllocReq) -> Result<ScanoutBuf, Failure> 
                     if frames < MAX_BURST_FRAMES {
                         continue;
                     }
+                } else if let Some(note) = ReleaseFence::decode(buf) {
+                    // A buffer's release, pushed while this exchange waits:
+                    // kept for the next acquire of that buffer.
+                    record_release(note, recv_fd);
+                    if frames < MAX_BURST_FRAMES {
+                        continue;
+                    }
+                    return Err(Failure::Dead);
                 } else if gndrm_uapi::wire::FrameAcquired::decode(buf).is_some() {
                     // The acquire counter shares this channel and can arrive
                     // while a reply is pending; it is not the reply.
@@ -593,6 +601,7 @@ fn exchange_req(fd: RawFd, req: ScanoutAllocReq) -> Result<ScanoutBuf, Failure> 
                         }
                     }
                     note_pool_fd_kind(recv_fd, r.ino);
+                    note_owned(r.ino);
                     return Ok(ScanoutBuf {
                         fd: recv_fd,
                         ino: r.ino,
@@ -693,36 +702,313 @@ pub(crate) fn poll_notes() {
     if *ch < 0 {
         return;
     }
+    // Every frame already queued, not just one: release notes arrive twice per
+    // frame, and one read per call would fall behind them.
+    for _ in 0..MAX_BURST_FRAMES {
+        let Some((buf, len, recv_fd)) = recv_push(*ch) else {
+            return;
+        };
+        dispatch_push(&buf[..len], recv_fd);
+    }
+}
+
+/// One pushed frame and the descriptor riding with it (`-1` for none), or
+/// `None` when nothing is queued (or the peer closed). Non-blocking.
+fn recv_push(ch: RawFd) -> Option<([u8; PUSH_LEN], usize, RawFd)> {
     // One frame of the largest push. SEQPACKET preserves boundaries but truncates
-    // on a short buffer, so this must cover every push: `FrameCapNote`,
-    // `VsyncNote` and `LsfgConfig`.
+    // on a short buffer, so this must cover every push.
     let mut buf = [0u8; PUSH_LEN];
-    // SAFETY: `*ch` is the connection this module owns and `buf` is one full
-    // frame; MSG_DONTWAIT leaves a frame that has not arrived for the next
-    // call, and a read of any other length is a peer that closed.
-    let n = unsafe { libc::recv(*ch, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
-    let Ok(len) = usize::try_from(n) else {
-        return;
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
     };
-    if len == 0 {
+    let mut cbuf = [0u64; 8];
+    let mut recv_fd: RawFd = -1;
+    // SAFETY: `ch` is the connection this module owns; the message points at
+    // live stack buffers; MSG_DONTWAIT leaves a frame that has not arrived for
+    // the next call.
+    let n = unsafe {
+        let mut msg: libc::msghdr = core::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr().cast();
+        msg.msg_controllen = core::mem::size_of_val(&cbuf) as _;
+        let n = libc::recvmsg(ch, &mut msg, libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC);
+        if n > 0 {
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                    let fd = core::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>());
+                    if recv_fd >= 0 {
+                        libc::close(recv_fd);
+                    }
+                    recv_fd = fd;
+                }
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            }
+        }
+        n
+    };
+    let len = usize::try_from(n).ok().filter(|&l| l > 0)?;
+    Some((buf, len, recv_fd))
+}
+
+/// Apply one pushed frame. `recv_fd` (owned) is kept only by a release note.
+fn dispatch_push(buf: &[u8], recv_fd: RawFd) {
+    if let Some(note) = ReleaseFence::decode(buf) {
+        record_release(note, recv_fd);
         return;
     }
+    if recv_fd >= 0 {
+        // SAFETY: a descriptor that rode with a frame that carries none.
+        unsafe { libc::close(recv_fd) };
+    }
     // Dispatch on the magic: every push type shares the socket, in any order.
-    if let Some(note) = FrameCapNote::decode(&buf[..len]) {
+    if let Some(note) = FrameCapNote::decode(buf) {
         apply_note(note);
-    } else if let Some(note) = VsyncNote::decode(&buf[..len]) {
+    } else if let Some(note) = VsyncNote::decode(buf) {
         apply_vsync(note);
-    } else if let Some(config) = LsfgConfig::decode(&buf[..len]) {
+    } else if let Some(config) = LsfgConfig::decode(buf) {
         if !config.is_request() {
             crate::lsfg::apply(config);
         }
-    } else if let Some(done) = gndrm_uapi::wire::PresentDone::decode(&buf[..len]) {
+    } else if let Some(done) = gndrm_uapi::wire::PresentDone::decode(buf) {
         // The panel latched the frame this id was marked for.
         crate::present::record(done.id, done.latch_ns);
-    } else if let Some(acq) = gndrm_uapi::wire::FrameAcquired::decode(&buf[..len]) {
-        // Sent from the acquire path; nothing to apply here. Accepted so the
-        // log does not report it as an unknown frame.
-        let _ = acq;
+    }
+    // Anything else (the shim's own acquire counter, a frame a newer daemon
+    // sends) is ignored.
+}
+
+// ------------------------------------------------------------ release fences
+//
+// The daemon sends gamescope's page-flip event when it publishes a frame, and
+// gamescope then hands the replaced buffer back to this shim while the panel
+// may still be scanning it out; a guest that renders into it then tears. A
+// daemon that knows this shim reads them (`CAP_RELEASE_FENCE`) says so before
+// the flip event leaves (a pending note) and forwards the buffer's release fence
+// when SurfaceFlinger reports it. The acquire that next hands the buffer to the
+// guest waits for both, bounded. An older daemon sends neither, and acquire
+// behaves as before.
+
+/// One scan-out buffer's release state.
+struct Release {
+    ino: u64,
+    /// Pending notes not yet followed by their fence.
+    outstanding: u32,
+    /// The newest fence received, `-1` for none (or "no fence: already free").
+    fd: RawFd,
+}
+
+/// Release state by scan-out inode, for buffers this process was handed.
+static RELEASES: Mutex<Vec<Release>> = Mutex::new(Vec::new());
+
+/// The most buffers tracked; the oldest entry is dropped beyond it.
+const MAX_RELEASES: usize = 64;
+
+/// Scan-out inodes this process received from the daemon. Notes for any other
+/// buffer (another client's, or the compositor's own) are dropped on arrival.
+static OWNED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// The most inodes remembered as owned; the oldest is forgotten beyond it.
+const MAX_OWNED: usize = 256;
+
+/// Bound of one acquire-side wait, a 30 Hz frame. A release signals within a
+/// vsync or two; this only matters when a note was lost.
+pub(crate) const RELEASE_WAIT: std::time::Duration = std::time::Duration::from_millis(33);
+
+/// Release fences waited at acquire, and waits that ran out of budget.
+pub(crate) static RELEASE_WAITS: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static RELEASE_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+
+fn note_owned(ino: u64) {
+    let mut o = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+    if o.contains(&ino) {
+        return;
+    }
+    if o.len() >= MAX_OWNED {
+        o.remove(0);
+    }
+    o.push(ino);
+}
+
+fn owned(ino: u64) -> bool {
+    OWNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&ino)
+}
+
+fn close_fd(fd: RawFd) {
+    if fd >= 0 {
+        // SAFETY: a descriptor the caller owns and gives up here.
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// Take in one release note; `fd` (owned) is the fence that rode with it.
+fn record_release(note: ReleaseFence, fd: RawFd) {
+    if note.ino == 0 || !owned(note.ino) {
+        close_fd(fd);
+        return;
+    }
+    let mut r = RELEASES.lock().unwrap_or_else(|e| e.into_inner());
+    let at = r.iter().position(|e| e.ino == note.ino);
+    if note.is_pending() {
+        close_fd(fd);
+        match at {
+            Some(i) => r[i].outstanding = r[i].outstanding.saturating_add(1),
+            None => {
+                if r.len() >= MAX_RELEASES {
+                    close_fd(r.remove(0).fd);
+                }
+                r.push(Release {
+                    ino: note.ino,
+                    outstanding: 1,
+                    fd: -1,
+                });
+            }
+        }
+        return;
+    }
+    // A fence nobody is waiting for: the buffer's wait already ran out (it was
+    // handed to the guest), so the fence is dropped rather than kept for a
+    // later acquire it does not describe.
+    let Some(i) = at.filter(|&i| r[i].outstanding > 0) else {
+        close_fd(fd);
+        return;
+    };
+    r[i].outstanding -= 1;
+    close_fd(core::mem::replace(&mut r[i].fd, fd));
+}
+
+/// What the acquire of one buffer has to wait for.
+enum ReleaseState {
+    /// Nothing: no note, or the release arrived with no fence.
+    Free,
+    /// A pending note whose fence has not arrived.
+    Pending,
+    /// The fence, taken out of the table (the caller owns and closes it).
+    Fence(RawFd),
+}
+
+fn take_release(ino: u64) -> ReleaseState {
+    let mut r = RELEASES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(i) = r.iter().position(|e| e.ino == ino) else {
+        return ReleaseState::Free;
+    };
+    if r[i].outstanding > 0 {
+        return ReleaseState::Pending;
+    }
+    let fd = r.remove(i).fd;
+    if fd < 0 {
+        ReleaseState::Free
+    } else {
+        ReleaseState::Fence(fd)
+    }
+}
+
+/// Forget `ino`'s release state after a wait ran out: a late fence for it is
+/// then dropped on arrival.
+fn abandon_release(ino: u64) {
+    let mut r = RELEASES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = r.iter().position(|e| e.ino == ino) {
+        close_fd(r.remove(i).fd);
+    }
+}
+
+/// Block for at most `left` until the channel has a frame to read (or, with no
+/// channel, just for a short slice): the wake for a fence still on its way.
+fn wait_channel(left: std::time::Duration) {
+    let slice = left.min(std::time::Duration::from_millis(4));
+    let ch = match CHAN.try_lock() {
+        Ok(g) => *g,
+        Err(std::sync::TryLockError::Poisoned(p)) => *p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => -1,
+    };
+    if ch >= 0 {
+        let mut pfd = libc::pollfd {
+            fd: ch,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live pollfd for the call. The descriptor is only polled,
+        // so a reconnect replacing it in the meantime costs at most one slice.
+        let rc = unsafe { libc::poll(&mut pfd, 1, slice.as_millis().max(1) as i32) };
+        if rc > 0 && pfd.revents & libc::POLLIN != 0 {
+            return;
+        }
+        if rc == 0 {
+            return;
+        }
+    }
+    std::thread::sleep(slice.min(std::time::Duration::from_millis(1)));
+}
+
+/// Wait for a sync file to signal, for at most `left`. `true` when it did.
+fn wait_sync_file(fd: RawFd, left: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + left;
+    loop {
+        let rest = deadline.saturating_duration_since(std::time::Instant::now());
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Rounded up, so a sub-millisecond remainder still waits.
+        let ms = rest.as_micros().div_ceil(1000) as i32;
+        // SAFETY: one live pollfd for the call.
+        let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if rc > 0 {
+            return true;
+        }
+        let eintr = rc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR);
+        if !eintr || rest.is_zero() {
+            return false;
+        }
+    }
+}
+
+/// Before the guest is given buffer `ino` again: wait, for at most `budget`,
+/// until the panel is done with it. Returns at once when the daemon announced
+/// no release for it (an older daemon, or a buffer the compositor did not scan
+/// out). Each fence is waited once and closed here.
+pub(crate) fn wait_release(ino: u64, budget: std::time::Duration) {
+    if ino == 0 {
+        return;
+    }
+    let start = std::time::Instant::now();
+    let deadline = start + budget;
+    poll_notes();
+    let done = loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match take_release(ino) {
+            ReleaseState::Free => break true,
+            ReleaseState::Fence(fd) => {
+                RELEASE_WAITS.fetch_add(1, Ordering::Relaxed);
+                let signalled = wait_sync_file(fd, left);
+                close_fd(fd);
+                break signalled;
+            }
+            ReleaseState::Pending => {
+                if left.is_zero() {
+                    abandon_release(ino);
+                    break false;
+                }
+                wait_channel(left);
+                poll_notes();
+            }
+        }
+    };
+    if !done {
+        let n = RELEASE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+        if n == 0 {
+            crate::logi!(gndrm_obf::obf!(
+                "scan-out: a release wait ran out after {}ms (ino={ino} waits={}); counted from here on",
+                start.elapsed().as_millis(),
+                RELEASE_WAITS.load(Ordering::Relaxed)
+            ));
+        }
     }
 }
 
@@ -970,5 +1256,192 @@ mod tests {
         // A period is truncated, never rounded up past `1 / target`.
         assert_eq!(period_ns(FPS_UNCAPPED), 0);
         assert_eq!(period_ns(3), 333_333_333);
+    }
+
+    /// The release tests share the process-wide tables and counters.
+    static RELEASE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A pipe standing in for a sync file: the read end polls readable once a
+    /// byte is written, the way a fence polls once it signals.
+    fn fence_pair() -> (RawFd, RawFd) {
+        let mut p = [0 as RawFd; 2];
+        // SAFETY: two out-params in a live array.
+        assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
+        (p[0], p[1])
+    }
+
+    fn signal(write_end: RawFd) {
+        // SAFETY: the write end of a live pipe.
+        assert_eq!(
+            unsafe { libc::write(write_end, b"x".as_ptr().cast(), 1) },
+            1
+        );
+    }
+
+    fn is_open(fd: RawFd) -> bool {
+        // SAFETY: probe only.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+    }
+
+    fn pending(ino: u64) -> ReleaseFence {
+        ReleaseFence {
+            ino,
+            flags: ReleaseFence::PENDING,
+        }
+    }
+
+    fn fence(ino: u64) -> ReleaseFence {
+        ReleaseFence { ino, flags: 0 }
+    }
+
+    #[test]
+    fn a_pushed_release_fence_is_waited_once_at_acquire() {
+        let _g = RELEASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ino = 0x5eed_0001;
+        note_owned(ino);
+        let (rd, wr) = fence_pair();
+        record_release(pending(ino), -1);
+        record_release(fence(ino), rd);
+        signal(wr);
+        let waits = RELEASE_WAITS.load(Ordering::Relaxed);
+        let timeouts = RELEASE_TIMEOUTS.load(Ordering::Relaxed);
+        wait_release(ino, RELEASE_WAIT);
+        assert_eq!(RELEASE_WAITS.load(Ordering::Relaxed), waits + 1);
+        assert!(!is_open(rd), "a waited fence must be closed");
+        // The next acquire of the buffer has nothing left to wait for.
+        wait_release(ino, RELEASE_WAIT);
+        assert_eq!(RELEASE_WAITS.load(Ordering::Relaxed), waits + 1);
+        assert_eq!(RELEASE_TIMEOUTS.load(Ordering::Relaxed), timeouts);
+        // SAFETY: the test owns the write end.
+        unsafe { libc::close(wr) };
+    }
+
+    #[test]
+    fn an_acquire_waits_for_a_fence_still_on_its_way() {
+        let _g = RELEASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ino = 0x5eed_0002;
+        note_owned(ino);
+        record_release(pending(ino), -1);
+        let (rd, wr) = fence_pair();
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            signal(wr);
+            record_release(fence(ino), rd);
+            wr
+        });
+        let timeouts = RELEASE_TIMEOUTS.load(Ordering::Relaxed);
+        let t0 = std::time::Instant::now();
+        wait_release(ino, std::time::Duration::from_millis(500));
+        let took = t0.elapsed();
+        let wr = late.join().unwrap();
+        assert!(
+            took >= std::time::Duration::from_millis(9),
+            "returned before the fence: {took:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_millis(400),
+            "waited past the fence: {took:?}"
+        );
+        assert_eq!(RELEASE_TIMEOUTS.load(Ordering::Relaxed), timeouts);
+        assert!(!is_open(rd));
+        // SAFETY: the test owns the write end.
+        unsafe { libc::close(wr) };
+    }
+
+    #[test]
+    fn an_unsignalled_fence_is_waited_for_and_bounded() {
+        let _g = RELEASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ino = 0x5eed_0003;
+        note_owned(ino);
+        let (rd, wr) = fence_pair();
+        record_release(pending(ino), -1);
+        record_release(fence(ino), rd);
+        let timeouts = RELEASE_TIMEOUTS.load(Ordering::Relaxed);
+        let t0 = std::time::Instant::now();
+        wait_release(ino, std::time::Duration::from_millis(20));
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(19));
+        assert_eq!(RELEASE_TIMEOUTS.load(Ordering::Relaxed), timeouts + 1);
+        assert!(!is_open(rd));
+        // SAFETY: the test owns the write end.
+        unsafe { libc::close(wr) };
+    }
+
+    #[test]
+    fn a_lost_fence_costs_one_bounded_wait_and_a_late_one_is_dropped() {
+        let _g = RELEASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ino = 0x5eed_0004;
+        note_owned(ino);
+        record_release(pending(ino), -1);
+        let timeouts = RELEASE_TIMEOUTS.load(Ordering::Relaxed);
+        let t0 = std::time::Instant::now();
+        wait_release(ino, std::time::Duration::from_millis(20));
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(19));
+        assert_eq!(RELEASE_TIMEOUTS.load(Ordering::Relaxed), timeouts + 1);
+        // The fence arrives after the buffer went to the guest: dropped.
+        let (rd, wr) = fence_pair();
+        record_release(fence(ino), rd);
+        assert!(
+            !is_open(rd),
+            "a fence for a re-acquired buffer must be closed"
+        );
+        let waits = RELEASE_WAITS.load(Ordering::Relaxed);
+        let t1 = std::time::Instant::now();
+        wait_release(ino, RELEASE_WAIT);
+        assert!(t1.elapsed() < std::time::Duration::from_millis(15));
+        assert_eq!(RELEASE_WAITS.load(Ordering::Relaxed), waits);
+        // SAFETY: the test owns the write end.
+        unsafe { libc::close(wr) };
+    }
+
+    #[test]
+    fn a_release_with_no_fence_frees_the_buffer_and_others_buffers_are_ignored() {
+        let _g = RELEASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ino = 0x5eed_0005;
+        note_owned(ino);
+        record_release(pending(ino), -1);
+        record_release(fence(ino), -1);
+        let t0 = std::time::Instant::now();
+        wait_release(ino, RELEASE_WAIT);
+        assert!(t0.elapsed() < std::time::Duration::from_millis(15));
+        // A buffer this process was never handed: nothing is kept for it.
+        let stranger = 0x5eed_0f00;
+        let (rd, wr) = fence_pair();
+        record_release(pending(stranger), -1);
+        record_release(fence(stranger), rd);
+        assert!(!is_open(rd));
+        let t1 = std::time::Instant::now();
+        wait_release(stranger, RELEASE_WAIT);
+        assert!(t1.elapsed() < std::time::Duration::from_millis(15));
+        // SAFETY: the test owns the write end.
+        unsafe { libc::close(wr) };
+    }
+
+    #[test]
+    fn a_pushed_fence_is_received_with_its_descriptor() {
+        let mut sv = [0 as RawFd; 2];
+        // SAFETY: two out-params in a live array.
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    sv.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let (rd, wr) = fence_pair();
+        send_with_fd(sv[0], &fence(42).encode(), rd);
+        let (buf, len, got) = recv_push(sv[1]).expect("a pushed frame");
+        assert_eq!(ReleaseFence::decode(&buf[..len]), Some(fence(42)));
+        assert!(got >= 0 && got != rd);
+        assert!(recv_push(sv[1]).is_none(), "nothing else was queued");
+        // SAFETY: the test owns every descriptor it opened or received.
+        unsafe {
+            [sv[0], sv[1], rd, wr, got].iter().for_each(|fd| {
+                libc::close(*fd);
+            })
+        };
     }
 }

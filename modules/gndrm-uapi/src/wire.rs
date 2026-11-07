@@ -744,6 +744,72 @@ impl PresentDone {
     }
 }
 
+/// Release-fence magic: ASCII "GNRF". Daemon -> shim, on the scan-out channel.
+///
+/// The daemon sends gamescope's page-flip event when it publishes a frame, and
+/// gamescope then hands the buffer that frame replaced back to its producer,
+/// while the panel may still be scanning that buffer out. These notes tell the
+/// producer when the buffer is off the panel:
+///
+/// - at publish, before the flip event leaves, a note with
+///   [`ReleaseFence::PENDING`] set: a release fence for `ino` will follow;
+/// - when SurfaceFlinger completes the transaction, a note without it, carrying
+///   the buffer's release fence (one sync-file descriptor via `SCM_RIGHTS`), or
+///   no descriptor when SurfaceFlinger reported none (the buffer is free).
+///
+/// Only a connection that declared [`CAP_RELEASE_FENCE`] is sent either; an
+/// older shim never sees them.
+pub const RELEASE_FENCE_MAGIC: u32 = 0x474E_5246;
+
+/// The `caps` bit a [`FrameCapSubscribe`] sets when the shim reads
+/// [`ReleaseFence`] notes (and their descriptor).
+pub const CAP_RELEASE_FENCE: u32 = 1 << 3;
+
+/// A scan-out buffer's release, daemon -> shim (see [`RELEASE_FENCE_MAGIC`]).
+///
+/// Encoded little-endian, 16 bytes: `magic:u32, flags:u32, ino:u64`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseFence {
+    /// The scan-out inode of the buffer the release belongs to.
+    pub ino: u64,
+    /// [`ReleaseFence::PENDING`] or 0.
+    pub flags: u32,
+}
+
+impl ReleaseFence {
+    pub const LEN: usize = 16;
+
+    /// The buffer was replaced on the layer; its fence follows in a later note.
+    pub const PENDING: u32 = 1 << 0;
+
+    #[must_use]
+    pub fn is_pending(self) -> bool {
+        self.flags & Self::PENDING != 0
+    }
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[0..4].copy_from_slice(&RELEASE_FENCE_MAGIC.to_le_bytes());
+        b[4..8].copy_from_slice(&self.flags.to_le_bytes());
+        b[8..16].copy_from_slice(&self.ino.to_le_bytes());
+        b
+    }
+
+    #[must_use]
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN
+            || u32::from_le_bytes(b[0..4].try_into().ok()?) != RELEASE_FENCE_MAGIC
+        {
+            return None;
+        }
+        Some(Self {
+            flags: u32::from_le_bytes(b[4..8].try_into().ok()?),
+            ino: u64::from_le_bytes(b[8..16].try_into().ok()?),
+        })
+    }
+}
+
 /// Vsync note magic: ASCII "GNVS". Daemon -> shim.
 pub const VSYNC_MAGIC: u32 = 0x474E_5653;
 
@@ -1269,5 +1335,28 @@ mod tests {
         // A subscribe never decodes as a note and vice versa.
         assert_eq!(FrameCapNote::decode(&enc), None);
         assert_eq!(FrameCapSubscribe::decode(&sub.encode()), Some(sub));
+    }
+
+    #[test]
+    fn release_fence_round_trips_and_rejects_other_frames() {
+        for flags in [0, ReleaseFence::PENDING] {
+            let n = ReleaseFence {
+                ino: 0x1234_5678_9abc,
+                flags,
+            };
+            let enc = n.encode();
+            assert_eq!(enc[0..4], RELEASE_FENCE_MAGIC.to_le_bytes());
+            assert_eq!(ReleaseFence::decode(&enc), Some(n));
+            assert_eq!(
+                ReleaseFence::decode(&enc).map(ReleaseFence::is_pending),
+                Some(flags != 0)
+            );
+            assert_eq!(ReleaseFence::decode(&enc[..15]), None);
+        }
+        assert_eq!(
+            ReleaseFence::decode(&PresentDone { id: 1, latch_ns: 2 }.encode()),
+            None
+        );
+        assert_ne!(CAP_RELEASE_FENCE, CAP_PRESENT_ID);
     }
 }

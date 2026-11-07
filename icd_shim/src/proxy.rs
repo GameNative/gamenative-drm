@@ -2833,6 +2833,22 @@ unsafe fn gn_acquire_common(
             VK_TIMEOUT
         };
     }
+    // The slot is ours, but the panel may still be scanning its buffer out: the
+    // compositor hands a buffer back at the flip event, which leaves when its
+    // replacement is published, before that replacement is on screen. Wait for
+    // the release the daemon forwards for it (none from an older daemon: no
+    // wait) before the guest may render into it. A non-blocking acquire is not
+    // made to block.
+    if timeout != 0 {
+        let budget = deadline.map_or(crate::scanout::RELEASE_WAIT, |dl| {
+            dl.saturating_duration_since(Instant::now())
+                .min(crate::scanout::RELEASE_WAIT)
+        });
+        crate::scanout::wait_release(
+            unsafe { (*(*sc).slots.as_ptr().add(idx as usize)).ino },
+            budget,
+        );
+    }
     if sem != 0 || fence != 0 {
         let gq = unsafe { (*gd).queues };
         if gq.is_null() {

@@ -54,6 +54,7 @@
 //! [`AscState::publish`] waits on it before reusing the same buffer.
 
 use core::ffi::{c_int, c_void};
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::RawFd;
@@ -70,7 +71,8 @@ use gndrm_daemon::scanout::{
 use gndrm_daemon::{CursorUpdate, FrameCap, Framebuffer, PlaneState, Presenter};
 use gndrm_uapi::wire::{
     scanout_ahb_format, FrameAcquired, FrameCapSubscribe, LsfgConfig, PresentDone, PresentMark,
-    ScanoutAllocReq, ScanoutAllocResp, CAP_FRAME_CAP, CAP_PRESENT_ID, CAP_VSYNC_NOTE,
+    ReleaseFence, ScanoutAllocReq, ScanoutAllocResp, CAP_FRAME_CAP, CAP_PRESENT_ID,
+    CAP_RELEASE_FENCE, CAP_VSYNC_NOTE,
 };
 
 use crate::ffi;
@@ -264,6 +266,33 @@ struct ReleaseCtx {
     /// reuse cache keys on it). Never cleared: the flag belongs to this
     /// registration, and a registration is not reused.
     latched: Arc<AtomicBool>,
+    /// For each transaction this registration was published in and whose
+    /// completion has not arrived yet, in apply order: the scan-out inode of
+    /// the buffer it replaced on the layer, 0 for none. The completion pops the
+    /// front and forwards that buffer's release fence to its producer.
+    replaced: Mutex<VecDeque<u64>>,
+}
+
+/// The most completions one registration can owe before the oldest entry is
+/// dropped (its producer's bounded wait then covers the missing note).
+const REPLACED_QUEUE_CAP: usize = 8;
+
+/// Tell the producers that read release fences that `ino` has been replaced on
+/// the layer and its release fence follows. Sent before the transaction is
+/// applied, hence before gamescope's page-flip event hands the buffer back.
+fn push_release_pending(ino: u64) {
+    let note = ReleaseFence {
+        ino,
+        flags: ReleaseFence::PENDING,
+    };
+    gndrm_daemon::pushes::push(CAP_RELEASE_FENCE, &note.encode());
+}
+
+/// Forward the release fence SurfaceFlinger reported for the replaced buffer
+/// `ino` (`fd`, borrowed; `-1` when it reported none, i.e. the buffer is free).
+fn push_release_fence(ino: u64, fd: RawFd) {
+    let note = ReleaseFence { ino, flags: 0 };
+    gndrm_daemon::pushes::push_with_fd(CAP_RELEASE_FENCE, &note.encode(), fd);
 }
 
 // SAFETY: after construction the only mutations are the atomic and the release
@@ -424,6 +453,18 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
         // SAFETY: `controls` is the array the get call above returned, released
         // exactly once here.
         unsafe { (ctx.stats_release_controls)(controls) };
+    }
+    // The fence belongs to the buffer this transaction replaced. Its producer
+    // may already have it back (the flip event left at publish), so the fence
+    // goes to it as well; the daemon's own wait below keeps its copy.
+    let replaced = ctx
+        .replaced
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .pop_front()
+        .unwrap_or(0);
+    if replaced != 0 {
+        push_release_fence(replaced, fd);
     }
     if fd >= 0
         && ctx
@@ -857,6 +898,7 @@ fn new_release_ctx(api: &ffi::ScApi) -> (*mut ReleaseCtx, Arc<AtomicBool>) {
         applied_ns: AtomicU64::new(0),
         present_id: AtomicU64::new(0),
         latched: Arc::clone(&latched),
+        replaced: Mutex::new(VecDeque::new()),
     }));
     (ctx, latched)
 }
@@ -1571,7 +1613,15 @@ impl AscState {
                             self.win_h)
                         );
                     }
-                    match build_show(&api, self.sc, ahb, ctx, rect, fence) {
+                    // The buffer this frame takes the layer from, whose release
+                    // its producer is told about (none for a re-show of itself).
+                    let replaced = self.last_publish.map_or(0, |lp| lp.ino);
+                    let replaced = if replaced == published_ino {
+                        0
+                    } else {
+                        replaced
+                    };
+                    match build_show(&api, self.sc, ahb, ctx, rect, fence, replaced) {
                         Some(tx) => {
                             apply_transaction(&api, tx);
                             // SAFETY: `ctx` is the leaked mailbox of this slot.
@@ -1903,7 +1953,7 @@ impl AscState {
             dst: lp.dst,
             dataspace: lp.dataspace,
         };
-        if let Some(tx) = build_show(&api, self.sc, ahb, ctx, rect, None) {
+        if let Some(tx) = build_show(&api, self.sc, ahb, ctx, rect, None, 0) {
             apply_transaction(&api, tx);
             // SAFETY: `ctx` is the leaked mailbox of this slot.
             unsafe {
@@ -3561,6 +3611,7 @@ fn build_show(
     ctx: *mut ReleaseCtx,
     rect: ShowRect,
     fence: Option<RawFd>,
+    replaced_ino: u64,
 ) -> Option<*mut ffi::ASurfaceTransaction> {
     let ShowRect {
         src,
@@ -3662,6 +3713,21 @@ fn build_show(
         // The completion reports the previous release fence, which is what
         // gates re-publishing this buffer.
         (api.st_set_on_complete)(tx, ctx.cast(), on_complete);
+        // One entry per transaction carrying this callback, so the completion
+        // pops the one that belongs to it.
+        {
+            let mut q = (*ctx)
+                .replaced
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if q.len() >= REPLACED_QUEUE_CAP {
+                q.pop_front();
+            }
+            q.push_back(replaced_ino);
+        }
+        if replaced_ino != 0 {
+            push_release_pending(replaced_ino);
+        }
         Some(tx)
     }
 }

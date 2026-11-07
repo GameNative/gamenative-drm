@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 #[cfg(test)]
-use gndrm_uapi::wire::{CAP_FRAME_CAP, CAP_PRESENT_ID, CAP_VSYNC_NOTE};
+use gndrm_uapi::wire::{CAP_FRAME_CAP, CAP_PRESENT_ID, CAP_RELEASE_FENCE, CAP_VSYNC_NOTE};
 
 /// One connection that asked to be pushed to: its descriptor and the cap bits it
 /// declared in its subscribe.
@@ -124,6 +124,13 @@ pub fn clear_served(fd: RawFd) {
 /// between. Any other failure means the peer is gone: the sink is dropped, and
 /// its descriptor closed unless the acceptor is serving it.
 pub fn push(cap: u32, frame: &[u8]) {
+    push_with_fd(cap, frame, -1);
+}
+
+/// [`push`], with `attach` riding along via `SCM_RIGHTS` when it is not `-1`:
+/// each sink receives its own duplicate, and the caller keeps (and closes)
+/// `attach`.
+pub fn push_with_fd(cap: u32, frame: &[u8], attach: RawFd) {
     let served = SERVED_FD.load(Ordering::Relaxed);
     let mut sinks = SINKS.lock().unwrap_or_else(PoisonError::into_inner);
     sinks.retain(|sink| {
@@ -133,14 +140,7 @@ pub fn push(cap: u32, frame: &[u8]) {
         // SAFETY: `sink.fd` is a descriptor this registry owns until it is
         // dropped or closed here, and `frame` outlives the call. MSG_NOSIGNAL
         // keeps a peer that has gone away from raising SIGPIPE in the daemon.
-        let sent = unsafe {
-            libc::send(
-                sink.fd,
-                frame.as_ptr().cast(),
-                frame.len(),
-                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
-            )
-        };
+        let sent = unsafe { send_frame(sink.fd, frame, attach) };
         if sent == frame.len() as isize {
             return true;
         }
@@ -156,6 +156,37 @@ pub fn push(cap: u32, frame: &[u8]) {
         }
         false
     });
+}
+
+/// One non-blocking `sendmsg` of `frame`, with `attach` as `SCM_RIGHTS` unless
+/// it is `-1`. Returns what `sendmsg` returned.
+///
+/// # Safety
+/// `fd` is a live socket and `attach` is `-1` or a live descriptor.
+unsafe fn send_frame(fd: RawFd, frame: &[u8], attach: RawFd) -> isize {
+    let mut iov = libc::iovec {
+        iov_base: frame.as_ptr().cast_mut().cast(),
+        iov_len: frame.len(),
+    };
+    // Room for one descriptor's control message, aligned for `cmsghdr`.
+    let mut cbuf = [0u64; 4];
+    // SAFETY: a zeroed msghdr is a valid empty message; every pointer set below
+    // refers to a buffer that outlives the call.
+    unsafe {
+        let mut msg: libc::msghdr = core::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        if attach >= 0 {
+            msg.msg_control = cbuf.as_mut_ptr().cast();
+            msg.msg_controllen = libc::CMSG_SPACE(core::mem::size_of::<RawFd>() as u32) as _;
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(core::mem::size_of::<RawFd>() as u32) as _;
+            core::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>(), attach);
+        }
+        libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT)
+    }
 }
 
 /// Close and forget every sink (session teardown: nothing is left to push to).
@@ -360,5 +391,60 @@ mod tests {
                 libc::close(*fd);
             })
         };
+    }
+
+    #[test]
+    fn a_descriptor_rides_only_to_sinks_that_read_release_fences() {
+        let _g = reset();
+        let (reads, peer_reads) = pair();
+        let (old, peer_old) = pair();
+        add(reads, CAP_FRAME_CAP | CAP_RELEASE_FENCE);
+        add(old, CAP_FRAME_CAP | CAP_PRESENT_ID);
+        let mut pipe = [0 as RawFd; 2];
+        // SAFETY: two out-params in a live array.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        push_with_fd(CAP_RELEASE_FENCE, b"fence", pipe[0]);
+        assert!(
+            recv_one(peer_old).is_none(),
+            "an older shim got a release fence"
+        );
+        // SAFETY: one frame and one descriptor's control message into live
+        // stack buffers.
+        let (got, fd) = unsafe {
+            let mut buf = [0u8; 64];
+            let mut iov = libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.len(),
+            };
+            let mut cbuf = [0u64; 4];
+            let mut msg: libc::msghdr = core::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cbuf.as_mut_ptr().cast();
+            msg.msg_controllen = core::mem::size_of_val(&cbuf) as _;
+            let n = libc::recvmsg(peer_reads, &mut msg, libc::MSG_DONTWAIT);
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            assert!(!cmsg.is_null(), "no descriptor rode with the note");
+            let fd = core::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>());
+            (buf[..n.max(0) as usize].to_vec(), fd)
+        };
+        assert_eq!(&got[..], b"fence");
+        assert!(
+            fd >= 0 && fd != pipe[0],
+            "the sink must get its own duplicate"
+        );
+        // The duplicate is the same pipe: a byte written to the write end is
+        // readable from it.
+        // SAFETY: the pipe and the received duplicate are live.
+        unsafe {
+            assert_eq!(libc::write(pipe[1], b"x".as_ptr().cast(), 1), 1);
+            let mut b = [0u8; 1];
+            assert_eq!(libc::read(fd, b.as_mut_ptr().cast(), 1), 1);
+            [reads, peer_reads, old, peer_old, pipe[0], pipe[1], fd]
+                .iter()
+                .for_each(|x| {
+                    libc::close(*x);
+                });
+        }
     }
 }
