@@ -2,10 +2,16 @@
 //! for.
 //!
 //! The Vulkan spec lets a swapchain have more images than `minImageCount`, and
-//! the shim normally adds spares for pacing. These games treat that as fatal or
-//! misbehave. Mesa's X11 WSI handles them with `vk_x11_strict_image_count`; the
-//! guest's swapchain is the shim's own under the WSI proxy, so Mesa never sees
-//! it and the shim carries the same list. See `docs/23-strict-image-count.md`.
+//! creation may raise the count for mailbox or for frame generation. These
+//! games treat that as fatal or misbehave. Mesa's X11 WSI handles them with
+//! `vk_x11_strict_image_count`; the guest's swapchain is the shim's own under
+//! the WSI proxy, so Mesa never sees it and the shim carries the same list.
+//!
+//! The list is the only remaining exception: creation honours every other
+//! guest's ask (Mesa's convention, `proxy::swapchain_slots`), so what a listed
+//! game needs today is not a different minimum but the absence of the bumps —
+//! and, behind a swapchain with no image to spare, hidden slots to present
+//! from. See `docs/23-strict-image-count.md`.
 
 use std::ffi::{c_char, CStr};
 use std::sync::OnceLock;
@@ -22,36 +28,22 @@ enum Match {
     Engine(&'static str, u32),
 }
 
-#[derive(Debug, PartialEq)]
-struct StrictGame {
-    game: Match,
-    /// Mesa's `vk_x11_override_min_image_count`, where it differs from the
-    /// minimum the shim already reports.
-    min_image_count: Option<u32>,
-}
-
-const fn listed(game: Match) -> StrictGame {
-    StrictGame {
-        game,
-        min_image_count: None,
-    }
-}
-
 /// Every `vk_x11_strict_image_count` entry of Mesa's `00-mesa-defaults.conf`.
-static STRICT_GAMES: &[StrictGame] = &[
-    listed(Match::Exe("RainbowSix_Vulkan.exe")),
-    listed(Match::Exe("R6-Extraction.exe")),
-    StrictGame {
-        game: Match::Exe("Hades.exe"),
-        min_image_count: Some(3),
-    },
-    listed(Match::Engine("UnrealEngine4", 23)),
-    listed(Match::Exe("DOOMx64vk.exe")),
-    listed(Match::Exe("Youngblood_x64vk.exe")),
-    listed(Match::Exe("NewColossus_x64vk.exe")),
-    listed(Match::AppName("metroexodus")),
-    listed(Match::Exe("AtlasFallen (VK).exe")),
-    listed(Match::AppName("DetroitBecomeHuman")),
+///
+/// Mesa's `vk_x11_override_min_image_count` has no place here: it exists to
+/// raise a minimum that would otherwise be lower than what the game needs, and
+/// the shim advertises `proxy::SC_DEFAULT_IMAGES` for every surface.
+static STRICT_GAMES: &[Match] = &[
+    Match::Exe("RainbowSix_Vulkan.exe"),
+    Match::Exe("R6-Extraction.exe"),
+    Match::Exe("Hades.exe"),
+    Match::Engine("UnrealEngine4", 23),
+    Match::Exe("DOOMx64vk.exe"),
+    Match::Exe("Youngblood_x64vk.exe"),
+    Match::Exe("NewColossus_x64vk.exe"),
+    Match::AppName("metroexodus"),
+    Match::Exe("AtlasFallen (VK).exe"),
+    Match::AppName("DetroitBecomeHuman"),
 ];
 
 /// The hidden slots behind a strict game's swapchain. A swapchain of 3 or more
@@ -74,8 +66,8 @@ fn find_strict_game(
     app_name: Option<&str>,
     engine_name: Option<&str>,
     engine_version: u32,
-) -> Option<&'static StrictGame> {
-    STRICT_GAMES.iter().find(|g| match g.game {
+) -> Option<&'static Match> {
+    STRICT_GAMES.iter().find(|g| match **g {
         Match::Exe(exe) => comm == &exe[..exe.len().min(COMM_LEN)],
         Match::AppName(name) => app_name.is_some_and(|a| a.contains(name)),
         Match::Engine(name, max_version) => {
@@ -84,7 +76,7 @@ fn find_strict_game(
     })
 }
 
-static MATCHED: OnceLock<&'static StrictGame> = OnceLock::new();
+static MATCHED: OnceLock<&'static Match> = OnceLock::new();
 
 unsafe fn c_str<'a>(p: *const c_char) -> Option<&'a str> {
     if p.is_null() {
@@ -113,7 +105,7 @@ pub unsafe fn note_instance(app: *const VkApplicationInfo) {
     let comm = std::fs::read_to_string("/proc/self/comm").unwrap_or_default();
     if let Some(game) = find_strict_game(comm.trim_end(), app_name, engine_name, engine_version) {
         if MATCHED.set(game).is_ok() {
-            crate::logi!(gndrm_obf::obf!("strict image count on: {:?}", game.game));
+            crate::logi!(gndrm_obf::obf!("strict image count on: {:?}", game));
         }
     }
 }
@@ -122,15 +114,11 @@ pub fn strict() -> bool {
     MATCHED.get().is_some()
 }
 
-pub fn min_image_count() -> Option<u32> {
-    MATCHED.get().and_then(|g| g.min_image_count)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn exe(comm: &str) -> Option<&'static StrictGame> {
+    fn exe(comm: &str) -> Option<&'static Match> {
         find_strict_game(comm, None, None, 0)
     }
 
@@ -180,13 +168,12 @@ mod tests {
         assert_eq!(hidden_slot_count(3), 0);
     }
 
+    /// The list is the only exception left: no entry asks creation for
+    /// anything a conforming guest would not itself have asked for.
     #[test]
-    fn only_hades_changes_the_reported_minimum() {
-        let raised: Vec<_> = STRICT_GAMES
-            .iter()
-            .filter(|g| g.min_image_count.is_some())
-            .map(|g| g.game)
-            .collect();
-        assert_eq!(raised, [Match::Exe("Hades.exe")]);
+    fn every_entry_is_a_name_and_nothing_else() {
+        assert_eq!(STRICT_GAMES.len(), 10);
+        assert!(STRICT_GAMES.contains(&Match::Exe("Hades.exe")));
+        assert!(STRICT_GAMES.contains(&Match::Exe("DOOMx64vk.exe")));
     }
 }

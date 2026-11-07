@@ -178,7 +178,8 @@ divisor cap reads its target exactly.
   declared the container's mode with the gate every vblank instead
   (`source=cap-rate-vsync`): its wait is answered when it queues the present
   (`docs/15`), the gate paces it,
-  and the swapchain keeps the mailbox image count (Retroid Pocket 6, DTD,
+  and the count stays the guest's own ask — the declared mode moves pacing,
+  not images (`proxy::swapchain_slots`; Retroid Pocket 6, DTD,
   VSync on, cap 60: 59.983 fps, no doubles; with the wait answered at queue,
   42 fps before and 60.0 after in a GPU-heavy 1080p scene). This is the only
   case answered at queue; every other mailbox or immediate presentation is
