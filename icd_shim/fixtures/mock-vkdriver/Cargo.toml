@@ -3,6 +3,7 @@ name = "mock-vkdriver"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 description = "Host-test fixture: fake vulkan ICD for the icd_shim integration tests"
 publish = false
 

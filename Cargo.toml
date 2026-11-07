@@ -17,7 +17,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-or-later"
+authors = ["Joshua Tam", "GameNative Inc."]
 
 # Perf-critical profile settings shared by the Android cdylib later.
 #

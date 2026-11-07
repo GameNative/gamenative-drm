@@ -4,6 +4,7 @@ description = "KMS emulator core: DRM object store + ioctl dispatch (host-testab
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 
 [dependencies]
 gndrm-obf = { path = "../gndrm-obf" }

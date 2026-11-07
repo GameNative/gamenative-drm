@@ -159,3 +159,13 @@ offset the shim maps; `GEM_CLOSE`), PRIME both ways, and syncobj. Modesetting
 and master acquisition are refused `EACCES`. `GET_CAP` reports
 `DUMB_BUFFER=1` and `PRIME=IMPORT|EXPORT`, the caps Mesa's `gbm_create_device`
 and glamor's device probe read before allocating.
+
+## License
+
+GNU General Public License v3.0 or later (`GPL-3.0-or-later`). The full text is
+`LICENSE`; third-party components and their licenses are in `THIRD_PARTY_NOTICES`.
+
+Copyright (C) 2026 Joshua Tam and GameNative Inc.
+
+The shipped `libadrenotools_gamescope.so` links the LSFG frame-generation engine,
+which is GPL-3.0-or-later, and is distributed under the same license.
