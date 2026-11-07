@@ -165,7 +165,7 @@ and glamor's device probe read before allocating.
 GNU General Public License v3.0 or later (`GPL-3.0-or-later`). The full text is
 `LICENSE`; third-party components and their licenses are in `THIRD_PARTY_NOTICES`.
 
-Copyright (C) 2026 Joshua Tam and Utkarsh Dalal.
+Copyright (C) 2026 Joshua Tam and GameNative Inc.
 
 The shipped `libadrenotools_gamescope.so` links the LSFG frame-generation engine,
 which is GPL-3.0-or-later, and is distributed under the same license.
