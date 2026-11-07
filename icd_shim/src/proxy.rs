@@ -879,10 +879,23 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
     true
 }
 
-/// The first slot generation may use: the guest's images and a strict game's
-/// hidden slots come before it.
+/// The first slot of the ring behind the guest's images.
+///
+/// One ring serves both consumers: a strict game's hidden copies and frame
+/// generation's destinations. They never run together — [`spare_in_use`] is off
+/// while generation is live — so a slot is only ever one of the two at any
+/// moment, and each allocator skips what the other still has out (`in_flight`
+/// for a slot at the compositor, `gen_due` for a batch queued to be written).
+/// Sizing one ring at `max(hidden, destinations)` instead of the sum is what
+/// keeps a listed game from paying for both: 4 + 5 slots became 5.
 unsafe fn gen_first_slot(sc: *mut GnSwapchain) -> usize {
-    unsafe { ((*sc).guest_slots + (*sc).spare_slots) as usize }
+    unsafe { (*sc).guest_slots as usize }
+}
+
+/// The slots one ring behind the guest's images needs: the larger of the two
+/// consumers, never their sum.
+fn dest_ring(hidden: usize, destinations: usize) -> usize {
+    destinations.max(hidden)
 }
 
 /// A guest slot whose frame goes out as it is, without a hidden copy.
@@ -1072,10 +1085,21 @@ unsafe fn spare_begin(
         return ptr::null_mut();
     };
     let first = unsafe { (*sc).guest_slots as usize };
+    let end = first + unsafe { (*sc).spare_slots } as usize;
+    let gd = unsafe { (*sc).dev };
+    // A batch generation has queued will be written into its slots; after the
+    // user turns generation off mid-session the copy path comes live at once,
+    // and picking one of those slots would tear the frame it is about to draw.
+    // The queue belongs to a swapchain, so only this one's entries count.
+    let gen_queued = unsafe { (*gd).gen_sc == sc };
     let hidden = {
         let _g = unsafe { (*sc).shared.lock().unwrap() };
-        let free = (first..unsafe { gen_first_slot(sc) })
-            .find(|&i| !unsafe { (*(*sc).slots.as_ptr().add(i)).in_flight });
+        let free = (first..end).find(|&i| {
+            let s = unsafe { (*sc).slots.as_ptr().add(i) };
+            !unsafe { (*s).in_flight }
+                && !(gen_queued
+                    && unsafe { (*gd).gen_due.iter().any(|d| d.slot as usize == i) })
+        });
         if let Some(i) = free {
             unsafe { (*(*sc).slots.as_mut_ptr().add(i)).in_flight = true };
         }
@@ -1342,8 +1366,8 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
         // The compositor returns buffers later than the ring assumed: add what
         // this batch is short, within the cap. A new slot is free by definition.
         let total = unsafe { (*sc).slots.len() } - guest;
-        let grow = (planned as usize - free.len())
-            .min(gen_destination_cap(capacity).saturating_sub(total));
+        let cap = gen_destination_cap(capacity);
+        let grow = (planned as usize - free.len()).min(cap.saturating_sub(total));
         if !crate::lsfg::skip("grow") && grow > 0 && lsfg_destinations(sc, total + grow) {
             free.extend(guest + total..guest + total + grow);
         }
@@ -2395,24 +2419,35 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     sc.guest_slots = n_slots;
     // Hidden slots only on gamescope's route, the one where a slot comes back on
     // the compositor's release. The guest never sees them (`spare_begin`).
-    let hidden = crate::image_count::hidden_slot_count(n_slots) as usize;
-    if strict_count && gamescope_route && hidden != 0 {
-        unsafe { lsfg_destinations(scp, hidden) };
-        sc.spare_slots = (sc.slots.len() - n_slots as usize) as u32;
-        crate::logi!(gndrm_obf::obf!(
-            "proxy swapchain create: strict image count: {} hidden slots behind {n_slots} images",
-            sc.spare_slots
-        ));
-    }
+    let hidden = if strict_count && gamescope_route {
+        crate::image_count::hidden_slot_count(n_slots) as usize
+    } else {
+        0
+    };
     let capacity = crate::lsfg::wanted().unwrap_or(1).saturating_sub(1);
     let dest_cap = if capacity == 0 {
         0
     } else {
         gen_destination_cap(capacity)
     };
-    sc.slots.reserve(dest_cap.max(gen_destination_cap(3)));
-    if dest_cap > 0 {
-        unsafe { lsfg_destinations(scp, dest_cap) };
+    // Both consumers take their images from the same ring past the guest's own
+    // ([`gen_first_slot`]), so it is sized for the larger of them and not their
+    // sum. The reserve covers the growth the destination allocator may ask for
+    // later: pushing past the vector's capacity would move every slot while the
+    // compositor holds raw pointers into them (see the note above).
+    let ring = dest_ring(hidden, dest_cap);
+    sc.slots.reserve(ring.max(gen_destination_cap(3)));
+    if ring > 0 {
+        unsafe { lsfg_destinations(scp, ring) };
+    }
+    sc.spare_slots = hidden as u32;
+    if hidden != 0 {
+        crate::logi!(gndrm_obf::obf!(
+            "proxy swapchain create: strict image count: {} images, {} of {} ring slot(s) for hidden copies",
+            n_slots,
+            hidden,
+            ring
+        ));
     }
 
     // What the guest was told the surface can be, next to what the slot images
@@ -6288,6 +6323,22 @@ unsafe extern "C" fn gn_vkGetDeviceProcAddr(
 mod swapchain_slots_tests {
     use super::*;
 
+    /// One ring for both consumers: a listed game with generation on pays for
+    /// the larger of the two, not for both. This is the difference between 5
+    /// slots and 9 at 720p, and between 9 and 20 past guest images at x4.
+    #[test]
+    fn the_ring_is_sized_for_the_larger_consumer() {
+        // No generation: the hidden set is all the ring is.
+        assert_eq!(dest_ring(4, 0), 4);
+        // No hidden set: the destinations are.
+        assert_eq!(dest_ring(0, 5), 5);
+        // Both, which is the case that must not add: 4 + 5 was 9.
+        assert_eq!(dest_ring(4, 5), 5);
+        assert_eq!(dest_ring(4, 11), 11);
+        // Neither.
+        assert_eq!(dest_ring(0, 0), 0);
+    }
+
     /// The ask is honoured: this is the whole point of the convention, and what
     /// a guest that sizes its per-image state from it depends on.
     #[test]
@@ -7656,12 +7707,15 @@ pub struct GnSwapchain {
     /// Whether `present_mode` is the container's or the guest's.
     pub mode_source: ModeSource,
     /// Every slot the shim owns: the guest's first (`guest_slots` of them), then
-    /// a strict game's hidden slots (`spare_slots`), then the generation
-    /// destinations. The guest sees only its own.
+    /// the guest's own images, then one ring behind them shared by a strict
+    /// game's hidden copies and generation's destinations (`dest_ring`). The
+    /// guest sees only its own.
     pub slots: Vec<GnSlot>,
     /// How many leading entries of `slots` are the guest's swapchain images.
     pub guest_slots: u32,
-    /// How many hidden slots follow them (`crate::image_count::hidden_slot_count`).
+    /// How many ring slots the copy path may use, counted from `guest_slots`
+    /// (`crate::image_count::hidden_slot_count`); 0 when there are none. The
+    /// ring itself may be larger when generation's destinations need more.
     pub spare_slots: u32,
     /// Made at the first present of a swapchain with hidden slots.
     pub spare: Option<SpareCopy>,

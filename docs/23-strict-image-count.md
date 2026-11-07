@@ -65,8 +65,15 @@ gets its exact count and no copy.
   under way can't be replaced. gamescope replaces a committed frame it hasn't
   latched, so mailbox still behaves as mailbox. FIFO can queue as many frames as
   there are hidden slots.
-- Frame generation reads the guest's image and has its own destinations, after the
-  hidden slots. While it is on, frames take the direct path and no copy is made.
+- Frame generation reads the guest's image and has its own destinations. The two
+  consumers share one ring behind the guest's images
+  (`proxy::dest_ring`): they never run together, so the ring is sized for the
+  larger of them — hidden vs `3 × (multiplier − 1) + 2` — and not for their sum.
+  Each allocator skips what the other still has out: `in_flight` for a slot at
+  the compositor, `gen_due` for a batch queued to be written. That last check is
+  what keeps a mid-session generation toggle from letting a copy land in a slot
+  the engine is about to draw into. While generation is on, frames take the
+  direct path and no copy is made.
 - The worker frees the guest's image, and the destroy joins the worker before it
   frees anything, so neither can overtake a copy.
 - A present on a queue of another family than the swapchain's first present goes
