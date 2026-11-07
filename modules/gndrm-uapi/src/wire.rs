@@ -753,9 +753,9 @@ impl PresentDone {
 ///
 /// - at publish, before the flip event leaves, a note with
 ///   [`ReleaseFence::PENDING`] set: a release fence for `ino` will follow;
-/// - when SurfaceFlinger completes the transaction, a note without it, carrying
+/// - when `SurfaceFlinger` completes the transaction, a note without it, carrying
 ///   the buffer's release fence (one sync-file descriptor via `SCM_RIGHTS`), or
-///   no descriptor when SurfaceFlinger reported none (the buffer is free).
+///   no descriptor when `SurfaceFlinger` reported none (the buffer is free).
 ///
 /// Only a connection that declared [`CAP_RELEASE_FENCE`] is sent either; an
 /// older shim never sees them.
