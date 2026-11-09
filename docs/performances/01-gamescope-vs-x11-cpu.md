@@ -281,10 +281,15 @@ The container's `MESA_VK_WSI_PRESENT_MODE=mailbox` overrides the title's own
 deliberate container default, and it is also why three of the plan items cannot
 fire on this title.
 
-One asymmetry is left unexplained and is worth a single look: the daemon serves
-**241.9** atomic commits/s while the guest presents **357.3/s**. Mailbox is
-allowed to drop replaced frames, so it is not a defect, but no doc explains the
-1.48 ratio and it is a pacing question rather than a CPU one.
+~~One asymmetry is left unexplained: 241.9 atomic commits/s against 357.3
+presents/s.~~ **Withdrawn — the two numbers count different events and were never
+meant to agree.** `ATOMIC heartbeat` is `g_n_atomic`, every
+`DRM_IOCTL_MODE_ATOMIC` the interposer sees (`gndrm_shim.c:2269`), and
+`notify_frame_published()` is the *producer* ring, documented at
+`modules/gndrm-android/src/lib.rs:303` as "one per frame the producer reports —
+not from the publish path". The pipeline carries four distinct rates (guest
+present 341/s, gamescope commit 242/s, panel 120/s, daemon vsync grid 121/s) and
+they are not supposed to match. See `02-instrumentation.md` §12.
 
 ### 5.2 The app now stops overriding the guest's present mode
 
@@ -310,6 +315,21 @@ on the gamescope route, so the shim declares what the guest asked for. Re-measur
   counterpart. One in-game A/B on the same room is still owed, and it needs no
   rebuild: `dxvk.numBackBuffers = 4` makes the guest ask for 4, restoring the
   depth under immediate so mode and depth can be separated.
+
+### 5.3 The lever that is bigger than the whole plan
+
+The container runs **uncapped** — `fpsLimiterEnabled: false`, `fpsLimiterTarget`
+already **120**, MangoHud reading 341–358 fps — on a **120 Hz** panel at
+1280x720. The guest therefore renders ~2.8× the frames the display can show, and
+every per-frame cost this plan is about (shim submit, worker wake, datagram,
+wayland commit, SF transaction) is paid at 341/s instead of 120/s.
+
+Capping to the panel rate cuts the per-frame path's total cost by ~2.8× before
+any code changes — orders of magnitude more than any item below, which is why the
+plan is now ranked against *that* baseline rather than against an uncapped one.
+It also accounts for the scene dependence: in the heavier room `slot_waits` goes
+9.8 % → 48.9 % at depth 3, so the acquire path's sys time rises with the overshoot
+rate (`02-instrumentation.md` §12).
 
 ### Where that leaves the work
 

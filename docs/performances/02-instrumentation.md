@@ -887,3 +887,70 @@ restores the depth under immediate (`base = asked = 4`), so the 9.8 % slot
 pressure can be isolated from the mode change itself. If depth-4+immediate lands
 on depth-3+immediate, the slot pressure costs nothing and the mode is the whole
 effect.
+
+---
+
+## 12. Third run: the census in-game, and what the two rates actually count
+
+All earlier census runs were at the **title screen**. In-game, in the same room as
+the §11 pair (Crossroads camp, slot 1, 80 s window, gates on, present mode
+`immediate` per the app change), the picture is different and it kills the
+"242 vs 357" reading this report carried earlier:
+
+| reading | title (§11) | **in-game** | note |
+|---|---|---|---|
+| guest presents/s | 357.3 | **341.0** | |
+| guest `commits=` | 357.3 | 341.0 | |
+| daemon atomic ioctls/s | 242.0 | **242.1** | **invariant across scene and mode** |
+| compositor releases/s | 357.3 | 341.0 | |
+| slot depth | 3 | 3 | |
+| **`slot_waits` / acquires** | 9.8 % | **48.9 %** | depth 3 is tight in-game |
+| acquire dwell mean | 0.028 ms | **0.092 ms** | still under 0.1 ms |
+| mean free slots | 1.07 | **0.81** | |
+| `commit_lat_us` | 1206 | **2582** | gate-release → commit ≈ 88 % of a 2.93 ms frame |
+| `starved` / stalls | 0 | 0 | |
+
+### The two numbers never meant the same thing
+
+This report previously called 242 vs 357 a "1.48 ratio" implying ~115 presents/s
+were answered without reaching an atomic commit. That was wrong twice over:
+
+- **`ATOMIC heartbeat` is `g_n_atomic`** (`modules/gndrm-shim/gndrm_shim.c:2269`),
+  incremented on every `DRM_IOCTL_MODE_ATOMIC` the interposer sees. gamescope has
+  no `DRM_MODE_ATOMIC_TEST_ONLY` commit anywhere in `src/`, so these are real
+  flips — but they are *commits*, not presents and not displayed frames.
+- **`presented/s` is a different counter again**, and `notify_frame_published()`
+  is a third: `modules/gndrm-android/src/lib.rs:303` documents it as the
+  **producer** ring — "one the guest acquired, or one frame generation inserted …
+  called from the scan-out channel, once per frame the producer reports — not
+  from the publish path". It measures what the session *produced*, deliberately
+  not what the display latched.
+
+So the pipeline has **three different rates**, and they are not supposed to agree:
+
+| rate | value here | what it is |
+|---|---|---|
+| guest `vkQueuePresentKHR` | 341/s | frames the title rendered |
+| gamescope atomic commits | 242/s | frames the compositor chose to commit |
+| panel / SF scan-out | 120/s | what the display can show |
+| daemon `vsync: check … (121.0 Hz)` | 121/s | the daemon's own pacing grid |
+
+### The lever this exposes
+
+The container runs **uncapped**: `fpsLimiterEnabled: false`, MangoHud at 341–358
+fps, on a **120 Hz** panel with `screenSize: 1280x720`. The guest renders ~2.8×
+the frames the display can show, and the compositor still commits ~2× the panel
+rate.
+
+Every per-frame cost this whole investigation has been chasing — the shim's
+submit, the worker wake, the datagram, the wayland commit, SF's transaction — is
+paid once per **present**, at 341/s, for a display that shows 120. Capping to the
+panel rate would cut the per-frame path's total cost by ~2.8× before a single line
+of code changed, which is two orders of magnitude more than any plan item.
+`fpsLimiterTarget` in the container is already **120**; it is simply switched off.
+
+That also explains the scene dependence without any new mechanism: in the heavier
+room, more of the 341 frames land late against the 120 Hz grid, so `slot_waits`
+goes 9.8 % → 48.9 % and the acquire path's sys time rises with it. The cost is not
+a constant per-present overhead with a scene-dependent bonus; it is the overshoot
+rate interacting with a 3-deep pool.
