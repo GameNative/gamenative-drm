@@ -1,4 +1,4 @@
-# 27 — The swapchain slot reap: route distinction, epochs, and hidden depth
+# 04 — The swapchain slot reap: route distinction, epochs, and hidden depth
 
 Repo `gamenative-drm`, branch `performance-report`. Read-only analysis; no code
 changed. Line numbers are from this tree.

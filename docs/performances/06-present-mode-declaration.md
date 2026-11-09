@@ -1,8 +1,8 @@
-# 29 — Present-mode declaration: why the per-frame re-send is load-bearing
+# 06 — Present-mode declaration: why the per-frame re-send is load-bearing
 
 Scope: the override/Wayland present route (the default, `use_guest_surface()` false,
 `proxy.rs:9655`), per presented frame, as it exists on branch `performance-report`.
-Read: doc 24 §4 F (`docs/24-gamescope-vs-x11-cpu.md:187-189`) and §5 item 5
+Read: doc 24 §4 F (`docs/01-gamescope-vs-x11-cpu.md:187-189`) and §5 item 5
 (`:235-237`), docs 09/10/11/15, `icd_shim/src/proxy.rs` 615-800 / 1900-2184 /
 2260-2300 / 2860-3071 / 3225-3380 / 7625-7760 / 7900-8035 / 9660-9760 /
 10286-10605, and gamescope's `src/wlserver.cpp` + `src/steamcompmgr.cpp` in
@@ -344,7 +344,7 @@ mailbox/async from the real frames, which is a real behaviour change on the path
 
 ## 6. Honest estimate of the saving
 
-Numbers from doc 24 §2 (`docs/24-gamescope-vs-x11-cpu.md:36-43`): 339 fps, CPU busy
+Numbers from doc 24 §2 (`docs/01-gamescope-vs-x11-cpu.md:36-43`): 339 fps, CPU busy
 45.8 → 47.3 % (+1.5 pts of 8 cores = +12.8 % of one core), CPU sys 20.3 → 21.9 %
 (+1.6 pts).
 

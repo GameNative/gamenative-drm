@@ -1,4 +1,4 @@
-# 24 — gamescope vs X11: where the extra CPU goes, and how to take it back
+# 01 — gamescope vs X11: where the extra CPU goes, and how to take it back
 
 Status: **measured on the shipped payload, causes ranked, no fix landed.** This
 is the reference for any work that tries to make the gamescope display path cost
@@ -147,7 +147,7 @@ are not.** `gndrm-daemon: commit #{}` is an `always_log` line, but it sits insid
 environment (`lib.rs:262`). Same for `asc hdr decision n=` (`asc.rs:1538`). So a
 container-only run cannot read the daemon→publish leg; it reads the guest leg and
 the gamescope→daemon leg and infers the rest. Step 1 of the plan is written
-around that (`25-gamescope-cpu-instrumentation.md`).
+around that (`02-instrumentation.md`).
 
 Instruments that a container-only run **does** get, all monotonic on their line:
 
@@ -213,7 +213,7 @@ may never reach — the run settles it.
 0.7 %. At 1280 px the gralloc stride is already tight (5120 = 1280×4), so there
 is no padding to reclaim, only compression. And bandwidth can only turn into CPU
 through B's spin, so D's CPU payoff collapses once B is settled
-(`31-scanout-pixel-format.md`).
+(`08-scanout-pixel-format.md`).
 
 **E — daemon per-frame allocations: confirmed, and smaller than claimed.** Five
 `Vec`s per atomic parse (not four), two per poll turn (not one), a per-commit
@@ -221,14 +221,14 @@ through B's spin, so D's CPU payoff collapses once B is settled
 lookup that also builds two CESU-8 `CString`s per published frame. Total
 0.9–2.3 ms of CPU per second against the daemon's ~72 ms/s — 1.5–3 % of the
 daemon's own cost, i.e. free to remove but not decisive
-(`28-daemon-present-allocations.md`).
+(`05-daemon-present-allocations.md`).
 
 **F — redundant wayland state: withdrawn, and the opposite is true.**
 `swapchain_set_present_mode` is *load-bearing on every commit*: gamescope clears
 `oCurrentPresentMode` in `PrepareCommit` (`wlserver.cpp:180`) after consuming it
 into the frame's pacing decision, and the shim turns its own acquire gate off for
 a FIFO declaration (`proxy.rs:10454`). Suppressing the re-send shim-side would
-un-pace every FIFO commit after the first. See `29-present-mode-declaration.md`.
+un-pace every FIFO commit after the first. See `06-present-mode-declaration.md`.
 
 **G — the compositor: not a defect.** `gamescope` at 5.7 pp of one core replaces
 the X server that used to live inside `app.gamenative` (19.3 → 18.0 in the same
@@ -253,19 +253,19 @@ not survive the source read.
 
 | # | item | verdict | doc |
 |---|---|---|---|
-| 1 | one instrumented run, no rebuild | **done — see §5.1** | `25-gamescope-cpu-instrumentation.md` |
-| 2 | answer `present_wait` at queue time | **closed by measurement** — nothing chains `VkPresentIdKHR`, zero `vkWaitForPresentKHR` | `26-present-wait-at-queue.md` |
-| 3 | batch/event-drive the slot reap, add depth | **closed by measurement** — 0 slot waits, 0.013 ms dwell, and the depth is already 4 | `27-swapchain-slot-reap.md` |
-| 4 | remove per-frame allocations + JNI lookup | **the only item left with a CPU target** — free, 1.5–3 % of the daemon | `28-daemon-present-allocations.md` |
-| 5 | stop re-sending unchanged wayland state | **closed twice** — load-bearing per commit, and `declared_fifo=0` so the path is unreachable | `29-present-mode-declaration.md` |
-| 6 | give gamescope real-time priority | **reframed** — `rt_cap` cannot work on Android; `nice -20` can; this is latency, not CPU | `30-compositor-scheduling.md` |
-| 7 | UBWC/tiled scan-out import | **closed** — an `AHardwareBuffer` cannot express UBWC, and the attempt already exists unmeasured on a backup branch | `31-scanout-pixel-format.md` |
+| 1 | one instrumented run, no rebuild | **done — see §5.1** | `02-instrumentation.md` |
+| 2 | answer `present_wait` at queue time | **closed by measurement** — nothing chains `VkPresentIdKHR`, zero `vkWaitForPresentKHR` | `03-present-wait.md` |
+| 3 | batch/event-drive the slot reap, add depth | **closed by measurement** — 0 slot waits, 0.013 ms dwell, and the depth is already 4 | `04-slot-reap.md` |
+| 4 | remove per-frame allocations + JNI lookup | **the only item left with a CPU target** — free, 1.5–3 % of the daemon | `05-daemon-present-allocations.md` |
+| 5 | stop re-sending unchanged wayland state | **closed twice** — load-bearing per commit, and `declared_fifo=0` so the path is unreachable | `06-present-mode-declaration.md` |
+| 6 | give gamescope real-time priority | **reframed** — `rt_cap` cannot work on Android; `nice -20` can; this is latency, not CPU | `07-compositor-scheduling.md` |
+| 7 | UBWC/tiled scan-out import | **closed** — an `AHardwareBuffer` cannot express UBWC, and the attempt already exists unmeasured on a backup branch | `08-scanout-pixel-format.md` |
 
 ### 5.1 Step 1 has now been run, and it closed two more items
 
 Both arms, 35 s settle + 95 s window, container restored byte-identical each
 time (`tools/gamescope-cpu-arm.sh`, full numbers in
-`25-gamescope-cpu-instrumentation.md` §10):
+`02-instrumentation.md` §10):
 
 | question the run answers | reading | consequence |
 |---|---|---|
@@ -290,7 +290,7 @@ allowed to drop replaced frames, so it is not a defect, but no doc explains the
 
 `XServerScreen.kt` strips `MESA_VK_WSI_PRESENT_MODE` and `WRAPPER_MAX_IMAGE_COUNT`
 on the gamescope route, so the shim declares what the guest asked for. Re-measured
-(`25-gamescope-cpu-instrumentation.md` §11):
+(`02-instrumentation.md` §11):
 
 - **It works:** `declared/requested/source` went from `mailbox/immediate/env` to
   `immediate/immediate/guest`.

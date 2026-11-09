@@ -1,4 +1,4 @@
-# 28 — The daemon present path: per-frame allocations and the per-frame JNI lookup
+# 05 — The daemon present path: per-frame allocations and the per-frame JNI lookup
 
 Status: **analysis + reviewable diffs. Nothing applied to the tree, nothing built.** Every hunk is
 keyed to `gamenative-drm` at `3588fa9` (`performance-report`). Verification done: each of the 32

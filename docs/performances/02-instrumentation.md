@@ -1,12 +1,12 @@
-# 25 — Instrumenting the gamescope present path (the zero-rebuild run)
+# 02 — Instrumenting the gamescope present path (the zero-rebuild run)
 
-Target of `docs/24-gamescope-vs-x11-cpu.md` §5 step 1 (`:215`–`:220`). One session,
+Target of `docs/01-gamescope-vs-x11-cpu.md` §5 step 1 (`:215`–`:220`). One session,
 one container edit (two env tokens), no rebuild, no code change. It must answer:
 
 * **B** — does the guest use `VK_KHR_present_id` / `VK_KHR_present_wait` **per frame**,
-  and if so, is the wait the per-frame stall? (`docs/24:156`–`163`)
+  and if so, is the wait the per-frame stall? (`docs/performances/01:156`–`163`)
 * **C** — is the guest starving on swapchain acquire, i.e. spending the frame
-  waiting for a slot the compositor has not released? (`docs/24:165`–`169`)
+  waiting for a slot the compositor has not released? (`docs/performances/01:165`–`169`)
 
 Two corrections to the plan text, both load-bearing, are in §1.2 and §2.3.
 
@@ -30,11 +30,11 @@ Everything below is grounded in the tree at
 Container `envVars` are handed to the launched guest process tree
 (`BionicProgramLauncherComponent.java:533`, `ProcessHelper.java:315`). The daemon
 lives in `app.gamenative` itself, so its gates need an app-side env, i.e. an APK
-rebuild (`docs/24:131`–`133`).
+rebuild (`docs/performances/01:131`–`133`).
 
 ### 1.2 Correction 1 — `gndrm-daemon: commit #N` is *not* available in this run
 
-`docs/24:123` lists `gndrm-daemon: commit #N` as usable. It is not, in a
+`docs/performances/01:123` lists `gndrm-daemon: commit #N` as usable. It is not, in a
 no-rebuild run: the line is emitted through the *ungated sink*
 (`commit.rs:205` → `Device::always_log`, `lib.rs:825`) but it sits **inside**
 `if want_commit_log && (…)` (`commit.rs:179`, guard at `:184`), and
@@ -121,7 +121,7 @@ One field, `envVars`, two tokens appended. Nothing else changes.
 Measured on the real file (`container.gamescope.json`, the Hades container):
 `4715 → 4751` bytes, **+36**, 76 other keys byte-identical, restore is
 byte-identical (`cmp` clean). Do **not** touch `dxwrapperConfig` (that is step
-2's `dxvk.latencySleep=False` arm, `docs/24:162`), `rendererPresentMode`,
+2's `dxvk.latencySleep=False` arm, `docs/performances/01:162`), `rendererPresentMode`,
 `sessionMetadata`, or `displayServer`.
 
 ### 2.2 Where the file is
@@ -256,7 +256,7 @@ Two host-side marks confirm the run is valid before any number is read:
   (`BionicProgramLauncherComponent.java:510`, unredacted for these keys —
   `EnvVarRedaction.java:13`–`21`).
 * `gn-vkshim: ICD loaded … comm=Hades2.exe` must appear (G0), proving the ICD
-  shim is in the **guest** address space, i.e. the whole reason `docs/24:75`–`82`
+  shim is in the **guest** address space, i.e. the whole reason `docs/performances/01:75`–`82`
   attributes >half the delta to the guest.
 
 Optional but free: run the existing 1 Hz `/proc` sampler
@@ -345,7 +345,7 @@ was dropped.
 | L3 gamescope release | `releases=` | G4 | `wl_buffer.release` (`REL_ALL_N`, `proxy.rs:8077`) |
 | L4 displayed | `presented=` | G4 | `wp_presentation.presented` (`present.rs:117`) |
 | L4' replaced | `discarded=` | G4 | mailbox replace (`present.rs:124`) |
-| L3.5 daemon atomic | `#N` | S1 | every `DRM_IOCTL_MODE_ATOMIC` gamescope issues (`gndrm_shim.c:2272`) — **upper bound** on daemon commits (`objs=`/`total=` distinguish the 40–60-property frame commits of `docs/24:108` from cursor/modeset atomics) |
+| L3.5 daemon atomic | `#N` | S1 | every `DRM_IOCTL_MODE_ATOMIC` gamescope issues (`gndrm_shim.c:2272`) — **upper bound** on daemon commits (`objs=`/`total=` distinguish the 40–60-property frame commits of `docs/performances/01:108` from cursor/modeset atomics) |
 
 `presented=` is only nonzero for frames that carried a present id
 (`expect_feedback` is reached only when `wait_id != 0`, behind the
@@ -379,7 +379,7 @@ Read it like this:
 * **`starve_n` is not the C signal.** With `timeout = UINT64_MAX` the acquire
   loops forever releasing the lock and reaping in 4 ms slices
   (`REAP_SLICE`, `proxy.rs:2657`, loop `:2779`–`:2804`), so `N_STARVE` only
-  increments on a *finite*-timeout call. `docs/24:169` names `starved=` — that
+  increments on a *finite*-timeout call. `docs/performances/01:169` names `starved=` — that
   will read 0 even under total slot starvation. **`slot_waits` and `dwell` are
   the C numbers.**
 * `slot_wait_frac ≈ 1` with `dwell ≈ 1/fps` and `mean_free ≈ 0` is starvation:
@@ -392,7 +392,7 @@ Read it like this:
   report `gate=off`, so `gate_holds` should be 0 — a clean C measurement. If
   `gate≠off`, the run is contaminated and the numbers must be split.
 * `p_ge8` is the one that ties C to the observed −1.6 %: an 8.33 ms acquire is a
-  missed 120 Hz interval, exactly the 18–21 ms idle frames of `docs/24:241`.
+  missed 120 Hz interval, exactly the 18–21 ms idle frames of `docs/performances/01:241`.
 
 ### 5.4 Cause B — present id / present wait
 
@@ -416,18 +416,18 @@ The verdict must be **mode-aware**, because the container sets
   `present.rs:316`–`:324`, called from `proxy.rs:8079`) and "answered by grace at
   `2/refresh_hz`" — at 120 Hz, **16.7 ms** (`present.rs:161`–`164`, `:405`–`:420`).
 
-So `docs/24:156`–`160`'s mechanism ("the shim only produces the answer when
+So `docs/performances/01:156`–`160`'s mechanism ("the shim only produces the answer when
 *some other thread* runs the reap loop") presupposes `Later`. If G4 says
 `declared=mailbox source=env`, waits are answered at commit and that mechanism
 cannot fire; the residual B cost is the call plus a futex handoff, not a
 per-frame stall. That is a materially different verdict, and the table in §7
 separates it.
 
-The grace path also gives a second, independent check: `docs/24:158` claims the
+The grace path also gives a second, independent check: `docs/performances/01:158` claims the
 wait "can present as busy polling". The shim's own wait is a `Condvar`
 (`present.rs:435`–`441`, bounded to 1 s at `:365`), i.e. **not** busy. If waits
 are slow *and* CPU is high, the spin is on the guest side (DXVK's latency
-tracker), which is consistent with `docs/24:145`–`151` (A) and with
+tracker), which is consistent with `docs/performances/01:145`–`151` (A) and with
 `present.rs:188`–`193`'s note on throttling the guest's frame-latency loop —
 worth saying out loud, because it changes where step 2 lands.
 
@@ -435,7 +435,7 @@ worth saying out loud, because it changes where step 2 lands.
 
 ## 6. What this run cannot decide
 
-* The daemon's own per-frame cost (`docs/24:178`, E) — needs `GNDRM_LOG_DAEMON`,
+* The daemon's own per-frame cost (`docs/performances/01:178`, E) — needs `GNDRM_LOG_DAEMON`,
   i.e. a rebuild (§1.2).
 * The publish rate as the daemon sees it (`asc hdr decision n=`) — same reason;
   L3/L4 substitute.
@@ -455,7 +455,7 @@ Assume the run is valid: G0 once, G1 present, `env vars are …` contains
 | observation | verdict |
 |---|---|
 | G5 `sTypes=[]`, `present_id=0`, zero G6 lines, `presented=0`, `at_queue=0` | **B refuted at precondition.** No `VkPresentIdKHR`, no `vkWaitForPresentKHR`. Nothing about present-wait explains any of the +1.5 pts; drop it and go to A/D/E/G. |
-| G5 has `1000294000`/`present_id≠0`, G6 ladder advancing at ≈ the L2 commit rate, outcomes mostly `latched`, `fallback` growing, per-wait durations ≈ `2/refresh` = 16.7 ms (≫ the 2.9 ms frame interval) | **B confirmed** as *the* per-frame stall: the guest waits a full refresh pair per frame on an answer the shim defers. `docs/24:221`–`227` (step 2) is the fix, and the CPU is the guest's latency loop, not the shim. |
+| G5 has `1000294000`/`present_id≠0`, G6 ladder advancing at ≈ the L2 commit rate, outcomes mostly `latched`, `fallback` growing, per-wait durations ≈ `2/refresh` = 16.7 ms (≫ the 2.9 ms frame interval) | **B confirmed** as *the* per-frame stall: the guest waits a full refresh pair per frame on an answer the shim defers. `docs/performances/01:221`–`227` (step 2) is the fix, and the CPU is the guest's latency loop, not the shim. |
 | ids present, G6 advancing, outcomes `done`, durations ≪ 1 ms, `at_queue≈commits` | **B refuted as mechanism** (advertisement is inert): the wait is satisfied at queue/commit, so it cannot serialise the frame. Remaining B cost ≤ the call. Look at A (submit+worker+futex per present) and D. |
 | ids present, G6 advancing, mixed `done`/`timeout`, durations clustered at ~1 s | **B in its degraded form**: `MAX_WAIT_NS = 1 s` (`present.rs:365`) means the daemon's mark is not arriving. That is a *bug*, not a tuning issue — stop the CPU work and fix the mark path first. |
 | ids present, `presented=0` while `releases=` advances at the commit rate | present marks are not reaching the daemon (`send_present_mark` is gated on `present_id != 0 && ino != 0`, `proxy.rs:2031`–`2036`); B is *unmeasurable* and the fifo/mailbox accounting above is the fallback. |
@@ -464,7 +464,7 @@ Assume the run is valid: G0 once, G1 present, `env vars are …` contains
 
 | observation | verdict |
 |---|---|
-| `slot_wait_frac ≥ 0.5`, `dwell ≥ 8 ms`, `p_ge8 > 0.1`, `mean_free ≈ 0`, `depth = 3` | **C confirmed.** Depth + release-gated slots is the pacing constraint; `docs/24:228`–`231` (step 3) applies, and the "add a 4th depth" half of it is testable next by `dxvk.numBackBuffers=4`. |
+| `slot_wait_frac ≥ 0.5`, `dwell ≥ 8 ms`, `p_ge8 > 0.1`, `mean_free ≈ 0`, `depth = 3` | **C confirmed.** Depth + release-gated slots is the pacing constraint; `docs/performances/01:228`–`231` (step 3) applies, and the "add a 4th depth" half of it is testable next by `dxvk.numBackBuffers=4`. |
 | `slot_wait_frac ≤ 0.05`, `dwell < 1 ms`, `p_blocked ≈ 0` | **C refuted.** Slots are always available; the guest is render-bound (or shim-bound) and no acquire time is lost. |
 | `slot_wait_frac ≥ 0.5` but `dwell < 1 ms` and `mean_free > 0` | **C refuted as cost** (the wait count is real, the time is not). The cost is per-present work, i.e. A. |
 | `starve_n > 0` | the guest calls acquire with a **finite** timeout (not the usual `UINT64_MAX`), so its own frame pacing treats a missing image as a timeout — this *is* acquire starvation in the guest's accounting, and it means dropped frames by the guest's estimate. Escalate: read `present.rs`'s callers and `G7`'s `timeout=` value. |
@@ -479,10 +479,10 @@ Assume the run is valid: G0 once, G1 present, `env vars are …` contains
 That is **not** a failed experiment: it closes B and C and leaves the delta to
 A (per-present guest syscalls: the extra `vkQueueSubmit` at `proxy.rs:3416`, the
 worker wake + `vkWaitForFences` at `proxy.rs:1974`, the two SEQPACKET datagrams,
-and `libgndrm_shim.so`'s `open/close/ioctl/mmap` hooks — `docs/24:145`–`153`),
-D (`docs/24:171`–`176`) and E (`docs/24:178`–`185`). The next cheap move is then
+and `libgndrm_shim.so`'s `open/close/ioctl/mmap` hooks — `docs/performances/01:145`–`153`),
+D (`docs/performances/01:171`–`176`) and E (`docs/performances/01:178`–`185`). The next cheap move is then
 `simpleperf record -p <Hades2 pid>` in the same scene (A's own falsifier,
-`docs/24:152`) — not step 2's latency-sleep arm, whose premise B would have
+`docs/performances/01:152`) — not step 2's latency-sleep arm, whose premise B would have
 already refuted.
 
 Record the *shape* either way: the run also yields `ΔL2/ΔL4` (frames not shown)
@@ -694,7 +694,7 @@ done
 
 Run it twice: `LABEL=gated ./gamescope-cpu-arm.sh`, and — if B/C come back null — a
 second `LABEL=latency-sleep-off` arm with `dxvk.latencySleep = False` in the
-container's `dxvk.conf` (`docs/24:162`) only to confirm the null, since the
+container's `dxvk.conf` (`docs/performances/01:162`) only to confirm the null, since the
 gates answer B directly.
 
 ---
@@ -760,7 +760,7 @@ the shim exists in the guest, and in X11 mode it does not exist at all.
 - **Cause B is dead.** No `VkPresentIdKHR` is chained and `vkWaitForPresentKHR`
   is never called (0 lines). Nothing waits on a present id, so *no* change to
   `present_wait_answer` can save anything on this title. Plan item 2 →
-  **closed** (`26-present-wait-at-queue.md` keeps the design for a title that
+  **closed** (`03-present-wait.md` keeps the design for a title that
   does opt in, and it is now explicitly conditional on that).
 - **Cause C is dead.** Zero slot waits, 0.013 ms dwell, 1.66 slots in flight and
   2.08 free, `starved=0`. The acquire is not stalling. Plan item 3 → **closed**,
@@ -769,7 +769,7 @@ the shim exists in the guest, and in X11 mode it does not exist at all.
   container's `MESA_VK_WSI_PRESENT_MODE=mailbox` overrides the title's own
   `immediate` request and the shim never enters a FIFO path. Plan item 5 stays
   closed for a stronger reason than the semantic one in
-  `29-present-mode-declaration.md`.
+  `06-present-mode-declaration.md`.
 - **A new, unexplained number worth one look:** the daemon serves **241.9**
   atomic commits/s while the guest presents **357.3/s**. Under mailbox the
   compositor legitimately drops replaced frames, so this is not a defect — but

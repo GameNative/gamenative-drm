@@ -1,11 +1,11 @@
-# 26 — `VK_KHR_present_wait`: what the shim answers, and where it could answer sooner
+# 03 — `VK_KHR_present_wait`: what the shim answers, and where it could answer sooner
 
-Design for `docs/24-gamescope-vs-x11-cpu.md` §5 item 2. Branch `performance-report`,
+Design for `docs/01-gamescope-vs-x11-cpu.md` §5 item 2. Branch `performance-report`,
 tree as it stands. Read-only analysis; nothing here has been built or measured.
 
 **Verdict up front.** The change is small (one decision function, one release-callback
 unification, one event source on the DRI3 route) and it is worth doing, but the premise
-as written in `docs/24` — "the shim only produces the answer when *some other thread*
+as written in `docs/performances/01` — "the shim only produces the answer when *some other thread*
 runs the reap loop, a wait that can degenerate into busy polling" — **does not match the
 code**. A present wait today is a `Condvar` under `present::WAITS`
 (`present.rs:72`, `:181`, `:435`), not a poll: it blocks, and it is woken by whichever
@@ -236,7 +236,7 @@ with `wait_policy()` reading `GN_VKSHIM_PRESENT_WAIT ∈ {queue, commit, release
 `commit`/`release` arms remain exactly today's behaviour and the existing table test
 (`proxy.rs:7124`–`:7167`) keeps its meaning by being run under `Commit`.
 Reason to keep three arms: §4 risks 1, 3 and 5 all need a per-container revert without a
-rebuild, and the container already carries env (`docs/24` §"Log gates").
+rebuild, and the container already carries env (`docs/performances/01` §"Log gates").
 
 ### 3.2 Queue-time consumption (E2)
 
@@ -380,7 +380,7 @@ queue-time policy), and the max observed block time. Keep `at_queue=`. Without
 ## 5. Falsification experiment — before any code
 
 No rebuild: container `dxvk.conf` / env only, plus the existing `GNDRM_LOG_VKSHIM=1`
-(docs/24 §"Log gates" — it reaches the guest from container `envVars`).
+(docs/performances/01 §"Log gates" — it reaches the guest from container `envVars`).
 
 **Knobs.** In the container's `dxvk.conf` (or `DXVK_CONFIG="…"` if the bundled DXVK is
 2.3+, else `DXVK_CONFIG_FILE`):
@@ -406,8 +406,8 @@ after N us` (`present.rs:296`–`:307`) — how often and how long; `at_queue=` 
 | Wait lines present per frame, block ≈ frame time, CPU(sync) does **not** move when the knobs are set | **B refuted at the shim**: the wait is real but cheap (2 futex ops), and the +1.6 pts is A (submits/commits) and/or the daemon legs |
 | Wait lines show `timeout` repeatedly, or wait frequency ≫ frame rate | **B confirmed in its strong form** (guest polling): queue-time answering collapses it to one call per wait; expect sys to fall toward X11 |
 | Knobs on → CPU(sync) → X11 **and** fps unchanged, but `starved=`/`slot_waits=` rise | B confirmed as *coupling*, C unmasked: apply item 2 then item 3, in that order, and expect the win only after both |
-| Knobs on → no change; `numBackBuffers=4` → CPU falls and `starved=` → 0 | **B refuted, C confirmed** (depth/release-gated slots, docs/24 §4 C). Item 2 is then only worth its cost as item 3's precondition |
-| Both arms flat, `starved=0`, waits ≈ frames | B and C both refuted: the delta is A (per-present submits, wayland attach/flush, PresentMark datagram) — go to items 1/3/5 in docs/24 §5, not item 2 |
+| Knobs on → no change; `numBackBuffers=4` → CPU falls and `starved=` → 0 | **B refuted, C confirmed** (depth/release-gated slots, docs/performances/01 §4 C). Item 2 is then only worth its cost as item 3's precondition |
+| Both arms flat, `starved=0`, waits ≈ frames | B and C both refuted: the delta is A (per-present submits, wayland attach/flush, PresentMark datagram) — go to items 1/3/5 in docs/performances/01 §5, not item 2 |
 
 **Size test that must be run with it** (this is what makes the experiment decisive rather
 than suggestive): +1.6 pts of 8 cores at 344 fps is `0.128 / 344 s ≈ 372 µs` of CPU per

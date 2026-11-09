@@ -1,4 +1,4 @@
-# 30 — Compositor scheduling: `rt_cap` cannot work on Android; `nice -20` can
+# 07 — Compositor scheduling: `rt_cap` cannot work on Android; `nice -20` can
 
 **Verdict first.** Item 6 as written cannot work on a non-rooted Android device, and both halves of it
 are dead: `-Drt_cap=enabled` does not build against the current cross prefix and, even if it did, does
