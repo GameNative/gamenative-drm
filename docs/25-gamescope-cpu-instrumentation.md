@@ -162,14 +162,14 @@ Prerequisites, in order:
    and `GNDRM_LOG_SHIM=1` (`EnvironmentTab.kt:219`–`221` builds exactly this
    `envVars` string) — then run with `NOFLIP=1`, which writes nothing.
 
-The edit itself never re-serialises JSON (§8.1 `plan1-flip.py`): it replaces only
+The edit itself never re-serialises JSON (§8.1 `container-env-flip.py`): it replaces only
 the characters between the quotes of the `"envVars"` value. Procedure:
 
 ```bash
 adb shell am force-stop app.gamenative        # drop the in-memory container copy
 adb exec-out run-as app.gamenative cat files/imagefs/home/xuser-STEAM_1145350/.container > orig.container
-python3 plan1-flip.py edit orig.container gated.container GNDRM_LOG_VKSHIM=1 GNDRM_LOG_SHIM=1
-python3 plan1-flip.py check orig.container gated.container       # proves only envVars moved
+python3 container-env-flip.py edit orig.container gated.container GNDRM_LOG_VKSHIM=1 GNDRM_LOG_SHIM=1
+python3 container-env-flip.py check orig.container gated.container       # proves only envVars moved
 adb push gated.container /data/local/tmp/plan1.new && adb shell chmod 644 /data/local/tmp/plan1.new
 adb shell "run-as app.gamenative sh -c \
   'cat /data/local/tmp/plan1.new > files/imagefs/home/xuser-STEAM_1145350/.container.tmp && \
@@ -199,7 +199,7 @@ Restore is the **inverse byte edit**, not a wholesale overwrite: the app writes
 that is the cheapest independent fps record for the arm
 (`container.gamescope.json` carries `avg_fps 345.17`, `total_frames 187857`). So
 `unset` the two keys from the *current* file and keep everything else; the
-resulting `envVars` equals the original string, and `plan1-flip.py check` proves
+resulting `envVars` equals the original string, and `container-env-flip.py check` proves
 nothing but `envVars` (and the app's own telemetry) moved.
 
 ---
@@ -221,7 +221,7 @@ The guest's lines arrive twice, under two different tags:
   `ReleaseTree.kt:12`–`27`).
 
 So **do not filter by tag**, and expect every line twice. Counters are immune
-(they are first-vs-last deltas); line *counts* are not — `plan1-parse.py` drops a
+(they are first-vs-last deltas); line *counts* are not — `gamescope-cpu-parse.py` drops a
 repeat of the same marker body within 50 ms (verified: a capture with every line
 duplicated under two tags yields the same rates and half the "stall lines").
 
@@ -306,7 +306,7 @@ incremented under the same gate (`proxy.rs:3243`–`3251`).
 
 ## 5. Parser design
 
-`§8.2 plan1-parse.py` implements this; it was run against three synthetic
+`§8.2 gamescope-cpu-parse.py` implements this; it was run against three synthetic
 captures built from the exact format strings above (steady state with present
 ids; starvation with FIFO; a capture with no census line) and reproduces the
 planted values exactly.
@@ -495,22 +495,22 @@ publish-limited or render-limited before anyone edits code.
 
 All three live beside this document and **the on-disk copies are canonical** —
 the listings below are the same logic, with the long `NOFLIP`/privilege messages
-trimmed. `plan1-flip.py` was exercised on the real `container.gamescope.json`
-(byte-identical round trip, 76 other keys untouched); `plan1-parse.py` was run on
+trimmed. `container-env-flip.py` was exercised on the real `container.gamescope.json`
+(byte-identical round trip, 76 other keys untouched); `gamescope-cpu-parse.py` was run on
 three synthetic captures built from the format strings above and reproduced every
 planted value (§5), including a capture with each line duplicated under two tags.
 `plan1-arm.sh` is syntax-checked only — it needs the device.
 
-### 8.1 `plan1-flip.py`
+### 8.1 `container-env-flip.py`
 
 ```python
 #!/usr/bin/env python3
 """Byte-anchored edit of one container's envVars value.
 
-  plan1-flip.py edit  <in> <out> K=V [K=V ...]
-  plan1-flip.py unset <in> <out> K [K ...]
-  plan1-flip.py check <in> <out>        # only envVars moved?
-  plan1-flip.py show  <file>
+  container-env-flip.py edit  <in> <out> K=V [K=V ...]
+  container-env-flip.py unset <in> <out> K [K ...]
+  container-env-flip.py check <in> <out>        # only envVars moved?
+  container-env-flip.py show  <file>
 """
 import json, re, sys
 
@@ -564,9 +564,9 @@ main()
 Measured: `4715 → 4751 (+36)`; `check` reports "ok: envVars only, 76 other keys
 identical"; `unset` returns the file byte-identically (`cmp` clean).
 
-### 8.2 `plan1-parse.py`
+### 8.2 `gamescope-cpu-parse.py`
 
-Shipped complete at `analysis/plan1-parse.py` (≈260 lines), with
+Shipped complete at `analysis/gamescope-cpu-parse.py` (≈260 lines), with
 `analysis/synthetic.log` as its self-test fixture (a present-id capture;
 expected output `120 presents/s`, `dwell 2.9 ms`, `depth 3`, `B ACTIVE … fast`).
 Core:
@@ -632,14 +632,14 @@ read_cfg > "$W/orig.container"
 python3 -c "import json;json.load(open('$W/orig.container'))" || {
   echo "FATAL: device config is not JSON; refusing to touch it"; exit 3; }
 cp "$W/orig.container" "$W/orig.container.keep"
-python3 "$here/plan1-flip.py" show "$W/orig.container" > "$W/orig.env.txt"
+python3 "$here/container-env-flip.py" show "$W/orig.container" > "$W/orig.env.txt"
 
 if [ "${NOFLIP:-0}" != 1 ]; then
   [ "$MODE" = none ] && { echo "FATAL: no run-as/su: edit envVars in the app, then NOFLIP=1"; exit 2; }
   # 2. edit, prove, force-stop, swap, verify
   say "editing envVars"
-  python3 "$here/plan1-flip.py" edit  "$W/orig.container" "$W/gated.container" "${GATES[@]}"
-  python3 "$here/plan1-flip.py" check "$W/orig.container" "$W/gated.container"
+  python3 "$here/container-env-flip.py" edit  "$W/orig.container" "$W/gated.container" "${GATES[@]}"
+  python3 "$here/container-env-flip.py" check "$W/orig.container" "$W/gated.container"
   sh_ "am force-stop $PKG" || true
   push_cfg "$W/gated.container"
   read_cfg > "$W/after_push.container"
@@ -666,9 +666,9 @@ say "restoring"
 sh_ "am force-stop $PKG" || true; sleep 2
 if [ "${NOFLIP:-0}" != 1 ]; then
   read_cfg > "$W/final.container"
-  python3 "$here/plan1-flip.py" unset "$W/final.container" "$W/restored.container" \
+  python3 "$here/container-env-flip.py" unset "$W/final.container" "$W/restored.container" \
           GNDRM_LOG_VKSHIM GNDRM_LOG_SHIM
-  python3 "$here/plan1-flip.py" check "$W/final.container" "$W/restored.container"
+  python3 "$here/container-env-flip.py" check "$W/final.container" "$W/restored.container"
   push_cfg "$W/restored.container"
   read_cfg > "$W/after_restore.container"
   cmp "$W/restored.container" "$W/after_restore.container" && echo "restore verified"
@@ -684,7 +684,7 @@ fi
 
 # 5. parse
 say "parse"
-python3 "$here/plan1-parse.py" "$W/cap.txt" --settle "$SETTLE" | tee "$W/summary.txt"
+python3 "$here/gamescope-cpu-parse.py" "$W/cap.txt" --settle "$SETTLE" | tee "$W/summary.txt"
 for pat in 'gn-vkshim: ICD loaded' 'proxy hb: ' 'present mode: declared=' \
            'proxy present: first pNext chain' 'present wait #' \
            'gn-vkshim stall: acquire found no free slot' 'ATOMIC heartbeat #'; do
@@ -692,7 +692,7 @@ for pat in 'gn-vkshim: ICD loaded' 'proxy hb: ' 'present mode: declared=' \
 done
 ```
 
-Run it twice: `LABEL=gated ./plan1-arm.sh`, and — if B/C come back null — a
+Run it twice: `LABEL=gated ./gamescope-cpu-arm.sh`, and — if B/C come back null — a
 second `LABEL=latency-sleep-off` arm with `dxvk.latencySleep = False` in the
 container's `dxvk.conf` (`docs/24:162`) only to confirm the null, since the
 gates answer B directly.
@@ -708,3 +708,77 @@ gates answer B directly.
 | log volume | ~1–2 lines/s from the shim + gamescope's own stderr; 16 MB buffer, 120 s |
 | CPU perturbation | the gate adds a `logf!` string build per census line only; counters are already incremented unconditionally at the hot sites (`proxy.rs:2705`, `:8077`), so the arm's CPU numbers remain comparable to the ungated baseline |
 | correctness risk | the emitters are `eprintln!` through the app's Timber bridge; if the bridge line is >4 KB logcat truncates it (`docs/04-gamenative-app.md:251`). Longest line here is G4 at ~330 B — safe. |
+
+---
+
+## 10. Executed — results (2026-11-10, payload `20261110.1`)
+
+Both arms were run with the tooling in this repo (`tools/gamescope-cpu-arm.sh`,
+`tools/container-env-flip.py`, `tools/gamescope-cpu-parse.py`), 35 s settle +
+95 s window, launched by `app_id` to the title screen — the census questions do
+not need the safe area, because a title streams frames too.
+
+```
+LABEL=gamescope DS=gamescope SETTLE=35 WINDOW=95 tools/gamescope-cpu-arm.sh
+LABEL=x11       DS=x11       SETTLE=35 WINDOW=95 tools/gamescope-cpu-arm.sh
+```
+
+Both arms restored the container **byte-identical to the original** (`restore:
+byte-identical`, `changed keys: []`), including the `displayServer` the arm
+temporarily moved.
+
+### gamescope arm (the measurement)
+
+| reading | value |
+|---|---|
+| guest presents/s (`vkQueuePresentKHR`) | 357.3 |
+| guest acquires/s | 357.3 |
+| guest `commits=` | 357.2 |
+| daemon atomic ioctls/s (`ATOMIC heartbeat #N`) | **241.9** |
+| compositor releases/s (`wl_buffer.release`) | 357.2 |
+| present-id on the first pNext chain | **False** (sType 1000275001 only) |
+| present-wait lines in window | **0** |
+| `slot_waits` / acquires | **0.0** |
+| acquire dwell mean | **0.013 ms** |
+| acquire ≥ 8.33 ms / ≥ 16.67 ms | **0.0 / 0.0** |
+| `starved` (finite-timeout acquire failures) | **0** |
+| slot depth | **4** |
+| mean in_flight / mean free slots | 1.66 / 2.08 |
+| declared / requested / source / gate | **mailbox / immediate / env / off** |
+| `declared_fifo` / `declared_other` | **0 / 25009** |
+| commit_lat_us (last) | 1228 |
+
+### X11 arm (the control, and it is a control)
+
+`gn-vkshim: ICD loaded` = **0**. With `displayServer=x11` the guest's WSI is
+Mesa's, so the ICD shim is never loaded and no census line can exist. That is
+the structural fact behind the +5.1 pp guest delta in doc 24: in gamescope mode
+the shim exists in the guest, and in X11 mode it does not exist at all.
+
+### What this decides
+
+- **Cause B is dead.** No `VkPresentIdKHR` is chained and `vkWaitForPresentKHR`
+  is never called (0 lines). Nothing waits on a present id, so *no* change to
+  `present_wait_answer` can save anything on this title. Plan item 2 →
+  **closed** (`26-present-wait-at-queue.md` keeps the design for a title that
+  does opt in, and it is now explicitly conditional on that).
+- **Cause C is dead.** Zero slot waits, 0.013 ms dwell, 1.66 slots in flight and
+  2.08 free, `starved=0`. The acquire is not stalling. Plan item 3 → **closed**,
+  including its "add a 4th slot" sub-item: **the depth is already 4**, not 3.
+- **Cause F cannot even be reached.** `declared_fifo=0` over 25 009 presents: the
+  container's `MESA_VK_WSI_PRESENT_MODE=mailbox` overrides the title's own
+  `immediate` request and the shim never enters a FIFO path. Plan item 5 stays
+  closed for a stronger reason than the semantic one in
+  `29-present-mode-declaration.md`.
+- **A new, unexplained number worth one look:** the daemon serves **241.9**
+  atomic commits/s while the guest presents **357.3/s**. Under mailbox the
+  compositor legitimately drops replaced frames, so this is not a defect — but
+  it means ~115 presents/s are answered without ever reaching an atomic commit,
+  and it is the one asymmetry in the pipeline that no doc yet explains. It is a
+  pacing question, not a CPU one.
+
+### Cost of the run, as designed
+
+One session per arm, no rebuild, no APK change; the gate adds one `logf!` build
+per census line and the counters are already unconditional at the hot sites, so
+the arm's CPU remains comparable. The whole thing is two commands.

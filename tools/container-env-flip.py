@@ -56,6 +56,38 @@ def apply(blob, pairs, remove=()):
     return rewrite(blob, toks)
 
 
+def scalar_pattern(key):
+    """A top-level string scalar, matched without re-serialising anything."""
+    return re.compile(rb'("' + key.encode() + rb'"\s*:\s*)"((?:[^"\\]|\\.)*)"')
+
+
+def set_scalar(blob, key, value):
+    """Rewrite one top-level string value in place; every other byte kept."""
+    pat = scalar_pattern(key)
+    m = pat.search(blob)
+    if not m:
+        sys.exit(f'FATAL: no top-level "{key}" string in the file')
+    enc = json.dumps(value, ensure_ascii=False)[1:-1].encode("utf-8")
+    out = blob[: m.start(2)] + enc + blob[m.end(2):]
+    try:
+        json.loads(out)
+    except Exception as e:
+        sys.exit(f"FATAL: edited file is not valid JSON: {e}")
+    return out
+
+
+def get_scalar(blob, key):
+    m = scalar_pattern(key).search(blob)
+    if not m:
+        sys.exit(f'FATAL: no top-level "{key}" string in the file')
+    return json.loads('"' + m.group(2).decode("utf-8") + '"')
+
+
+def diff_keys(a, b):
+    return sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+
+
+
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
@@ -71,6 +103,20 @@ def main():
         ob = apply(blob, [a.split("=", 1) for a in sys.argv[4:]])
     elif cmd == "unset":
         ob = apply(blob, [], remove=sys.argv[4:])
+    elif cmd == "getfield":
+        print(get_scalar(blob, sys.argv[3]))
+        return
+    elif cmd == "setfield":
+        # setfield <in> <out> KEY VALUE ...  (top-level string scalars only)
+        args = sys.argv[4:]
+        ob = blob
+        for i in range(0, len(args), 2):
+            ob = set_scalar(ob, args[i], args[i + 1])
+        open(out, "wb").write(ob)
+        a, b = json.loads(blob), json.loads(ob)
+        print(f'{out}: {len(blob)} -> {len(ob)} bytes ({len(ob) - len(blob):+d}); '
+              f'changed keys: {diff_keys(a, b) or "none"}')
+        return
     elif cmd == "check":
         ob = open(out, "rb").read()
         a, b = json.loads(blob), json.loads(ob)

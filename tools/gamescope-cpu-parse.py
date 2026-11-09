@@ -295,10 +295,17 @@ def main():
     else:
         print("B: ids advertised, zero wait calls sampled -> present_wait unused")
     sw = (n_slot / n_acq) if (n_slot is not None and n_acq) else None
-    print("C: no census line -> gate never reached the guest" if sw is None else
-          f"C {'CONFIRMED' if (sw >= 0.5 and (ge8 or 0) > 0.1) else ('REFUTED' if sw <= 0.05 else 'PARTIAL')}:"
-          f" slot_waits/acquires={sw:.1%}, dwell={dwell if dwell is None else round(dwell, 2)} ms,"
-          f" >=8.33 ms={ge8 if ge8 is None else round(ge8, 1)}")
+    if sw is None:
+        # No census line at all is NOT "the gate never reached the guest": with
+        # displayServer=x11 the ICD shim is never loaded (the guest's WSI is
+        # Mesa's), so the control arm cannot carry this measurement by design.
+        print("C: UNDECIDED in this capture - no shim census line. If this arm "
+              "ran with displayServer=x11 that is expected (the shim is "
+              "gamescope-only) and the arm is a control, not a measurement.")
+    else:
+        print(f"C {'CONFIRMED' if (sw >= 0.5 and (ge8 or 0) > 0.1) else ('REFUTED' if sw <= 0.05 else 'PARTIAL')}:"
+              f" slot_waits/acquires={sw:.1%}, dwell={dwell if dwell is None else round(dwell, 2)} ms,"
+              f" >=8.33 ms={ge8 if ge8 is None else round(ge8, 1)}")
 
 
 if __name__ == "__main__":

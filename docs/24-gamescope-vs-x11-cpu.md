@@ -253,31 +253,62 @@ not survive the source read.
 
 | # | item | verdict | doc |
 |---|---|---|---|
-| 1 | one instrumented run, no rebuild | **do first** — but container-only gates cover the guest and gamescope legs, not the daemon/publish | `25-gamescope-cpu-instrumentation.md` |
-| 2 | answer `present_wait` at queue time | **conditional** — the mechanism needs a FIFO declaration; mailbox is already answered at commit | `26-present-wait-at-queue.md` |
-| 3 | batch/event-drive the slot reap, add depth | **narrowed to (a)** — the reap is DRI3-only; on this route only the epoch is missing | `27-swapchain-slot-reap.md` |
-| 4 | remove per-frame allocations + JNI lookup | **land opportunistically** — free, but 1.5–3 % of the daemon's cost | `28-daemon-present-allocations.md` |
-| 5 | stop re-sending unchanged wayland state | **closed** — the re-send is load-bearing per commit | `29-present-mode-declaration.md` |
+| 1 | one instrumented run, no rebuild | **done — see §5.1** | `25-gamescope-cpu-instrumentation.md` |
+| 2 | answer `present_wait` at queue time | **closed by measurement** — nothing chains `VkPresentIdKHR`, zero `vkWaitForPresentKHR` | `26-present-wait-at-queue.md` |
+| 3 | batch/event-drive the slot reap, add depth | **closed by measurement** — 0 slot waits, 0.013 ms dwell, and the depth is already 4 | `27-swapchain-slot-reap.md` |
+| 4 | remove per-frame allocations + JNI lookup | **the only item left with a CPU target** — free, 1.5–3 % of the daemon | `28-daemon-present-allocations.md` |
+| 5 | stop re-sending unchanged wayland state | **closed twice** — load-bearing per commit, and `declared_fifo=0` so the path is unreachable | `29-present-mode-declaration.md` |
 | 6 | give gamescope real-time priority | **reframed** — `rt_cap` cannot work on Android; `nice -20` can; this is latency, not CPU | `30-compositor-scheduling.md` |
 | 7 | UBWC/tiled scan-out import | **closed** — an `AHardwareBuffer` cannot express UBWC, and the attempt already exists unmeasured on a backup branch | `31-scanout-pixel-format.md` |
 
-### The one thing to do next
+### 5.1 Step 1 has now been run, and it closed two more items
 
-Item 1, with the scope correction: `GNDRM_LOG_VKSHIM=1 GNDRM_LOG_SHIM=1` in the
-container `envVars`, one session, 30 s settle + 90 s window. It answers three
-questions at once and needs no code:
+Both arms, 35 s settle + 95 s window, container restored byte-identical each
+time (`tools/gamescope-cpu-arm.sh`, full numbers in
+`25-gamescope-cpu-instrumentation.md` §10):
 
-1. **Which present mode does the guest actually declare?** `present mode:
-   declared=…` — if it is not FIFO, cause B is dead and item 2 stays closed.
-2. **Is there any `slot_waits` at all?** — if it is 0 on a clean baseline, item 3
-   drops to the epoch fix only.
-3. **Does `present_id` appear in the pNext chain?** — if not, nothing is waiting
-   on a present id and B is dead regardless of mode.
+| question the run answers | reading | consequence |
+|---|---|---|
+| does the guest chain `VkPresentIdKHR`? | **no** (only sType 1000275001) | cause B dead, item 2 closed |
+| is `vkWaitForPresentKHR` called? | **0 lines** | same |
+| do acquires ever wait for a slot? | **0.0**, dwell **0.013 ms**, `starved=0` | cause C dead, item 3 closed |
+| what depth does the guest actually get? | **4** (mean in flight 1.66, free 2.08) | item 3's "add a 4th slot" was already true |
+| is a FIFO declaration ever made? | **no** — `declared=mailbox requested=immediate source=env`, `declared_fifo=0` over 25 009 presents | item 5 unreachable as well as semantic |
+| does the X11 arm exercise the shim? | **no** — `gn-vkshim: ICD loaded` = 0 | the +5.1 pp guest term *is* the shim's existence, not its behaviour |
 
-Everything else in the plan is worth at most a few tenths of a point of CPU on an
-8-core SoC that is already at 102 °C and 19.4 W. The honest conclusion of this
-report is that **payload `20261110.1` has already collected the win**, and the
-remaining work is defence against regressions rather than a hunt.
+The container's `MESA_VK_WSI_PRESENT_MODE=mailbox` overrides the title's own
+`immediate` request, which is why no FIFO path is ever taken. That is a
+deliberate container default, and it is also why three of the plan items cannot
+fire on this title.
+
+One asymmetry is left unexplained and is worth a single look: the daemon serves
+**241.9** atomic commits/s while the guest presents **357.3/s**. Mailbox is
+allowed to drop replaced frames, so it is not a defect, but no doc explains the
+1.48 ratio and it is a pacing question rather than a CPU one.
+
+### Where that leaves the work
+
+Step 1 answered all three questions in one session (§5.1) and **closed items 2,
+3 and 5**. Nothing the plan set out to remove is actually running on this title.
+
+What is left, in order:
+
+1. **Item 4** — the daemon's per-frame allocations and the per-frame JNI lookup.
+   The only remaining item with a defensible CPU target, worth 1.5–3 % of the
+   daemon's own cost, and free to land.
+2. **Items 6 and 7 are not CPU work** — one is frame-time p99 under a
+   late-scheduled compositor thread, the other is closed.
+3. **Cause A's remainder in the shim** (the extra submit, the worker wake, two
+   datagrams, the `mode_census()` mutex) has no design doc yet, because step 1
+   refuted the two witnesses that would have justified it. If someone wants to
+   chase the last +5.1 pp of one core in the guest, `simpleperf record` on
+   `Hades2.exe` in the same scene is the next instrument, not another plan item.
+
+The honest conclusion of this report stands and is now measured rather than
+argued: **payload `20261110.1` has already collected the win.** +0.3 pts of eight
+cores and −0.04 W at identical fps, with the daemon serving 242 of the guest's
+357 presents per second and no stall anywhere in the chain. The useful output of
+this investigation is the four refutations and the tooling, not a set of changes.
 
 ## 6. Driving a gamescope session from the host (measurement prerequisite)
 

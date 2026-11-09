@@ -18,7 +18,8 @@ GID=${GID:-1145350}                # Steam appid -> app_id extra
 SRC=${SRC:-STEAM}                  # game_source extra -> appId STEAM_1145350
 SETTLE=${SETTLE:-30}               # s of scene settle before the census window
 WINDOW=${WINDOW:-90}               # s of steady-state sampling
-LABEL=${LABEL:-step1}
+DS=${DS:-}                         # optional displayServer override (gamescope|x11)
+LABEL=${LABEL:-${DS:-step1}}
 W=${W:-$here/run-$LABEL}
 CFG=/data/data/$PKG/files/imagefs/home/xuser-$CID/.container
 REL=files/imagefs/home/xuser-$CID/.container
@@ -81,8 +82,27 @@ if [ "${NOFLIP:-0}" = 1 ]; then
 else
   # ---- 2. edit + prove only envVars moved, then write atomically ---------
   say "editing envVars"
-  python3 "$here/container-env-flip.py" edit "$W/orig.container" "$W/gated.container" "${GATES[@]}"
-  python3 "$here/container-env-flip.py" check "$W/orig.container" "$W/gated.container"
+  python3 "$here/container-env-flip.py" edit "$W/orig.container" "$W/gated0.container" "${GATES[@]}"
+  if [ -n "$DS" ]; then
+    echo "displayServer: $(python3 "$here/container-env-flip.py" getfield "$W/orig.container" displayServer) -> $DS"
+    python3 "$here/container-env-flip.py" setfield "$W/gated0.container" "$W/gated.container" displayServer "$DS"
+  else
+    cp "$W/gated0.container" "$W/gated.container"
+  fi
+  # prove nothing but envVars (and, when asked, displayServer) moved
+  python3 - "$W/orig.container" "$W/gated.container" "${DS:-}" <<'PY'
+import json, sys
+a, b = (json.load(open(p)) for p in sys.argv[1:3])
+want = sys.argv[3]
+allowed = {"envVars"} | ({"displayServer"} if want else set())
+bad = sorted(k for k in set(a) | set(b) if k not in allowed and a.get(k) != b.get(k))
+if bad:
+    sys.exit(f"FATAL: unexpected keys changed: {bad}")
+print("ok: only", ", ".join(sorted(allowed)), "differ")
+if want:
+    assert b["displayServer"] == want, (b["displayServer"], want)
+print("displayServer on the pushed file:", b["displayServer"])
+PY
   sh_ "am force-stop $PKG" || true                       # drop the in-memory copy
   push_cfg "$W/gated.container"
   read_cfg > "$W/after_push.container"
@@ -115,8 +135,13 @@ if [ "${NOFLIP:-0}" != 1 ]; then
   read_cfg > "$W/final.container"
   # keep everything the app wrote during the session (sessionMetadata, extraData),
   # drop only the two gates
-  python3 "$here/container-env-flip.py" unset "$W/final.container" "$W/restored.container" GNDRM_LOG_VKSHIM GNDRM_LOG_SHIM
-  python3 "$here/container-env-flip.py" check "$W/final.container" "$W/restored.container"
+  python3 "$here/container-env-flip.py" unset "$W/final.container" "$W/restored0.container" GNDRM_LOG_VKSHIM GNDRM_LOG_SHIM
+  if [ -n "$DS" ]; then
+    orig_ds=$(python3 "$here/container-env-flip.py" getfield "$W/orig.container.keep" displayServer)
+    python3 "$here/container-env-flip.py" setfield "$W/restored0.container" "$W/restored.container" displayServer "$orig_ds"
+  else
+    cp "$W/restored0.container" "$W/restored.container"
+  fi
   cmp -s "$W/restored.container" "$W/orig.container.keep" \
     && echo "restore: byte-identical to the original" \
     || echo "restore: envVars back to the original; other bytes differ only by session telemetry"
