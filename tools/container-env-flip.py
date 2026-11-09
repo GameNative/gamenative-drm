@@ -87,6 +87,29 @@ def diff_keys(a, b):
     return sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
 
 
+def set_flag(blob, key, value):
+    """Rewrite one bare JSON boolean/number token in place; every other byte kept."""
+    pat = re.compile(rb'("' + key.encode() + rb'"\s*:\s*)(true|false|-?\d+)')
+    m = pat.search(blob)
+    if not m:
+        sys.exit(f'FATAL: no bare "{key}":true|false|<number> token in the file')
+    out = blob[: m.start(2)] + value.encode() + blob[m.end(2):]
+    try:
+        json.loads(out)
+    except Exception as e:
+        sys.exit(f"FATAL: edited file is not valid JSON: {e}")
+    return out
+
+
+def get_flag(blob, key):
+    pat = re.compile(rb'("' + key.encode() + rb'"\s*:\s*)(true|false|-?\d+)')
+    m = pat.search(blob)
+    if not m:
+        sys.exit(f'FATAL: no bare "{key}" token in the file')
+    return m.group(2).decode()
+
+
+
 
 def main():
     if len(sys.argv) < 3:
@@ -105,6 +128,18 @@ def main():
         ob = apply(blob, [], remove=sys.argv[4:])
     elif cmd == "getfield":
         print(get_scalar(blob, sys.argv[3]))
+        return
+    elif cmd == "getflag":
+        print(get_flag(blob, sys.argv[3]))
+        return
+    elif cmd == "setflag":
+        # setflag <in> <out> KEY true|false|<number> ...
+        args = sys.argv[4:]
+        ob = blob
+        for i in range(0, len(args), 2):
+            ob = set_flag(ob, args[i], args[i + 1])
+        open(out, "wb").write(ob)
+        print(f'{out}: {len(blob)} -> {len(ob)} bytes ({len(ob) - len(blob):+d})')
         return
     elif cmd == "setfield":
         # setfield <in> <out> KEY VALUE ...  (top-level string scalars only)

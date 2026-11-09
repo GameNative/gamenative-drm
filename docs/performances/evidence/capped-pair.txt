@@ -1,0 +1,4 @@
+# capped @120 Hz, same room/save, adjacent pair, 240 s each
+
+x11_cap: window 236s  cpu_busy 25.6%  user 14.5%  sys 9.3%  gpu 55.6%  clk 607MHz  power 6.50W  cpuss 61.1C
+gs_cap: window 238s  cpu_busy 22.9%  user 13.1%  sys 7.7%  gpu 55.0%  clk 607MHz  power 7.49W  cpuss 62.9C

@@ -331,6 +331,62 @@ It also accounts for the scene dependence: in the heavier room `slot_waits` goes
 9.8 % → 48.9 % at depth 3, so the acquire path's sys time rises with the overshoot
 rate (`02-instrumentation.md` §12).
 
+### 5.4 Capped to 120 Hz: the two paths converge on CPU and invert on power
+
+`fpsLimiterEnabled` was set true in the container (`fpsLimiterTarget` was already
+120, `dxvk.numBackBuffers` untouched, `displayServer` varied only), and the same
+room and save were re-measured as an adjacent pair, 240 s each:
+
+| metric | X11 capped | gamescope capped | delta |
+|---|---|---|---|
+| fps (MangoHud) | 120.0 | 119.8 | — |
+| CPU busy (8 cores) | 25.6 % | **22.9 %** | **−2.7 pts** |
+| CPU user | 14.5 % | 13.1 % | −1.4 |
+| CPU sys | 9.3 % | 7.7 % | −1.6 |
+| GPU busy / clock | 55.6 % / 607 MHz | 55.0 % / 607 MHz | −0.6 |
+| package power | 6.50 W | **7.49 W** | **+0.99 W (+15 %)** |
+| cpuss / gpu | 61.1 / 46.8 °C | 62.9 / 48.1 °C | +1.8 / +1.3 |
+| RAM used | 6.32 GB | 6.46 GB | +0.14 |
+
+Per process, over the same windows:
+
+| process | X11 | gamescope | Δ |
+|---|---|---|---|
+| `Hades2.exe` | 106.2 | 96.0 | **−10.2** |
+| `app.gamenative` | 35.9 | 14.7 | **−21.2** |
+| `surfaceflinger` | 12.9 | 18.1 | +5.2 |
+| `gamescope` | 0 | 4.2 | +4.2 |
+
+Three things fall out of this, and the first two contradict the uncapped picture.
+
+**1. The cap is the lever, and it is worth far more than everything else.**
+Uncapped → capped, same room, same path: CPU busy 46.1 % → 25.6 % (X11) and
+50.0 % → 22.9 % (gamescope); package power 19.6 W → 6.5–7.5 W; GPU clock
+774 → 607 MHz; cpuss 101.7 → 61.1 °C. That is ~2.7× the power for the same 120
+frames the panel can show, bought by rendering 341.
+
+**2. Capping flips which path is CPU-cheaper.** Uncapped, gamescope cost more
+(+5.1 pp in the guest, +3.9 pts overall). Capped, gamescope costs **less** CPU
+(−2.7 pts), and the guest is 10 pp *cheaper* under gamescope. The mechanism is
+visible in the per-process rows: at 120 fps the in-process X server inside
+`app.gamenative` costs 35.9 pp of a core — more than the gndrm daemon (14.7) plus
+gamescope (4.2) plus SF's increase (5.2) together. Under X11 the cap is enforced
+inside the app, and that limiter is not free. So the earlier "gamescope costs more
+CPU" finding is a property of the **uncapped** configuration, not of the display
+path.
+
+**3. Power disagrees with CPU, in the opposite direction.** gamescope is 2.7 pts
+cheaper on CPU and 1 W dearer on power, 1.8 °C hotter, with identical GPU busy and
+clock. The same inversion appears at the title screen (3.5 W X11 vs 4.0 W
+gamescope). So CPU is not a usable proxy for the display path's energy cost: the
+extra watt is being spent outside the CPU — most plausibly the per-frame composite
+dispatch and the higher SurfaceFlinger activity (12.9 → 18.1) keeping the display
+pipeline and more cores resident. **Any further work on this should be judged on
+package power, not cpu%.**
+
+Gap left open: the capped configuration was not censused, so the `slot_waits`
+figure for it is unknown. The uncapped 48.9 % cannot be assumed.
+
 ### Where that leaves the work
 
 Step 1 answered all three questions in one session (§5.1) and **closed items 2,

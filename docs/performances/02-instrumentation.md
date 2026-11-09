@@ -954,3 +954,18 @@ room, more of the 341 frames land late against the 120 Hz grid, so `slot_waits`
 goes 9.8 % → 48.9 % and the acquire path's sys time rises with it. The cost is not
 a constant per-present overhead with a scene-dependent bonus; it is the overshoot
 rate interacting with a 3-deep pool.
+
+---
+
+## 13. Not yet measured: the census at the cap
+
+Every census figure above was taken with the container **uncapped** (341–357
+presents/s). Once `fpsLimiterEnabled` is on and the session runs at 119.8 fps, the
+`slot_waits` fraction cannot be inferred from the uncapped 9.8 %/48.9 % — at a
+third of the present rate against the same 3-deep pool the contention should
+collapse, but "should" is not a measurement.
+
+One arm, 80 s, `DS=gamescope` with the gates on and `fpsLimiterEnabled` true, is
+all it takes. It matters because the capped pair is now the configuration that
+matters (see `01-gamescope-vs-x11-cpu.md` §5.4), and the slot-pressure question —
+whether a 3-deep pool with no ceiling costs anything — is only answerable there.
