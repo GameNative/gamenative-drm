@@ -109,10 +109,10 @@ steady-state full-frame copy and no readback.
 |---|---|---|---|
 | 1 | present dispatch, present-id/mode extraction, slot fence reset | `proxy.rs:3238`–`3357` | guest main |
 | 2 | **render-completion submit** (waits the guest's present semaphores) + an extra empty submit when a present fence is chained | `proxy.rs:3415`, `:3418` | guest main |
-| 3 | present discipline (`fifo`/`mailbox`/`immediate`), mode census under a global mutex | `proxy.rs:3113`, `:10504` | guest main |
+| 3 | present discipline (`fifo`/`mailbox`/`immediate`), present-id answer, and `mode_census()` under a **process-global mutex** every present | `proxy.rs:3114`, `:3095`, `:10547` | guest main |
 | 4 | present worker: fence wait → commit bookkeeping → **present mark datagram** → wayland attach/damage/commit/flush | `proxy.rs:1961`–`2168` | guest worker |
 | 5 | buffer release → `in_flight=false`, slot free | `proxy.rs:8054` | guest worker |
-| 6 | acquire gated on a free slot, `x11_reap` per slice | `proxy.rs:2696`, `:2786` | guest main |
+| 6 | acquire gated on a free slot; `x11_reap` is a **no-op on this route** (`present.is_null()` → return, `proxy.rs:675`), so only the `cv_free` slice and its timeout remain | `proxy.rs:2696`, `:2657` | guest main |
 | 7 | gamescope composites into a pool buffer, builds the atomic request (~40–60 `drmModeAtomicAddProperty`), libliftoff solve, **`drmModeAtomicCommit`** | gamescope `DRMBackend.cpp:3308`, `:4609` | gamescope |
 | 8 | **intercepted ioctl = a synchronous SEQPACKET round trip** under a global lock | `gndrm_shim.c:2225`→`rpc` `:660` | gamescope |
 | 9 | daemon serve loop: `poll`+`recvmsg`, parse, validate, apply, **fresh `HashSet` of live inodes**, `dup` of the buffer fd, queue job, reply | `server.rs:380`, `commit.rs:47`–`547` | app |
@@ -124,151 +124,160 @@ The frame is **exactly one deep**: gamescope blocks on the GPU timeline after
 its composite and again on the flip event, so every per-frame CPU cost between
 the guest's commit and the flip event is serial, not overlapped.
 
-### Log gates (complete list — there is no `GNDRM_LOG_BUFFER`)
+### Log gates, and which ones a container can actually turn on
 
-| gate | subsystem | where read | usable instrument |
+| gate | subsystem | read at | container-settable? |
 |---|---|---|---|
-| `GNDRM_LOG_DAEMON` | `gndrm_daemon::*` + the `asc_log!` macro (HDR decision, layer rect, publish probes) | `log_policy.rs:54`, `asc.rs:135` | `gndrm-daemon: commit #N` (monotonic), `asc hdr decision n=` |
-| `GNDRM_LOG_ASC` | `gamenative_drm`, `::asc`, `::ffi` | `log_policy.rs:55` | layer/geometry warnings |
-| `GNDRM_LOG_VKSHIM` | the whole ICD shim — **also arms the WSI census itself** | `lib.rs:104` | `proxy commit: … #N`, `proxy hb: acq=/pres=/starved=`, `proxy present: first pNext chain … present_id=` |
-| `GNDRM_LOG_SHIM` | the C ioctl interposer | `gndrm_shim.c:226` | `ATOMIC heartbeat #N`, `ADDFB2 ok/fail` |
-| `GNDRM_LOG_INPUT` | wayland injector | `log_policy.rs:56` | injector connect/retry |
-| `GNDRM_LOG` | fallback for unknown module paths | `log_policy.rs:110` | — |
+| `GNDRM_LOG_VKSHIM` | the whole ICD shim — **also arms the WSI census itself** | `lib.rs:104` | **yes** (guest process) |
+| `GNDRM_LOG_SHIM` | the C ioctl interposer | `gndrm_shim.c:226` | **yes** (gamescope process) |
+| `GNDRM_LOG_DAEMON` | `gndrm_daemon::*` + `asc_log!` | `log_policy.rs:54`, `asc.rs:135` | **no** — app process |
+| `GNDRM_LOG_ASC` | `gamenative_drm`, `::asc`, `::ffi` | `log_policy.rs:55` | **no** — app process |
+| `GNDRM_LOG_INPUT` | wayland injector | `log_policy.rs:56` | **no** — app process |
+| `GNDRM_LOG` | fallback for unknown module paths | `log_policy.rs:110` | **no** — app process |
 
 Gate semantics: on iff the value is present, non-empty and not `"0"` (the C shim
-differs — any non-NULL). Container `envVars` reach the **guest only**, so
-`GNDRM_LOG_VKSHIM` and `GNDRM_LOG_SHIM` can be set from the container;
-`GNDRM_LOG_DAEMON`/`_ASC`/`_INPUT` need an app-side env (APK rebuild).
+differs — any non-NULL). Container `envVars` reach the **guest process tree
+only**, and the daemon runs inside `app.gamenative`, so the two gates that would
+measure the daemon and the publish need an app-side env, i.e. an APK rebuild.
 
-Frame-rate triad for layer-to-layer accounting, all monotonic on their lines:
-`proxy commit: … #N` (guest) → `gndrm-daemon: commit #N` (daemon) →
-`asc hdr decision n=` (publish). `ATOMIC heartbeat #N` covers the
-gamescope→daemon leg without the vkshim gate.
+That matters because **the daemon-side counters are the ones that look free and
+are not.** `gndrm-daemon: commit #{}` is an `always_log` line, but it sits inside
+`if want_commit_log && (…)` where `want_commit_log = verbose_logging()`
+(`commit.rs:179`), and `verbose_logging()` reads `GNDRM_LOG_DAEMON` from the
+environment (`lib.rs:262`). Same for `asc hdr decision n=` (`asc.rs:1538`). So a
+container-only run cannot read the daemon→publish leg; it reads the guest leg and
+the gamescope→daemon leg and infers the rest. Step 1 of the plan is written
+around that (`25-gamescope-cpu-instrumentation.md`).
 
-## 4. Where the CPU actually goes — ranked, each with its falsifier
+Instruments that a container-only run **does** get, all monotonic on their line:
 
-Ranking is by (plausible size) × (fit to the observed signature: sys +1.0 and
-user −0.9 at flat total CPU and identical fps, with the only growth inside
-`Hades2.exe` at +5.1 pp of one core). Only what can plausibly move *that* term is
-worth acting on; the ceiling for everything below is a few tenths of a point of
-8-core CPU.
+- `proxy commit: … #N` — guest commits (`proxy.rs:2175`, `N_COMMIT_OK`).
+- `proxy hb: fmt=… create= destroy= images= acq= present=` — the WSI census. It
+  carries `acq=` and `present=` but **not** `starved=` or `slots=`
+  (`proxy.rs:307`); doc 24 originally claimed otherwise.
+- `proxy present: first pNext chain … present_id=` — whether the guest opted into
+  present-id.
+- `present mode: declared=… commits= declared_fifo= declared_other= slot_waits=
+  commit_lat_us=` — the ready-made per-mode census, change-triggered and ungated,
+  gated to 10 s otherwise (`proxy.rs:10547`).
+- `ATOMIC heartbeat #N` — the gamescope→daemon atomic rate, no vkshim gate
+  (`gndrm_shim.c`).
 
-**A. Guest-side WSI machinery in the shim — the largest term.** Per present the
-guest pays an extra `vkQueueSubmit`, a worker-thread wake and `vkWaitForFences`,
-an X/server round trip when the DRI3 route is active, a polled per-slot fence
-reap (`xcb_sync_query_fence` per in-flight slot), two SEQPACKET datagrams, plus
-`libgndrm_shim.so`'s `open/close/ioctl/mmap` hooks over the whole guest. That is
-the only per-frame code that exists in one arm and not the other and it is
-syscall-shaped, matching the `cpu_sys` delta.
-*Falsify:* `simpleperf record` on `Hades2.exe` in the same scene — if
-`gn-present`, `xcb_*` and the shim hooks together are under ~2 pp, this is not
-the main term.
+## 4. Where the CPU actually goes — re-ranked after seven deep passes
 
-**B. `VK_KHR_present_wait` turns a display-side wait into guest CPU.** The shim
-always advertises present-id/present-wait (`wsi_policy.rs`); Mesa's X11 WSI
-implements neither. If DXVK/vkd3d-proton take that capability, the guest waits
-per frame on an answer that the shim only produces when *some other thread*
-happens to run the reap loop — a wait that can present as busy polling.
-*Falsify (cheapest decisive experiment in this report):* set
-`dxvk.latencySleep = False` (and optionally `dxvk.maxFrameLatency = 0`) in the
-container's `dxvk.conf`. CPU back to ≈X11 at equal fps ⇒ confirmed.
+The ranking below supersedes the first pass. Four of its eight candidates did not
+survive being read against the source; each withdrawal is recorded with the
+evidence, because the wrong model is what would otherwise get built.
 
-**C. Depth + release-gated slots → acquire starvation.** The guest asks for 3
-images and slots only return through the polled reap; at ~2.9 ms/frame with a
-4 ms reap slice the acquire loop sits in the reap path on most frames.
-*Falsify:* `dxvk.numBackBuffers = 4`, and read `starved=` / the stall lines
-(`gn-vkshim stall: acquire found no free slot`, `acquire blocked >=1s …`).
+**Read the per-process table with its error bar.** `top -n 1 -b -m 14` truncates
+to the top 14 and quantises to 3.7 pp per row per sample, with ~20 samples per
+arm, so a per-process mean is trustworthy only to roughly ±5 pp. A +20.8 pp move
+is real; a +5.1 pp move is at the edge of resolution. The reconciliation of the
+per-process sum against `/proc/stat` does not close (+95 ms/s from the listed
+rows vs +24 ms/s measured overall), and that is a sampling artefact, not a
+finding — do not quote the per-process table as a partition of the total.
 
-**D. The guest renders into `VK_IMAGE_TILING_LINEAR` so the daemon can scan it
-out** (`proxy.rs:12124`), where X11-mode DXVK images are driver-tiled with UBWC.
-More bandwidth per frame against an already 84 %-busy GPU, and any spin-based
-wait in **B** converts that into CPU.
-*Falsify:* GPU-side counters per arm at equal fps; the definitive fix is a
-modifier/UBWC import path in the scan-out pool, which the daemon does not have.
+**A — guest-side WSI machinery: still the only term worth attacking, but
+narrower than first stated.** Per present on the default route the guest pays the
+render-completion submit (`proxy.rs:3415`, plus an extra empty submit at `:3418`
+when a present fence is chained), a present-worker wake and fence wait, two
+SEQPACKET datagrams, the wayland attach/commit/flush, and `mode_census()` under a
+process-global mutex (`proxy.rs:3114`). **Withdrawn**: the "polled per-slot fence
+reap, one `xcb_sync_query_fence` per in-flight slot per frame" is *not* on this
+route — `x11_reap` returns immediately when `present.is_null()` (`proxy.rs:675`),
+and that field is only set on the `GN_VKSHIM_GUEST_SURFACE=1` DRI3 route. On the
+default route the acquire side costs a `cv_free` wait with a 4 ms slice
+(`proxy.rs:2657`), not an X round trip.
 
-**E. Daemon per-frame allocations (app side, +7.2 pp).** Three stand out and all
-are trivially removable: a fresh `HashSet<u64>` of every live GEM inode rebuilt
-per commit (`commit.rs:540`), 4 `Vec` allocations per atomic parse
-(`commit.rs:300`), and a rebuilt `Vec<pollfd>` per scan-out iteration
-(`asc.rs:2560`). Also `GetStaticMethodID` on every published frame for the
-Kotlin `onFramePublished` upcall (`lib.rs:387`).
-*Falsify:* per-thread CPU of `gndrm`/`gndrm-commit` after caching these; or
-malloc counters under `simpleperf`.
+**B — per-frame `VK_KHR_present_wait`: largely refuted as written for this
+container.** The shim does advertise `present_id`/`present_wait`
+(`wsi_policy.rs:65`), and the waitable is a process-global `Mutex<Waits>` +
+`Condvar` (`present.rs:72`, `:181`), so any spin would be guest-side. But
+`present_wait_answer` already answers **at commit** for mailbox and immediate
+(`proxy.rs:2057`), and at queue time for a rate-vsync declaration
+(`proxy.rs:3097`); only the FIFO path defers to release. The container ships
+`MESA_VK_WSI_PRESENT_MODE=mailbox`, so the mechanism this cause needs — "the wait
+is only satisfied by another thread's poll" — cannot fire unless the guest
+declares FIFO. Keep it as a conditional, not a cause.
 
-**F. Redundant per-frame wayland state.** `swapchain_set_present_mode` is issued
-on every commit even when the mode did not change (`proxy.rs:2137`).
-*Falsify:* drop the call when unchanged; measure guest sys time.
+**C — acquire starvation: arithmetically bounded at ~46 µs/frame.** 4 ms slice
+against a 2.9 ms frame, and 340 vs 344.6 fps, is one lost wakeup per ~87 frames.
+Also **withdrawn**: `starved=` is not on the `proxy hb:` line at all
+(`proxy.rs:307` carries `acq=`/`present=` only); the readable census is
+`present mode: … slot_waits= commit_lat_us=` (`proxy.rs:10547`). `N_STARVE`
+increments when no free slot is found (`proxy.rs:2823`), which an unbounded wait
+may never reach — the run settles it.
 
-**G. gamescope itself (+6.1 pp) is not the problem it looks like.** It never
-composites on the CPU, never reads a frame back, and its composite is a single
-compute dispatch sized by output pixels. What it does pay per frame is the
-atomic-request build, the libliftoff solve (cached when a layout is known-bad),
-and two blocking waits. `-Drt_cap=disabled` means no `nice(-20)`/`SCHED_FIFO`
-(`main.cpp:882`), so all of it competes at normal priority.
-*Falsify:* gamescope's own per-thread time with the flip path idled by a fake
-caps; or build `-Drt_cap=enabled`.
+**D — linear tiling: real but small, and not the CPU lever.** ~1.25 GB/s per pass,
+~5 GB/s over four passes ≈ 7 % of the 68.3 GB/s peak; recovering ~0.5 GB/s is
+0.7 %. At 1280 px the gralloc stride is already tight (5120 = 1280×4), so there
+is no padding to reclaim, only compression. And bandwidth can only turn into CPU
+through B's spin, so D's CPU payoff collapses once B is settled
+(`31-scanout-pixel-format.md`).
 
-**H. `surfaceflinger` +3.7 pp is transaction traffic**, not composition: one
-layer, 8 ops + 1 apply per publish at ~330 Hz plus a completion callback, where
-X11 delivers one `queueBuffer` per frame from a persistent buffer.
-*Falsify:* SF `TransactionQueued`/`TransactionCompleted` counts per frame per
-arm.
+**E — daemon per-frame allocations: confirmed, and smaller than claimed.** Five
+`Vec`s per atomic parse (not four), two per poll turn (not one), a per-commit
+`HashSet` of live inodes that needs refcounts rather than a dirty flag, and a JNI
+lookup that also builds two CESU-8 `CString`s per published frame. Total
+0.9–2.3 ms of CPU per second against the daemon's ~72 ms/s — 1.5–3 % of the
+daemon's own cost, i.e. free to remove but not decisive
+(`28-daemon-present-allocations.md`).
 
-Rejected by inspection, so they are not worth another run: per-call shim
-dispatch trampolines (sub-µs), `ring_push` in `vkQueueSubmit`, per-frame
-daemon→shim datagrams, and gamescope CPU compositing (it does not exist).
+**F — redundant wayland state: withdrawn, and the opposite is true.**
+`swapchain_set_present_mode` is *load-bearing on every commit*: gamescope clears
+`oCurrentPresentMode` in `PrepareCommit` (`wlserver.cpp:180`) after consuming it
+into the frame's pacing decision, and the shim turns its own acquire gate off for
+a FIFO declaration (`proxy.rs:10454`). Suppressing the re-send shim-side would
+un-pace every FIFO commit after the first. See `29-present-mode-declaration.md`.
 
-## 5. Plan to reduce the gamescope CPU cost
+**G — the compositor: not a defect.** `gamescope` at 5.7 pp of one core replaces
+the X server that used to live inside `app.gamenative` (19.3 → 18.0 in the same
+pair). It never composites on the CPU and never reads a frame back. Its per-frame
+cost is the atomic build, the libliftoff solve and two blocking waits
+(`DRMBackend.cpp:4609`, `:4718`), and with `-Drt_cap=disabled` it competes at
+normal priority.
 
-Ordered by expected effect per unit of risk. Every step names the measurement
-that decides whether it worked, and none changes visual behaviour.
+**H — SurfaceFlinger: withdrawn.** The matched pair shows 10.9 vs 10.9, not
++3.7. The first pass's +3.7 came from comparing across builds.
 
-**Scope, set by the matched pair in §2:** the target is the guest's +5.1 pp, not
-the total. At +0.3 pts of 8-core busy and −0.04 W there is no power win left to
-collect, so items 2–5 are justified only as *less work in the guest*; item 6 is a
-latency item with no CPU claim; item 7 is closed unless the GPU is shown to be
-bandwidth-starved at the tested scene. Do item 1 first regardless — it is one
-session, no code, and it decides whether 2 and 3 have a target at all.
+Bottom line: the residual is **+0.3 pts of 8 cores**, of which the guest term is
+~5 pp of one core, and the only candidate that can plausibly move it is A. There
+is no power to win (−0.04 W).
 
-1. **Instrument before touching anything.** One run per arm with
-   `GNDRM_LOG_VKSHIM=1` (+`GNDRM_LOG_SHIM=1`) in the container envVars, 60 s,
-   same scene: capture `proxy commit: #N`, `proxy hb: acq=/pres=/starved=`,
-   `proxy present: first pNext chain … present_id=`, `ATOMIC heartbeat #N`.
-   This alone decides **B** (is present-wait in use?) and **C** (is the guest
-   starving?) without a rebuild. Cost: one session, no code.
-2. **Kill the per-frame wait in the guest** (fixes **B**). If present-id is in
-   use, answer the wait at queue time for every mode the shim owns (it already
-   does this for FIFO+cap, `present_wait_answer` `proxy.rs:3116`) rather than at
-   release, and make the release path event-driven (present-complete callback)
-   instead of a polling `x11_reap`. Expected: most of the guest's extra sys
-   time. Verify: `cpu_sys` ratio X11↔gamescope at equal fps, and `starved=`
-   returning to 0.
-3. **Batch and event-drive the slot reap** (fixes **C**). One
-   `xcb_sync_query_fence` per slot per frame becomes one per release event; add
-   a 4th depth by default when the guest asks for 3 and the daemon pool has a
-   spare buffer. Verify: `slots=[…]`/`starved=`, and acquire→commit time.
-4. **Remove the three daemon allocations** (fixes **E**) and cache
-   `GetStaticMethodID`. Verify: `gndrm-commit` thread CPU before/after at the
-   same publish rate; expect a small but free win.
-5. **Suppress unchanged wayland state** (fixes **F**): only call
-   `set_present_mode` when it differs from the applied value. Verify: guest sys
-   time, and the wayland write count per frame.
-6. **Give gamescope real-time priority** (mitigates **G**): build with
-   `-Drt_cap=enabled` and pass the capability, or set `SCHED_FIFO` on the
-   compositor threads from the app. This does not reduce CPU; it removes the
-   18–21 ms idle frames that a late-scheduled commit thread produces (recorded
-   in the A52 header). Verify: frame-time p99, not CPU.
-7. **Attack the bandwidth term (D) last, and only if 2–4 leave a gap.** A
-   UBWC/modifier scan-out import is a pool-format change with a wide blast
-   radius (the daemon cannot scan out UBWC today, and the layout must stay
-   agreed between shim, interposer and daemon via `GNDRM_SCANOUT_LAYOUT`).
-   Verify: GPU busy at equal fps, then CPU with fps pinned by the cap.
+## 5. The plan, item by item — verdicts after the design pass
 
-What this plan deliberately does not do: switch to `GN_VKSHIM_GUEST_SURFACE=1`
-(the DRI3 route adds round trips and is the *worse* CPU path), enable
-`-Dpipewire` (adds a full-frame RGB→NV12 dispatch per present), or force
-composition (`--force-composition` / `-c` / `ENABLE_VKBASALT=1` all flip every
-frame to the composite path).
+Each item now has its own document with the file:line evidence, the change, the
+invariants, the risks and the measurement that decides it. **The plan is
+re-ordered and three items are closed**, because the premise they rested on did
+not survive the source read.
+
+| # | item | verdict | doc |
+|---|---|---|---|
+| 1 | one instrumented run, no rebuild | **do first** — but container-only gates cover the guest and gamescope legs, not the daemon/publish | `25-gamescope-cpu-instrumentation.md` |
+| 2 | answer `present_wait` at queue time | **conditional** — the mechanism needs a FIFO declaration; mailbox is already answered at commit | `26-present-wait-at-queue.md` |
+| 3 | batch/event-drive the slot reap, add depth | **narrowed to (a)** — the reap is DRI3-only; on this route only the epoch is missing | `27-swapchain-slot-reap.md` |
+| 4 | remove per-frame allocations + JNI lookup | **land opportunistically** — free, but 1.5–3 % of the daemon's cost | `28-daemon-present-allocations.md` |
+| 5 | stop re-sending unchanged wayland state | **closed** — the re-send is load-bearing per commit | `29-present-mode-declaration.md` |
+| 6 | give gamescope real-time priority | **reframed** — `rt_cap` cannot work on Android; `nice -20` can; this is latency, not CPU | `30-compositor-scheduling.md` |
+| 7 | UBWC/tiled scan-out import | **closed** — an `AHardwareBuffer` cannot express UBWC, and the attempt already exists unmeasured on a backup branch | `31-scanout-pixel-format.md` |
+
+### The one thing to do next
+
+Item 1, with the scope correction: `GNDRM_LOG_VKSHIM=1 GNDRM_LOG_SHIM=1` in the
+container `envVars`, one session, 30 s settle + 90 s window. It answers three
+questions at once and needs no code:
+
+1. **Which present mode does the guest actually declare?** `present mode:
+   declared=…` — if it is not FIFO, cause B is dead and item 2 stays closed.
+2. **Is there any `slot_waits` at all?** — if it is 0 on a clean baseline, item 3
+   drops to the epoch fix only.
+3. **Does `present_id` appear in the pNext chain?** — if not, nothing is waiting
+   on a present id and B is dead regardless of mode.
+
+Everything else in the plan is worth at most a few tenths of a point of CPU on an
+8-core SoC that is already at 102 °C and 19.4 W. The honest conclusion of this
+report is that **payload `20261110.1` has already collected the win**, and the
+remaining work is defence against regressions rather than a hunt.
 
 ## 6. Driving a gamescope session from the host (measurement prerequisite)
 
