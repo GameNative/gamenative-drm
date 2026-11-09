@@ -782,3 +782,63 @@ the shim exists in the guest, and in X11 mode it does not exist at all.
 One session per arm, no rebuild, no APK change; the gate adds one `logf!` build
 per census line and the counters are already unconditional at the hot sites, so
 the arm's CPU remains comparable. The whole thing is two commands.
+
+---
+
+## 11. Second run: the app now strips the present-mode and image-count overrides
+
+`XServerScreen.kt` gained, on the gamescope route only:
+
+```kotlin
+if (!isX11Display) {
+    envVars.remove("MESA_VK_WSI_PRESENT_MODE")
+    envVars.remove("WRAPPER_MAX_IMAGE_COUNT")
+}
+```
+
+so the guest's own request reaches the shim instead of the container's. Re-ran the
+census arm on the resulting APK (`DS=gamescope`, same payload, same window):
+
+| reading | before (§10) | after | note |
+|---|---|---|---|
+| declared / requested / source | mailbox / immediate / **env** | **immediate / immediate / guest** | the change works as intended |
+| slot depth | 4 | **3** | the removed ceiling had been granting a 4th slot |
+| `slot_waits` / acquires | 0.0 | **0.098 (9.8 %)** | new, and caused by the depth drop |
+| acquire dwell mean | 0.013 ms | 0.028 ms | still sub-30 µs |
+| acquire ≥ 8.33 ms | 0.0 | **0.0** | no frame-rate-affecting stall |
+| `starved` | 0 | 0 | no failed acquire |
+| mean free slots | 2.08 | 1.07 | tighter, as expected at depth 3 |
+| guest presents/s | 357.3 | 357.3 | unchanged |
+| daemon atomic ioctls/s | 241.9 | **242.0** | **unchanged — so the 1.48 ratio is not a mailbox artefact** |
+| `VkPresentIdKHR` / present waits | none / 0 | none / 0 | still refuted |
+
+**The atomic rate not moving is the interesting part.** Switching the guest from
+mailbox to immediate does not change how often gamescope commits (242/s against
+357 presents/s), which means the compositor's commit cadence is paced by
+something else — not by the present mode and not by frame arrival. That is the
+one unexplained number in the pipeline and it is documented here as such.
+
+### CPU effect, measured two ways
+
+The two obvious in-game arms are NOT a controlled comparison: the save now spawns
+in a different room than the §2 pair, and that room is heavier. So the control is
+the one scene that is byte-identical across runs — the title screen.
+
+| scene | metric | old APK (mailbox, depth 4) | new APK (immediate, depth 3) |
+|---|---|---|---|
+| **title** (controlled) | CPU busy | 27.3 % | **25.7 %** (−1.6) |
+| | CPU sys | 14.9 % | 13.8 % (−1.1) |
+| | package power | 8.06 W | **7.84 W** (−0.22) |
+| | GPU busy / clock | 38.4 % / 607 MHz | 38.5 % / 607 MHz |
+
+So on the only scene where nothing but the APK differs, the change is a small
+**win** (−1.6 pts of 8 cores, −0.22 W). The in-game pair on the new room measures
++3.9 pts against X11 (46.1 % → 50.0 %, sys +3.5, 19.63 → 19.96 W, fps 338.8 vs
+339.3) — but that room has no old-APK counterpart, so it cannot be laid at this
+change's door and must not be compared with the +0.3 pts of the §2 pair.
+
+**What is still owed:** one in-game A/B of the two configurations on the *same*
+room. It needs either an APK rebuild that keeps `WRAPPER_MAX_IMAGE_COUNT`, or a
+container-side `dxvk.numBackBuffers = 4` to restore the depth without a rebuild —
+the depth drop to 3 with 9.8 % slot waits is the one mechanism the change
+introduced that could plausibly cost anything.

@@ -286,6 +286,27 @@ One asymmetry is left unexplained and is worth a single look: the daemon serves
 allowed to drop replaced frames, so it is not a defect, but no doc explains the
 1.48 ratio and it is a pacing question rather than a CPU one.
 
+### 5.2 The app now stops overriding the guest's present mode
+
+`XServerScreen.kt` strips `MESA_VK_WSI_PRESENT_MODE` and `WRAPPER_MAX_IMAGE_COUNT`
+on the gamescope route, so the shim declares what the guest asked for. Re-measured
+(`25-gamescope-cpu-instrumentation.md` §11):
+
+- **It works:** `declared/requested/source` went from `mailbox/immediate/env` to
+  `immediate/immediate/guest`.
+- **It costs one side effect:** the removed ceiling had been granting a 4th
+  swapchain slot, so the depth is now **3** and `slot_waits` is **9.8 %** of
+  acquires (dwell still 28 µs, no `starved`, nothing over 8.33 ms).
+- **It does not move the atomic rate:** still 242/s against 357 presents/s, so the
+  1.48 ratio is not a mailbox artefact.
+- **On the one truly controlled scene (the title screen) it is a small win:**
+  CPU busy 27.3 % → 25.7 %, sys 14.9 % → 13.8 %, power 8.06 → 7.84 W, GPU identical.
+- **The in-game pair cannot attribute it:** the save now spawns in a different,
+  heavier room (+3.9 pts against X11 there), and that room has no old-APK
+  counterpart. One in-game A/B on the same room is still owed — either an APK
+  rebuild that keeps `WRAPPER_MAX_IMAGE_COUNT`, or `dxvk.numBackBuffers = 4` to
+  restore the depth from the container.
+
 ### Where that leaves the work
 
 Step 1 answered all three questions in one session (§5.1) and **closed items 2,
