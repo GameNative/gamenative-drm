@@ -6908,13 +6908,13 @@ mod tests {
                 choose_live_mode(mode, ModeSource::Guest, mode, false, 0, None),
                 (mode, Declared::Mode)
             );
-            // A cap at the display's rate: FIFO for a guest that asked for
-            // mailbox or immediate, the swapchain's mode (with the gate) for
-            // one that asked for FIFO-relaxed.
+            // A cap at the display's rate: the swapchain's mode (with the
+            // gate), cap-rate for a guest that asked for mailbox or immediate,
+            // cap-rate-vsync for one that asked for FIFO-relaxed.
             let at_rate = if mode == r {
                 (r, Declared::CapRateVsync)
             } else {
-                (f, Declared::CapRate)
+                (mode, Declared::CapRate)
             };
             assert_eq!(
                 choose_live_mode(mode, ModeSource::Guest, mode, false, 60, g60),
@@ -6968,11 +6968,11 @@ mod tests {
             gamescope_route_pacing((f, Declared::CapCompat), None, 60, None),
             Pacing::Off
         );
-        // FIFO at the display's rate: no gate either; gamescope's limiter
-        // (divisor 1) paces it, as on master.
+        // Mailbox at the display's rate for a self-paced guest: the gate,
+        // every vblank.
         assert_eq!(
-            gamescope_route_pacing((f, Declared::CapRate), None, 60, grid),
-            Pacing::Off
+            gamescope_route_pacing((m, Declared::CapRate), None, 60, grid).clock(),
+            GateClock::Vsync
         );
         // Mailbox, immediate, FIFO-relaxed under a cap: the gate, on the grid.
         for mode in [
@@ -7050,8 +7050,8 @@ mod tests {
         let off = Pacing::Off;
         // Cap at the display's rate (60 on 59.97 Hz), env mailbox: a guest
         // that asked for FIFO (VSync on) or FIFO-relaxed gets mailbox with the
-        // gate every vblank, its present wait answered at commit; one that asked
-        // for mailbox or immediate (self-paced) gets FIFO with no gate.
+        // gate every vblank, its present wait answered at commit; so does one
+        // that asked for mailbox or immediate (self-paced), as cap-rate.
         assert_eq!(
             row(Some("mailbox"), f, 60, None, g60),
             (m, "cap-rate-vsync", every(g60, 1))
@@ -7063,7 +7063,7 @@ mod tests {
         for guest in [m, i] {
             assert_eq!(
                 row(Some("mailbox"), guest, 60, None, g60),
-                (f, "cap-rate", off)
+                (m, "cap-rate", every(g60, 1))
             );
         }
         // Capped below the display's rate, env mailbox, whatever the guest
@@ -7128,7 +7128,7 @@ mod tests {
         // Every other mailbox or immediate presentation keeps master's answer
         // at the commit: below-rate caps and no cap (the container's mode),
         // frame generation, and a guest that asked for mailbox or immediate
-        // (declared FIFO under cap-rate or cap-compat).
+        // (mailbox under cap-rate, FIFO under cap-compat).
         for requested in [f, r, m, i] {
             for live in [m, i] {
                 assert_eq!(
@@ -7142,12 +7142,14 @@ mod tests {
             );
         }
         for requested in [m, i] {
-            for why in [CapRate, CapCompat] {
-                assert_eq!(
-                    present_wait_answer(true, why, requested, f),
-                    WaitAnswer::AtCommit
-                );
-            }
+            assert_eq!(
+                present_wait_answer(true, CapRate, requested, m),
+                WaitAnswer::AtCommit
+            );
+            assert_eq!(
+                present_wait_answer(true, CapCompat, requested, f),
+                WaitAnswer::AtCommit
+            );
         }
         // FIFO and FIFO-relaxed out of a FIFO guest: the compositor answers.
         assert_eq!(present_wait_answer(true, Mode, f, f), WaitAnswer::Later);
@@ -10290,8 +10292,9 @@ enum Declared {
     Generating,
     /// FIFO for want of the daemon's stamp lead (`source=cap-compat`).
     CapCompat,
-    /// FIFO because the cap is the display's rate and the guest asked for
-    /// mailbox or immediate (`source=cap-rate`).
+    /// The container's mode with the vblank-grid gate because the cap is the
+    /// display's rate and the guest asked for mailbox or immediate
+    /// (`source=cap-rate`).
     CapRate,
     /// The container's mode with the vblank-grid gate because the cap is the
     /// display's rate and the guest asked for FIFO or FIFO-relaxed
@@ -10321,18 +10324,14 @@ enum Declared {
 ///   each frame, and with ~16 ms of work per frame and three images it fell
 ///   to 40 fps at 60 Hz.
 /// - a cap at the display's rate, a mode other than FIFO and a guest that
-///   asked for mailbox or immediate (self-paced): FIFO, with no acquire gate
-///   (`source=cap-rate`), as on master. At that cap one
-///   frame per vblank is all the panel shows under either mode, and under
-///   mailbox the shim would have to keep two commits out of one gamescope
-///   composite without knowing when gamescope latches: its wakeup moves with
-///   its rolling draw time (vblankmanager.cpp). A guest that paces itself just
-///   below the display's rate had ~1 frame a second replaced in gamescope's
-///   mailbox that way. Under FIFO gamescope latches one commit per vblank at
-///   its own wakeup and its limiter (divisor 1) paces the guest. The gate is
-///   not kept on top: FIFO's back-pressure already holds the guest, and the two
-///   stacked turned a guest whose acquire-to-commit grew past a period into a
-///   40 fps session on a 60 Hz panel.
+///   asked for mailbox or immediate (self-paced): the swapchain's mode with the
+///   vblank-grid gate, one release per vblank (`source=cap-rate`). Declared
+///   FIFO with no gate, gamescope did not hold a guest faster than the panel:
+///   Portal 2 at cap 60 on a 60 Hz panel committed ~115 frames a second and
+///   had each one released, against the daemon's 60 publishes. The cost of
+///   mailbox here is a guest that paces itself just below the display's rate:
+///   gamescope's wakeup moves with its rolling draw time (vblankmanager.cpp),
+///   and ~1 frame a second of such a guest is replaced in its mailbox.
 /// - no cap, the container's env naming a mode other than FIFO and a guest
 ///   that asked for FIFO or FIFO-relaxed: the guest's mode (`source=guest`);
 ///   see [`choose_live_mode`].
@@ -10405,7 +10404,7 @@ fn choose_live_mode(
                 if vsync_request {
                     (mode, Declared::CapRateVsync)
                 } else {
-                    (VK_PRESENT_MODE_FIFO_KHR, Declared::CapRate)
+                    (mode, Declared::CapRate)
                 }
             }
             Some(_) => (mode, Declared::Mode),
@@ -10436,8 +10435,8 @@ unsafe fn acquire_pacing(sc: *mut GnSwapchain) -> crate::vsync_gate::Pacing {
 /// - frame generation sets the source rate: the gate holds it on the cap's own
 ///   clock (the app disarms gamescope's limiter then; generation paces the
 ///   output on the latch grid itself);
-/// - any FIFO declaration (a FIFO swapchain, FIFO for want of the stamp lead,
-///   FIFO because the cap is the display's rate): no gate. gamescope's limiter
+/// - any FIFO declaration (a FIFO swapchain, FIFO for want of the stamp
+///   lead): no gate. gamescope's limiter
 ///   holds FIFO commits, one per limited vblank, and is the cap;
 /// - mailbox, immediate, FIFO-relaxed: gamescope's limiter does not hold them
 ///   (`wlserver_surface_is_fifo` is FIFO only), so the gate is the cap, on the
