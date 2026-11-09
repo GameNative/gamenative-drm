@@ -802,7 +802,7 @@ census arm on the resulting APK (`DS=gamescope`, same payload, same window):
 | reading | before (§10) | after | note |
 |---|---|---|---|
 | declared / requested / source | mailbox / immediate / **env** | **immediate / immediate / guest** | the change works as intended |
-| slot depth | 4 | **3** | the removed ceiling had been granting a 4th slot |
+| slot depth | 4 | **3** | caused by the **present mode**, not the image count — see below |
 | `slot_waits` / acquires | 0.0 | **0.098 (9.8 %)** | new, and caused by the depth drop |
 | acquire dwell mean | 0.013 ms | 0.028 ms | still sub-30 µs |
 | acquire ≥ 8.33 ms | 0.0 | **0.0** | no frame-rate-affecting stall |
@@ -811,6 +811,49 @@ census arm on the resulting APK (`DS=gamescope`, same payload, same window):
 | guest presents/s | 357.3 | 357.3 | unchanged |
 | daemon atomic ioctls/s | 241.9 | **242.0** | **unchanged — so the 1.48 ratio is not a mailbox artefact** |
 | `VkPresentIdKHR` / present waits | none / 0 | none / 0 | still refuted |
+
+### Correcting the depth story: it is the mode, not `WRAPPER_MAX_IMAGE_COUNT`
+
+The first write-up of this run said "the removed ceiling had been granting a 4th
+slot". That is wrong, and the source says so plainly.
+
+`WRAPPER_MAX_IMAGE_COUNT` is read in exactly one place, `max_swapchain_images()`
+(`proxy.rs:7387`):
+
+```rust
+match std::env::var("WRAPPER_MAX_IMAGE_COUNT").ok().and_then(|v| v.trim().parse::<u32>().ok()) {
+    Some(v) if v >= 2 => v.min(GN_MAX_SC_IMAGES as u32),   // 8
+    _                => GN_MAX_SC_IMAGES as u32,           // 8
+}
+```
+
+This container set it to **`0`**, and `0` fails the `v >= 2` guard, so it took the
+`_` arm and returned `GN_MAX_SC_IMAGES` = 8 — **identical to leaving it unset**.
+Removing that variable from the env was therefore a no-op here; it only matters
+when the value is ≥ 2, where it lowers both the advertised `maxImageCount`
+(`proxy.rs:10016`) and the slot ceiling.
+
+The 4th slot came from the **mode**, in `swapchain_slots()` (`proxy.rs:7364`):
+
+```rust
+let base = asked.clamp(2, ceiling.max(2));
+if mode == VK_PRESENT_MODE_MAILBOX_KHR {
+    base.max(SC_MAILBOX_IMAGES.min(ceiling.max(2)))   // SC_MAILBOX_IMAGES = 4
+} else {
+    base                                              // immediate/FIFO: the ask
+}
+```
+
+`SC_MAILBOX_IMAGES = 4` is Mesa's `WSI_WL_BUMPED_NUM_IMAGES` — "for true mailbox
+mode we need at least 4 images" — so a mailbox swapchain is floored at 4 while
+the ask (`SC_DEFAULT_IMAGES`, and DXVK's 3) is 3. Switching the guest from mailbox
+to immediate removes the floor, and the depth falls to the asked-for 3 on its own.
+
+So the single effective component of the app change is the **present-mode
+removal**; the image-count removal did nothing for this container. Consequence
+for the Kotlin comment: "a ceiling set here would compete with what the surface
+capabilities report" is true only for values ≥ 2 — a `0` (which is what the
+container ships) is already treated as absent.
 
 **The atomic rate not moving is the interesting part.** Switching the guest from
 mailbox to immediate does not change how often gamescope commits (242/s against
@@ -838,7 +881,9 @@ So on the only scene where nothing but the APK differs, the change is a small
 change's door and must not be compared with the +0.3 pts of the §2 pair.
 
 **What is still owed:** one in-game A/B of the two configurations on the *same*
-room. It needs either an APK rebuild that keeps `WRAPPER_MAX_IMAGE_COUNT`, or a
-container-side `dxvk.numBackBuffers = 4` to restore the depth without a rebuild —
-the depth drop to 3 with 9.8 % slot waits is the one mechanism the change
-introduced that could plausibly cost anything.
+room, to separate *mode* from *depth*. A rebuild is not needed for that: set
+`dxvk.numBackBuffers = 4` in the container, which makes the guest ask for 4 and
+restores the depth under immediate (`base = asked = 4`), so the 9.8 % slot
+pressure can be isolated from the mode change itself. If depth-4+immediate lands
+on depth-3+immediate, the slot pressure costs nothing and the mode is the whole
+effect.
