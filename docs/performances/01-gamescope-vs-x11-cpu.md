@@ -384,8 +384,14 @@ dispatch and the higher SurfaceFlinger activity (12.9 → 18.1) keeping the disp
 pipeline and more cores resident. **Any further work on this should be judged on
 package power, not cpu%.**
 
-Gap left open: the capped configuration was not censused, so the `slot_waits`
-figure for it is unknown. The uncapped 48.9 % cannot be assumed.
+The capped configuration was then censused (`02-instrumentation.md` §13), which
+answers the one open item: **the 3-deep pool costs nothing at the cap.** At 120 fps
+the guest switches to FIFO, `slot_waits` reads 100 % but the dwell is 6.25 ms —
+one frame period — with `starved = 0` and a free slot available, so the acquire is
+being parked by the limiter, not contended. `dxvk.numBackBuffers = 4` has nothing
+to win. The same census shows the atomic rate is exactly **2.0 per present** at
+the cap and 0.71 uncapped, so "242/s" was two different constraints coinciding,
+not a fixed cadence.
 
 ### Where that leaves the work
 

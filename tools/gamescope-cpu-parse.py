@@ -228,7 +228,8 @@ def main():
     add(("acquire blocked at all (acqus nz/n)", nz))
     add(("gate hold mean (ms) [cap, not slot]", (gus / ghold / 1000.0) if ghold else 0.0))
     add(("slot_waits / acquires", (n_slot / n_acq) if (n_slot is not None and n_acq) else None))
-    add(("starved (finite-timeout acquire failures)", d(s["acq_census"], "starved", t0, t1)))
+    n_starved = d(s["acq_census"], "starved", t0, t1)
+    add(("starved (finite-timeout acquire failures)", n_starved))
     add(("gate_holds (acquires parked by the cap)", d(s["cen"], "gate_holds", t0, t1)))
     add(("gate_late / skipped", (d(s["cen"], "gate_late", t0, t1),
                                  d(s["cen"], "skipped", t0, t1))))
@@ -290,8 +291,26 @@ def main():
         print("B REFUTED (precondition): no VkPresentIdKHR chained, no vkWaitForPresentKHR.")
     elif outcomes:
         slow = [u for v in outcomes.values() for u in v if u > 1000]
-        print(f"B ACTIVE (ids+waits): {total_waits} sampled waits, {len(slow)} >1 ms"
-              f" -> {'CONFIRMED: the wait is the per-frame stall' if slow else 'mechanism REFUTED: waits answered fast'}")
+        allu = [u for v in outcomes.values() for u in v]
+        # A ~one-frame-period wait is the limiter pacing the guest, not a stall.
+        frame_us = None
+        try:
+            pres = d(s["cen"], "acquires", t0, t1)
+            span = (t1 - t0) if (t0 is not None and t1 is not None) else None
+            if pres and span:
+                frame_us = span * 1e6 / pres
+        except Exception:
+            frame_us = None
+        mean_us = (sum(allu) / len(allu)) if allu else 0.0
+        paced_wait = (frame_us is not None and mean_us and
+                      0.55 <= mean_us / frame_us <= 1.15)
+        if paced_wait:
+            print(f"B ACTIVE but PACED: {total_waits} sampled waits, mean {mean_us:.0f} us "
+                  f"vs a {frame_us:.0f} us frame - the wait is the frame period, i.e. the "
+                  f"cap, not a stall.")
+        else:
+            print(f"B ACTIVE (ids+waits): {total_waits} sampled waits, {len(slow)} >1 ms"
+                  f" -> {'CONFIRMED: the wait is the per-frame stall' if slow else 'mechanism REFUTED: waits answered fast'}")
     else:
         print("B: ids advertised, zero wait calls sampled -> present_wait unused")
     sw = (n_slot / n_acq) if (n_slot is not None and n_acq) else None
@@ -303,9 +322,22 @@ def main():
               "ran with displayServer=x11 that is expected (the shim is "
               "gamescope-only) and the arm is a control, not a measurement.")
     else:
-        print(f"C {'CONFIRMED' if (sw >= 0.5 and (ge8 or 0) > 0.1) else ('REFUTED' if sw <= 0.05 else 'PARTIAL')}:"
-              f" slot_waits/acquires={sw:.1%}, dwell={dwell if dwell is None else round(dwell, 2)} ms,"
-              f" >=8.33 ms={ge8 if ge8 is None else round(ge8, 1)}")
+        # A high slot_wait fraction is only evidence of *starvation* when the
+        # waits are short and frequent. Under the fps cap the acquire is parked
+        # by the limiter itself: 100 % of acquires wait, each for about one frame
+        # period, with a free slot available and `starved` at zero. Reporting
+        # that as contention would send the next reader after the pool.
+        paced = (dwell is not None and dwell >= 4.0 and not n_starved
+                 and (ge8 or 0) < 0.1)
+        if paced:
+            print(f"C PACED, NOT STARVED: slot_waits/acquires={sw:.1%} but dwell="
+                  f"{round(dwell, 2)} ms (~one frame period), starved={n_starved}, "
+                  f">=8.33 ms={ge8 if ge8 is None else round(ge8, 1)} - the cap is "
+                  f"holding the acquire, the pool is not contended.")
+        else:
+            print(f"C {'CONFIRMED' if (sw >= 0.5 and (ge8 or 0) > 0.1) else ('REFUTED' if sw <= 0.05 else 'PARTIAL')}:"
+                  f" slot_waits/acquires={sw:.1%}, dwell={dwell if dwell is None else round(dwell, 2)} ms,"
+                  f" >=8.33 ms={ge8 if ge8 is None else round(ge8, 1)}, starved={n_starved}")
 
 
 if __name__ == "__main__":

@@ -957,15 +957,65 @@ rate interacting with a 3-deep pool.
 
 ---
 
-## 13. Not yet measured: the census at the cap
+## 13. The census at the cap — and why both verdicts had to change
 
-Every census figure above was taken with the container **uncapped** (341–357
-presents/s). Once `fpsLimiterEnabled` is on and the session runs at 119.8 fps, the
-`slot_waits` fraction cannot be inferred from the uncapped 9.8 %/48.9 % — at a
-third of the present rate against the same 3-deep pool the contention should
-collapse, but "should" is not a measurement.
+Same room, same save, `fpsLimiterEnabled` true, `displayServer` gamescope, gates
+on, 70 s window. The result is a different regime, not a smaller version of the
+uncapped one:
 
-One arm, 80 s, `DS=gamescope` with the gates on and `fpsLimiterEnabled` true, is
-all it takes. It matters because the capped pair is now the configuration that
-matters (see `01-gamescope-vs-x11-cpu.md` §5.4), and the slot-pressure question —
-whether a 3-deep pool with no ceiling costs anything — is only answerable there.
+| reading | uncapped in-game (§12) | **capped @120** |
+|---|---|---|
+| guest presents/s | 341.0 | **121.0** |
+| gamescope atomic ioctls/s | 242.1 | **242.0** |
+| atomic ioctls per present | 0.71 | **2.00** |
+| declared / requested | immediate / immediate | **fifo / fifo** |
+| `slot_waits` / acquires | 48.9 % | **100 %** |
+| acquire dwell mean | 0.092 ms | **6.255 ms** |
+| `>= 8.33 ms` fraction | 0.0 % | **0.1 %** |
+| mean in_flight / free | 1.84 / 0.81 | **2.00 / 0.97** |
+| present-wait lines | **0** | **13** |
+| present waits/s | 0 | **121.0** |
+| wait outcome | — | `done`, mean **8257 µs**, max 8357 |
+| `starved` / `gate_holds` | 0 / 0 | **0 / 0** |
+| `commit_lat_us` | 2582 | 954 |
+
+### What it says
+
+1. **Capping switches the guest to FIFO.** Uncapped it asks for `immediate`; at
+   the cap it asks for `fifo`, and gamescope's limiter does the pacing. That is
+   why `gate=off` — the shim's own gate is not needed when the compositor is
+   pacing.
+2. **The atomic rate is exactly 2.0 per present at the cap**, and 0.71 per present
+   uncapped. So the 242/s is not a fixed cadence at all — it is what happens when
+   the composite is pinned to the 120 Hz grid and gamescope issues two atomics per
+   flip (its `Commit()` path plus the per-frame request). At 341 presents/s the
+   same 242/s of commits means most presents never produce one. This supersedes
+   the "invariant at 242" note in §12: the invariance was a coincidence of two
+   different binding constraints.
+3. **`VK_KHR_present_wait` is used at the cap and nowhere else.** 121 waits/s, each
+   answered `done` after 8257 µs — which is 8.263 ms, the frame period to within
+   6 µs. The guest is being paced by the wait, and it costs nothing in CPU because
+   it is a `Condvar` sleep, not a spin.
+4. **The 3-deep pool is not a cost at the cap.** `slot_waits` reads 100 %, but the
+   dwell (6.25 ms) is the frame period, `starved` is 0, and the free-slot mean is
+   0.97 — the acquire is parked by the limiter with a slot actually available. So
+   item 3's remaining question ("does depth 3 cost anything?") is **answered no**,
+   and `dxvk.numBackBuffers = 4` has nothing to win here.
+
+### Both verdicts were wrong for this regime, so the parser now discriminates
+
+`slot_waits` and wait duration mean opposite things in the two regimes:
+
+| regime | `slot_waits` | dwell | reading |
+|---|---|---|---|
+| uncapped, immediate | 48.9 % | **0.09 ms** | genuine short-wait contention |
+| capped, fifo | 100 % | **6.25 ms** | the limiter parking the acquire |
+
+A plain threshold on `slot_waits` reported the capped case as worse contention
+than the uncapped one, which is backwards. `tools/gamescope-cpu-parse.py` now
+classifies it: `slot_waits >= 50 %` with `dwell >= 4 ms`, `starved == 0` and
+`>=8.33 ms < 10 %` prints **"C PACED, NOT STARVED"**, and a present-wait whose
+mean lands within 0.55–1.15× the frame period prints **"B ACTIVE but PACED"**
+instead of "CONFIRMED: the wait is the per-frame stall". Both were checked
+against both captures; the uncapped one still reads as contention and unused
+present-wait, as it should.

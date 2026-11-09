@@ -1,0 +1,40 @@
+# capture /home/joshua/.hermes/cache/scratch/hades-cmp/cap_census.txt
+# window 6.3..76.4 s  (70.0 s, settle 0 s)
+guest presents/s        (vkQueuePresentKHR)         121.019
+guest acquires/s        (vkAcquireNextImageKHR)     121.019
+guest wal commits/s     (N_COMMIT_OK, 'commits=')   121.02
+daemon atomic ioctls/s  (ATOMIC heartbeat #N)       242.037
+compositor releases/s   (wl_buffer.release)         121.02
+presented/s             (wp presentation feedback)  121.02
+discarded/s             (mailbox replace)           0.0
+shim commit probe #N/s  (proxy commit, 1/120)       121.019
+acquire dwell mean (ms)                             6.255
+acquire >=8.33 ms fraction                          0.001
+acquire >=16.67 ms fraction                         0.0
+acquire blocked at all (acqus nz/n)                 1.0
+gate hold mean (ms) [cap, not slot]                 0.0
+slot_waits / acquires                               1.0
+starved (finite-timeout acquire failures)           0
+gate_holds (acquires parked by the cap)             0
+gate_late / skipped                                 (0, 0)
+slot depth (len of slots=[…])                       3
+mean in_flight slots                                2.0
+mean free slots (never A, never F)                  0.97
+present_id on first present chain                   None
+first pNext sTypes                                  []
+present-wait lines in window                        13
+present waits/s (counter #N)                        121.02
+wait answered at queue (at_queue)                   0
+wait answered w/o latch (release or grace)          0
+  wait outcome 'done' n / mean us / max us          (13, 8256.6, 8357)
+vkWaitSemaphores calls/s                            1.128
+declared / requested / source / gate                ('fifo', 'fifo', 'guest', 'off')
+declared_fifo / declared_other                      (8476, 0)
+feedback / lsfg                                     ('on', 0)
+commit_lat_us (last)                                954
+stall lines                                         0
+stall-ring dumps (acquire >=1 s)                    0
+
+# verdicts
+B ACTIVE but PACED: 13 sampled waits, mean 8257 us vs a 8263 us frame - the wait is the frame period, i.e. the cap, not a stall.
+C PACED, NOT STARVED: slot_waits/acquires=100.0% but dwell=6.25 ms (~one frame period), starved=0, >=8.33 ms=0.0 - the cap is holding the acquire, the pool is not contended.
