@@ -958,9 +958,36 @@ string, so no `clippy::literal_string_with_formatting_args` churn. P6's new fiel
 
 ---
 
-## 8. Landed: P3 and P4 (2026-11-10)
+## 8. Landed: P1-P4 (2026-11-10)
 
-Two of the six patches are in, both steady-state wins with no invariant risk:
+Four of the six patches are in.
+
+- **P1 (refcounted live-inode set)** — `Stores` keeps one count per inode named
+  by a `gems` or `gems_closed` entry plus a membership generation; `live_inos()`
+  returns `Arc<HashSet<u64>>` and rebuilds only when membership changed, so an
+  unchanged commit pays an `Arc` clone instead of walking both tables. Every
+  mutation site is hooked: both GEM-creation paths, `GEM_CLOSE` (moves to the
+  orphan table without changing the count), the `PRIME` re-dup path (a second
+  entry for the same inode, so it refs again) and the orphan sweep in destroy-FB.
+  The `debug_assert` recount of both tables is **proven live**: with a
+  deliberately broken count the golden suite fails with `ino_refs disagrees with
+  gems ∪ gems_closed`, and restored it is green — an assertion that cannot fire
+  would have made the pass meaningless.
+- **P2 (decode out of the payload)** — `parse_atomic` computes section offsets
+  from the header and `count_objs` instead of materializing four scratch arrays;
+  the whole frame's length is checked before anything is resolved, so errno
+  precedence is unchanged. One allocation remains (`sets`).
+- **P3 (pollfd reuse)** and **P4 (cached method id)** — as in the previous
+  commit.
+
+Verified after all four: `cargo test --workspace` **342 passed, 0 failed**
+(including the 36 golden commit sequences), `clippy -D warnings` clean on host
+`--all-targets` and on `aarch64-linux-android`, and `tools/build-android.sh`
+green through the export and undefined-symbol audits.
+
+### Superseded note
+
+Two of the six patches (P3, P4) landed first and are described here as before:
 
 - **P3 (pollfd reuse)** — `pushes::fds_except` became `fds_except_into(&mut Vec,
   except)`, and both loops that poll it (`asc.rs` scan-out channel, `lib.rs`
@@ -977,14 +1004,13 @@ Verified: `cargo check`/`clippy -D warnings` clean for `aarch64-linux-android`,
 `cargo test --workspace` 124 + 33 + 99 + 36 + 16 + 9 + 8 + 5 + 4 + 3 + 2 + 2
 passing, none failed.
 
-**Not landed, and why:**
+**Not landed, and why:** **P6 (census built only when printable)** is a
+diagnostics-path change — the build already sits inside `diag_on()`, so it only
+helps a build running with `GNDRM_LOG_DAEMON` on. It rewrites a text-equality
+invariant for no steady-state win; skip it unless the diagnostics overhead itself
+becomes the question.
 
-- **P6 (census built only when printable)** is a diagnostics-path change — the
-  build already sits inside `diag_on()`, so it only helps a build running with
-  `GNDRM_LOG_DAEMON` on. It rewrites a text-equality invariant for no steady-state
-  win; skip it unless the diagnostics overhead itself becomes the question.
-- **P1 (refcounted live-inode set)** and **P2 (decode out of the payload)** are
-  the two real steady-state items and are designed here but not written. P1
-  touches every mutation site of two object tables and its failure mode is
-  retiring a buffer a client still imports — it wants its own commit with the
-  `debug_assert` recount exercised by a device session, not a tail-end edit.
+**Still owed for P1:** a device session on the shipping build. The recount proves
+the accounting is consistent across every path the tests drive, but a real
+session's churn (handle open/close per buffer, FB add/remove per frame) is the
+environment that would expose a site the tests do not reach.
