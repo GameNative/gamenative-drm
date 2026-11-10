@@ -315,6 +315,18 @@ pub unsafe fn swapchain_factory_create_swapchain(
     )
 }
 
+/// gamescope_swapchain.destroy (opcode 0), then the proxy.
+pub unsafe fn swapchain_destroy(sc: *mut wl_proxy) {
+    wl_proxy_marshal_array(sc, 0, std::ptr::null_mut());
+    wl_proxy_destroy(sc);
+}
+
+/// wl_surface.destroy (opcode 0), then the proxy.
+pub unsafe fn surface_destroy(surface: *mut wl_proxy) {
+    wl_proxy_marshal_array(surface, 0, std::ptr::null_mut());
+    wl_proxy_destroy(surface);
+}
+
 /// gamescope_swapchain.override_window_content (opcode 1): server id, XID.
 pub unsafe fn swapchain_override_window_content(sc: *mut wl_proxy, server: u32, xid: u32) {
     let mut args = [wl_argument { u: server }, wl_argument { u: xid }];

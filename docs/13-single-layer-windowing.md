@@ -59,12 +59,41 @@ Step by step, with the override's exact insertion point.
    helper Dishonored nests under) — swaps it for the root child gamescope
    actually paints, matched by `_NET_WM_PID`/`WM_CLASS`, falling back to the X
    input focus, then `_NET_ACTIVE_WINDOW`, then the largest candidate.
-4. **The override is created.** The shim opens **its own wayland connection** to
-   gamescope's wayland socket (`wl_setup`), creates **its own `wl_surface`**
-   (`wlproto::compositor_create_surface`), wraps it in a `gamescope_swapchain`
-   (`swapchain_factory_create_swapchain`), and binds that surface to the X
-   window: `swapchain_override_window_content(scobj, server=0, bound_window)` —
-   `gamescope_swapchain.override_window_content`.
+4. **The override is created, and bound at the first commit.** The shim opens
+   **its own wayland connection** to gamescope's wayland socket (`wl_setup`),
+   creates **its own `wl_surface`** (`wlproto::compositor_create_surface`),
+   wraps it in a `gamescope_swapchain`
+   (`swapchain_factory_create_swapchain`). The binding to the X window waits
+   for a swapchain's first commit (`bind_window_at_first_commit`):
+   `swapchain_override_window_content(scobj, server=0, bound_window)` —
+   `gamescope_swapchain.override_window_content`, sent in the same flush and
+   right before that commit. gamescope keeps one surface per window and a new
+   binding retires the old one, so a swapchain that never presents (the Epic
+   overlay creates one on a child of the game's window only to find `Present`)
+   never takes the window from the game.
+
+   Two decisions live at different instants here, deliberately:
+
+   | decision | when | why not earlier |
+   |---|---|---|
+   | which XID (`resolve_override_target`) | surface creation | the swapchain's extent is read from the window (`surface_extent`), so a surface needs an answer to hand out caps |
+   | taking the window | first commit | a surface proves it is the game's content by painting |
+
+   The first of the two is a reading of the X tree, and on the fallback path it
+   is a guess: `resolve_override_target` returns `provisional = true` when the
+   named window's root-child ancestor is degenerate and the target came from
+   pid/class/focus instead. That guess is re-asked at the first commit, when the
+   tree has the guest's own window in it; the answer replaces `GnSurface.window`
+   so later caps and later swapchains agree. Under `wine explorer
+   /desktop=shell` the ancestor is the full-size desktop window, so the
+   legitimate branch is taken and nothing is re-asked.
+
+   `vkDestroySurfaceKHR` sends `gamescope_swapchain.destroy` and then
+   `wl_surface.destroy`. The order is load-bearing: the first nulls
+   `wl_surface_info->x11_surface`, so the second skips
+   `wlserver_x11_surface_info_finish()` and the window keeps its Xwayland main
+   surface. Reversed, the destroy finishes the window's surface info —
+   `main_surface = nullptr`, `wl_id = 0` — for the rest of the session.
 5. **gamescope accepts it.** `gamescope_xwayland_server_t::handle_override_window_content`
    (`src/wlserver.cpp:836`) resolves the named XID the same way —
    `x11_window = x11_find_toplevel_for_xid( this->ctx->dpy, x11_window )` —
