@@ -52,17 +52,19 @@ mod log;
 mod log_policy;
 mod vsync;
 
+use std::collections::HashMap;
 use std::io;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::thread;
 use std::time::Duration;
 
-use jni::objects::{GlobalRef, JClass, JObject, JString};
+use jni::objects::{GlobalRef, JClass, JObject, JStaticMethodID, JString};
 use jni::sys::{jboolean, jfloat, jint, jstring};
 use jni::{JNIEnv, JavaVM};
+use jni::signature::{Primitive, ReturnType};
 
 use gndrm_daemon::diag;
 use gndrm_daemon::server;
@@ -354,6 +356,32 @@ enum AppCall {
     Failed,
 }
 
+/// Resolved `()V` upcall ids, so a per-frame publish does not pay a
+/// `GetStaticMethodID` plus two `CString` builds for the name and signature on
+/// every call. The class is cached for the process lifetime, so an entry here
+/// cannot outlive the class it points into; a failure re-resolves next time.
+static METHOD_IDS: Mutex<Option<HashMap<String, JStaticMethodID>>> = Mutex::new(None);
+
+/// The id for `method` on `class`, resolved once and then reused.
+fn static_method_id(
+    env: &mut JNIEnv,
+    class: &GlobalRef,
+    method: &str,
+) -> Option<JStaticMethodID> {
+    {
+        let cache = METHOD_IDS.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(id) = cache.as_ref().and_then(|m| m.get(method)) {
+            return Some(*id);
+        }
+    }
+    let id = env.get_static_method_id(class, method, "()V").ok()?;
+    let mut cache = METHOD_IDS.lock().unwrap_or_else(PoisonError::into_inner);
+    cache
+        .get_or_insert_with(HashMap::new)
+        .insert(method.to_owned(), id);
+    Some(id)
+}
+
 /// Attach the calling thread (kept attached — a per-frame caller keeps one
 /// attachment instead of re-attaching each call, and the thread dies with the
 /// session), call a no-arg static method on `GameNativeDrm`. The class must be
@@ -384,7 +412,21 @@ fn call_app_static(method: &str) -> AppCall {
             return AppCall::Failed;
         }
     };
-    match env.call_static_method(class, method, "()V", &[]) {
+    let Some(method_id) = static_method_id(&mut env, class, method) else {
+        log_warn!("{}", gndrm_obf::obf!("{method}: no static id for ()V"));
+        return AppCall::Failed;
+    };
+    // SAFETY: `method_id` was resolved from this same cached class and ids stay
+    // valid for the life of the class, which is never unloaded here.
+    let call = unsafe {
+        env.call_static_method_unchecked(
+            class,
+            method_id,
+            ReturnType::Primitive(Primitive::Void),
+            &[],
+        )
+    };
+    match call {
         Ok(_) => {
             // A `()V` call comes back `Ok` even when the Java body threw: the
             // jni crate never inspects the pending exception on its void path,
@@ -625,6 +667,10 @@ fn server_thread_inner(
                 // The acceptor is a subsystem: a panic here stops scan-out
                 // allocation and is reported, but the app (and the serve loop
                 // on the main gndrm thread) stay alive.
+                // Reused across turns: the descriptor rows move, the heap
+                // objects do not (this loop runs whenever no client is served).
+                let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(6);
+                let mut retired: Vec<RawFd> = Vec::with_capacity(4);
                 let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     loop {
                         // The note eventfds are watched here too: a subscriber
@@ -634,8 +680,8 @@ fn server_thread_inner(
                         // Retired subscribers report while no connection is
                         // being served, so their descriptors are watched here
                         // beside the listener (see `gndrm_daemon::pushes`).
-                        let retired = gndrm_daemon::pushes::fds_except(-1);
-                        let mut pfds = Vec::with_capacity(4 + retired.len());
+                        gndrm_daemon::pushes::fds_except_into(&mut retired, -1);
+                        pfds.clear();
                         for fd in [
                             listener,
                             signal,

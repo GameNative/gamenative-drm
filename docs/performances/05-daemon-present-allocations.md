@@ -955,3 +955,36 @@ collect) — leaving it would be an `unused_imports` warning, which these diffs 
 string, so no `clippy::literal_string_with_formatting_args` churn. P6's new field is
 `pub(crate)` like its neighbours, and `PlaneState` is already in scope in the daemon `lib.rs`
 (`pub use objects::{… PlaneState …}`, `lib.rs:42`).
+
+---
+
+## 8. Landed: P3 and P4 (2026-11-10)
+
+Two of the six patches are in, both steady-state wins with no invariant risk:
+
+- **P3 (pollfd reuse)** — `pushes::fds_except` became `fds_except_into(&mut Vec,
+  except)`, and both loops that poll it (`asc.rs` scan-out channel, `lib.rs`
+  unserved-listener loop) now own their buffers outside the loop. Same rows, same
+  order, same `revents` semantics; only the heap object is reused.
+- **P4 (cached method id)** — `call_app_static` no longer pays a
+  `GetStaticMethodID` plus two `CString` builds per call. The cache holds
+  `JStaticMethodID`, which is `Copy + Send + Sync` in `jni` 0.21 (storing the raw
+  `jmethodID` does not compile: `*mut _jmethodID` is not `Send`), keyed by method
+  name and only ever used with the cached `CALLBACK_CLASS`, which is never
+  unloaded.
+
+Verified: `cargo check`/`clippy -D warnings` clean for `aarch64-linux-android`,
+`cargo test --workspace` 124 + 33 + 99 + 36 + 16 + 9 + 8 + 5 + 4 + 3 + 2 + 2
+passing, none failed.
+
+**Not landed, and why:**
+
+- **P6 (census built only when printable)** is a diagnostics-path change — the
+  build already sits inside `diag_on()`, so it only helps a build running with
+  `GNDRM_LOG_DAEMON` on. It rewrites a text-equality invariant for no steady-state
+  win; skip it unless the diagnostics overhead itself becomes the question.
+- **P1 (refcounted live-inode set)** and **P2 (decode out of the payload)** are
+  the two real steady-state items and are designed here but not written. P1
+  touches every mutation site of two object tables and its failure mode is
+  retiring a buffer a client still imports — it wants its own commit with the
+  `debug_assert` recount exercised by a device session, not a tail-end edit.

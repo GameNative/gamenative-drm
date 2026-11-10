@@ -310,11 +310,14 @@ on the gamescope route, so the shim declares what the guest asked for. Re-measur
   1.48 ratio is not a mailbox artefact.
 - **On the one truly controlled scene (the title screen) it is a small win:**
   CPU busy 27.3 % → 25.7 %, sys 14.9 % → 13.8 %, power 8.06 → 7.84 W, GPU identical.
-- **The in-game pair cannot attribute it:** the save now spawns in a different,
-  heavier room (+3.9 pts against X11 there), and that room has no old-APK
-  counterpart. One in-game A/B on the same room is still owed, and it needs no
-  rebuild: `dxvk.numBackBuffers = 4` makes the guest ask for 4, restoring the
-  depth under immediate so mode and depth can be separated.
+- **The in-game pair cannot attribute it:** the arm ran in a heavier area than
+  the §2 pair and has no old-APK counterpart. One in-game A/B on the same area is
+  still owed, and it needs no rebuild: `dxvk.numBackBuffers = 4` makes the guest
+  ask for 4, restoring the depth under immediate so mode and depth can be
+  separated. (The spawn point is stable enough to plan on — `tools/scene-fingerprint.py`
+  puts every in-game capture after the first within 2.2 of each other and only
+  that first load ~34 away, so the "different room on every load" impression was
+  wrong. Compare fingerprints before laying two arms against each other.)
 
 ### 5.3 The lever that is bigger than the whole plan
 
@@ -428,8 +431,8 @@ vsync locked the title to 121 fps. Two consequences:
 
 - **A title-screen uncapped arm is impossible under gamescope.** At the title the
   guest picks FIFO itself, so the container's cap setting cannot express
-  "uncapped" there. Uncapped numbers have to come from an in-game scene, which is
-  exactly where the room spawns vary.
+  "uncapped" there. Uncapped numbers have to come from an in-game scene, which
+  needs the scene fingerprint to keep the comparison honest.
 - **At an identical 121 fps, letting the guest do the vsync costs 9 more points of
   CPU than our limiter does** (25.1 % vs 16.1 %) — and costs nothing in watts
   (4.32 vs 4.53 W, inside noise). So in this regime the extra CPU is free, and

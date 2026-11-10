@@ -70,15 +70,20 @@ pub fn forget(fd: RawFd) -> bool {
 /// The registered descriptors, minus `except`: what a loop serving one
 /// connection should keep reading for the others (a retired subscriber still
 /// reports what it produces — see [`crate::pushes`]).
-#[must_use]
-pub fn fds_except(except: RawFd) -> Vec<RawFd> {
-    SINKS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .map(|s| s.fd)
-        .filter(|fd| *fd != except)
-        .collect()
+///
+/// `out` is the caller's buffer, cleared and refilled: the scan-out loop polls
+/// once per frame and once per completion, so its descriptor list must not be a
+/// fresh heap object every turn.
+pub fn fds_except_into(out: &mut Vec<RawFd>, except: RawFd) {
+    out.clear();
+    out.extend(
+        SINKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|s| s.fd)
+            .filter(|fd| *fd != except),
+    );
 }
 
 /// Whether any registered sink asked for pushes of `cap`'s kind. This is what

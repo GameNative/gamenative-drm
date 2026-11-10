@@ -2543,6 +2543,10 @@ pub fn serve_scanout(
     PRESENT_FD.store(present_fd, Ordering::Relaxed);
     PRESENT_AWARE.store(false, Ordering::Relaxed);
     let _present_channel = PresentChannel(present_fd);
+    // Reused across turns: `poll` is rebuilt every turn (the descriptor set
+    // moves), but the two vectors holding it are allocated once per channel.
+    let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(8);
+    let mut retired: Vec<RawFd> = Vec::with_capacity(4);
     loop {
         // The channel is idle until a request arrives. Its state is what tells
         // a shim-side timeout apart from a request the daemon never read: if
@@ -2558,11 +2562,11 @@ pub fn serve_scanout(
         // Retired subscribers keep reporting (see `pushes`), and this loop is
         // where the daemon spends its time: their descriptors are polled beside
         // the served one, and their frames read in the drain below.
-        let retired = gndrm_daemon::pushes::fds_except(fd);
+        gndrm_daemon::pushes::fds_except_into(&mut retired, fd);
         // Slots 0..6 keep their meaning whatever the descriptors are: a `-1`
         // eventfd stays in its row (poll ignores it) rather than shifting the
         // indices the branches below read.
-        let mut pfds = Vec::with_capacity(6 + retired.len());
+        pfds.clear();
         for fd in [fd, listener, stop, cap_fd, vsync_fd, present_fd] {
             pfds.push(libc::pollfd {
                 fd,

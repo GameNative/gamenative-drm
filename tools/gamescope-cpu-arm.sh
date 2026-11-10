@@ -30,6 +30,35 @@ mkdir -p "$W"
 sh_() { "$ADB" shell "$@"; }
 say() { printf '\n== %s\n' "$*"; }
 
+# cpuss temperature, the die the workloads actually saturate.
+cpuss() {
+  sh_ 'for z in /sys/class/thermal/thermal_zone*; do
+         [ "$(cat $z/type 2>/dev/null)" = "cpuss-0-0" ] && cat $z/temp; done' | tr -d '\r'
+}
+
+# Wait until the die has stopped heating before opening the window. Two arms run
+# back to back start from different temperatures, and leakage rises with heat, so
+# an ungated window silently compares "gamescope" with "whatever ran second".
+# Plateau = the sampled temperature moved less than PLATEAU_DC (tenths of a
+# degree) across PLATEAU_S. Gives up after PLATEAU_MAX_S and says so.
+wait_plateau() {
+  local prev cur waited=0 step=15
+  prev=$(cpuss); sleep "$step"; waited=$((waited + step))
+  while [ "$waited" -lt "${PLATEAU_MAX_S:-240}" ]; do
+    cur=$(cpuss)
+    if [ -n "$prev" ] && [ -n "$cur" ]; then
+      local d=$(( cur > prev ? cur - prev : prev - cur ))
+      if [ "$d" -le "${PLATEAU_DC:-20}" ]; then
+        echo "thermal plateau at $(( cur / 1000 )) C (moved $(( d / 10 )) C in ${step}s)"
+        return 0
+      fi
+    fi
+    prev=$cur; sleep "$step"; waited=$((waited + step))
+  done
+  echo "WARNING: no thermal plateau within ${PLATEAU_MAX_S:-240}s (last $(( ${cur:-0} / 1000 )) C)"
+  return 1
+}
+
 say "device"
 "$ADB" get-state >/dev/null || { echo "FATAL: no device"; exit 1; }
 if sh_ "run-as $PKG true" >/dev/null 2>&1; then MODE=run-as
@@ -123,9 +152,18 @@ LOGPID=$!
 sleep 2
 sh_ "am start -n $PKG/.MainActivity -a app.gamenative.LAUNCH_GAME --ei app_id $GID --es game_source $SRC" \
   || { kill $LOGPID; echo "FATAL: launch intent failed"; exit 5; }
-sleep $(( SETTLE + WINDOW ))
+# Thermal gate before the window, not after: `SETTLE` alone lets a back-to-back
+# arm open its window on a die that is still heating.
+wait_plateau || true
+# The scene is whatever the save spawned into; record what it actually was so two
+# arms can be matched (or refused) instead of assumed comparable.
+"$ADB" exec-out screencap -p > "$W/scene.png" 2>/dev/null || true
+sleep "$WINDOW"
 kill $LOGPID 2>/dev/null || true; wait $LOGPID 2>/dev/null || true
 echo "captured $(wc -l < "$W/cap.txt") lines"
+if [ -s "$W/scene.png" ]; then
+  python3 "$here/scene-fingerprint.py" "$W/scene.png" | sed 's/^/scene: /'
+fi
 
 # ---- 4. stop the session and restore the container ----------------------
 say "restoring"
