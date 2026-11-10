@@ -1,0 +1,11 @@
+# on battery, title screen, adb over wireless, 120 s per arm
+
+arm        fps  cpu%  sys%  gpu%  power_W   se   cpuss_C
+x11_unc     358  25.5  14.1  37.9     7.38  0.16   64.2
+x11_cap     120  17.8   7.8  26.1     4.38  0.11   52.0
+gs_cap      121  16.1   6.5  26.6     4.53  0.18   51.5
+gs_unc3     121  25.1  12.5  26.6     4.32  0.14   52.4
+
+capped GS-X11: +0.15 W +/- 0.21 (0.7 sigma), cpu -1.7 pts
+cap saves 3.00 W on X11 (7.38 -> 4.38)
+note: usb power-supply node reads 0.26 W while offline; sampler zeros it

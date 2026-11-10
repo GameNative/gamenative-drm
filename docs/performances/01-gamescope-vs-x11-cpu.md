@@ -382,7 +382,8 @@ gamescope). So CPU is not a usable proxy for the display path's energy cost: the
 extra watt is being spent outside the CPU — most plausibly the per-frame composite
 dispatch and the higher SurfaceFlinger activity (12.9 → 18.1) keeping the display
 pipeline and more cores resident. **Any further work on this should be judged on
-package power, not cpu%.**
+package power, not cpu%.** §5.5 then shows that on battery the watt difference
+itself vanishes, so the surviving claim is CPU: gamescope is cheaper at the cap.
 
 The capped configuration was then censused (`02-instrumentation.md` §13), which
 answers the one open item: **the 3-deep pool costs nothing at the cap.** At 120 fps
@@ -392,6 +393,47 @@ being parked by the limiter, not contended. `dxvk.numBackBuffers = 4` has nothin
 to win. The same census shows the atomic rate is exactly **2.0 per present** at
 the cap and 0.71 uncapped, so "242/s" was two different constraints coinciding,
 not a fixed cadence.
+
+### 5.5 On battery: the 1 W gap does not reproduce
+
+Everything above measured power as `usb_in − battery_net`, an inference that
+folds in charger taper and phantom readings on the USB node — that node reports
+**3000 µA at 86000 µV (0.26 W) while offline**, which on battery inflates every
+reading unless it is zeroed. On battery `battery current × voltage` *is* system
+power, so the arms were repeated there, adb over wireless, same title screen
+(the only scene that is byte-identical every load), 120 s each, adjacent.
+
+| arm | fps | CPU busy | CPU sys | GPU | **package power** | cpuss |
+|---|---|---|---|---|---|---|
+| X11 uncapped | 358 | 25.5 % | 14.1 % | 37.9 % | **7.38 W** ±0.16 | 64.2 °C |
+| X11 capped | 120 | 17.8 % | 7.8 % | 26.1 % | **4.38 W** ±0.11 | 52.0 °C |
+| gamescope capped | 121 | **16.1 %** | 6.5 % | 26.6 % | **4.53 W** ±0.18 | 51.5 °C |
+| gamescope, cap off | 121 | 25.1 % | 12.5 % | 26.6 % | 4.32 W ±0.14 | 52.4 °C |
+
+**The 1 W was an artefact of the charger measurement.** At the cap, gamescope is
+**+0.15 W ± 0.21 (0.7 σ)** — no measurable difference — while still being 1.7
+points cheaper on CPU. The +0.99 W seen on the charger is not reproducible on
+battery, and the phantom 0.26 W on the offline USB node is the right order of
+magnitude to have produced it.
+
+**The cap is worth 3.0 W on the same path** (X11 7.38 → 4.38 W), which remains the
+dominant lever by a wide margin.
+
+### 5.6 The guest, not the container, decides the title screen's rate
+
+The fourth arm was meant to be gamescope uncapped, and it would not run: with
+`fpsLimiterEnabled` verified **false** in the container, the guest still asked for
+`fifo` (`present mode: declared=fifo requested=fifo source=guest`) and DXVK's own
+vsync locked the title to 121 fps. Two consequences:
+
+- **A title-screen uncapped arm is impossible under gamescope.** At the title the
+  guest picks FIFO itself, so the container's cap setting cannot express
+  "uncapped" there. Uncapped numbers have to come from an in-game scene, which is
+  exactly where the room spawns vary.
+- **At an identical 121 fps, letting the guest do the vsync costs 9 more points of
+  CPU than our limiter does** (25.1 % vs 16.1 %) — and costs nothing in watts
+  (4.32 vs 4.53 W, inside noise). So in this regime the extra CPU is free, and
+  the app's limiter is the cheaper way to hold the rate, not the dearer one.
 
 ### Where that leaves the work
 
