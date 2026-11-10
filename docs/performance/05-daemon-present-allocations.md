@@ -1010,7 +1010,47 @@ helps a build running with `GNDRM_LOG_DAEMON` on. It rewrites a text-equality
 invariant for no steady-state win; skip it unless the diagnostics overhead itself
 becomes the question.
 
-**Still owed for P1:** a device session on the shipping build. The recount proves
-the accounting is consistent across every path the tests drive, but a real
-session's churn (handle open/close per buffer, FB add/remove per frame) is the
-environment that would expose a site the tests do not reach.
+**P1 got its device session** on the shipped build: two arms under gamescope with
+the real churn of a running guest (handle open/close per buffer, FB add/remove per
+frame) for about ten minutes, no panic and no recount failure, `publishes ==
+vsyncs` with `late=0` throughout. That session sat at the title screen — injected
+clicks do not reach the guest on this build, which is unrelated to the daemon and
+is recorded in §9's companion note in the skill — so an in-game scene is still
+unexercised. The accounting is proven consistent; it is not yet proven under
+in-game buffer churn.
+
+## 9. What the four patches are worth, counted
+
+Opinions about allocations in hot paths are cheap, so the commit path now has an
+instrument that counts instead of estimating:
+`modules/gndrm-daemon/tests/present_alloc_bench.rs` drives the real
+`Device::dispatch` with a linearized ATOMIC flip request (ten plane properties,
+alternating between two imported framebuffers, 4 000 flips after a 64-flip warm
+up) behind a counting global allocator. Allocation counts are deterministic, so
+one run is the number; the timing column was repeated three times and is quoted
+as the minimum, because that is all the evidence supports.
+
+| revision | allocs/flip | bytes/flip | ns/flip (min of 3) |
+|---|---|---|---|
+| `53a0aa5` — before all four | 6.04 | 915 | 1770 |
+| `43268c5` — +P3/P4 | 6.04 | 915 | 1734 |
+| `e4634a7` — +P1/P2 | **1.04** | **695** | 1831 |
+
+**Six allocations per commit become one — −83 %, and −220 bytes.** The five that
+go are exactly what §2 named: the four scratch arrays in `parse_atomic` and the
+`HashSet` the presenter collected from both object tables every frame. The one
+that remains is the `sets` array the design deliberately kept.
+
+**The time is not claimable.** Minimums are 1770 / 1734 / 1831 ns and the medians
+2448 / 2498 / 1860 — the spread between repeats of one build is larger than the
+spread between builds, which is what "under the noise floor" should have meant
+before it was measured. At the 242 commits/s the daemon actually serves on this
+device, the whole commit path is about 0.5 ms of CPU per second, so no device
+arm could resolve a change in it either. Report the allocation count; do not
+report a frame-rate or CPU% win for these patches.
+
+**P3 and P4 are not covered by this instrument**, and the flat P3/P4 row is not
+evidence against them: the `pollfd` hoist lives in the event-loop poll and the
+method-id cache in the JNI publish path, and the commit dispatch enters neither.
+Their justification stays the code argument in §3 and §4 — no per-frame `Vec`
+and no per-frame `GetStaticMethodID` — rather than a bench.
