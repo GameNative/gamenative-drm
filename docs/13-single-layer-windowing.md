@@ -62,9 +62,15 @@ Step by step, with the override's exact insertion point.
 4. **The override is created.** The shim opens **its own wayland connection** to
    gamescope's wayland socket (`wl_setup`), creates **its own `wl_surface`**
    (`wlproto::compositor_create_surface`), wraps it in a `gamescope_swapchain`
-   (`swapchain_factory_create_swapchain`), and binds that surface to the X
-   window: `swapchain_override_window_content(scobj, server=0, bound_window)` —
-   `gamescope_swapchain.override_window_content`.
+   (`swapchain_factory_create_swapchain`). The binding to the X window waits
+   for a swapchain's first commit (`bind_window_at_first_commit`):
+   `swapchain_override_window_content(scobj, server=0, bound_window)` —
+   `gamescope_swapchain.override_window_content`, sent right before that
+   commit. gamescope keeps one surface per window and a new binding retires the
+   old one, so a swapchain that never presents (the Epic overlay creates one on
+   a child of the game's window only to find `Present`) never takes the window
+   from the game. `vkDestroySurfaceKHR` sends `gamescope_swapchain.destroy` and
+   `wl_surface.destroy`, which drop the binding on the compositor side.
 5. **gamescope accepts it.** `gamescope_xwayland_server_t::handle_override_window_content`
    (`src/wlserver.cpp:836`) resolves the named XID the same way —
    `x11_window = x11_find_toplevel_for_xid( this->ctx->dpy, x11_window )` —

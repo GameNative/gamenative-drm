@@ -764,6 +764,7 @@ unsafe fn commit_generated(sc: *mut GnSwapchain, slot_index: usize) {
     let parent = unsafe { (*(*sc).surf).parent };
     let _sg = SEND_LOCK.lock().unwrap();
     unsafe {
+        bind_window_at_first_commit(sc);
         wlproto::surface_attach(parent, (*s).buf, 0, 0);
         wlproto::surface_damage_buffer(
             parent,
@@ -2004,6 +2005,27 @@ fn worker_main(sc: *mut GnSwapchain) {
     }
 }
 
+/// Binds the swapchain's override surface to its X window, once per swapchain,
+/// right before its first commit. gamescope keeps one surface per window, so a
+/// swapchain that never presents (the Epic overlay's Present probe on a child
+/// of the game's window) must not take the window from the one that does.
+/// Called with `SEND_LOCK` held.
+unsafe fn bind_window_at_first_commit(sc: *mut GnSwapchain) {
+    unsafe {
+        let surf = (*sc).surf;
+        if (*sc).window_bound || (*surf).swapchain_obj.is_null() {
+            return;
+        }
+        (*sc).window_bound = true;
+        // Single xwayland server (--xwayland-count 1) is always id 0.
+        wlproto::swapchain_override_window_content((*surf).swapchain_obj, 0, (*surf).window);
+        crate::logf!(gndrm_obf::obf!(
+            "override: swapchain {sc:?} binds surface {surf:?} to XID {:#x} at its first commit",
+            (*surf).window
+        ));
+    }
+}
+
 /// Commit a guest frame: into its X11 window on that route, otherwise attached
 /// to the surface and committed. The slot's own fence has already been waited.
 unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
@@ -2139,6 +2161,7 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
                     gamescope_present_mode(declared_present_mode(sc)),
                 );
             }
+            bind_window_at_first_commit(sc);
             wlproto::surface_attach(parent, (*s).buf, 0, 0);
             wlproto::surface_damage_buffer(
                 parent,
@@ -2364,6 +2387,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         cv_put: Condvar::new(),
         cv_free: Condvar::new(),
         x11_trace: 0,
+        window_bound: false,
         next: ptr::null_mut(),
     });
     let scp: *mut GnSwapchain = &mut *sc;
@@ -3055,6 +3079,7 @@ unsafe fn present_sync_commit(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32)
                         gamescope_present_mode(declared_present_mode(sc)),
                     );
                 }
+                bind_window_at_first_commit(sc);
                 wlproto::surface_attach(parent, (*slot).buf, 0, 0);
                 wlproto::surface_damage_buffer(
                     parent,
@@ -7724,6 +7749,8 @@ pub struct GnSwapchain {
     pub cv_put: Condvar,
     pub cv_free: Condvar,
     pub x11_trace: u32,
+    /// Set by `bind_window_at_first_commit`, under `SEND_LOCK`.
+    pub window_bound: bool,
     pub next: *mut GnSwapchain,
     /// Set once a destination could not be made: the set stops growing.
     pub gen_no_grow: bool,
@@ -9667,10 +9694,10 @@ fn use_guest_surface() -> bool {
 
 /// The override/Wayland present route — the DEFAULT (`GN_VKSHIM_GUEST_SURFACE`
 /// unset, or any value other than exactly `1`; see `use_guest_surface`).
-/// Creates the shim's OWN wl_surface, wraps it in a
-/// gamescope_swapchain, and binds it to the guest's X window via
-/// override_window_content; the compositor then routes this surface's commits
-/// as that window's content. Presenting therefore shows the guest's frames
+/// Creates the shim's OWN wl_surface and wraps it in a
+/// gamescope_swapchain; a swapchain's first commit binds it to the guest's X
+/// window via override_window_content (`bind_window_at_first_commit`), and the
+/// compositor then routes this surface's commits as that window's content. Presenting therefore shows the guest's frames
 /// directly — wine's own GDI/2D window content is NOT composited (the known
 /// and accepted "chooses, never combines" consequence of this route). That
 /// GDI/2D gap is exactly what the guest-surface route (the opt-in) buys.
@@ -9720,9 +9747,6 @@ unsafe fn xlib_override_surface(
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         let scobj = wlproto::swapchain_factory_create_swapchain(factory, surf);
-        // Single xwayland server (--xwayland-count 1) is always id 0. Bind to
-        // the window gamescope paints, not the one wine happened to name.
-        wlproto::swapchain_override_window_content(scobj, 0, bound_window);
         wlproto::wl_display_flush(dpy);
         drop(_sg);
         let s = Box::new(GnSurface {
@@ -9745,7 +9769,7 @@ unsafe fn xlib_override_surface(
         }
         *out = s as usize as VkSurfaceKHR;
         crate::logf!(gndrm_obf::obf!(
-            "override: proxy surface {:?} (own wl_surface {:?} bound to XID {:#x}; Vulkan-only, guest GDI/2D not composited)",
+            "override: proxy surface {:?} (own wl_surface {:?} for XID {:#x}, bound at its first present; Vulkan-only, guest GDI/2D not composited)",
             s,
             surf,
             window
@@ -9903,10 +9927,10 @@ unsafe extern "C" fn gn_vkDestroySurfaceKHR(
         if !(*s).swapchain_obj.is_null() || !(*s).own_surface.is_null() {
             let _sg = SEND_LOCK.lock().unwrap();
             if !(*s).swapchain_obj.is_null() {
-                wlproto::wl_proxy_destroy((*s).swapchain_obj);
+                wlproto::swapchain_destroy((*s).swapchain_obj);
             }
             if !(*s).own_surface.is_null() {
-                wlproto::wl_proxy_destroy((*s).own_surface);
+                wlproto::surface_destroy((*s).own_surface);
             }
             wlproto::wl_display_flush((*s).dpy);
             drop(_sg);
