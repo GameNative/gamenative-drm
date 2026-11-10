@@ -1598,17 +1598,20 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeDisplayIn
     .unwrap_or(std::ptr::null_mut())
 }
 
-/// `GameNativeDrm.nativePointerAbsolute(x, y)`.
+/// `GameNativeDrm.nativePointerAbsolute(x, y, width, height)` — (x, y) on a
+/// width x height extent that covers the output.
 #[no_mangle]
 pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativePointerAbsolute(
     _env: JNIEnv,
     _class: JClass,
     x: jint,
     y: jint,
+    width: jint,
+    height: jint,
 ) {
     // Input handlers are a subsystem too: a poisoned injector lock must not
     // abort the app (see injector.rs), and anything else is contained here.
-    if let Err(e) = std::panic::catch_unwind(|| injector::pointer_absolute(x, y)) {
+    if let Err(e) = std::panic::catch_unwind(|| injector::pointer_absolute(x, y, width, height)) {
         report_panic("gndrm-input", e.as_ref());
     }
 }

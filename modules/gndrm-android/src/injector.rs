@@ -116,7 +116,8 @@ const XKB_KEYMAP_FORMAT_TEXT_V1: u32 = 1;
 
 /// Input events posted from JNI (any thread) into the injector thread.
 enum InputEvent {
-    PointerAbsolute(i32, i32),
+    /// (x, y) on a width x height extent that covers the output.
+    PointerAbsolute(i32, i32, i32, i32),
     PointerMotion(i32, i32),
     PointerButton(i32, bool),
     PointerAxis(i32, f32),
@@ -262,8 +263,8 @@ fn post(ev: InputEvent) {
     }
 }
 
-pub fn pointer_absolute(x: i32, y: i32) {
-    post(InputEvent::PointerAbsolute(x, y));
+pub fn pointer_absolute(x: i32, y: i32, width: i32, height: i32) {
+    post(InputEvent::PointerAbsolute(x, y, width, height));
 }
 pub fn pointer_motion(dx: i32, dy: i32) {
     post(InputEvent::PointerMotion(dx, dy));
@@ -742,11 +743,20 @@ fn connect_and_run(
 fn apply(state: &State, ev: InputEvent) {
     let t = now_ms();
     match ev {
-        InputEvent::PointerAbsolute(x, y) => {
+        InputEvent::PointerAbsolute(x, y, width, height) => {
             if let Some(p) = &state.pointer {
-                // Extent = the gamescope output size; coordinates arrive in
-                // the same space (the view the user touches IS the output).
-                p.motion_absolute(t, x as u32, y as u32, 0, 0);
+                // The compositor maps (x, y) / (width, height) onto the
+                // output; wlroots drops a motion_absolute with a 0 extent.
+                if width <= 0 || height <= 0 {
+                    return;
+                }
+                p.motion_absolute(
+                    t,
+                    x.max(0) as u32,
+                    y.max(0) as u32,
+                    width as u32,
+                    height as u32,
+                );
                 p.frame();
             }
         }

@@ -340,7 +340,8 @@ in the app's `jniLibs/arm64-v8a/` and is loaded via
 - session inputs, before `nativeStart`: `nativeSetPanelRefreshHz(hz)` (the mode's
   rate) and `nativeSetScanoutGeometry(w, h)` (the mode's size — the app's
   Upscaling Resolution; `0, 0` clears it).
-- injector calls: `nativePointerAbsolute(x, y)`, `nativePointerMotion(dx, dy)`,
+- injector calls: `nativePointerAbsolute(x, y, width, height)` ((x, y) on a
+  width x height extent that covers the output), `nativePointerMotion(dx, dy)`,
   `nativePointerButton(btn, pressed)`, `nativePointerAxis(axis, value)`,
   `nativeKey(evdevCode, pressed)`.
 
