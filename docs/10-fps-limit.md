@@ -120,7 +120,7 @@ divisor cap reads its target exactly.
   | mailbox (default) | none, guest asked for FIFO (in-game VSync on) | fifo (`source=guest`) | the display (FIFO) |
   | mailbox (default) | none, guest asked for mailbox or immediate | mailbox | nobody |
   | mailbox | at the display's rate, guest asked for FIFO (in-game VSync on) | mailbox (`source=cap-rate-vsync`) | the shim's acquire gate, every vblank; the present wait is answered when the guest queues the present |
-  | mailbox | at the display's rate, guest asked for mailbox or immediate | fifo (`source=cap-rate`) | gamescope's limiter (divisor 1), one FIFO commit per vblank; no gate, as on master |
+  | mailbox | at the display's rate, guest asked for mailbox or immediate | mailbox (`source=cap-rate`) | the shim's acquire gate, every vblank |
   | mailbox | below the display's rate | mailbox | the shim's acquire gate, on the display's vblank grid |
   | fifo | none | fifo | the display (FIFO) |
   | fifo | set | fifo | gamescope's divisor limiter |
@@ -148,12 +148,20 @@ divisor cap reads its target exactly.
   `fifo_relaxed` included, is rejected as Mesa rejects it, the guest's own mode is
   used, and the shim logs `Invalid MESA_VK_WSI_PRESENT_MODE value!` whether or not
   `GNDRM_LOG_VKSHIM` is set, so a typo shows in a shipped session. It is
-  overridden in one case: a non-FIFO value under a cap at the display's rate is
-  declared FIFO (`source=cap-rate`, below). Mesa reads the same variable, so it
-  also sets the mode a zink guest's own swapchain asks for below the shim.
+  overridden in one case: a non-FIFO value under a cap is declared FIFO until the
+  daemon's stamp lead is known (`source=cap-compat`, below). Mesa reads the same
+  variable, so it also sets the mode a zink guest's own swapchain asks for below the shim.
 
-  **Why mailbox is not declared at the display's rate.** At that cap the panel
-  shows one frame per vblank under either mode, and under mailbox the shim has to
+  **Mailbox at the display's rate, and what it costs.** At that cap the panel
+  shows one frame per vblank under either mode. A self-paced guest was declared
+  FIFO here with no gate, on the assumption that gamescope's FIFO holds it; it
+  does not hold a guest faster than the panel. Retroid Pocket 6, Portal 2 main
+  menu, in-game VSync off, cap 60 on a 60 Hz panel: per 10 s ~1150 acquires,
+  commits and releases against the daemon's 600 publishes, 112-120 fps. Declared
+  the container's mailbox with the gate every vblank (`source=cap-rate`), the
+  same scene runs 600 acquires, commits, releases and `gate_holds` per 10 s,
+  597-600 publishes, 60.0 fps, 59.98 presents/s on `SurfaceFlinger` and no
+  doubled interval in 125. Under mailbox the shim has to
   keep two commits out of one gamescope composite. It cannot see when gamescope
   latches: gamescope takes commits at its wakeup, the target vblank minus its
   rolling draw time and red zone (`vblankmanager.cpp` 142-199), and that draw time
@@ -165,11 +173,10 @@ divisor cap reads its target exactly.
   VSync off, a guest pacing itself at ~59.3 fps on a 59.98 Hz panel): mailbox with
   the gate gave 58.3 fps on `SurfaceFlinger` with ~1 commit a second replaced in
   gamescope's mailbox; a one-commit-per-window queue in the shim at a guessed
-  2.5 ms boundary gave 59.0 with ~0.8 a second still replaced; FIFO on master
-  gives 59.22 on the same scene. Under FIFO gamescope latches one commit per
-  vblank at its own wakeup (`steamcompmgr.cpp` 8028-8049) and its limiter's
-  divisor at this cap is 1, which is master's behaviour in this cell. That holds
-  for a guest that asked for mailbox or immediate, which paces itself. A guest
+  2.5 ms boundary gave 59.0 with ~0.8 a second still replaced; FIFO gave 59.22
+  on the same scene. That cost, ~1 doubled frame a second for a guest that paces
+  itself just below the display's rate, is what mailbox pays here; a guest
+  faster than the cap is held on the grid by the gate and does not pay it. A guest
   that asked for FIFO (in-game VSync on) waits on each frame's presentation
   before starting the next; declared FIFO, that wait is gamescope's `presented`
   at its latch, so the whole frame has to fit between two latches, and with
@@ -185,11 +192,10 @@ divisor cap reads its target exactly.
   case answered at queue; every other mailbox or immediate presentation is
   answered at the commit, as on master. A container set to
   `MESA_VK_WSI_PRESENT_MODE=fifo` never reaches it, so setting a game's
-  container to fifo restores master's behaviour for that game. The
-  vblank-grid gate is not kept on top of it: FIFO's back-pressure already holds
-  the guest, and the two stacked turned a guest whose acquire-to-commit grew
-  past a period into a 40 fps session on a 60 Hz panel (DTD on a 1280x960
-  device after a live 120 to 60 Hz switch: `gate_holds` 0, `gate_late` 400 and
+  container to fifo restores master's behaviour for that game. FIFO with the
+  vblank-grid gate stacked on it is worse than either: the two turned a guest
+  whose acquire-to-commit grew past a period into a 40 fps session on a 60 Hz
+  panel (DTD on a 1280x960 device after a live 120 to 60 Hz switch: `gate_holds` 0, `gate_late` 400 and
   `skipped` 200 per 10 s, commit latency 24 ms, 400/600 publishes). Below the
   display's rate the gate's releases
   are at least two vblanks apart and two frames in one composite are rare, so
@@ -227,10 +233,10 @@ divisor cap reads its target exactly.
   whenever the declared mode, its source, the cap or the gate changes:
   `present mode: declared=… requested=… source=env|guest|cap-rate|cap-compat
   route=gamescope cap=… gate=vsync|clock|off lsfg=…` (`source=guest`: the guest's
-  own mode, no env or a FIFO request with no cap; `source=cap-rate`: declared FIFO
-  because the cap is the display's rate and the guest paces itself, with
-  `gate=off`; `source=cap-rate-vsync`: the container's mode with `gate=vsync`
-  because the cap is the display's rate and the guest asked for FIFO; `source=cap-compat`:
+  own mode, no env or a FIFO request with no cap; `source=cap-rate`: the
+  container's mode with `gate=vsync` because the cap is the display's rate and the
+  guest paces itself; `source=cap-rate-vsync`: the same because the cap is the
+  display's rate and the guest asked for FIFO; `source=cap-compat`:
   declared FIFO for want of the stamp lead, with `gate=off`; `gate=clock` is frame
   generation's source rate or a cap above the display's rate). With
   `GNDRM_LOG_VKSHIM=1` the same line repeats every 10 s with the counters a device
