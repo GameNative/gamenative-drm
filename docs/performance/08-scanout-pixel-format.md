@@ -20,7 +20,7 @@ Three findings drive that, in order of weight:
    (`docs/01-gamescope-vs-x11-cpu.md:39-44`: cpu_sys +1.6 pts, cpu_user −0.5 pts,
    gpubusy +0.7 pts at −1.6 % fps). Bandwidth does not produce sys time; it produces GPU
    idle time. The only mechanism that turns a bandwidth stall into CPU in this stack is
-   cause **B**'s spin-based `vkWaitForPresentKHR` (`docs/performances/01:156-163`). Fix B and item 7's
+   cause **B**'s spin-based `vkWaitForPresentKHR` (`docs/performance/01:156-163`). Fix B and item 7's
    CPU contribution goes to approximately zero by construction. Item 7 is correctly
    ranked last and should stay gated behind items 2–4.
 2. **The daemon cannot scan out UBWC today and the reason is one usage bit that is there
@@ -313,9 +313,9 @@ Turnip has a debug switch that disables UBWC for **every image it creates**:
 - `mesa src/freedreno/vulkan/tu_image.cc:738-740` — `if (TU_DEBUG(NOUBWC)) image->ubwc_enabled = false;`
 
 So: run **Hades II in the in-app X11 arm** (where DXVK really does get UBWC render targets —
-`docs/performances/01:171-176`) with and without `TU_DEBUG=noubwc` in the container's env vars, same save,
+`docs/performance/01:171-176`) with and without `TU_DEBUG=noubwc` in the container's env vars, same save,
 same 210 s window, uncapped at 1280x720, and compare fps / gpubusy / cpu_sys. Container env
-reaches the guest (`docs/performances/01:130-133`), so this is **zero code, no rebuild, two sessions**.
+reaches the guest (`docs/performance/01:130-133`), so this is **zero code, no rebuild, two sessions**.
 
 That number is the *entire* value of UBWC on this workload on this GPU. It is an upper bound
 on item 7, because item 7 also has to pay for the extra passes the gamescope path adds.
@@ -326,18 +326,18 @@ bound, and an upper bound that fails to move fps closes the item.
 
 ### 4.2 The supporting measurement, in the existing harness
 
-`docs/performances/01`'s own falsifier for cause D is "GPU-side counters per arm at equal fps". Be honest
+`docs/performance/01`'s own falsifier for cause D is "GPU-side counters per arm at equal fps". Be honest
 about what that can be on this device without root:
 
 | counter | available to a non-privileged app | site |
 |---|---|---|
-| `gpubusy`, `devfreq/cur_freq` | yes | already sampled at 1 Hz (`docs/performances/01:21`) |
-| package power (USB − battery) | yes | already sampled (`docs/performances/01:22-28`) |
+| `gpubusy`, `devfreq/cur_freq` | yes | already sampled at 1 Hz (`docs/performance/01:21`) |
+| package power (USB − battery) | yes | already sampled (`docs/performance/01:22-28`) |
 | Adreno performance counters (SP/TP/DRAM busy) | **no** — `/sys/kernel/debug/kgsl` needs root; there is no non-root DRAM-throughput node on this platform | — |
 | HWC/SF-side frame stats | yes, but they describe composition, not guest bandwidth | `dumpsys SurfaceFlinger` |
 
 So "a GPU-counter read per arm" reduces to gpubusy + clock + power, which is what §2 of
-`docs/performances/01` already reports: **gpubusy 83.8 % → 84.5 %, clock 760 → 759 MHz, power +2.1 %.**
+`docs/performance/01` already reports: **gpubusy 83.8 % → 84.5 %, clock 760 → 759 MHz, power +2.1 %.**
 If linear scan-out cost real bandwidth on a bandwidth-limited GPU, the gamescope arm would
 show a *higher* busy fraction and a *lower* clock at 1.6 % fewer fps. It shows +0.7 pts and
 −1 MHz. That is the measurement, already taken.
@@ -404,7 +404,7 @@ measures.
    that both halves of a shipped pair must agree on, the presenter's foreign-copy fallback,
    gamescope's A51 block, and libliftoff's willingness to place the plane.
 
-The ranking in `docs/performances/01:243-247` is right, and it is right for a reason the document states
+The ranking in `docs/performance/01:243-247` is right, and it is right for a reason the document states
 but does not lean on: **the delta is sys time, and sys time is causes A/B/C.** Until B is
 fixed there is no mechanism by which item 7's bandwidth term can reach the CPU counter at
 all; after B is fixed the term has nowhere to go but fps, where it is bounded by the number
