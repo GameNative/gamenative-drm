@@ -600,18 +600,33 @@ unsafe fn named_identity(
     (pid, cls, cls_len)
 }
 
+/// The window the content override must bind to, and how the answer was found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverrideTarget {
+    /// The root-child window gamescope will paint.
+    pub window: u32,
+    /// True when the named window's ancestor was degenerate, so the answer came
+    /// from the fallback rule (pid, class, input focus, `_NET_ACTIVE_WINDOW`).
+    /// That rule reads the tree as it is at this instant, so its answer is a
+    /// guess about the window the guest will render into — worth re-asking once
+    /// the guest has committed a frame. A legitimate ancestor is not a guess and
+    /// is never re-resolved.
+    pub provisional: bool,
+}
+
 /// The window the content override must bind to (see the section comment).
 ///
 /// Opens its own X connection; returns `named` unchanged when it cannot
 /// connect, so a failed resolve degrades to the previous behaviour rather than
 /// binding nothing.
-pub unsafe fn resolve_override_target(named: u32) -> u32 {
+pub unsafe fn resolve_override_target(named: u32) -> OverrideTarget {
+    let unresolved = OverrideTarget { window: named, provisional: false };
     let conn = unsafe { xcb_connect(ptr::null(), ptr::null_mut()) };
     if conn.is_null() || unsafe { xcb_connection_has_error(conn) } != 0 {
         if !conn.is_null() {
             unsafe { xcb_disconnect(conn) };
         }
-        return named;
+        return unresolved;
     }
     let target = unsafe { resolve_override_target_on(conn, named) };
     unsafe { xcb_disconnect(conn) };
@@ -656,9 +671,9 @@ pub unsafe fn window_extent(window: u32) -> Option<(u32, u32)> {
 ///     focus / `_NET_ACTIVE_WINDOW` are accepted as that window when no
 ///     pid/class match is found; otherwise the largest match wins.
 ///  4. No candidate -> return the ancestor (the caller logs the empty set).
-unsafe fn resolve_override_target_on(conn: *mut xcb_connection_t, named: u32) -> u32 {
+unsafe fn resolve_override_target_on(conn: *mut xcb_connection_t, named: u32) -> OverrideTarget {
     let Some(resolved) = (unsafe { resolve_target(conn, named) }) else {
-        return named;
+        return OverrideTarget { window: named, provisional: false };
     };
     let ancestor = resolved.window;
     let (aw, ah) = unsafe { window_size(conn, ancestor) };
@@ -666,7 +681,7 @@ unsafe fn resolve_override_target_on(conn: *mut xcb_connection_t, named: u32) ->
         crate::logf!(gndrm_obf::obf!(
             "override target: named=0x{named:x} ancestor=0x{ancestor:x} {aw}x{ah} -> 0x{ancestor:x} (legitimate; unchanged)"
         ));
-        return ancestor;
+        return OverrideTarget { window: ancestor, provisional: false };
     }
 
     let pid_atom = unsafe { intern_atom(conn, b"_NET_WM_PID") };
@@ -677,14 +692,14 @@ unsafe fn resolve_override_target_on(conn: *mut xcb_connection_t, named: u32) ->
 
     let root = unsafe { window_root(conn, ancestor) };
     if root == 0 {
-        return ancestor;
+        return OverrideTarget { window: ancestor, provisional: true };
     }
     let active = unsafe { window_u32_prop(conn, root, active_atom) };
     let focus = unsafe { input_focus(conn) };
 
     let tree = unsafe { xcb_query_tree_reply(conn, xcb_query_tree(conn, root), ptr::null_mut()) };
     if tree.is_null() {
-        return ancestor;
+        return OverrideTarget { window: ancestor, provisional: true };
     }
     let n = unsafe { (*tree).children_len as usize };
     let kids = unsafe { (tree as *const u8).add(32).cast::<u32>() };
@@ -758,7 +773,10 @@ unsafe fn resolve_override_target_on(conn: *mut xcb_connection_t, named: u32) ->
         "override target: named=0x{named:x} ancestor=0x{ancestor:x} {aw}x{ah} -> 0x{chosen:x} ({why}; self_pid={self_pid} named_pid={named_pid} named_class=\"{}\"; root_children:{report})",
         String::from_utf8_lossy(&named_cls[..named_cls_len])
     ));
-    chosen
+    // Every answer from this half of the rule came out of the fallback, so the
+    // target is a reading of the tree as it is now: the guest has not committed
+    // a frame yet, and the window it will render into may not even be mapped.
+    OverrideTarget { window: chosen, provisional: true }
 }
 
 // ---------------------------------------------------------------- the route
@@ -1516,8 +1534,12 @@ mod tests {
 
         let chosen = unsafe { resolve_override_target_on(conn, named) };
         assert_eq!(
-            chosen, game,
+            chosen.window, game,
             "a degenerate 1x1 ancestor is swapped for the painted 640x480 window"
+        );
+        assert!(
+            chosen.provisional,
+            "a fallback answer is a reading of the tree, and is re-asked at the first commit"
         );
 
         // A legitimate (full-size) ancestor is returned unchanged.
@@ -1528,8 +1550,8 @@ mod tests {
         unsafe { xcb_flush(conn) };
         assert_eq!(
             unsafe { resolve_override_target_on(conn, lclient) },
-            legit,
-            "a non-degenerate ancestor is returned unchanged"
+            OverrideTarget { window: legit, provisional: false },
+            "a non-degenerate ancestor is returned unchanged, and is not a guess"
         );
 
         unsafe {
