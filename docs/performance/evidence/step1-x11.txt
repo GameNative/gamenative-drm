@@ -1,0 +1,34 @@
+# capture /data/workspace/Projects/gamenative-drm/tools/run-x11/cap.txt
+# window: NO CENSUS LINE FOUND
+guest presents/s        (vkQueuePresentKHR)         None
+guest acquires/s        (vkAcquireNextImageKHR)     None
+guest wal commits/s     (N_COMMIT_OK, 'commits=')   None
+daemon atomic ioctls/s  (ATOMIC heartbeat #N)       None
+compositor releases/s   (wl_buffer.release)         None
+presented/s             (wp presentation feedback)  None
+discarded/s             (mailbox replace)           None
+acquire dwell mean (ms)                             None
+acquire >=8.33 ms fraction                          None
+acquire >=16.67 ms fraction                         None
+acquire blocked at all (acqus nz/n)                 None
+gate hold mean (ms) [cap, not slot]                 0.0
+slot_waits / acquires                               None
+starved (finite-timeout acquire failures)           None
+gate_holds (acquires parked by the cap)             None
+gate_late / skipped                                 (None, None)
+present_id on first present chain                   None
+first pNext sTypes                                  []
+present-wait lines in window                        0
+wait answered at queue (at_queue)                   None
+wait answered w/o latch (release or grace)          None
+vkWaitSemaphores calls/s                            None
+declared / requested / source / gate                (None, None, None, None)
+declared_fifo / declared_other                      (None, None)
+feedback / lsfg                                     (None, None)
+commit_lat_us (last)                                None
+stall lines                                         0
+stall-ring dumps (acquire >=1 s)                    0
+
+# verdicts
+B: ids advertised, zero wait calls sampled -> present_wait unused
+C: no census line -> gate never reached the guest

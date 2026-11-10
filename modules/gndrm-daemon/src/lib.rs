@@ -1676,6 +1676,7 @@ impl Device {
         self.stores
             .gems
             .insert(handle, objects::GemObject { fd, ino, size });
+        self.stores.gem_ino_ref(ino);
         self.stores.gem_by_ino.insert(ino, handle);
         c.handle = handle;
         let mut body = Vec::new();
@@ -1747,6 +1748,7 @@ impl Device {
         self.stores
             .gems
             .insert(handle, objects::GemObject { fd, ino, size });
+        self.stores.gem_ino_ref(ino);
         self.stores.gem_by_ino.insert(ino, handle);
         let mut body = Vec::new();
         pod_write(
@@ -1909,8 +1911,13 @@ impl Device {
             Some(gem) => {
                 self.stores.gem_by_ino.remove(&gem.ino);
                 if fb_referenced {
+                    // The orphan table names the same inode: the object only
+                    // moves, so its reference count is unchanged.
                     self.stores.gems_closed.insert(c.handle, gem);
                 } else {
+                    // The last reference to the object: one inode leaves the
+                    // live set (`Stores::live_inos`).
+                    self.stores.gem_ino_unref(gem.ino);
                     close_fd(gem.fd);
                     // No FB references it: the handle is truly gone, so its id
                     // returns to the space (gamescope opens/closes a handle per
@@ -2070,6 +2077,9 @@ impl Device {
                                         size,
                                     },
                                 );
+                                // A fresh handle for an inode that may already
+                                // be named: the census counts entries.
+                                self.stores.gem_ino_ref(ino);
                                 new_handle
                             }
                             // Space exhausted: release the dup we just made and
@@ -2125,6 +2135,7 @@ impl Device {
                 continue;
             }
             if let Some(gem) = self.stores.gems_closed.remove(&h) {
+                self.stores.gem_ino_unref(gem.ino);
                 close_fd(gem.fd);
                 // The last reference is gone: recycle the handle id too.
                 self.stores.free_gem(h);
@@ -2170,7 +2181,10 @@ struct CommitJob {
     src_fd: Option<RawFd>,
     /// Inodes still backed by a GEM object at commit time (the presenter's
     /// retire signal).
-    live_inos: HashSet<u64>,
+    ///
+    /// Shared with the object store's cached snapshot (`Stores::live_inos`), so
+    /// queuing a commit copies an `Arc`, not the set.
+    live_inos: Arc<HashSet<u64>>,
     /// Acquire fence from `IN_FENCE_FD`.
     fence: Option<RawFd>,
     /// Built at commit time when `PAGE_FLIP_EVENT` was requested; the worker

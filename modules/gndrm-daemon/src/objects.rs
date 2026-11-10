@@ -22,8 +22,9 @@
 //! | 0x4000..0x4FFF | syncobj handles         |
 //! | 0x40..=0x4F  | static topology object ids  |
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::RawFd;
+use std::sync::Arc;
 
 use gndrm_uapi::mode::*;
 use gndrm_uapi::wire::errno;
@@ -206,6 +207,17 @@ pub struct Stores {
     pub gems_closed: HashMap<u32, GemObject>,
     pub fbs: HashMap<u32, Framebuffer>,
     pub blobs: HashMap<u32, Blob>,
+    /// One reference count per inode named by a `gems` or `gems_closed` entry
+    /// (`gem_by_ino` is not a superset of them — see `Device::ioctl_gem_close`).
+    /// The presenter's liveness set is derived from this instead of being
+    /// walked out of both tables on every commit.
+    ino_refs: HashMap<u64, u32>,
+    /// Membership generation of `ino_refs`: bumped only when an inode enters or
+    /// leaves it, never when a count changes — a client that re-imports and
+    /// re-closes a buffer per frame must not invalidate the cached set.
+    ino_gen: u64,
+    /// The set for `ino_gen`, shared with every commit still in flight.
+    ino_snapshot: Option<(u64, Arc<HashSet<u64>>)>,
     /// Freed ids, one list per space, handed back out before the monotonic
     /// counter advances. Without this the space is bounded by the number of
     /// ids *ever* allocated, so a game churning framebuffers (Nidhogg) runs it
@@ -231,6 +243,9 @@ impl Default for Stores {
             gems_closed: HashMap::new(),
             fbs: HashMap::new(),
             blobs: HashMap::new(),
+            ino_refs: HashMap::new(),
+            ino_gen: 0,
+            ino_snapshot: None,
             free_gems: Vec::new(),
             free_fbs: Vec::new(),
             free_blobs: Vec::new(),
@@ -244,6 +259,62 @@ impl Default for Stores {
 }
 
 impl Stores {
+    /// Record one more GEM entry naming `ino`.
+    pub fn gem_ino_ref(&mut self, ino: u64) {
+        let n = self.ino_refs.entry(ino).or_insert(0);
+        *n = n.saturating_add(1);
+        if *n == 1 {
+            self.ino_gen = self.ino_gen.wrapping_add(1);
+        }
+    }
+
+    /// Record one fewer GEM entry naming `ino`; the entry naming it is already
+    /// gone. A count that reaches zero takes the inode out of the live set.
+    pub fn gem_ino_unref(&mut self, ino: u64) {
+        use std::collections::hash_map::Entry;
+        let Entry::Occupied(mut e) = self.ino_refs.entry(ino) else {
+            // An unref without a ref: the recount assertion in `live_inos`
+            // (debug builds) is what catches a real accounting error.
+            return;
+        };
+        let n = *e.get();
+        *e.get_mut() = n.saturating_sub(1);
+        if n <= 1 {
+            e.remove();
+            self.ino_gen = self.ino_gen.wrapping_add(1);
+        }
+    }
+
+    /// The inodes still backed by a GEM object, as of now — the presenter's
+    /// retire signal. Rebuilt only when membership changed since the cached
+    /// generation; a commit in flight holds the `Arc`, so queuing one copies a
+    /// pointer rather than the set.
+    #[must_use]
+    pub fn live_inos(&mut self) -> Arc<HashSet<u64>> {
+        debug_assert!(
+            {
+                // The census must equal what a walk of both tables would give.
+                let mut walked: HashSet<u64> = HashSet::new();
+                let mut counts: HashMap<u64, u32> = HashMap::new();
+                for g in self.gems.values().chain(self.gems_closed.values()) {
+                    walked.insert(g.ino);
+                    *counts.entry(g.ino).or_insert(0) += 1;
+                }
+                walked.len() == self.ino_refs.len()
+                    && walked.iter().all(|i| counts.get(i) == self.ino_refs.get(i))
+            },
+            "ino_refs disagrees with gems ∪ gems_closed"
+        );
+        if let Some((gen, set)) = &self.ino_snapshot {
+            if *gen == self.ino_gen {
+                return Arc::clone(set);
+            }
+        }
+        let set = Arc::new(self.ino_refs.keys().copied().collect::<HashSet<u64>>());
+        self.ino_snapshot = Some((self.ino_gen, Arc::clone(&set)));
+        set
+    }
+
     /// Next-never-allocated id per space (`[gem, fb, blob, syncobj]`): the
     /// high-water mark of what the session needed at once. A resource leak
     /// shows up here as an unbounded rise across churn.

@@ -1,0 +1,38 @@
+# capture /home/joshua/.hermes/cache/scratch/hades-cmp/ingame_census.keep
+# window 3.0..83.0 s  (80.0 s, settle 0 s)
+guest presents/s        (vkQueuePresentKHR)         341.014
+guest acquires/s        (vkAcquireNextImageKHR)     341.014
+guest wal commits/s     (N_COMMIT_OK, 'commits=')   341.032
+daemon atomic ioctls/s  (ATOMIC heartbeat #N)       242.077
+compositor releases/s   (wl_buffer.release)         341.02
+presented/s             (wp presentation feedback)  0.0
+discarded/s             (mailbox replace)           0.0
+shim commit probe #N/s  (proxy commit, 1/120)       341.05
+acquire dwell mean (ms)                             0.092
+acquire >=8.33 ms fraction                          0.0
+acquire >=16.67 ms fraction                         0.0
+acquire blocked at all (acqus nz/n)                 1.0
+gate hold mean (ms) [cap, not slot]                 0.0
+slot_waits / acquires                               0.489
+starved (finite-timeout acquire failures)           0
+gate_holds (acquires parked by the cap)             0
+gate_late / skipped                                 (0, 0)
+slot depth (len of slots=[…])                       3
+mean in_flight slots                                1.84
+mean free slots (never A, never F)                  0.81
+present_id on first present chain                   None
+first pNext sTypes                                  []
+present-wait lines in window                        0
+wait answered at queue (at_queue)                   0
+wait answered w/o latch (release or grace)          0
+vkWaitSemaphores calls/s                            1.037
+declared / requested / source / gate                ('immediate', 'immediate', 'guest', 'off')
+declared_fifo / declared_other                      (0, 27286)
+feedback / lsfg                                     ('on', 0)
+commit_lat_us (last)                                2582
+stall lines                                         0
+stall-ring dumps (acquire >=1 s)                    0
+
+# verdicts
+B: ids advertised, zero wait calls sampled -> present_wait unused
+C PARTIAL: slot_waits/acquires=48.9%, dwell=0.09 ms, >=8.33 ms=0.0

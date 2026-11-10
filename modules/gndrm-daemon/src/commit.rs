@@ -15,7 +15,6 @@
 //! rides this frame via `SCM_RIGHTS` (phase-1 contract: at most one fence per
 //! commit — gamescope only ever fences the primary plane).
 
-use std::collections::HashSet;
 use std::os::fd::RawFd;
 
 use gndrm_uapi::drm::*;
@@ -297,58 +296,74 @@ impl Device {
     }
 
     /// Decode the linearized extension into `(obj, prop, value)` triples.
+    ///
+    /// The wire layout is fixed-stride, so every element's offset is a
+    /// closed-form function of the header, `count_objs` and the running flat
+    /// index: the four scratch arrays the obvious decoder needs (`objs`,
+    /// `counts`, `prop_ids`, `values`) are never materialized, and the only
+    /// allocation left is the `sets` vector this returns.
     fn parse_atomic(
         &self,
         a: &DrmModeAtomic,
         payload: &[u8],
     ) -> Result<ParsedCommit, DispatchResult> {
-        let mut off = core::mem::size_of::<DrmModeAtomic>();
+        const HDR: usize = core::mem::size_of::<DrmModeAtomic>();
         let n = a.count_objs as usize;
         // Kernel caps the object count; mirror with a sane bound.
         if n == 0 || n > 64 {
             return Err(DispatchResult::err(errno::EINVAL));
         }
-        let mut objs = Vec::with_capacity(n);
+        // Section offsets, in wire order (module docs): u32 objs[n], u32
+        // counts[n], u32 prop_ids[total], u64 values[total].
+        let objs_at = HDR;
+        let counts_at = objs_at + 4 * n;
+        // Pass one: the per-object bound the old decoder applied element by
+        // element, and the flat total it needed before it could size the rest
+        // of the frame. Reading the counts implies the object array is present
+        // (it sits before them), so no separate pass over it is needed here.
+        let mut total = 0usize;
+        let mut counts_off = counts_at;
         for _ in 0..n {
-            let Some(id) = take_u32(payload, &mut off) else {
-                return Err(DispatchResult::err(errno::EINVAL));
-            };
-            objs.push(id);
-        }
-        let mut counts = Vec::with_capacity(n);
-        for _ in 0..n {
-            let Some(c) = take_u32(payload, &mut off) else {
+            let Some(c) = take_u32(payload, &mut counts_off) else {
                 return Err(DispatchResult::err(errno::EINVAL));
             };
             if c > 64 {
                 return Err(DispatchResult::err(errno::EINVAL));
             }
-            counts.push(c);
+            total += c as usize;
         }
-        // Two flat arrays: all prop ids, then all values (wire doc above).
-        let total: usize = counts.iter().map(|&c| c as usize).sum();
-        let mut prop_ids = Vec::with_capacity(total);
-        for _ in 0..total {
-            let Some(p) = take_u32(payload, &mut off) else {
-                return Err(DispatchResult::err(errno::EINVAL));
-            };
-            prop_ids.push(p);
-        }
-        let mut values = Vec::with_capacity(total);
-        for _ in 0..total {
-            let Some(v) = take_u64(payload, &mut off) else {
-                return Err(DispatchResult::err(errno::EINVAL));
-            };
-            values.push(v);
+        let prop_ids_at = counts_at + 4 * n;
+        let values_at = prop_ids_at + 4 * total;
+        // `n <= 64` and every count <= 64 bound `total`, so neither offset can
+        // overflow, and one length test decides what four element-wise reads
+        // used to: a short frame is rejected before anything is resolved.
+        if payload.len() < values_at + 8 * total {
+            return Err(DispatchResult::err(errno::EINVAL));
         }
         let mut sets = Vec::with_capacity(total);
         let mut wants_fence = false;
-        let mut flat = 0;
-        for (i, &obj_id) in objs.iter().enumerate() {
-            for _ in 0..counts[i] {
-                let prop_id = prop_ids[flat];
-                let value = values[flat];
-                flat += 1;
+        // Pass two: resolve in commit order, straight out of the payload. Every
+        // read below is inside the span just checked, so a failure here is
+        // unreachable in practice and stays an errno rather than a panic.
+        let mut objs_off = objs_at;
+        // Rewound for the second pass: the counts were read, not consumed.
+        counts_off = counts_at;
+        let mut prop_off = prop_ids_at;
+        let mut value_off = values_at;
+        for _ in 0..n {
+            let Some(obj_id) = take_u32(payload, &mut objs_off) else {
+                return Err(DispatchResult::err(errno::EINVAL));
+            };
+            let Some(count) = take_u32(payload, &mut counts_off) else {
+                return Err(DispatchResult::err(errno::EINVAL));
+            };
+            for _ in 0..count {
+                let Some(prop_id) = take_u32(payload, &mut prop_off) else {
+                    return Err(DispatchResult::err(errno::EINVAL));
+                };
+                let Some(value) = take_u64(payload, &mut value_off) else {
+                    return Err(DispatchResult::err(errno::EINVAL));
+                };
                 let Some(prop_index) = props::resolve(obj_id, prop_id) else {
                     self.diag(|| {
                         format!(
@@ -537,13 +552,11 @@ impl Device {
         // ("client stopped importing"). The pool reuses a retired buffer only
         // once the presenter has reported the frame's completion (see
         // `scanout`).
-        let live_inos: HashSet<u64> = self
-            .stores
-            .gems
-            .values()
-            .map(|g| g.ino)
-            .chain(self.stores.gems_closed.values().map(|g| g.ino))
-            .collect();
+        // Inodes still backed by a GEM object — the presenter's retire signal
+        // ("client stopped importing"). The object store keeps this set
+        // reference-counted and cached (`Stores::live_inos`), so an unchanged
+        // membership costs an `Arc` clone instead of a walk of both tables.
+        let live_inos = self.stores.live_inos();
         let plane = self.primary_state();
 
         // Real GEM semantics: the buffer is in-flight from commit until its

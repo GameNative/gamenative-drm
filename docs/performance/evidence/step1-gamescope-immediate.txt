@@ -1,0 +1,38 @@
+# capture /data/workspace/Projects/gamenative-drm/tools/run-gamescope/cap.txt
+# window 57.3..127.4 s  (70.0 s, settle 35 s)
+guest presents/s        (vkQueuePresentKHR)         357.301
+guest acquires/s        (vkAcquireNextImageKHR)     357.301
+guest wal commits/s     (N_COMMIT_OK, 'commits=')   357.288
+daemon atomic ioctls/s  (ATOMIC heartbeat #N)       242.004
+compositor releases/s   (wl_buffer.release)         357.288
+presented/s             (wp presentation feedback)  0.0
+discarded/s             (mailbox replace)           0.0
+shim commit probe #N/s  (proxy commit, 1/120)       357.021
+acquire dwell mean (ms)                             0.028
+acquire >=8.33 ms fraction                          0.0
+acquire >=16.67 ms fraction                         0.0
+acquire blocked at all (acqus nz/n)                 1.0
+gate hold mean (ms) [cap, not slot]                 0.0
+slot_waits / acquires                               0.098
+starved (finite-timeout acquire failures)           0
+gate_holds (acquires parked by the cap)             0
+gate_late / skipped                                 (0, 0)
+slot depth (len of slots=[…])                       3
+mean in_flight slots                                1.81
+mean free slots (never A, never F)                  1.07
+present_id on first present chain                   False
+first pNext sTypes                                  [1000275001]
+present-wait lines in window                        0
+wait answered at queue (at_queue)                   0
+wait answered w/o latch (release or grace)          0
+vkWaitSemaphores calls/s                            1.071
+declared / requested / source / gate                ('immediate', 'immediate', 'guest', 'off')
+declared_fifo / declared_other                      (0, 25018)
+feedback / lsfg                                     ('on', 0)
+commit_lat_us (last)                                1206
+stall lines                                         0
+stall-ring dumps (acquire >=1 s)                    0
+
+# verdicts
+B REFUTED (precondition): no VkPresentIdKHR chained, no vkWaitForPresentKHR.
+C PARTIAL: slot_waits/acquires=9.8%, dwell=0.03 ms, >=8.33 ms=0.0
