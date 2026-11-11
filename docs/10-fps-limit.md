@@ -104,53 +104,33 @@ divisor cap reads its target exactly.
   took the slot; a subscriber whose peer is gone is dropped there, and the
   connection currently being served stays its own loop's to close. This is what
   makes a cap change made mid-session reach an already-connected shim at all.
-- **Who enforces it follows the present mode, and the mode follows the container.**
-  On gamescope's override route the shim declares to gamescope, per commit
-  (`gamescope_swapchain.set_present_mode`), the container's
-  `MESA_VK_WSI_PRESENT_MODE` (mailbox is the container default; the user may set
-  fifo, relaxed or immediate), or the guest's own mode when the env is absent
-  (`icd_shim/src/proxy.rs` `effective_present_mode`, `live_present_mode`).
+- **Who enforces the cap follows the mode the guest asked for.** On gamescope's
+  override route the shim declares to gamescope, per commit
+  (`gamescope_swapchain.set_present_mode`), the mode the game requested
+  (`icd_shim/src/proxy.rs` `guest_present_mode`: its
+  `VkSwapchainCreateInfoKHR.presentMode`, FIFO when it names an unknown one).
+  Nothing overrides that request: there is no environment variable above it, so
+  no container setting can turn a game's own VSync into a mailbox session, and a
+  guest that asks for immediate gets immediate.
   gamescope's limiter holds only commits declared FIFO (`wlserver_surface_is_fifo`):
   it latches one per limited vblank (`steamcompmgr.cpp` `handle_done_commits_xwayland`)
   and the client is paced by `wl_buffer.release`. Any other mode is taken at the
   next composite, so there the shim's acquire gate is the cap:
 
-  | container mode | cap | declared | what limits the rate |
+  | guest asked for | cap | declared | what limits the rate |
   |---|---|---|---|
-  | mailbox (default) | none, guest asked for FIFO (in-game VSync on) | fifo (`source=guest`) | the display (FIFO) |
-  | mailbox (default) | none, guest asked for mailbox or immediate | mailbox | nobody |
-  | mailbox | at the display's rate, guest asked for FIFO (in-game VSync on) | mailbox (`source=cap-rate-vsync`) | the shim's acquire gate, every vblank; the present wait is answered when the guest queues the present |
-  | mailbox | at the display's rate, guest asked for mailbox or immediate | fifo (`source=cap-rate`) | gamescope's limiter (divisor 1), one FIFO commit per vblank; no gate, as on master |
-  | mailbox | below the display's rate | mailbox | the shim's acquire gate, on the display's vblank grid |
-  | fifo | none | fifo | the display (FIFO) |
-  | fifo | set | fifo | gamescope's divisor limiter |
-  | any, frame generation on | any | mailbox | the source-rate gate (`docs/17`) |
+  | fifo | none or set | fifo | the display (FIFO); gamescope's divisor limiter under a cap |
+  | fifo_relaxed | none | fifo_relaxed | the display (relaxed FIFO) |
+  | fifo_relaxed | at the display's rate | fifo_relaxed (`source=cap-rate-vsync`) | the shim's acquire gate, every vblank; the present wait is answered when the guest queues the present |
+  | mailbox, immediate | none | the guest's mode | nobody |
+  | mailbox, immediate | at the display's rate | fifo (`source=cap-rate`) | gamescope's limiter (divisor 1), one FIFO commit per vblank; no gate, as on master |
+  | mailbox, immediate, fifo_relaxed | below the display's rate | the guest's mode | the shim's acquire gate, on the display's vblank grid |
+  | any, frame generation on | any | mailbox (`source=generating`) | the source-rate gate (`docs/17`) |
 
-  FIFO-relaxed (`relaxed`) and immediate behave as mailbox in this table. No env: the guest's
-  own mode takes the env's place. "At the display's rate" is a cap within 0.5 %
-  of the measured rate (60 on a 59.97 Hz panel); a cap above it runs on the
-  gate's own clock under the container's mode.
-
-  **With no cap a guest's FIFO request wins over the container's default.** Every
-  container carries `MESA_VK_WSI_PRESENT_MODE=mailbox` as a stamped default the user
-  did not choose. With no cap, honouring it turned a game's own VSync (a FIFO
-  request) into an uncapped mailbox session, which is neither master's behaviour nor
-  what the user asked for. A FIFO request (FIFO-relaxed too) is a specific wish and
-  is declared as asked (`source=guest`); a mailbox or immediate request means "do not
-  make me wait", and the container's mailbox is the substitute, as on the X11 route
-  (an uncapped immediate guest gets mailbox, not tearing). An env of `fifo` is an
-  explicit wish and wins in every case. Under a cap the table above applies whatever
-  the guest asked for.
-
-  **The user's control is `MESA_VK_WSI_PRESENT_MODE`.** It sits in the container's
-  environment, written from the driver's present-mode setting, and takes Mesa's
-  names: `fifo`, `relaxed` (FIFO-relaxed), `mailbox`, `immediate`. Anything else,
-  `fifo_relaxed` included, is rejected as Mesa rejects it, the guest's own mode is
-  used, and the shim logs `Invalid MESA_VK_WSI_PRESENT_MODE value!` whether or not
-  `GNDRM_LOG_VKSHIM` is set, so a typo shows in a shipped session. It is
-  overridden in one case: a non-FIFO value under a cap at the display's rate is
-  declared FIFO (`source=cap-rate`, below). Mesa reads the same variable, so it
-  also sets the mode a zink guest's own swapchain asks for below the shim.
+  "At the display's rate" is a cap within 0.5 % of the measured rate (60 on a
+  59.97 Hz panel); a cap above it runs on the gate's own clock under the guest's
+  mode. Below and above it the declaration is the guest's; only the two cells
+  where gamescope's limiter would otherwise see a non-FIFO commit move it.
 
   **Why mailbox is not declared at the display's rate.** At that cap the panel
   shows one frame per vblank under either mode, and under mailbox the shim has to
@@ -170,31 +150,28 @@ divisor cap reads its target exactly.
   vblank at its own wakeup (`steamcompmgr.cpp` 8028-8049) and its limiter's
   divisor at this cap is 1, which is master's behaviour in this cell. That holds
   for a guest that asked for mailbox or immediate, which paces itself. A guest
-  that asked for FIFO (in-game VSync on) waits on each frame's presentation
-  before starting the next; declared FIFO, that wait is gamescope's `presented`
-  at its latch, so the whole frame has to fit between two latches, and with
-  ~16 ms of work and three images it fell to 40 fps at 60 Hz (a 1280x960
+  that asked for FIFO-relaxed at the display's rate waits on each frame's
+  presentation before starting the next; declared FIFO, that wait is gamescope's
+  `presented` at its latch, so the whole frame has to fit between two latches, and
+  with ~16 ms of work and three images it fell to 40 fps at 60 Hz (a 1280x960
   device, DTD in game: 400 commits per 10 s, 400/600 publishes). That guest is
-  declared the container's mode with the gate every vblank instead
+  declared its own mode with the gate every vblank instead
   (`source=cap-rate-vsync`): its wait is answered when it queues the present
-  (`docs/15`), the gate paces it,
-  and the count stays the guest's own ask — the declared mode moves pacing,
-  not images (`proxy::swapchain_slots`; Retroid Pocket 6, DTD,
-  VSync on, cap 60: 59.983 fps, no doubles; with the wait answered at queue,
-  42 fps before and 60.0 after in a GPU-heavy 1080p scene). This is the only
-  case answered at queue; every other mailbox or immediate presentation is
-  answered at the commit, as on master. A container set to
-  `MESA_VK_WSI_PRESENT_MODE=fifo` never reaches it, so setting a game's
-  container to fifo restores master's behaviour for that game. The
-  vblank-grid gate is not kept on top of it: FIFO's back-pressure already holds
-  the guest, and the two stacked turned a guest whose acquire-to-commit grew
-  past a period into a 40 fps session on a 60 Hz panel (DTD on a 1280x960
-  device after a live 120 to 60 Hz switch: `gate_holds` 0, `gate_late` 400 and
-  `skipped` 200 per 10 s, commit latency 24 ms, 400/600 publishes). Below the
-  display's rate the gate's releases
-  are at least two vblanks apart and two frames in one composite are rare, so
-  mailbox stays (FIFO with gamescope's limiter quantized a 32 fps game to 30 at a
-  60 cap on 120 Hz; mailbox with the gate did not).
+  (`docs/15`), the gate paces it, and the count stays the guest's own ask — the
+  declared mode moves pacing, not images (`proxy::swapchain_slots`; Retroid
+  Pocket 6, DTD, VSync on, cap 60: 59.983 fps, no doubles; with the wait answered
+  at queue, 42 fps before and 60.0 after in a GPU-heavy 1080p scene). This is the
+  only case answered at queue; every other mailbox or immediate presentation is
+  answered at the commit, as on master. The vblank-grid gate is not kept on top
+  of a FIFO declaration: FIFO's back-pressure already holds the guest, and the two
+  stacked turned a guest whose acquire-to-commit grew past a period into a 40 fps
+  session on a 60 Hz panel (DTD on a 1280x960 device after a live 120 to 60 Hz
+  switch: `gate_holds` 0, `gate_late` 400 and `skipped` 200 per 10 s, commit
+  latency 24 ms, 400/600 publishes). Below the display's rate the gate's releases
+  are at least two vblanks apart and two frames in one composite are rare, so the
+  guest's mode stays (FIFO with gamescope's limiter quantized a 32 fps game to 30
+  at a 60 cap on 120 Hz; mailbox with the gate did not).
+
 
   The gate (`icd_shim/src/vsync_gate.rs`) releases acquires on the vblank grid
   gamescope composites from, not on a clock of its own: the daemon's `VsyncNote`

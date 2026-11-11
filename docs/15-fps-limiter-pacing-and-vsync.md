@@ -11,9 +11,9 @@ cursor, scan-out and mode patches.
 
 | place | what it holds | set by |
 |---|---|---|
-| the shim's declared present mode | the container's `MESA_VK_WSI_PRESENT_MODE` (else the guest's mode); with no cap, a guest's FIFO request over a non-FIFO env; FIFO under a cap at the display's rate; mailbox under frame generation | the container, the guest and the cap (`docs/10`) |
+| the shim's declared present mode | the mode the guest asked for; FIFO under a cap at the display's rate when the guest asked for mailbox or immediate; mailbox under frame generation | the guest and the cap (`docs/10`) |
 | gamescope's own limiter | `nRefreshHz / nTargetFPS`, a divisor of the mode's rate; holds FIFO commits only | `debug_set_fps_limit`, sent only when generation is off |
-| the shim's acquire gate | the cap, on the display's vblank grid, unless the container's mode is FIFO | `FrameCapNote{fps}` and `VsyncNote` from the daemon |
+| the shim's acquire gate | the cap, on the display's vblank grid, unless the declared mode is FIFO | `FrameCapNote{fps}` and `VsyncNote` from the daemon |
 | the presenter's latch grid | the display's latch points, as measured | `VsyncNote` from the daemon (`docs/17`) |
 
 Which one holds the cap follows the declared mode. Declared FIFO (the container set
@@ -50,8 +50,8 @@ that rate is the display's.
 
 - **FIFO.** A present is requeued until the display releases a buffer, so the guest is
   paced to the panel whether or not it asked to be. On gamescope's override route the
-  mode declared per commit is the container's `MESA_VK_WSI_PRESENT_MODE` (the guest's
-  own without it), cap or no cap, and mailbox under frame generation (`docs/10`). On
+  mode declared per commit is the one the guest asked for, cap or no cap, and mailbox
+  under frame generation (`docs/10`). On
   that route the shim answers `vkWaitForPresentKHR` from
   gamescope's presentation feedback, as Mesa's Wayland WSI does: every commit that
   carries a wait requests a `wp_presentation_feedback`, and the wait is answered on
@@ -177,15 +177,15 @@ that rate is the display's.
 
 ## Behaviour changes in gamescope sessions
 
-- **The container's present mode is declared, except under a cap at the display's
-  rate.** `MESA_VK_WSI_PRESENT_MODE` decides the mode on the gamescope route as on the
-  X11 Present route; without it the guest's own mode is declared. A container left at
-  the mailbox default runs, with no cap, FIFO for a guest that asked for FIFO (its
-  own VSync, `source=guest`) and mailbox for any other guest, and mailbox capped by the shim's
-  vblank-grid gate under a cap below the display's rate. Under a cap at the display's
-  rate it is declared FIFO with no gate (`source=cap-rate`), because the shim
-  cannot keep two mailbox commits out of one gamescope composite (`docs/10`). One set
-  to fifo runs FIFO under gamescope's limiter.
+- **The guest's present mode is what gets declared.** There is no environment
+  override above it, so a game's own VSync request is never turned into a mailbox
+  session and an immediate request stays immediate. With no cap
+  the declared mode is the guest's own (`source=guest`). Under a cap below the
+  display's rate it is still the guest's own, paced by the shim's vblank-grid gate.
+  Under a cap at the display's rate a guest that asked for mailbox or immediate is
+  declared FIFO with no gate (`source=cap-rate`), because the shim cannot keep two
+  mailbox commits out of one gamescope composite (`docs/10`); one that asked for
+  FIFO keeps FIFO and gamescope's limiter.
 - **A game below the cap keeps its own rate under mailbox** (caps below the display's
   rate). Under FIFO and gamescope's
   limiter each frame is held to whole limited vblanks, so a game below the cap judders

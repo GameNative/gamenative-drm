@@ -185,12 +185,13 @@ static WAIT_CV: Condvar = Condvar::new();
 /// answered by the compositor's release or, at the latest, two refresh periods
 /// after the commit.
 ///
-/// `answer_now` is for swapchains whose effective present mode is mailbox or
-/// immediate. The guest may believe it has FIFO (the shim applies
-/// `MESA_VK_WSI_PRESENT_MODE` behind its back) and wait on every frame, while a
-/// guest that knew its real mode would not wait at all: DXVK skips the present
-/// wait for mailbox and immediate. Holding the wait for the grace there throttles
-/// the guest's frame-latency loop to `(start-to-commit + 2 periods) / (L + 1)`.
+/// `answer_now` is for swapchains whose declared present mode is mailbox or
+/// immediate. A guest that asked for FIFO can still be declared a non-FIFO mode
+/// under a cap at the display's rate (`docs/10`), and it waits on every frame
+/// because FIFO told it it must; a guest that knew its real mode would not wait
+/// at all, since DXVK skips the present wait for mailbox and immediate. Holding
+/// the wait for the grace there throttles the guest's frame-latency loop to
+/// `(start-to-commit + 2 periods) / (L + 1)`.
 pub(crate) fn committed(id: u64, sc: usize, commit_ns: u64, answer_now: bool) {
     if answer_now {
         record_for(id, sc, commit_ns);

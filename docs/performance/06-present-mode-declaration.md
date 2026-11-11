@@ -120,7 +120,7 @@ one:
 | change | effect on the computed value | re-sent? |
 |---|---|---|
 | initial attach (first commit on a surface) | `decl_pm = NO_DECL` ≠ any wire value | yes, invariant 1 |
-| present mode change (`effective_present_mode`, `proxy.rs:2302`) | value changes | yes |
+| present mode change (the guest's `presentMode` at swapchain creation) | value changes | yes |
 | fps cap set/cleared (`scanout::cap_fps_note`, `:173`) | `capped` flips ⇒ `Declared::Mode` ↔ `CapRate`/`CapCompat` | yes |
 | **display type / refresh change** (`vsync_gate::current_grid` period, `vsync_gate.rs:73-85`) | `at_display_rate(cap, grid)` (`vsync_gate.rs:218`) flips ⇒ FIFO ↔ the swapchain's mode. 60-cap on 60 Hz = FIFO; same 60-cap on 120 Hz = mailbox ⇒ 2→1 | yes, because the value moved. If the value does *not* move (same refresh, same cap) there is nothing to tell gamescope |
 | frame generation on/off (`lsfg::live()`) | `Declared::Generating` ⇒ mailbox, and back | yes (§5) |

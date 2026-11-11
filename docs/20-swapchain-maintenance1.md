@@ -50,9 +50,8 @@ present wait and the cap gate, which were already served.
   compatibility answer names one mode, so a conforming guest never asks; a request
   for another mode is logged once and the swapchain's mode kept
   (`MODE_SWITCH_NOTED`). Serving it means the requested mode enters
-  `effective_present_mode` / `live_present_mode` and the cap gate's
-  FIFO-versus-mailbox rule per present, with the container override still winning
-  (`docs/15` §"present mode"). That is the pacing-sensitive part: it must be
+  `guest_present_mode` / `live_present_mode` and the cap gate's
+  FIFO-versus-mailbox rule per present (`docs/15` §"present mode"). That is the pacing-sensitive part: it must be
   measured in a scene whose frame time is near the period, with the cap at the
   panel rate, before it ships.
 - **`VK_KHR_present_id2` / `VK_KHR_present_wait2`.** Same semantics as v1 with the

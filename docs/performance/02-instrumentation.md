@@ -405,8 +405,9 @@ Read it like this:
 | `fallback` | `Δfallback` — waits the daemon's latch did **not** answer: the buffer release (`present.rs:316`–`:324`) **or** the 2-refresh grace (`:405`–`:420`). Both increment the same counter; only the per-wait µs in G6 separates them (grace ≈ `2/refresh` = 16.7 ms at 120 Hz, release ≈ one frame + a vblank) |
 | `semwait_rate` | G11 count / Δt — `vkWaitSemaphores`, the DXVK latency-sleep shape |
 
-The verdict must be **mode-aware**, because the container sets
-`MESA_VK_WSI_PRESENT_MODE=mailbox`:
+The verdict must be **mode-aware**, because at the time of these runs the
+container set `MESA_VK_WSI_PRESENT_MODE=mailbox` (the shim no longer reads it;
+these are runs from before `refactor/vsync`):
 
 * `present_wait_answer` returns `AtQueue` only when the route is gamescope **and**
   `why == CapRateVsync`; `AtCommit` when either the guest's requested mode or the
@@ -766,8 +767,8 @@ the shim exists in the guest, and in X11 mode it does not exist at all.
   2.08 free, `starved=0`. The acquire is not stalling. Plan item 3 → **closed**,
   including its "add a 4th slot" sub-item: **the depth is already 4**, not 3.
 - **Cause F cannot even be reached.** `declared_fifo=0` over 25 009 presents: the
-  container's `MESA_VK_WSI_PRESENT_MODE=mailbox` overrides the title's own
-  `immediate` request and the shim never enters a FIFO path. Plan item 5 stays
+  container's `MESA_VK_WSI_PRESENT_MODE=mailbox` then overrode the title's own
+  `immediate` request and the shim never entered a FIFO path. Plan item 5 stays
   closed for a stronger reason than the semantic one in
   `06-present-mode-declaration.md`.
 - **A new, unexplained number worth one look:** the daemon serves **241.9**
