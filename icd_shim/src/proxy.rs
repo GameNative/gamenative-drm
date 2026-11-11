@@ -835,6 +835,7 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
                 fence_sem: 0,
                 acquired: false,
                 in_flight: false,
+                parked_ns: 0,
                 acq_seq: 0,
                 acquired_ns: 0,
                 ino: 0,
@@ -2385,6 +2386,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             fence_sem: 0,
             acquired: false,
             in_flight: false,
+            parked_ns: 0,
             acq_seq: 0,
             acquired_ns: 0,
             ino: 0,
@@ -2645,6 +2647,37 @@ unsafe extern "C" fn gn_vkDestroySwapchainKHR(
 // imported dma-buf image directly.
 const REAP_SLICE: Duration = Duration::from_millis(4);
 
+/// How long a slot the compositor has released may wait for the daemon's own
+/// release note before it is taken anyway, in nanoseconds.
+///
+/// The note is a fence signal, so it arrives in microseconds once SurfaceFlinger
+/// releases the buffer. The bound exists for the two cases where it never does:
+/// a note lost to a full socket (the daemon's pushes are fire-and-forget), and a
+/// compositor that never releases. Holding the guest through either would be a
+/// hang, and a slot taken after a hundred milliseconds of silence is one frame
+/// that may tear against one guest that never runs again.
+const RELEASE_NOTE_LIMIT_NS: u64 = 100_000_000;
+
+/// How long an acquire may sleep while a slot is parked on a release note.
+///
+/// The note is read by whoever next drains the channel, including this loop, so a
+/// parked wait is a poll of the channel and not a sleep: a slice longer than the
+/// note's own latency adds that latency to every frame the guest is waiting for.
+/// At a 120 Hz acquire interval a 4 ms slice is half a frame, measured as a fifth
+/// of the panel's frames repeated.
+const PARKED_SLICE: Duration = Duration::from_micros(250);
+
+/// Whether any slot of this swapchain is waiting on the daemon's release note.
+unsafe fn any_parked(sc: *mut GnSwapchain) -> bool {
+    for k in 0..unsafe { (*sc).guest_slots as usize } {
+        let s = unsafe { (*sc).slots.as_ptr().add(k) };
+        if unsafe { (*s).parked_ns != 0 } {
+            return true;
+        }
+    }
+    false
+}
+
 /// Claim the first swapchain slot that is neither held by the app nor awaiting a
 /// compositor release. On success `idx` is set to the slot (marked acquired);
 /// when none is free `idx` is left unchanged.
@@ -2659,12 +2692,26 @@ const REAP_SLICE: Duration = Duration::from_millis(4);
 /// free-running scheme needs a rotating slot choice (so each commit carries a
 /// newer buffer) and its own back-pressure, not just this condition relaxed.
 unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
+    let now = monotonic_ns();
     for k in 0..unsafe { (*sc).guest_slots as usize } {
         let s = unsafe { (*sc).slots.as_mut_ptr().add(k) };
-        if unsafe { !(*s).acquired && !(*s).in_flight } {
+        // A parked slot has been let go by the compositor and is waiting on the
+        // display's own release. The daemon's note is that release; a note that
+        // never arrives must not strand the guest, so a slot parked longer than
+        // the bound is taken anyway and counted.
+        let free = unsafe {
+            !(*s).acquired
+                && (!(*s).in_flight
+                    || ((*s).parked_ns != 0
+                        && (crate::scanout::take_released((*s).ino, (*s).parked_ns)
+                            || now.saturating_sub((*s).parked_ns) >= RELEASE_NOTE_LIMIT_NS)))
+        };
+        if free {
             *idx = k as i32;
             unsafe {
                 (*s).acquired = true;
+                (*s).in_flight = false;
+                (*s).parked_ns = 0;
             }
             let seq = ACQ_SEQ.fetch_add(1, Ordering::Relaxed);
             unsafe {
@@ -2771,11 +2818,22 @@ unsafe fn gn_acquire_common(
             // pixmap, instead of a timer.
             drop(g);
             unsafe { x11_reap(sc) };
+            // Read what the daemon has pushed while the guest was blocked here:
+            // a release note is what frees a parked slot, and a guest waiting on
+            // one produces no other event that would read it.
+            crate::scanout::poll_notes();
             g = (*sc).shared.lock().unwrap();
             unsafe { acquire_take_free(sc, &mut idx) };
             if idx >= 0 || g.stopping {
                 break;
             }
+            // A parked slot can only be freed by a note, so the wait is a poll
+            // of the channel at the note's own scale rather than the idle slice.
+            let base = if unsafe { any_parked(sc) } {
+                PARKED_SLICE
+            } else {
+                REAP_SLICE
+            };
             let slice = match deadline {
                 Some(dl) => {
                     let now = Instant::now();
@@ -2783,9 +2841,9 @@ unsafe fn gn_acquire_common(
                         timed_out = true;
                         break;
                     }
-                    (dl - now).min(REAP_SLICE)
+                    (dl - now).min(base)
                 }
-                None => REAP_SLICE,
+                None => base,
             };
             let (guard, _res) = (*sc).cv_free.wait_timeout(g, slice).unwrap();
             g = guard;
@@ -7255,6 +7313,12 @@ pub struct GnSlot {
     pub fence_sem: VkSemaphore,
     pub acquired: bool, // owned by the app (acquire -> present)
     pub in_flight: bool,  // committed, awaiting wl_buffer.release
+    // When the compositor released the buffer and the daemon had not yet
+    // reported SurfaceFlinger's release, `CLOCK_MONOTONIC` ns; 0 when the slot is
+    // not waiting on that. The compositor is done *compositing* with it, which is
+    // before the display is done *scanning* it out (see `crate::scanout`), so the
+    // slot stays busy until the note arrives or this ages out.
+    pub parked_ns: u64,
     // Guest-side trace: the acquire sequence that filled this slot, so a
     // present can be tied back to the acquire that handed the guest the image.
     pub acq_seq: u64,
@@ -7664,7 +7728,17 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
         if logging && !guest_slot {
             GEN_RELEASES.fetch_add(1, Ordering::Relaxed);
         }
-        (*slot).in_flight = false;
+        // The compositor has finished compositing with the buffer. That is not
+        // the same as the display finishing reading it, which is what a producer
+        // has to wait for: a buffer the daemon allocated is held again here until
+        // the daemon reports the scan-out release, and freed on that note. A
+        // buffer the daemon does not track (a local allocation, or a daemon too
+        // old to send notes) is freed here, as before.
+        if (*slot).ino != 0 && crate::scanout::release_notes_live() {
+            (*slot).parked_ns = monotonic_ns();
+        } else {
+            (*slot).in_flight = false;
+        }
         (*sc).cv_free.notify_all();
         let wait_id = core::mem::replace(&mut (*slot).wait_id, 0);
         drop(_g);

@@ -31,22 +31,44 @@ again. Deferring the release by one flip removes the tear by removing a buffer
 from every producer: a 3-image swapchain keeps one in flight instead of two, so
 a producer can no longer run ahead of the flip and a late frame has no cushion.
 
-The number that decides between that and SurfaceFlinger's own fence is how long
-the buffer is actually held. `sf hold:` measures it where the daemon already
-waits: the publish reusing a registration waits on the release fence the
-previous completion stored, and the gap from that frame's latch to the wait
-returning is the hold.
+SurfaceFlinger's own release fence is the exact answer, and the daemon already
+receives it. `ASurfaceTransactionStats_getPreviousReleaseFenceFd` reports, in the
+completion of a transaction, the fence of the buffer that transaction
+**replaced** — not the one it published:
+
+```
+publish X, which replaces W   ──▶  completion reports W's fence
+                                   ▼
+                            fence signals: W is free
+```
+
+So the fence is filed on W's mailbox (`ReleaseCtx::replaced_ctx`) rather than on
+the publisher's — that attribution is what makes it usable at all — and it is
+waited on off the completion thread. Two things use it:
+
+- the publish that reuses W waits on it before applying, so the pool never
+  republishes a buffer the panel is still reading;
+- a watcher thread waits on it and pushes `BufferReleased` (`CAP_RELEASE_NOTE`)
+  carrying W's scan-out inode. A shim that declares the cap keeps that slot busy
+  until the note arrives: the compositor's `wl_buffer.release` only parks it.
+
+A producer the shim does not render for — the guest's own GL blits through
+Xwayland — reads no notes, and for that class the deferral above is the only
+lever.
+
+`sf hold:` measures the hold where it ends: the watcher samples the gap from the
+released buffer's latch to the instant its fence signals.
 
 ```
 gndrm-daemon: sf hold: n=<samples> <half=<n> half-one=<n> one-1.5=<n> 1.5-2.5=<n> over-2.5=<n> max=<us>us period=<us>us timeouts=<n>
 ```
 
 Buckets are halves of one display period, and the period is the latch grid's own
-(gap between consecutive latches; over 100 ms counts as a stall, not a period).
-`one-1.5` and above is the share a one-flip deferral does **not** cover: while
-those are zero the deferral is sufficient on that device, and once they are not,
-only the release fence is exact. `timeouts` counts waits that hit
-`RELEASE_FENCE_TIMEOUT_MS` and produced no sample. One line per 10 s.
+(median of the last nine accepted gaps; a gap outside 3–50 ms is a burst or a
+stall, not a period). `one-1.5` and above is the share a one-flip deferral does
+**not** cover. `timeouts` counts fences that reached `RELEASE_WATCH_MAX` (500 ms)
+without signalling — the release is reported anyway, so a stuck compositor
+delays a producer instead of hanging it. One line per 10 s.
 
 ## Why the event is emitted with the publish
 
@@ -71,9 +93,9 @@ into every paced frame.
 
 Buffer-reuse safety is unchanged: the scan-out pool still caches a buffer for
 reuse only once the presenter reports SurfaceFlinger's completion (the slot's
-`latched` flag), and the next publish still blocks on the previous release
-fence. Only the *event* — a pacing/visibility signal to the client — stops
-carrying the round trip.
+`latched` flag), and the publish that reuses a buffer still waits on that
+buffer's own release fence. Only the *event* — a pacing/visibility signal to the
+client — stops carrying the round trip.
 
 ## Measured effect
 

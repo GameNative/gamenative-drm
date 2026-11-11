@@ -58,7 +58,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::RawFd;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -69,8 +69,9 @@ use gndrm_daemon::scanout::{
 };
 use gndrm_daemon::{CursorUpdate, FrameCap, Framebuffer, PlaneState, Presenter};
 use gndrm_uapi::wire::{
-    scanout_ahb_format, FrameAcquired, FrameCapSubscribe, LsfgConfig, PresentDone, PresentMark,
-    ScanoutAllocReq, ScanoutAllocResp, CAP_FRAME_CAP, CAP_PRESENT_ID, CAP_VSYNC_NOTE,
+    scanout_ahb_format, BufferReleased, FrameAcquired, FrameCapSubscribe, LsfgConfig, PresentDone,
+    PresentMark, ScanoutAllocReq, ScanoutAllocResp, CAP_FRAME_CAP, CAP_PRESENT_ID,
+    CAP_RELEASE_NOTE, CAP_VSYNC_NOTE,
 };
 
 use crate::ffi;
@@ -160,6 +161,18 @@ static PQ_METADATA_SET: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 
 /// The last latch the completion callback reported, for the flip period.
 static HOLD_LAST_LATCH_NS: AtomicU64 = AtomicU64::new(0);
+/// The last [`HOLD_GAPS`] accepted latch gaps. One gap is a sample of the
+/// display, but a burst of callbacks, or a second swapchain publishing between
+/// two latches, makes it far too small — and a period that small turns every
+/// hold into an outlier. The median of the last few is what the buckets are
+/// percentages of.
+const HOLD_GAPS: usize = 9;
+/// A latch gap outside this band is not a display period: below the fastest
+/// panel this ships on, above a stall.
+const HOLD_GAP_MIN_NS: u64 = 3_000_000;
+const HOLD_GAP_MAX_NS: u64 = 50_000_000;
+static HOLD_GAP_RING: Mutex<[u64; HOLD_GAPS]> = Mutex::new([0; HOLD_GAPS]);
+static HOLD_GAP_NEXT: AtomicU64 = AtomicU64::new(0);
 /// One display period as the latch grid delivered it, 0 until two latches.
 static HOLD_PERIOD_NS: AtomicU64 = AtomicU64::new(0);
 /// Release-fence waits that produced a sample.
@@ -186,7 +199,10 @@ fn note_hold(latch_ns: u64, released_ns: u64) {
     HOLD_N.fetch_add(1, Ordering::Relaxed);
     HOLD_MAX_US.fetch_max(hold_us, Ordering::Relaxed);
     let period_ns = HOLD_PERIOD_NS.load(Ordering::Relaxed);
-    if period_ns == 0 {
+    // Nothing to compare against until a few gaps have been seen: before the
+    // ring fills, a burst can still pass as a period and every hold then reads
+    // as an outlier.
+    if period_ns == 0 || HOLD_GAP_NEXT.load(Ordering::Relaxed) < HOLD_GAPS as u64 / 2 {
         return;
     }
     let percent = hold_ns.saturating_mul(100) / period_ns;
@@ -224,7 +240,11 @@ fn report_hold(now_ns: u64) {
         return;
     }
     let b = |i: usize| HOLD_BUCKETS[i].load(Ordering::Relaxed);
-    log_info!(
+    // Ungated: a shipped session cannot turn the daemon's gated channels on
+    // (`GNDRM_LOG_*` is set by the launcher in this process, not by a
+    // container), and this is the number that decides which release rule is
+    // safe. One line per 10 s is the same cadence as the shim's census.
+    log_always!(
         "{}",
         format_args!(
             "sf hold: n={} <half={} half-one={} one-1.5={} 1.5-2.5={} over-2.5={} max={}us period={}us timeouts={}",
@@ -365,6 +385,18 @@ struct ReleaseCtx {
     /// reuse cache keys on it). Never cleared: the flag belongs to this
     /// registration, and a registration is not reused.
     latched: Arc<AtomicBool>,
+    /// The scan-out inode this mailbox belongs to: the identity a release note
+    /// names, and 0 for a foreign slot the pool does not own.
+    ino: u64,
+    /// The mailbox of the buffer this registration's buffer replaced on the
+    /// layer, or null when it replaced nothing.
+    ///
+    /// This is what makes SurfaceFlinger's release fence attributable. Its
+    /// `getPreviousReleaseFenceFd` describes the buffer the transaction
+    /// *replaced*, not the one it published — so the fence a completion reports
+    /// belongs to `replaced_ctx`, and is filed there for that buffer's own
+    /// reuse and its own release note.
+    replaced_ctx: AtomicPtr<ReleaseCtx>,
 }
 
 // SAFETY: after construction the only mutations are the atomic and the release
@@ -526,14 +558,39 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
         // exactly once here.
         unsafe { (ctx.stats_release_controls)(controls) };
     }
-    if fd >= 0
-        && ctx
-            .release_fd
-            .compare_exchange(-1, fd, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-    {
-        // SAFETY: `fd` is a valid descriptor owned by this call.
-        unsafe { libc::close(fd) };
+    // The fence describes the buffer this transaction *replaced*, not the one it
+    // published: SurfaceFlinger reports the release of whatever the new buffer
+    // took off the layer. So it is filed on the replaced buffer's mailbox — the
+    // one whose next publish waits on it, and whose scan-out inode names it to
+    // the producer — and a copy goes to the watcher that reports the release.
+    let prev = ctx.replaced_ctx.load(Ordering::Acquire);
+    if fd >= 0 {
+        if prev.is_null() {
+            // Nothing was on the layer before this transaction: there is no
+            // buffer whose release the fence could describe.
+            // SAFETY: `fd` is a valid descriptor owned by this call.
+            unsafe { libc::close(fd) };
+        } else {
+            // Its own copy first: the mailbox's descriptor is consumed by that
+            // buffer's next publish (waited on, then closed), so the watcher
+            // must not poll a descriptor another thread may close under it.
+            // SAFETY: `prev` is a leaked mailbox, live for the session.
+            unsafe {
+                let watch = libc::dup(fd);
+                if watch >= 0 {
+                    watch_release((*prev).ino, watch, (*prev).latch_ns.load(Ordering::Relaxed));
+                }
+                if (*prev)
+                    .release_fd
+                    .compare_exchange(-1, fd, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    // A fence was already waiting there: the older one describes
+                    // an earlier release of the same buffer and is superseded.
+                    libc::close(fd);
+                }
+            }
+        }
     }
     // The latch time is a sample of the panel's latch grid, which the presenter
     // places generated frames on — and the answer a guest waiting on this
@@ -547,10 +604,24 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
             crate::vsync::sample(latch_ns, ctx.applied_ns.load(Ordering::Relaxed));
             // The flip cadence, for the release-hold probe: the gap between
             // consecutive latches is one display period, which is what a hold
-            // is measured against. A gap over 100 ms is a stall, not a period.
+            // is measured against. Gaps outside `HOLD_GAP_MIN_NS..=MAX` are a
+            // burst or a stall rather than a period, and the period kept is the
+            // median of the last few, because one gap is not a measurement.
             let prev = HOLD_LAST_LATCH_NS.swap(latch_ns, Ordering::Relaxed);
-            if prev != 0 && latch_ns > prev && latch_ns - prev < 100_000_000 {
-                HOLD_PERIOD_NS.store(latch_ns - prev, Ordering::Relaxed);
+            if prev != 0 && latch_ns > prev {
+                let gap = latch_ns - prev;
+                if (HOLD_GAP_MIN_NS..=HOLD_GAP_MAX_NS).contains(&gap) {
+                    let slot = (HOLD_GAP_NEXT.fetch_add(1, Ordering::Relaxed)
+                        % HOLD_GAPS as u64) as usize;
+                    let mut ring = HOLD_GAP_RING.lock().unwrap_or_else(|e| e.into_inner());
+                    ring[slot] = gap;
+                    let mut vals: Vec<u64> = ring.iter().copied().filter(|g| *g != 0).collect();
+                    drop(ring);
+                    vals.sort_unstable();
+                    if let Some(mid) = vals.get(vals.len() / 2) {
+                        HOLD_PERIOD_NS.store(*mid, Ordering::Relaxed);
+                    }
+                }
             }
             ctx.latch_ns.store(latch_ns, Ordering::Relaxed);
         }
@@ -561,6 +632,166 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
     // cache and the next publish's release-fence wait key on.
     ctx.latched.store(true, Ordering::Release);
     diag::diag().set_role(Role::PresenterCallback, State::Idle);
+}
+
+// ------------------------------------------------------- scan-out releases
+//
+// A compositor hands a buffer back when it has finished *compositing* with it.
+// The display may still be reading it: on this path the consumer is
+// SurfaceFlinger, which reports a buffer's true release a transaction later, as
+// the previous-release fence of whoever replaced it. A producer that took the
+// compositor's release as its own therefore wrote into memory that was still
+// being scanned out, and the panel showed two frames at once for however long
+// the overlap lasted.
+//
+// The completion callback already receives that fence, attributed to the buffer
+// the transaction replaced (see [`ReleaseCtx::replaced_ctx`]). It is waited on
+// here, off the callback thread, and reported to the producer as a
+// [`BufferReleased`] note — the one fact no compositor can give a producer.
+
+/// Release fences waiting for the watcher, `(ino, fd, latch_ns of that buffer)`.
+/// Added by the completion callback, which must not block: a fence is waited on
+/// here instead, and the latch travels with it so the hold is measured where it
+/// ends rather than when the buffer happens to come round again.
+static RELEASE_WATCH: Mutex<Vec<(u64, RawFd, u64)>> = Mutex::new(Vec::new());
+
+/// Eventfd the callback writes to wake the watcher, so a fence added between
+/// polls is picked up at once rather than at the end of one. -1 until the
+/// watcher has started; a fence queued before that is drained by its first pass.
+static RELEASE_WAKE: AtomicI32 = AtomicI32::new(-1);
+
+/// Whether the watcher thread exists.
+static RELEASE_THREAD: AtomicBool = AtomicBool::new(false);
+
+/// How long one fence may stay unsignalled before the release is reported
+/// anyway. A fence SurfaceFlinger never signals means the compositor is stuck;
+/// holding the producer behind it would turn that into a hang, so the buffer is
+/// reported released and the case is counted.
+const RELEASE_WATCH_MAX: Duration = Duration::from_millis(500);
+
+/// Fences the watcher may hold at once. A session has one per buffer in the
+/// pool; a producer that stopped presenting leaves its last ones behind, and
+/// they must not accumulate.
+const RELEASE_WATCH_CAP: usize = 32;
+
+/// Hand one release fence to the watcher. `ino` 0 is a buffer the pool copied
+/// into (nothing outside holds it), so its fence is only ever closed.
+fn watch_release(ino: u64, fd: RawFd, latch_ns: u64) {
+    // Nobody reads release notes: the producer is not a shim that gates on them,
+    // so the fence is worth nothing here. Checked per fence rather than per
+    // session, because the subscriber that matters may connect after the first
+    // buffers are already in flight.
+    if ino == 0 || !gndrm_daemon::pushes::wants(CAP_RELEASE_NOTE) {
+        // SAFETY: the descriptor was duplicated for this call.
+        unsafe { libc::close(fd) };
+        return;
+    }
+    if !RELEASE_THREAD.swap(true, Ordering::Relaxed) {
+        let _ = thread::Builder::new()
+            .name("gn-release".to_string())
+            .spawn(release_watcher);
+    }
+    RELEASE_WATCH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((ino, fd, latch_ns));
+    let wake = RELEASE_WAKE.load(Ordering::Relaxed);
+    if wake >= 0 {
+        // SAFETY: `wake` is this module's eventfd, created non-blocking; an
+        // 8-byte counter write is the whole protocol.
+        unsafe {
+            let one = 1u64;
+            libc::write(wake, (&raw const one).cast(), 8);
+        }
+    }
+}
+
+/// Report one buffer as released to the producers that gate on it, and close its
+/// fence. Every path that retires a watch goes through here, so exactly one note
+/// is sent per fence.
+fn report_release(ino: u64, fd: RawFd, latch_ns: u64) {
+    // SAFETY: the descriptor was created for the watcher and is closed once.
+    unsafe { libc::close(fd) };
+    // The hold: from the panel taking this buffer to SurfaceFlinger letting it
+    // go. Sampled here rather than at the buffer's next publish, which may be
+    // seconds later and would measure the pool's rotation instead.
+    let now = crate::vsync::now_ns();
+    if latch_ns != 0 {
+        note_hold(latch_ns, now);
+    }
+    report_hold(now);
+    gndrm_daemon::pushes::push(CAP_RELEASE_NOTE, &BufferReleased { ino }.encode());
+}
+
+/// Wait on the release fences the producers are owed, and report each one as it
+/// signals.
+///
+/// One thread for the session, mostly asleep: it wakes on a new fence, on the
+/// oldest one ageing out, or on the poll tick. Nothing else waits on it, so a
+/// slow fence cannot delay a publish.
+fn release_watcher() {
+    let wake = eventfd_new();
+    RELEASE_WAKE.store(wake, Ordering::Relaxed);
+    let mut live: Vec<(u64, RawFd, u64, Instant)> = Vec::new();
+    loop {
+        {
+            let mut queued = RELEASE_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+            for (ino, fd, latch_ns) in queued.drain(..) {
+                if live.len() >= RELEASE_WATCH_CAP {
+                    let (old_ino, old_fd, old_latch, _) = live.remove(0);
+                    report_release(old_ino, old_fd, old_latch);
+                }
+                live.push((ino, fd, latch_ns, Instant::now()));
+            }
+        }
+        if live.is_empty() {
+            // Nothing owed: wait for a fence to be handed over. The wake fd is
+            // drained here, so the next `poll` starts clean.
+            let mut p = libc::pollfd {
+                fd: wake,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd, no timeout.
+            unsafe { libc::poll((&raw mut p).cast(), 1, -1) };
+            drain_eventfd(wake);
+            continue;
+        }
+        let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(live.len() + 1);
+        pfds.push(libc::pollfd {
+            fd: wake,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        pfds.extend(live.iter().map(|&(_, fd, _, _)| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }));
+        // SAFETY: `pfds` holds one entry per live fence plus the wake fd, all
+        // valid for the call; the timeout bounds a fence that never signals.
+        let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as _, 50) };
+        if pfds[0].revents != 0 {
+            drain_eventfd(wake);
+        }
+        let now = Instant::now();
+        // Backwards, so the indices still to visit are unaffected by a removal.
+        for i in (0..live.len()).rev() {
+            let mut ready = n > 0 && pfds[i + 1].revents != 0;
+            let mut timed_out = false;
+            if !ready && now.duration_since(live[i].3) >= RELEASE_WATCH_MAX {
+                ready = true;
+                timed_out = true;
+            }
+            if ready {
+                let (ino, fd, latch_ns, _) = live.swap_remove(i);
+                if timed_out {
+                    note_hold_timeout();
+                }
+                report_release(ino, fd, latch_ns);
+            }
+        }
+    }
 }
 
 /// Payload the reuse cache stores for one registered scan-out buffer: the
@@ -798,9 +1029,9 @@ impl ScanoutPool {
 
     /// A fresh completion mailbox for one registration, with the reuse gate
     /// the completion callback publishes into.
-    fn new_ctx(&self) -> (*mut ReleaseCtx, Arc<AtomicBool>) {
+    fn new_ctx(&self, ino: u64) -> (*mut ReleaseCtx, Arc<AtomicBool>) {
         let api = self.api.expect(&"a slot is only committed when the presenter is enabled");
-        new_release_ctx(&api)
+        new_release_ctx(&api, ino)
     }
 
     /// Register a handed-out buffer as `ino`'s slot, logging how it was
@@ -825,7 +1056,7 @@ impl ScanoutPool {
             height,
             format: session_format(),
         };
-        let (ctx, latched) = self.new_ctx();
+        let (ctx, latched) = self.new_ctx(buffer.ino);
         let replaced = self.cache.commit(
             buffer.ino,
             geom,
@@ -951,7 +1182,7 @@ fn ctx_release_fd(buf: &PoolBuf) -> RawFd {
 
 /// A fresh completion mailbox for one registration, with the reuse gate the
 /// completion callback publishes into. Leaked (see [`ReleaseCtx`]).
-fn new_release_ctx(api: &ffi::ScApi) -> (*mut ReleaseCtx, Arc<AtomicBool>) {
+fn new_release_ctx(api: &ffi::ScApi, ino: u64) -> (*mut ReleaseCtx, Arc<AtomicBool>) {
     let latched = Arc::new(AtomicBool::new(false));
     let ctx = Box::into_raw(Box::new(ReleaseCtx {
         stats_get_controls: api.st_stats_get_controls,
@@ -963,6 +1194,8 @@ fn new_release_ctx(api: &ffi::ScApi) -> (*mut ReleaseCtx, Arc<AtomicBool>) {
         applied_ns: AtomicU64::new(0),
         present_id: AtomicU64::new(0),
         latched: Arc::clone(&latched),
+        ino,
+        replaced_ctx: AtomicPtr::new(ptr::null_mut()),
     }));
     (ctx, latched)
 }
@@ -1114,6 +1347,10 @@ pub struct AscState {
     /// must be able to name the thread holding it.
     pool: Arc<TrackedMutex<ScanoutPool>>,
     last_publish: Option<LastPublish>,
+    /// The mailbox of the buffer currently on the layer, or null before the
+    /// first show. Written for the next publish to record what it replaced, so
+    /// a completion's release fence can be filed against the right buffer.
+    last_shown_ctx: *mut ReleaseCtx,
     frames: u64,
     warned_fence_timeout: bool,
     /// Inodes already reported as having no registered buffer (log once each).
@@ -1218,6 +1455,7 @@ impl AscState {
                 ScanoutPool::new(api),
             )),
             last_publish: None,
+            last_shown_ctx: ptr::null_mut(),
             frames: 0,
             warned_fence_timeout: false,
             logged_unregistered: Vec::new(),
@@ -1520,18 +1758,12 @@ impl AscState {
                 // SAFETY: `ctx` points at the leaked mailbox of this slot.
                 let pending = unsafe { (*ctx).release_fd.swap(-1, Ordering::AcqRel) };
                 if pending >= 0 {
-                    // The wait returning is the release: SurfaceFlinger has
-                    // finished with the buffer this registration carried, so the
-                    // gap from that frame's latch is its hold (see `note_hold`).
-                    let latch = unsafe { (*ctx).latch_ns.load(Ordering::Relaxed) };
+                    // This buffer's own release fence, filed by the transaction
+                    // that replaced it: nothing may reuse the buffer until it
+                    // signals. The wait is a guard, not a measurement — the hold
+                    // is sampled by the watcher, where the fence actually ends
+                    // (see `report_release`).
                     let timed_out = wait_fence(pending);
-                    let now = crate::vsync::now_ns();
-                    if timed_out {
-                        note_hold_timeout();
-                    } else if latch != 0 {
-                        note_hold(latch, now);
-                    }
-                    report_hold(now);
                     if timed_out && !self.warned_fence_timeout {
                         self.warned_fence_timeout = true;
                         log_warn!("{}", "asc: previous release fence timed out; reusing buffer anyway (logged once)");
@@ -1677,9 +1909,16 @@ impl AscState {
                             self.win_h)
                         );
                     }
+                    // What this show replaces on the layer: the completion of
+                    // this transaction reports the *replaced* buffer's release
+                    // fence, so the mailbox that owns it has to be named before
+                    // the callback can run.
+                    // SAFETY: `ctx` is the leaked mailbox of this slot.
+                    unsafe { (*ctx).replaced_ctx.store(self.last_shown_ctx, Ordering::Relaxed) };
                     match build_show(&api, self.sc, ahb, ctx, rect, fence) {
                         Some(tx) => {
                             apply_transaction(&api, tx);
+                            self.last_shown_ctx = ctx;
                             // SAFETY: `ctx` is the leaked mailbox of this slot.
                             unsafe {
                                 (*ctx)
@@ -1780,7 +2019,10 @@ impl AscState {
         let slot = match ForeignCopy::new(fb, src_fd) {
             Ok(copy) => {
                 self.foreign_buffers += 1;
-                let (ctx, _latched) = new_release_ctx(&api);
+                // A copy target is the pool's own buffer, not one the shim
+                // allocated: no producer holds it by a scan-out inode, so it is
+                // registered unnamed and no release note is filed for it.
+                let (ctx, _latched) = new_release_ctx(&api, 0);
                 ForeignSlot {
                     layout,
                     copy: Some(copy),
@@ -2005,6 +2247,7 @@ impl AscState {
         };
         if let Some(tx) = build_show(&api, self.sc, ahb, ctx, rect, None) {
             apply_transaction(&api, tx);
+            self.last_shown_ctx = ctx;
             // SAFETY: `ctx` is the leaked mailbox of this slot.
             unsafe {
                 (*ctx)

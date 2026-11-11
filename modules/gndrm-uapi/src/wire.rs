@@ -534,12 +534,14 @@ impl FrameCapNote {
 /// The daemon latches the capability for the connection and answers with the
 /// current target as a [`FrameCapNote`]; it pushes the same note again whenever
 /// the target changes. `caps` is a bitmask of what the shim can honour:
-/// [`CAP_FRAME_CAP`] and [`CAP_VSYNC_NOTE`]. A shim that never sends this is sent no
+/// [`CAP_FRAME_CAP`], [`CAP_VSYNC_NOTE`], [`CAP_PRESENT_ID`] and
+/// [`CAP_RELEASE_NOTE`]. A shim that never sends this is sent no
 /// [`FrameCapNote`] -- one frame per request, as before -- which is what keeps an
 /// older shim on the channel it expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameCapSubscribe {
-    /// Capability bits: [`CAP_FRAME_CAP`], [`CAP_VSYNC_NOTE`].
+    /// Capability bits: [`CAP_FRAME_CAP`], [`CAP_VSYNC_NOTE`], [`CAP_PRESENT_ID`],
+    /// [`CAP_RELEASE_NOTE`].
     pub caps: u32,
 }
 
@@ -740,6 +742,58 @@ impl PresentDone {
         Some(Self {
             id: u64::from_le_bytes(b[8..16].try_into().ok()?),
             latch_ns: u64::from_le_bytes(b[16..24].try_into().ok()?),
+        })
+    }
+}
+
+/// Buffer-released magic: ASCII "GNBR". Daemon -> shim, on the scan-out channel.
+///
+/// The daemon reports that `SurfaceFlinger` has finished reading a scan-out
+/// buffer, so the producer may write into it again. Only a connection that
+/// declared [`CAP_RELEASE_NOTE`] is sent one.
+///
+/// This is the one thing the producer cannot learn from the compositor: a
+/// compositor hands a buffer back when it has finished *compositing* with it,
+/// which is before the display has finished *scanning* it out. The daemon sees
+/// the difference — `SurfaceFlinger` reports the released buffer's fence in the
+/// completion of the transaction that replaced it — and reports it here.
+pub const BUFFER_RELEASED_MAGIC: u32 = 0x474E_4252;
+
+/// The `caps` bit a [`FrameCapSubscribe`] sets when the shim gates reuse of a
+/// scan-out buffer on [`BufferReleased`]. A daemon pushes no release note to a
+/// connection that did not set it.
+pub const CAP_RELEASE_NOTE: u32 = 1 << 3;
+
+/// A scan-out buffer `SurfaceFlinger` is finished with, daemon -> shim.
+///
+/// Encoded little-endian, 16 bytes: `magic:u32, reserved:u32, ino:u64`. `ino` is
+/// the scan-out inode the buffer was registered under, the same identity a
+/// [`PresentMark`] carries and the shim's slot was allocated from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferReleased {
+    /// The scan-out inode of the buffer that may be written again.
+    pub ino: u64,
+}
+
+impl BufferReleased {
+    pub const LEN: usize = 16;
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[0..4].copy_from_slice(&BUFFER_RELEASED_MAGIC.to_le_bytes());
+        b[8..16].copy_from_slice(&self.ino.to_le_bytes());
+        b
+    }
+
+    #[must_use]
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN || u32::from_le_bytes(b[0..4].try_into().ok()?) != BUFFER_RELEASED_MAGIC
+        {
+            return None;
+        }
+        Some(Self {
+            ino: u64::from_le_bytes(b[8..16].try_into().ok()?),
         })
     }
 }
@@ -1199,6 +1253,56 @@ mod tests {
         );
         for other in ["", "RGBA", "1", "5", "rgba "] {
             assert_eq!(ScanoutLayout::from_env_value(other), None);
+        }
+    }
+
+    #[test]
+    fn buffer_released_round_trip() {
+        let note = BufferReleased { ino: 0x1234_5678_9abc };
+        let enc = note.encode();
+        assert_eq!(enc.len(), BufferReleased::LEN);
+        assert_eq!(enc[0..4], BUFFER_RELEASED_MAGIC.to_le_bytes());
+        assert_eq!(BufferReleased::decode(&enc), Some(note));
+
+        // Its magic is its own, and it decodes to nothing else on the channel:
+        // every push shares the socket, so a shape read as another is a note
+        // applied to the wrong thing.
+        for other in [
+            SCANOUT_MAGIC,
+            FRAME_CAP_MAGIC,
+            FRAME_CAP_SUBSCRIBE_MAGIC,
+            PRESENT_MARK_MAGIC,
+            PRESENT_DONE_MAGIC,
+            VSYNC_MAGIC,
+        ] {
+            assert_ne!(BUFFER_RELEASED_MAGIC, other);
+        }
+        assert_eq!(BufferReleased::decode(&[0u8; BufferReleased::LEN]), None);
+        assert_eq!(BufferReleased::decode(&[]), None);
+        let mut short = note.encode().to_vec();
+        short.truncate(BufferReleased::LEN - 1);
+        assert_eq!(BufferReleased::decode(&short), None);
+        // An inode of 0 is never a buffer the daemon registered, so a zeroed
+        // note cannot be mistaken for a real release.
+        assert_eq!(
+            BufferReleased::decode(&BufferReleased { ino: 0 }.encode()),
+            Some(BufferReleased { ino: 0 })
+        );
+    }
+
+    #[test]
+    fn release_note_cap_is_its_own_bit() {
+        // Every cap bit is distinct: the shim declares what it honours in one
+        // mask, and a shared bit would have it honour a push it cannot read.
+        for (a, b) in [
+            (CAP_FRAME_CAP, CAP_VSYNC_NOTE),
+            (CAP_FRAME_CAP, CAP_PRESENT_ID),
+            (CAP_FRAME_CAP, CAP_RELEASE_NOTE),
+            (CAP_VSYNC_NOTE, CAP_PRESENT_ID),
+            (CAP_VSYNC_NOTE, CAP_RELEASE_NOTE),
+            (CAP_PRESENT_ID, CAP_RELEASE_NOTE),
+        ] {
+            assert_ne!(a, b);
         }
     }
 

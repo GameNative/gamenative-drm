@@ -18,12 +18,13 @@
 
 use gndrm_uapi::wire::{
     scanout_ahb_format, FrameCapNote, FrameCapSubscribe, LsfgConfig, ScanoutAllocReq,
-    ScanoutAllocResp, ScanoutLayout, VsyncNote, CAP_FRAME_CAP, CAP_PRESENT_ID, CAP_VSYNC_NOTE,
+    BufferReleased, ScanoutAllocResp, ScanoutLayout, VsyncNote, CAP_FRAME_CAP, CAP_PRESENT_ID,
+    CAP_RELEASE_NOTE, CAP_VSYNC_NOTE,
     FPS_UNCAPPED, SCANOUT_LAYOUT_ENV, SCANOUT_REQ_AHB_HANDLE,
 };
 use std::ffi::c_void;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Default budget for one exchange, matching the LD_PRELOAD shim's: a daemon
@@ -419,7 +420,7 @@ fn connect(path: &str) -> RawFd {
         if !send_frame(
             fd,
             &FrameCapSubscribe {
-                caps: CAP_FRAME_CAP | CAP_VSYNC_NOTE | CAP_PRESENT_ID,
+                caps: CAP_FRAME_CAP | CAP_VSYNC_NOTE | CAP_PRESENT_ID | CAP_RELEASE_NOTE,
             }
             .encode(),
         ) {
@@ -672,6 +673,82 @@ pub(crate) fn send_present_mark(ino: u64, id: u64) {
     send_frame(*ch, &gndrm_uapi::wire::PresentMark { ino, id }.encode());
 }
 
+// ------------------------------------------------------ scan-out releases
+//
+// A compositor handing a buffer back means it has finished *compositing* with
+// it. The display may still be reading it: SurfaceFlinger reports a buffer's
+// true release a transaction later, as the previous-release fence of whichever
+// buffer replaced it on the layer, and the daemon turns that fence into a
+// [`BufferReleased`] note. Until the note arrives a slot stays busy, because a
+// producer that reused the buffer on the compositor's release wrote into memory
+// the panel was still scanning — and the panel showed both frames at once for
+// as long as the two writes overlapped.
+
+/// Scan-out inodes the daemon reported released, as `(ino, CLOCK_MONOTONIC ns
+/// when this process took the note)`. Bounded: a note for a buffer whose slot is
+/// gone is dropped, and a producer cannot grow this list.
+static RELEASED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// How many releases may be held before the oldest is dropped. A session has one
+/// per buffer in the pool; a note whose slot never comes back is stale.
+const RELEASED_CAP: usize = 32;
+
+/// Release notes seen this session. Zero means the daemon does not send them (an
+/// older build), and a slot is freed on the compositor's release as it was
+/// before: the note improves on that behaviour, it does not depend on it.
+static RELEASE_NOTES: AtomicU64 = AtomicU64::new(0);
+
+/// Record that the daemon reported `ino` released.
+///
+/// A note is not applied here: the slot that owns the buffer is parked, and it is
+/// taken on the next acquire pass (see `acquire_take_free`), so this runs on the
+/// thread that read the note and touches nothing else.
+pub(crate) fn note_buffer_released(ino: u64) {
+    if ino == 0 {
+        return;
+    }
+    RELEASE_NOTES.fetch_add(1, Ordering::Relaxed);
+    let mut q = RELEASED.lock().unwrap_or_else(|e| e.into_inner());
+    if q.len() >= RELEASED_CAP {
+        q.remove(0);
+    }
+    q.push((ino, crate::proxy::monotonic_ns()));
+}
+
+/// Whether the daemon sends release notes at all. Until one has arrived, a slot
+/// frees on the compositor's release exactly as it did before this note existed.
+pub(crate) fn release_notes_live() -> bool {
+    RELEASE_NOTES.load(Ordering::Relaxed) != 0
+}
+
+/// Take a release note for `ino` that arrived at or after `since_ns`, and drop
+/// every older note for the same buffer.
+///
+/// `since_ns` is when the slot was parked. A note older than that describes an
+/// earlier frame of the same buffer — it says nothing about the frame now on the
+/// panel — and must not free the slot early. `true` when a note applied.
+pub(crate) fn take_released(ino: u64, since_ns: u64) -> bool {
+    if ino == 0 {
+        return false;
+    }
+    let mut q = RELEASED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut applied = false;
+    q.retain(|&(held, at)| {
+        if held != ino {
+            return true;
+        }
+        if at < since_ns {
+            return false;
+        }
+        if applied {
+            return true;
+        }
+        applied = true;
+        false
+    });
+    applied
+}
+
 pub(crate) fn poll_notes() {
     let ch = match CHAN.try_lock() {
         Ok(g) => g,
@@ -707,6 +784,10 @@ pub(crate) fn poll_notes() {
     } else if let Some(done) = gndrm_uapi::wire::PresentDone::decode(&buf[..len]) {
         // The panel latched the frame this id was marked for.
         crate::present::record(done.id, done.latch_ns);
+    } else if let Some(released) = BufferReleased::decode(&buf[..len]) {
+        // SurfaceFlinger is finished with this scan-out buffer: the producer may
+        // write into it again (see `note_buffer_released`).
+        note_buffer_released(released.ino);
     } else if let Some(acq) = gndrm_uapi::wire::FrameAcquired::decode(&buf[..len]) {
         // Sent from the acquire path; nothing to apply here. Accepted so the
         // log does not report it as an unknown frame.
@@ -720,6 +801,38 @@ const PUSH_LEN: usize = LsfgConfig::LEN;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A release note frees the frame it describes and no other: the slot is
+    /// parked before one can arrive, so a note older than the park describes an
+    /// earlier frame of the same buffer and must not free this one.
+    #[test]
+    fn a_release_note_only_applies_to_the_frame_it_describes() {
+        note_buffer_released(9_001);
+        assert!(take_released(9_001, 0), "a note after the park frees the slot");
+        assert!(!take_released(9_001, 0), "and is consumed by it");
+
+        // A note taken before the slot was parked: dropped, and it must not free
+        // the slot on the next pass either.
+        note_buffer_released(9_002);
+        let parked = crate::proxy::monotonic_ns() + 1;
+        assert!(!take_released(9_002, parked));
+        assert!(!take_released(9_002, 0));
+
+        // An inode of 0 is never a registered buffer.
+        note_buffer_released(0);
+        assert!(!take_released(0, 0));
+    }
+
+    #[test]
+    fn release_notes_are_bounded_and_observed() {
+        assert!(release_notes_live(), "a note was recorded above");
+        for ino in 0..(RELEASED_CAP as u64 + 8) {
+            note_buffer_released(7_000 + ino);
+        }
+        let held = RELEASED.lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert!(held <= RELEASED_CAP, "held {held} of at most {RELEASED_CAP}");
+    }
+
 
     /// Bind a `SOCK_SEQPACKET` listener on the abstract namespace, the way the
     /// daemon's scan-out acceptor does.
