@@ -196,11 +196,11 @@ pub fn start(runtime_dir: String, display: String) -> i32 {
                 stop,
                 thread: Some(t),
             });
-            log_info!("{}", gndrm_obf::obf!("injector started (target {path})"));
+            log_info!("{}", format_args!("injector started (target {path})"));
             0
         }
         Err(e) => {
-            log_error!("{}", gndrm_obf::obf!("injector spawn: {e}"));
+            log_error!("{}", format_args!("injector spawn: {e}"));
             -5
         }
     }
@@ -244,11 +244,11 @@ pub fn stop() {
         } else {
             log_warn!(
                 "{}",
-                gndrm_obf::obf!("injector thread parked past {JOIN_TIMEOUT:?}; detached")
+                format_args!("injector thread parked past {JOIN_TIMEOUT:?}; detached")
             );
         }
     }
-    log_info!("{}", gndrm_obf::obf!("injector stopped"));
+    log_info!("{}", "injector stopped");
 }
 
 fn post(ev: InputEvent) {
@@ -418,11 +418,9 @@ pub fn display_and_features() -> String {
         .join(",");
     format!(
         "{}",
-        gndrm_obf::obf!(
-            "features=0x{features:X};connector={};display_flags=0x{:X};rates={rates}",
+        format_args!("features=0x{features:X};connector={};display_flags=0x{:X};rates={rates}",
             info.connector,
-            info.flags
-        )
+            info.flags)
     )
 }
 
@@ -524,7 +522,7 @@ impl Dispatch<GamescopeReshade, ()> for State {
     ) {
         // The protocol has one event today, so the match is exhaustive.
         let GsReshadeEvent::EffectReady { effect_path } = event;
-        log_info!("{}", gndrm_obf::obf!("reshade effect ready: {effect_path}"));
+        log_info!("{}", format_args!("reshade effect ready: {effect_path}"));
     }
 }
 
@@ -597,10 +595,10 @@ fn run(path: &str, rx: &mpsc::Receiver<InputEvent>, stop: &AtomicBool) {
             Ok(()) => return, // stop requested
             Err(e) => {
                 if !logged_wait {
-                    log_info!("{}", gndrm_obf::obf!("injector waiting for {path}: {e}"));
+                    log_info!("{}", format_args!("injector waiting for {path}: {e}"));
                     logged_wait = true;
                 } else {
-                    log_warn!("{}", gndrm_obf::obf!("injector reconnecting: {e}"));
+                    log_warn!("{}", format_args!("injector reconnecting: {e}"));
                 }
                 // Drain stale input while disconnected, then wait.
                 while rx.try_recv().is_ok() {}
@@ -618,7 +616,7 @@ fn connect_and_run(
 ) -> Result<(), String> {
     let stream = UnixStream::connect(path).map_err(|e| e.to_string())?;
     let conn = Connection::from_socket(stream)
-        .map_err(|e| format!("{}", gndrm_obf::obf!("from_socket: {e}")))?;
+        .map_err(|e| format!("{}", format_args!("from_socket: {e}")))?;
     let mut event_queue = conn.new_event_queue::<State>();
     let qh = event_queue.handle();
 
@@ -636,18 +634,16 @@ fn connect_and_run(
     };
     event_queue
         .roundtrip(&mut state)
-        .map_err(|e| format!("{}", gndrm_obf::obf!("registry roundtrip: {e}")))?;
+        .map_err(|e| format!("{}", format_args!("registry roundtrip: {e}")))?;
 
     let (Some(seat), Some(ptr_mgr), Some(kbd_mgr)) = (&state.seat, &state.ptr_mgr, &state.kbd_mgr)
     else {
         return Err(format!(
             "{}",
-            gndrm_obf::obf!(
-                "missing globals (seat={} ptr={} kbd={})",
+            format_args!("missing globals (seat={} ptr={} kbd={})",
                 state.seat.is_some(),
                 state.ptr_mgr.is_some(),
-                state.kbd_mgr.is_some()
-            )
+                state.kbd_mgr.is_some())
         ));
     };
 
@@ -656,19 +652,17 @@ fn connect_and_run(
     let keyboard = state
         .keyboard
         .as_ref()
-        .expect(&gndrm_obf::obf!("keyboard just created"));
+        .expect(&"keyboard just created");
     upload_keymap(keyboard);
     if state.gs_control.is_none() {
         log_warn!(
-            "{}",
-            gndrm_obf::obf!("gamescope_control not offered; fps cap unavailable")
+            "gamescope_control not offered; fps cap unavailable"
         );
     }
     conn.flush()
-        .map_err(|e| format!("{}", gndrm_obf::obf!("flush: {e}")))?;
+        .map_err(|e| format!("{}", format_args!("flush: {e}")))?;
     log_info!(
-        "{}",
-        gndrm_obf::obf!("injector connected: virtual pointer + keyboard created")
+        "injector connected: virtual pointer + keyboard created"
     );
 
     // Main loop: apply queued input, apply a pending fps cap, flush, drain
@@ -728,12 +722,12 @@ fn connect_and_run(
             }
         }
         conn.flush()
-            .map_err(|e| format!("{}", gndrm_obf::obf!("flush: {e}")))?;
+            .map_err(|e| format!("{}", format_args!("flush: {e}")))?;
         // Keep the read side drained and detect server death promptly.
         if last_roundtrip.elapsed() >= Duration::from_millis(500) {
             event_queue
                 .roundtrip(&mut state)
-                .map_err(|e| format!("{}", gndrm_obf::obf!("roundtrip: {e}")))?;
+                .map_err(|e| format!("{}", format_args!("roundtrip: {e}")))?;
             last_roundtrip = std::time::Instant::now();
         }
     }
@@ -818,17 +812,15 @@ fn upload_keymap(keyboard: &ZwpVirtualKeyboardV1) {
     if fd < 0 {
         log_error!(
             "{}",
-            gndrm_obf::obf!(
-                "keymap memfd_create failed: {}",
-                std::io::Error::last_os_error()
-            )
+            format_args!("keymap memfd_create failed: {}",
+                std::io::Error::last_os_error())
         );
         return;
     }
     // SAFETY: fd is valid; bytes outlive the call.
     let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
     if written != bytes.len() as isize {
-        log_error!("{}", gndrm_obf::obf!("keymap write short: {written}"));
+        log_error!("{}", format_args!("keymap write short: {written}"));
         // SAFETY: owned fd.
         unsafe { libc::close(fd) };
         return;

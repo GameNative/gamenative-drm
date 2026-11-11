@@ -1,0 +1,59 @@
+name: build
+
+# PR gate: every change compiles with no warnings.
+#
+# Host build only. The Android artifacts (`tools/build-android.sh`,
+# `build-shim.sh android`) need the NDK, the gamescope termux prefix and the
+# export/undefined-symbol audits that read the cross build's output — that is a
+# workstation step, not something this runner can stand up. What is checked here
+# is the part CI can hold: the workspace builds for the host target, tests and
+# benches included, with `-D warnings`, and clippy accepts every target.
+#
+# No formatting check on purpose: the tree is hand-formatted.
+#
+# No artifacts are produced or uploaded; the result is the job's status.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host:
+    name: host build, no warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The guest-side clients link the host's Vulkan, wayland and xcb:
+      # `utils/src/{vk,wlproto}.rs` and `icd_shim/src/x11.rs` carry the `#[link]`
+      # attributes, so a runner without the -dev packages fails at link time with
+      # `unable to find library -lvulkan` rather than in the code.
+      - name: system libraries the clients link
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            libvulkan-dev libwayland-dev \
+            libxcb1-dev libxcb-dri3-dev libxcb-present-dev libxcb-sync-dev
+
+      # `--all-targets` compiles the test and bench targets too, so a change
+      # that only breaks a test build fails here rather than at review.
+      - name: cargo build (workspace, all targets, warnings are errors)
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo build --workspace --all-targets --locked
+
+      - name: cargo clippy (workspace, all targets, warnings are errors)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

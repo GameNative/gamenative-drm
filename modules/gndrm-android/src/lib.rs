@@ -221,9 +221,7 @@ fn scanout_geometry(win_w: u16, win_h: u16) -> (u16, u16) {
     } else {
         log_info!(
             "{}",
-            gndrm_obf::obf!(
-                "scan-out geometry {want_w}x{want_h} does not fit the {win_w}x{win_h} window; the mode is the window"
-            )
+            format_args!("scan-out geometry {want_w}x{want_h} does not fit the {win_w}x{win_h} window; the mode is the window")
         );
         (win_w, win_h)
     }
@@ -248,30 +246,29 @@ fn cache_java_vm(env: &mut JNIEnv) {
     match env.get_java_vm() {
         Ok(vm) => {
             if JAVA_VM.set(vm).is_ok() {
-                log_info!("{}", gndrm_obf::obf!("cached JavaVM for JNI callbacks"));
+                log_info!("{}", "cached JavaVM for JNI callbacks");
             }
         }
-        Err(e) => log_warn!("{}", gndrm_obf::obf!("get_java_vm failed: {e}")),
+        Err(e) => log_warn!("{}", format_args!("get_java_vm failed: {e}")),
     }
     match env.find_class("app/gamenative/display/GameNativeDrm") {
         Ok(class) => match env.new_global_ref(class) {
             Ok(global) => {
                 if CALLBACK_CLASS.set(global).is_ok() {
                     log_info!(
-                        "{}",
-                        gndrm_obf::obf!("cached GameNativeDrm class for JNI callbacks")
+                        "cached GameNativeDrm class for JNI callbacks"
                     );
                 }
             }
             Err(e) => log_warn!(
                 "{}",
-                gndrm_obf::obf!("new_global_ref(GameNativeDrm) failed: {e}")
+                format_args!("new_global_ref(GameNativeDrm) failed: {e}")
             ),
         },
         Err(e) => {
             log_warn!(
                 "{}",
-                gndrm_obf::obf!("find_class(GameNativeDrm) failed: {e}")
+                format_args!("find_class(GameNativeDrm) failed: {e}")
             );
             let _ = env.exception_clear();
         }
@@ -293,10 +290,8 @@ pub(crate) fn clear_booting_splash() {
         if !LOGGED.swap(true, Ordering::Relaxed) && (failed || gndrm_daemon::verbose_logging()) {
             crate::log_always!(
                 "{}",
-                gndrm_obf::obf!(
-                    "gndrm-daemon: splash-clear upcall clearBootingSplash outcome={}",
-                    if failed { "failed" } else { "ok" }
-                )
+                format_args!("gndrm-daemon: splash-clear upcall clearBootingSplash outcome={}",
+                    if failed { "failed" } else { "ok" })
             );
         }
     }
@@ -391,14 +386,14 @@ fn call_app_static(method: &str) -> AppCall {
     let Some(vm) = JAVA_VM.get() else {
         log_warn!(
             "{}",
-            gndrm_obf::obf!("{method}: no cached JavaVM; call skipped")
+            format_args!("{method}: no cached JavaVM; call skipped")
         );
         return AppCall::Failed;
     };
     let Some(class) = CALLBACK_CLASS.get() else {
         log_warn!(
             "{}",
-            gndrm_obf::obf!("{method}: GameNativeDrm class not cached; call skipped")
+            format_args!("{method}: GameNativeDrm class not cached; call skipped")
         );
         return AppCall::Failed;
     };
@@ -407,13 +402,13 @@ fn call_app_static(method: &str) -> AppCall {
         Err(e) => {
             log_warn!(
                 "{}",
-                gndrm_obf::obf!("{method}: attach_current_thread failed: {e}")
+                format_args!("{method}: attach_current_thread failed: {e}")
             );
             return AppCall::Failed;
         }
     };
     let Some(method_id) = static_method_id(&mut env, class, method) else {
-        log_warn!("{}", gndrm_obf::obf!("{method}: no static id for ()V"));
+        log_warn!("{}", format_args!("{method}: no static id for ()V"));
         return AppCall::Failed;
     };
     // SAFETY: `method_id` was resolved from this same cached class and ids stay
@@ -436,14 +431,14 @@ fn call_app_static(method: &str) -> AppCall {
             if let Ok(true) = env.exception_check() {
                 let _ = env.exception_describe();
                 let _ = env.exception_clear();
-                log_warn!("{}", gndrm_obf::obf!("{method}: threw; exception cleared"));
+                log_warn!("{}", format_args!("{method}: threw; exception cleared"));
                 return AppCall::Failed;
             }
-            log_info!("{}", gndrm_obf::obf!("{method}: called"));
+            log_info!("{}", format_args!("{method}: called"));
             AppCall::Ok
         }
         Err(e) => {
-            log_warn!("{}", gndrm_obf::obf!("{method}: call failed: {e}"));
+            log_warn!("{}", format_args!("{method}: call failed: {e}"));
             // Never leave a pending exception on this thread.
             let _ = env.exception_clear();
             AppCall::Failed
@@ -507,7 +502,7 @@ fn report_panic(subsystem: &str, payload: &(dyn std::any::Any + Send)) {
         .unwrap_or("<non-string panic payload>");
     log_error!(
         "{}",
-        gndrm_obf::obf!("{subsystem}: PANICKED: {msg}; subsystem stopped, app continues")
+        format_args!("{subsystem}: PANICKED: {msg}; subsystem stopped, app continues")
     );
 }
 
@@ -563,25 +558,25 @@ fn server_thread_inner(
         Err(e) => {
             log_warn!(
                 "{}",
-                gndrm_obf::obf!("accept(rpc): {e} (stopped before client?)")
+                format_args!("accept(rpc): {e} (stopped before client?)")
             );
             return;
         }
     };
-    fds.lock().expect(&gndrm_obf::obf!("fds poisoned")).rpc = rpc;
+    fds.lock().expect(&"fds poisoned").rpc = rpc;
     let event = match server::accept(listener) {
         Ok(fd) => fd,
         Err(e) => {
-            log_warn!("{}", gndrm_obf::obf!("accept(event): {e}"));
+            log_warn!("{}", format_args!("accept(event): {e}"));
             // SAFETY: rpc is owned by this thread.
             unsafe { libc::close(rpc) };
             return;
         }
     };
-    fds.lock().expect(&gndrm_obf::obf!("fds poisoned")).event = event;
+    fds.lock().expect(&"fds poisoned").event = event;
     log_info!(
         "{}",
-        gndrm_obf::obf!("client connected (rpc={rpc} event={event})")
+        format_args!("client connected (rpc={rpc} event={event})")
     );
 
     // 3. Third and later connections: the scan-out allocator channel (see
@@ -600,8 +595,7 @@ fn server_thread_inner(
         fd if fd >= 0 => Some(fd),
         _ => {
             log_warn!(
-                "{}",
-                gndrm_obf::obf!("eventfd for the scan-out acceptor failed; no client allocator")
+                "eventfd for the scan-out acceptor failed; no client allocator"
             );
             None
         }
@@ -618,10 +612,7 @@ fn server_thread_inner(
         }
         _ => {
             log_warn!(
-                "{}",
-                gndrm_obf::obf!(
-                    "eventfd for the frame-cap push failed; a target change reaches the shim only when it reconnects"
-                )
+                "eventfd for the frame-cap push failed; a target change reaches the shim only when it reconnects"
             );
             -1
         }
@@ -631,7 +622,7 @@ fn server_thread_inner(
     // holds across its blocking SurfaceFlinger round-trip.
     let pool = asc_state
         .lock()
-        .expect(&gndrm_obf::obf!("asc state poisoned"))
+        .expect(&"asc state poisoned")
         .pool();
     // The scan-out thread takes the pool Arc below, so the ADDFB2 geometry
     // sink installed further down needs its own clone.
@@ -713,11 +704,11 @@ fn server_thread_inner(
                             if e.raw_os_error() == Some(libc::EINTR) {
                                 continue;
                             }
-                            log_info!("{}", gndrm_obf::obf!("scan-out acceptor poll: {e}"));
+                            log_info!("{}", format_args!("scan-out acceptor poll: {e}"));
                             return;
                         }
                         if pfds[1].revents != 0 {
-                            log_info!("{}", gndrm_obf::obf!("scan-out acceptor stopping"));
+                            log_info!("{}", "scan-out acceptor stopping");
                             return;
                         }
                         // A push owes nothing to the allocator: it goes out
@@ -747,15 +738,15 @@ fn server_thread_inner(
                             Err(e) => {
                                 log_info!(
                                     "{}",
-                                    gndrm_obf::obf!("accept(scanout): {e}; acceptor stopping")
+                                    format_args!("accept(scanout): {e}; acceptor stopping")
                                 );
                                 return;
                             }
                         };
-                        fds.lock().expect(&gndrm_obf::obf!("fds poisoned")).scanout = fd;
+                        fds.lock().expect(&"fds poisoned").scanout = fd;
                         log_info!(
                             "{}",
-                            gndrm_obf::obf!("scan-out channel connected (fd={fd})")
+                            format_args!("scan-out channel connected (fd={fd})")
                         );
                         let outcome =
                             asc::serve_scanout(fd, listener, signal, cap_fd, &pool, &doorbell);
@@ -770,7 +761,7 @@ fn server_thread_inner(
                                 guard.scanout = -1;
                             }
                         }
-                        log_info!("{}", gndrm_obf::obf!("scan-out channel closed (fd={fd})"));
+                        log_info!("{}", format_args!("scan-out channel closed (fd={fd})"));
                         // A connection that asked for pushes keeps its
                         // registration when it only lost the allocator role: the
                         // cap, the grid and the frame-generation settings are
@@ -786,9 +777,7 @@ fn server_thread_inner(
                         {
                             log_info!(
                                 "{}",
-                                gndrm_obf::obf!(
-                                    "scan-out channel {fd} keeps its push subscription"
-                                )
+                                format_args!("scan-out channel {fd} keeps its push subscription")
                             );
                         } else {
                             let _ = gndrm_daemon::pushes::forget(fd);
@@ -796,7 +785,7 @@ fn server_thread_inner(
                             unsafe { libc::close(fd) };
                         }
                         if matches!(outcome, asc::ScanoutChannel::Stop) {
-                            log_info!("{}", gndrm_obf::obf!("scan-out acceptor stopping"));
+                            log_info!("{}", "scan-out acceptor stopping");
                             return;
                         }
                         // Closed or Superseded: loop and adopt the newest connection
@@ -827,7 +816,7 @@ fn server_thread_inner(
                         break;
                     }
                     if let Some(line) = d.maybe_stall_dump(diag::STALL_WARN_MS) {
-                        log_warn!("{}", gndrm_obf::obf!("asc: {line}"));
+                        log_warn!("{}", format_args!("asc: {line}"));
                     }
                 }
             })) {
@@ -863,14 +852,14 @@ fn server_thread_inner(
         if addfb_logged.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
             log_info!(
                 "{}",
-                gndrm_obf::obf!("asc: addfb geometry {width}x{height} alloc_len={alloc_len}")
+                format_args!("asc: addfb geometry {width}x{height} alloc_len={alloc_len}")
             );
         }
         addfb_pool
             .lock(diag::Role::Commit)
             .note_framebuffer(width, height, alloc_len);
     }));
-    let log = |msg: &str| crate::log::daemon_info(&format!("{}", gndrm_obf::obf!("server: {msg}")));
+    let log = |msg: &str| crate::log::daemon_info(&format!("{}", format_args!("server: {msg}")));
     server::serve(&mut dev, rpc, event, &log);
 
     // 5. Teardown. Wake and join the scan-out acceptor first (it may be parked
@@ -925,7 +914,7 @@ fn server_thread_inner(
     if let Ok(state) = asc_state.lock() {
         log_info!(
             "{}",
-            gndrm_obf::obf!("asc: {} frames published", state.frames_presented())
+            format_args!("asc: {} frames published", state.frames_presented())
         );
     }
     // SAFETY: this thread owns both descriptors; nothing else uses them.
@@ -933,7 +922,7 @@ fn server_thread_inner(
         libc::close(rpc);
         libc::close(event);
     }
-    log_info!("{}", gndrm_obf::obf!("server thread exit"));
+    log_info!("{}", "server thread exit");
 }
 
 fn start(
@@ -964,13 +953,13 @@ fn start(
         Err(_) => return E_INVAL,
     };
     if width < 64 || height < 64 {
-        log_error!("{}", gndrm_obf::obf!("bad geometry {width}x{height}"));
+        log_error!("{}", format_args!("bad geometry {width}x{height}"));
         return E_INVAL;
     }
 
-    let mut slot = RUNTIME.lock().expect(&gndrm_obf::obf!("runtime poisoned"));
+    let mut slot = RUNTIME.lock().expect(&"runtime poisoned");
     if slot.is_some() {
-        log_warn!("{}", gndrm_obf::obf!("nativeStart while running"));
+        log_warn!("{}", "nativeStart while running");
         return E_BUSY;
     }
 
@@ -980,8 +969,7 @@ fn start(
         unsafe { ffi::ANativeWindow_fromSurface(env.get_native_interface(), surface.as_raw()) };
     if raw_window.is_null() {
         log_error!(
-            "{}",
-            gndrm_obf::obf!("ANativeWindow_fromSurface returned null")
+            "ANativeWindow_fromSurface returned null"
         );
         return E_INVAL;
     }
@@ -990,7 +978,7 @@ fn start(
     let listener = match server::listen_seqpacket(&name) {
         Ok(fd) => fd,
         Err(e) => {
-            log_error!("{}", gndrm_obf::obf!("listen({name}): {e}"));
+            log_error!("{}", format_args!("listen({name}): {e}"));
             // SAFETY: window was acquired above and nothing else holds it.
             unsafe { ffi::ANativeWindow_release(window.0) };
             return E_IO;
@@ -1006,7 +994,7 @@ fn start(
     let render_listener = match server::listen_seqpacket(&render_name) {
         Ok(fd) => fd,
         Err(e) => {
-            log_error!("{}", gndrm_obf::obf!("listen({render_name}): {e}"));
+            log_error!("{}", format_args!("listen({render_name}): {e}"));
             // SAFETY: listener/window acquired above; nothing else holds them.
             unsafe {
                 libc::close(listener);
@@ -1018,7 +1006,7 @@ fn start(
     let render_stop = match server::new_stop_eventfd() {
         Ok(fd) => fd,
         Err(e) => {
-            log_error!("{}", gndrm_obf::obf!("render stop eventfd: {e}"));
+            log_error!("{}", format_args!("render stop eventfd: {e}"));
             // SAFETY: listener/render_listener/window acquired above.
             unsafe {
                 libc::close(listener);
@@ -1081,7 +1069,7 @@ fn start(
     let render_handle = match render_handle {
         Ok(h) => h,
         Err(e) => {
-            log_error!("{}", gndrm_obf::obf!("render thread spawn: {e}"));
+            log_error!("{}", format_args!("render thread spawn: {e}"));
             // SAFETY: nothing else can own these now.
             unsafe {
                 libc::close(listener);
@@ -1101,7 +1089,7 @@ fn start(
     let handle = match handle {
         Ok(h) => h,
         Err(e) => {
-            log_error!("{}", gndrm_obf::obf!("spawn: {e}"));
+            log_error!("{}", format_args!("spawn: {e}"));
             // Stop the render thread already started above, then reclaim.
             server::signal_stop(render_stop);
             // SAFETY: nothing else can own these now.
@@ -1125,7 +1113,7 @@ fn start(
         Ok(Ok(asc)) => asc,
         other => {
             if let Ok(Err(e)) = other {
-                log_error!("{}", gndrm_obf::obf!("server thread init: {e}"));
+                log_error!("{}", format_args!("server thread init: {e}"));
             }
             // Thread already exited (or is exiting); reclaim everything.
             let _ = handle.join();
@@ -1146,13 +1134,10 @@ fn start(
 
     log_info!(
         "{}",
-        gndrm_obf::obf!("started: socket={name} {panel_w}x{panel_h} into {win_w}x{win_h}")
+        format_args!("started: socket={name} {panel_w}x{panel_h} into {win_w}x{win_h}")
     );
     log_info!(
-        "{}",
-        gndrm_obf::obf!(
-            "gndrm build 20260926-1: ADDFB2_MODIFIERS + IN_FORMATS (LINEAR) on both planes"
-        )
+        "gndrm build 20260926-1: ADDFB2_MODIFIERS + IN_FORMATS (LINEAR) on both planes"
     );
     let asc = Arc::downgrade(&asc);
     *slot = Some(Runtime {
@@ -1175,10 +1160,10 @@ fn start(
 fn stop() {
     let rt = RUNTIME
         .lock()
-        .expect(&gndrm_obf::obf!("runtime poisoned"))
+        .expect(&"runtime poisoned")
         .take();
     let Some(mut rt) = rt else { return };
-    log_info!("{}", gndrm_obf::obf!("stopping ({})", rt.name));
+    log_info!("{}", format_args!("stopping ({})", rt.name));
     choreographer::stop();
     // Unblock accept()/recvmsg() regardless of which phase the thread is in.
     // SAFETY: fds are valid or -1; shutdown only unblocks, the thread
@@ -1198,7 +1183,7 @@ fn stop() {
     }
     if let Some(t) = rt.render_thread.take() {
         if t.join().is_err() {
-            log_error!("{}", gndrm_obf::obf!("render thread panicked"));
+            log_error!("{}", "render thread panicked");
         }
     }
     // SAFETY: the render thread is joined; nothing else uses these now.
@@ -1223,7 +1208,7 @@ fn stop() {
     }
     if let Some(t) = rt.thread.take() {
         if t.join().is_err() {
-            log_error!("{}", gndrm_obf::obf!("server thread panicked"));
+            log_error!("{}", "server thread panicked");
         }
     }
     // The presenter is down (dropped on the joined thread); the window is ours
@@ -1231,7 +1216,7 @@ fn stop() {
     // SAFETY: presenter no longer references the window.
     unsafe { ffi::ANativeWindow_release(rt.window.0) };
     FIRST_FRAME_COMMITTED.store(false, Ordering::Relaxed);
-    log_info!("{}", gndrm_obf::obf!("stopped"));
+    log_info!("{}", "stopped");
 }
 
 /// Adopt a new display window for a RUNNING session: rebuild the publish layer
@@ -1248,21 +1233,20 @@ fn retarget(env: &mut JNIEnv, surface: &JObject, width: jint, height: jint) -> j
     if width < 64 || height < 64 {
         log_error!(
             "{}",
-            gndrm_obf::obf!("bad retarget geometry {width}x{height}")
+            format_args!("bad retarget geometry {width}x{height}")
         );
         return E_INVAL;
     }
-    let mut slot = RUNTIME.lock().expect(&gndrm_obf::obf!("runtime poisoned"));
+    let mut slot = RUNTIME.lock().expect(&"runtime poisoned");
     let Some(rt) = slot.as_mut() else {
-        log_info!("{}", gndrm_obf::obf!("retarget: no running session"));
+        log_info!("{}", "retarget: no running session");
         return E_NOENT;
     };
     // The presenter owns the session's strong reference to the shared state, so
     // a failed upgrade means the session is already shutting down.
     let Some(state) = rt.asc.upgrade() else {
         log_warn!(
-            "{}",
-            gndrm_obf::obf!("retarget: the presenter is shutting down; no layer to rebuild")
+            "retarget: the presenter is shutting down; no layer to rebuild"
         );
         return E_NOENT;
     };
@@ -1272,8 +1256,7 @@ fn retarget(env: &mut JNIEnv, surface: &JObject, width: jint, height: jint) -> j
         unsafe { ffi::ANativeWindow_fromSurface(env.get_native_interface(), surface.as_raw()) };
     if raw.is_null() {
         log_error!(
-            "{}",
-            gndrm_obf::obf!("retarget: ANativeWindow_fromSurface returned null")
+            "retarget: ANativeWindow_fromSurface returned null"
         );
         return E_INVAL;
     }
@@ -1309,10 +1292,7 @@ fn retarget(env: &mut JNIEnv, surface: &JObject, width: jint, height: jint) -> j
         .retarget(raw, win_w, win_h);
     if !rebuilt {
         log_error!(
-            "{}",
-            gndrm_obf::obf!(
-                "retarget: the publish layer could not be rebuilt; keeping the current window"
-            )
+            "retarget: the publish layer could not be rebuilt; keeping the current window"
         );
         // SAFETY: `raw` is the extra reference this call acquired.
         unsafe { ffi::ANativeWindow_release(raw) };
@@ -1329,7 +1309,7 @@ fn retarget(env: &mut JNIEnv, surface: &JObject, width: jint, height: jint) -> j
     let _ = injector::gamescope_command("debug_force_repaint");
     log_info!(
         "{}",
-        gndrm_obf::obf!("retarget: adopted the new window {win_w}x{win_h}")
+        format_args!("retarget: adopted the new window {win_w}x{win_h}")
     );
     0
 }
@@ -1483,7 +1463,7 @@ fn set_scanout_geometry(width: jint, height: jint) {
     if width < 64 || height < 64 {
         log_warn!(
             "{}",
-            gndrm_obf::obf!("scan-out geometry {width}x{height} below 64x64; ignored")
+            format_args!("scan-out geometry {width}x{height} below 64x64; ignored")
         );
         return;
     }
@@ -1502,7 +1482,7 @@ fn set_panel_refresh_hz(refresh_hz: jint) {
     if !(1..=1000).contains(&refresh_hz) {
         log_warn!(
             "{}",
-            gndrm_obf::obf!("panel refresh {refresh_hz} Hz out of range 1..=1000; ignored")
+            format_args!("panel refresh {refresh_hz} Hz out of range 1..=1000; ignored")
         );
         return;
     }

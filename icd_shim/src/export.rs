@@ -352,11 +352,9 @@ fn register_image(e: EmuImage) {
         if old.image != e.image {
             return true;
         }
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: image {:#x} reused; dropping stale fd={}",
+        crate::logf!("export-emu: image {:#x} reused; dropping stale fd={}",
             old.image,
-            old.fd
-        ));
+            old.fd);
         close_fd(old.fd);
         false
     });
@@ -525,12 +523,10 @@ pub unsafe extern "C" fn gn_vkGetPhysicalDeviceImageFormatProperties2(
         LINEAR_MODIFIER_REFUSED.store(true, Ordering::Relaxed);
     }
     if !LOGGED_QUERY.swap(true, Ordering::Relaxed) {
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: modifier query fmt={} usage={:#x} flags={:#x} driver={res} features={features:#x} linear={lres}",
+        crate::logf!("export-emu: modifier query fmt={} usage={:#x} flags={:#x} driver={res} features={features:#x} linear={lres}",
             lin.format,
             lin.usage,
-            lin.flags
-        ));
+            lin.flags);
     }
     if lres != VK_SUCCESS {
         return res;
@@ -602,18 +598,14 @@ pub unsafe fn try_create_image(
         && std::env::var_os("GNDRM_EXPORT_AHB").is_some_and(|v| v == "1")
     {
         DMABUF_IMPORT.store(DMABUF_REFUSED, Ordering::Relaxed);
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: GNDRM_EXPORT_AHB=1, importing pool buffers as AHardwareBuffers from the start"
-        ));
+        crate::logf!("export-emu: GNDRM_EXPORT_AHB=1, importing pool buffers as AHardwareBuffers from the start");
     }
     if DMABUF_IMPORT.load(Ordering::Relaxed) == DMABUF_UNKNOWN
         && LINEAR_MODIFIER_REFUSED.load(Ordering::Relaxed)
         && std::env::var_os("GNDRM_EXPORT_AHB").is_none_or(|v| v != "0")
     {
         DMABUF_IMPORT.store(DMABUF_REFUSED, Ordering::Relaxed);
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: the driver refuses LINEAR DRM-modifier images; importing pool buffers as AHardwareBuffers from the start (GNDRM_EXPORT_AHB=0 forces the dma-buf route)"
-        ));
+        crate::logf!("export-emu: the driver refuses LINEAR DRM-modifier images; importing pool buffers as AHardwareBuffers from the start (GNDRM_EXPORT_AHB=0 forces the dma-buf route)");
     }
     let route = DMABUF_IMPORT.load(Ordering::Relaxed);
     let (w, h) = (ci.extent.width, ci.extent.height);
@@ -624,9 +616,7 @@ pub unsafe fn try_create_image(
     }
     .or_else(|| crate::scanout::allocate(w, h));
     let Some(buf) = buf else {
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: pool allocation {w}x{h} refused; driver create"
-        ));
+        crate::logf!("export-emu: pool allocation {w}x{h} refused; driver create");
         return None;
     };
     let fl = unsafe { find_in(ci.pNext, STYPE_IMAGE_FORMAT_LIST_CREATE_INFO) }
@@ -675,17 +665,13 @@ pub unsafe fn try_create_image(
         }
     }
     if buf.ahb.is_null() {
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: no AHardwareBuffer from the daemon for {w}x{h}; nothing to fall back to"
-        ));
+        crate::logf!("export-emu: no AHardwareBuffer from the daemon for {w}x{h}; nothing to fall back to");
         close_fd(buf.fd);
         return Some(refused.unwrap_or(VK_ERROR_INITIALIZATION_FAILED));
     }
     if let Some(r) = refused {
         DMABUF_IMPORT.store(DMABUF_REFUSED, Ordering::Relaxed);
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: dma-buf import failed ({r}), importing pool buffer as AHardwareBuffer"
-        ));
+        crate::logf!("export-emu: dma-buf import failed ({r}), importing pool buffer as AHardwareBuffer");
     }
     let res = unsafe { create_ahb_backed(gd, ci, &buf, fl_ptr, alloc) };
     unsafe { crate::scanout::ahb_release(buf.ahb) };
@@ -801,14 +787,12 @@ pub unsafe fn try_create_import_image(
         note_import(unsafe { *out }, true);
     }
     if IMPORT_LOGS.fetch_add(1, Ordering::Relaxed) < IMPORT_LOG_FIRST_N {
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: import image {:#x} {}x{} fmt={} usage={:#x} created for the AHardwareBuffer route: {res}",
+        crate::logf!("export-emu: import image {:#x} {}x{} fmt={} usage={:#x} created for the AHardwareBuffer route: {res}",
             if res == VK_SUCCESS { unsafe { *out } } else { 0 },
             ci.extent.width,
             ci.extent.height,
             ci.format,
-            ci.usage
-        ));
+            ci.usage);
     }
     Some(res)
 }
@@ -850,20 +834,16 @@ unsafe fn try_allocate_import(
                 close_fd(buf.fd);
                 unsafe { crate::scanout::ahb_release(buf.ahb) };
                 DMABUF_IMPORT.store(DMABUF_REFUSED, Ordering::Relaxed);
-                crate::logf!(gndrm_obf::obf!(
-                    "export-emu: dma-buf import of pool buffer ino={ino} for image {:#x} failed ({res}); later imports take the AHardwareBuffer route",
-                    image
-                ));
+                crate::logf!("export-emu: dma-buf import of pool buffer ino={ino} for image {:#x} failed ({res}); later imports take the AHardwareBuffer route",
+                    image);
             }
         }
         return Some(res);
     }
     let ino = fd_ino(fd);
     let Some(buf) = crate::scanout::lookup_ahb(ino) else {
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: import ino={ino} for image {:#x}: no pool AHardwareBuffer from the daemon",
-            image
-        ));
+        crate::logf!("export-emu: import ino={ino} for image {:#x}: no pool AHardwareBuffer from the daemon",
+            image);
         return Some(VK_ERROR_INVALID_EXTERNAL_HANDLE);
     };
     close_fd(buf.fd);
@@ -922,10 +902,8 @@ unsafe fn import_ahb_dedicated(
     };
     let res = unsafe { get_props(dev, ahb, &mut props) };
     if res != VK_SUCCESS || props.memory_type_bits == 0 {
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: import ino={ino} AHB properties {res} memTypeBits={:#x}",
-            props.memory_type_bits
-        ));
+        crate::logf!("export-emu: import ino={ino} AHB properties {res} memTypeBits={:#x}",
+            props.memory_type_bits);
         return if res != VK_SUCCESS {
             res
         } else {
@@ -956,21 +934,18 @@ unsafe fn import_ahb_dedicated(
     };
     let res = unsafe { alloc_mem(dev, &ai, ptr::null(), out) };
     if IMPORT_LOGS.fetch_add(1, Ordering::Relaxed) < IMPORT_LOG_FIRST_N || res != VK_SUCCESS {
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: import ino={ino} as AHardwareBuffer for image {:#x} size={} type={} format={} fd link={} -> {res}",
+        crate::logf!("export-emu: import ino={ino} as AHardwareBuffer for image {:#x} size={} type={} format={} fd link={} -> {res}",
             image,
             props.allocation_size,
             mem_type,
             fmt.format,
-            crate::scanout::fd_link(fd)
-        ));
+            crate::scanout::fd_link(fd));
     }
     res
 }
 
 fn log_image(ci: &VkImageCreateInfo, buf: &crate::scanout::ScanoutBuf, image: VkImage, how: &str) {
-    crate::logf!(gndrm_obf::obf!(
-        "export-emu: image {:#x} {}x{} fmt={} usage={:#x} pool fd={} ino={} stride={} {how}",
+    crate::logf!("export-emu: image {:#x} {}x{} fmt={} usage={:#x} pool fd={} ino={} stride={} {how}",
         image,
         ci.extent.width,
         ci.extent.height,
@@ -978,8 +953,7 @@ fn log_image(ci: &VkImageCreateInfo, buf: &crate::scanout::ScanoutBuf, image: Vk
         ci.usage,
         buf.fd,
         buf.ino,
-        buf.stride
-    ));
+        buf.stride);
 }
 
 /// The first memory type in `bits`, preferring a device-local one.
@@ -1067,9 +1041,7 @@ unsafe fn create_dmabuf_backed(
         ci2.tiling = VK_IMAGE_TILING_LINEAR;
         res = unsafe { create(dev, &ci2, alloc, &mut image) };
         linear_tiling = true;
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: explicit LINEAR create {r1}; LINEAR tiling create {res}"
-        ));
+        crate::logf!("export-emu: explicit LINEAR create {r1}; LINEAR tiling create {res}");
     }
     if res != VK_SUCCESS {
         return Err(res);
@@ -1116,17 +1088,13 @@ unsafe fn create_dmabuf_backed(
                 break;
             }
         }
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: {} image {:#x} layout pitch={pitch} offset={offset} (pool stride {})",
+        crate::logf!("export-emu: {} image {:#x} layout pitch={pitch} offset={offset} (pool stride {})",
             if linear_tiling { "LINEAR-tiling" } else { "explicit-LINEAR" },
             image,
-            buf.stride
-        ));
+            buf.stride);
         if pitch != 0 && (pitch != u64::from(buf.stride) || offset != 0) {
-            crate::logf!(gndrm_obf::obf!(
-                "export-emu: driver pitch {pitch} != pool stride {}; the dma-buf route cannot scan out, trying AHardwareBuffer",
-                buf.stride
-            ));
+            crate::logf!("export-emu: driver pitch {pitch} != pool stride {}; the dma-buf route cannot scan out, trying AHardwareBuffer",
+                buf.stride);
             return fail(VK_ERROR_FORMAT_NOT_SUPPORTED);
         }
     }
@@ -1138,12 +1106,10 @@ unsafe fn create_dmabuf_backed(
         unsafe { libc::lseek(buf.fd, 0, libc::SEEK_SET) };
     }
     if pool_size >= 0 && (pool_size as u64) < reqs.size {
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: pool fd for image {:#x} is {} bytes < size={}",
+        crate::logf!("export-emu: pool fd for image {:#x} is {} bytes < size={}",
             image,
             pool_size,
-            reqs.size
-        ));
+            reqs.size);
         return fail(VK_ERROR_INVALID_EXTERNAL_HANDLE);
     }
     let mut fd_bits = u32::MAX;
@@ -1165,11 +1131,9 @@ unsafe fn create_dmabuf_backed(
         if r == VK_SUCCESS && p.memoryTypeBits & reqs.memoryTypeBits != 0 {
             fd_bits = p.memoryTypeBits;
         } else {
-            crate::logf!(gndrm_obf::obf!(
-                "export-emu: dma-buf fd properties {r} memTypeBits {:#x} (image {:#x})",
+            crate::logf!("export-emu: dma-buf fd properties {r} memTypeBits {:#x} (image {:#x})",
                 p.memoryTypeBits,
-                reqs.memoryTypeBits
-            ));
+                reqs.memoryTypeBits);
         }
     }
     let types = unsafe { memory_types(gd) };
@@ -1200,15 +1164,13 @@ unsafe fn create_dmabuf_backed(
     };
     let mut mem: VkDeviceMemory = 0;
     let res = unsafe { alloc_mem(dev, &ai, ptr::null(), &mut mem) };
-    crate::logf!(gndrm_obf::obf!(
-        "export-emu: import pool fd for image {:#x} size={} pool={} type={} bits={:#x}/{:#x} -> {res}",
+    crate::logf!("export-emu: import pool fd for image {:#x} size={} pool={} type={} bits={:#x}/{:#x} -> {res}",
         image,
         reqs.size,
         pool_size,
         mem_type,
         reqs.memoryTypeBits,
-        fd_bits
-    ));
+        fd_bits);
     if res != VK_SUCCESS {
         unsafe { libc::close(fd) };
         return fail(res);
@@ -1243,9 +1205,7 @@ unsafe fn create_ahb_backed(
         ))
     };
     let Some(get_props) = get_props else {
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: driver resolves no vkGetAndroidHardwareBufferPropertiesANDROID"
-        ));
+        crate::logf!("export-emu: driver resolves no vkGetAndroidHardwareBufferPropertiesANDROID");
         return Err(VK_ERROR_INITIALIZATION_FAILED);
     };
     let mut fmt = AhbFormatProperties {
@@ -1264,15 +1224,13 @@ unsafe fn create_ahb_backed(
         memory_type_bits: 0,
     };
     let res = unsafe { get_props(dev, buf.ahb, &mut props) };
-    crate::logf!(gndrm_obf::obf!(
-        "export-emu: AHB ino={} size={} memTypeBits={:#x} format={} external={:#x} (image fmt {}): {res}",
+    crate::logf!("export-emu: AHB ino={} size={} memTypeBits={:#x} format={} external={:#x} (image fmt {}): {res}",
         buf.ino,
         props.allocation_size,
         props.memory_type_bits,
         fmt.format,
         fmt.external_format,
-        ci.format
-    ));
+        ci.format);
     if res != VK_SUCCESS {
         return Err(res);
     }
@@ -1292,9 +1250,7 @@ unsafe fn create_ahb_backed(
     let mut image: VkImage = 0;
     let res = unsafe { create(dev, &ci2, alloc, &mut image) };
     if res != VK_SUCCESS {
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: AHB image create failed: {res}"
-        ));
+        crate::logf!("export-emu: AHB image create failed: {res}");
         return Err(res);
     }
     let img_bits = unsafe { image_requirements(gd, image) }.map_or(u32::MAX, |r| r.memoryTypeBits);
@@ -1321,12 +1277,10 @@ unsafe fn create_ahb_backed(
     };
     let mut mem: VkDeviceMemory = 0;
     let res = unsafe { alloc_mem(dev, &ai, ptr::null(), &mut mem) };
-    crate::logf!(gndrm_obf::obf!(
-        "export-emu: AHB import for image {:#x} size={} type={} -> {res}",
+    crate::logf!("export-emu: AHB import for image {:#x} size={} type={} -> {res}",
         image,
         props.allocation_size,
-        mem_type
-    ));
+        mem_type);
     if res != VK_SUCCESS {
         unsafe { destroy_real_image(gd, image, alloc) };
         return Err(res);
@@ -1400,11 +1354,9 @@ pub unsafe extern "C" fn gn_vkDestroyImage(
     if enabled() && image != 0 {
         forget_import(image);
         if let Some((e, mems)) = forget_image(image) {
-            crate::logf!(gndrm_obf::obf!(
-                "export-emu: drop image {:#x} pool fd={} mems={mems}",
+            crate::logf!("export-emu: drop image {:#x} pool fd={} mems={mems}",
                 e.image,
-                e.fd
-            ));
+                e.fd);
             unclaimed = e.mem;
         }
     }
@@ -1592,9 +1544,7 @@ pub unsafe extern "C" fn gn_vkUpdateDescriptorSets(
         }
     }
     if skipped > 0 && !LOGGED_NULL_SKIP.swap(true, Ordering::Relaxed) {
-        crate::logf!(gndrm_obf::obf!(
-            "export-emu: skipped {skipped} null descriptor element(s) in {write_count} write(s)"
-        ));
+        crate::logf!("export-emu: skipped {skipped} null descriptor element(s) in {write_count} write(s)");
     }
     unsafe {
         real(

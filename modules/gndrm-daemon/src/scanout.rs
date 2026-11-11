@@ -596,7 +596,7 @@ mod tests {
         let (payload, cold) = match pool.begin(g) {
             Reservation::Reuse { payload, .. } => (payload, false),
             Reservation::Cold { .. } => (cold_id, true),
-            Reservation::Full => panic!("{}", gndrm_obf::obf!("pool reported full at {g:?}")),
+            Reservation::Full => panic!("{}", format_args!("pool reported full at {g:?}")),
         };
         pool.commit(id, g, payload, Arc::clone(&latch), cold);
         latch
@@ -654,10 +654,8 @@ mod tests {
             } => {}
             other => panic!(
                 "{}",
-                gndrm_obf::obf!(
-                    "expected the retired buffer to be handed back out, got {}",
-                    describe(&other)
-                )
+                format_args!("expected the retired buffer to be handed back out, got {}",
+                    describe(&other))
             ),
         }
         assert_eq!(pool.free_len(), 0, "the reused buffer left the free list");
@@ -683,7 +681,7 @@ mod tests {
             Reservation::Reuse { ino, payload } => (ino, payload),
             other => panic!(
                 "{}",
-                gndrm_obf::obf!("expected reuse, got {}", describe(&other))
+                format_args!("expected reuse, got {}", describe(&other))
             ),
         };
         assert_eq!(reserved, (42, 42), "the free-list entry kept its ino");
@@ -717,7 +715,7 @@ mod tests {
                 Reservation::Reuse { ino, payload } => (ino, payload),
                 other => panic!(
                     "{}",
-                    gndrm_obf::obf!("expected reuse, got {}", describe(&other))
+                    format_args!("expected reuse, got {}", describe(&other))
                 ),
             };
             assert_eq!(ino, 7, "the retained identity is stable across cycles");
@@ -778,10 +776,8 @@ mod tests {
             Reservation::Cold { evicted: None } => {}
             other => panic!(
                 "{}",
-                gndrm_obf::obf!(
-                    "expected a cold allocation while the buffer is in flight, got {}",
-                    describe(&other)
-                )
+                format_args!("expected a cold allocation while the buffer is in flight, got {}",
+                    describe(&other))
             ),
         }
     }
@@ -812,7 +808,7 @@ mod tests {
             }
             other => panic!(
                 "{}",
-                gndrm_obf::obf!("expected an eviction, got {}", describe(&other))
+                format_args!("expected an eviction, got {}", describe(&other))
             ),
         }
         assert_eq!(pool.free_len(), 1, "exactly one buffer was evicted");
@@ -839,7 +835,7 @@ mod tests {
                 }
                 Reservation::Full => panic!(
                     "{}",
-                    gndrm_obf::obf!("pool unexpectedly full at frame {frame}")
+                    format_args!("pool unexpectedly full at frame {frame}")
                 ),
             };
             let latch = Arc::new(AtomicBool::new(false));
@@ -923,9 +919,9 @@ mod tests {
             Some(Reservation::Cold { evicted: None }) => {}
             Some(other) => panic!(
                 "{}",
-                gndrm_obf::obf!("expected a cold reservation, got {}", describe(&other))
+                format_args!("expected a cold reservation, got {}", describe(&other))
             ),
-            None => panic!("{}", gndrm_obf::obf!("a known geometry must resolve")),
+            None => panic!("{}", "a known geometry must resolve"),
         }
         assert_eq!(
             pool.resolve_len(4096, 5),
@@ -1095,7 +1091,7 @@ mod tests {
             for g in geoms {
                 let reservation = pool
                     .begin_len(g.alloc_len(), g.format)
-                    .expect(&gndrm_obf::obf!("known geometry"));
+                    .expect("known geometry");
                 let (id, cold) = match reservation {
                     Reservation::Reuse { payload, .. } => (payload, false),
                     Reservation::Cold { evicted: None } => {
@@ -1106,10 +1102,10 @@ mod tests {
                     Reservation::Cold { evicted: Some(_) } => {
                         panic!(
                             "{}",
-                            gndrm_obf::obf!("pool thrashed: evicted a free buffer at cap {CAP}")
+                            format_args!("pool thrashed: evicted a free buffer at cap {CAP}")
                         )
                     }
-                    Reservation::Full => panic!("{}", gndrm_obf::obf!("pool wedged at cap {CAP}")),
+                    Reservation::Full => panic!("{}", format_args!("pool wedged at cap {CAP}")),
                 };
                 let latch = Arc::new(AtomicBool::new(false));
                 pool.commit(id, g, id, Arc::clone(&latch), cold);
@@ -1134,7 +1130,7 @@ mod tests {
             }
         }
 
-        let settled = settled_at.expect(&gndrm_obf::obf!("round 5 ran"));
+        let settled = settled_at.expect("round 5 ran");
         assert_eq!(
             allocations, settled,
             "allocations must stop once every geometry's working set is warm"

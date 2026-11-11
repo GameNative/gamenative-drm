@@ -62,17 +62,17 @@ pub enum CopyRefusal {
 impl core::fmt::Display for CopyRefusal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Modifier(m) => write!(f, "{}", gndrm_obf::obf!("modifier {m:#x} is not linear")),
+            Self::Modifier(m) => write!(f, "{}", format_args!("modifier {m:#x} is not linear")),
             Self::Format(fourcc) => write!(
                 f,
                 "{}",
-                gndrm_obf::obf!("format {} is not 32 bpp", fourcc_name(*fourcc))
+                format_args!("format {} is not 32 bpp", fourcc_name(*fourcc))
             ),
-            Self::Geometry => write!(f, "{}", gndrm_obf::obf!("unsupported plane geometry")),
+            Self::Geometry => write!(f, "unsupported plane geometry"),
             Self::OutOfBounds { need, have } => write!(
                 f,
                 "{}",
-                gndrm_obf::obf!("rows need {need} bytes, dma-buf has {have}")
+                format_args!("rows need {need} bytes, dma-buf has {have}")
             ),
         }
     }

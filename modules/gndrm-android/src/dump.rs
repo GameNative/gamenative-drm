@@ -29,7 +29,7 @@ pub(crate) fn ppm(
         ScanoutLayout::Bgra8888 => (2, 0),
     };
     let mut out = Vec::with_capacity(width * height * 3 + 16);
-    out.extend_from_slice(format!("{}", gndrm_obf::obf!("P6\n{width} {height}\n255\n")).as_bytes());
+    out.extend_from_slice(format!("{}", format_args!("P6\n{width} {height}\n255\n")).as_bytes());
     for row in src.chunks(stride).take(height) {
         for x in 0..width {
             let px = &row[x * BPP..];

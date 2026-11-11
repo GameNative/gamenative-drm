@@ -16,6 +16,3 @@ crate-type = ["rlib"]
 
 [dependencies]
 libc = "0.2"
-# The shim's log gate prefixes every diagnostic; literals stay obfuscated so a
-# shipped binary's strings do not spell out the engine's internals.
-gndrm-obf = { path = "../gndrm-obf" }

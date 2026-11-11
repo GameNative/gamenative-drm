@@ -10,8 +10,5 @@ authors.workspace = true
 all = "deny"
 pedantic = "warn"
 
-[dependencies]
-gndrm-obf = { path = "../gndrm-obf" }
-
 [dev-dependencies]
 cc = "1"

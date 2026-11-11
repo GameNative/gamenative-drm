@@ -86,14 +86,14 @@ impl ForeignCopy {
     pub(crate) fn new(fb: &Framebuffer, src_fd: RawFd) -> Result<Self, String> {
         let len = source_len(src_fd);
         if len == 0 {
-            return Err(gndrm_obf::obf!("dma-buf length unknown").to_string());
+            return Err("dma-buf length unknown".to_string());
         }
         let layout = gndrm_daemon::scanout_layout();
         let plan = plan_copy(fb, len, layout).map_err(|r| r.to_string())?;
         // SAFETY: fcntl on a descriptor the caller keeps open for this call.
         let fd = unsafe { libc::fcntl(src_fd, libc::F_DUPFD_CLOEXEC, 0) };
         if fd < 0 {
-            return Err(gndrm_obf::obf!("dup failed (errno {})", errno()).to_string());
+            return Err(format_args!("dup failed (errno {})", errno()).to_string());
         }
         // SAFETY: a fresh shared read-only mapping of the whole dma-buf.
         let map = unsafe {
@@ -110,7 +110,7 @@ impl ForeignCopy {
             let e = errno();
             // SAFETY: `fd` is owned here.
             unsafe { libc::close(fd) };
-            return Err(gndrm_obf::obf!("mmap of {len} bytes failed (errno {e})").to_string());
+            return Err(format_args!("mmap of {len} bytes failed (errno {e})").to_string());
         }
         let format = if plan.ten_bit {
             ffi::AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM
@@ -134,7 +134,7 @@ impl ForeignCopy {
                 libc::munmap(map, len as usize);
                 libc::close(fd);
             }
-            return Err(gndrm_obf::obf!("AHardwareBuffer_allocate failed (rc={rc})").to_string());
+            return Err(format_args!("AHardwareBuffer_allocate failed (rc={rc})").to_string());
         }
         let mut real = ffi::AHardwareBufferDesc::default();
         // SAFETY: `ahb` is a live buffer owned here.
@@ -161,7 +161,7 @@ impl ForeignCopy {
         let dst_pitch = self.stride as usize;
         if dst_pitch < self.plan.row_bytes {
             return Err(
-                gndrm_obf::obf!("target stride {dst_pitch} shorter than a row").to_string(),
+                format_args!("target stride {dst_pitch} shorter than a row").to_string(),
             );
         }
         let mut addr: *mut c_void = ptr::null_mut();
@@ -176,7 +176,7 @@ impl ForeignCopy {
             )
         };
         if rc != 0 || addr.is_null() {
-            return Err(gndrm_obf::obf!("AHardwareBuffer_lock failed (rc={rc})").to_string());
+            return Err(format_args!("AHardwareBuffer_lock failed (rc={rc})").to_string());
         }
         sync(self.src_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
         // SAFETY: the mapping covers `map_len` bytes for the life of `self`;
@@ -247,7 +247,7 @@ impl CursorStage {
         // SAFETY: `desc` is a live stack value; `ahb` receives one reference.
         let rc = unsafe { ffi::AHardwareBuffer_allocate(&desc, &mut ahb) };
         if rc != 0 || ahb.is_null() {
-            return Err(gndrm_obf::obf!("AHardwareBuffer_allocate failed (rc={rc})").to_string());
+            return Err(format_args!("AHardwareBuffer_allocate failed (rc={rc})").to_string());
         }
         let stage = Self { ahb, width, height };
         let mut real = ffi::AHardwareBufferDesc::default();
@@ -267,7 +267,7 @@ impl CursorStage {
             )
         };
         if rc != 0 || addr.is_null() {
-            return Err(gndrm_obf::obf!("AHardwareBuffer_lock failed (rc={rc})").to_string());
+            return Err(format_args!("AHardwareBuffer_lock failed (rc={rc})").to_string());
         }
         // SAFETY: the locked buffer covers `dst_pitch * height` bytes.
         unsafe {

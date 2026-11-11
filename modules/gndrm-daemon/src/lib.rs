@@ -706,7 +706,7 @@ impl Device {
         // Infallible: a fresh store has the whole blob space free.
         let in_formats_blob = stores
             .alloc_blob()
-            .expect(&gndrm_obf::obf!("in_formats blob id"));
+            .expect("in_formats blob id");
         stores.blobs.insert(
             in_formats_blob,
             Blob {
@@ -716,7 +716,7 @@ impl Device {
         );
         let cursor_in_formats_blob = stores
             .alloc_blob()
-            .expect(&gndrm_obf::obf!("in_formats blob id"));
+            .expect("in_formats blob id");
         stores.blobs.insert(
             cursor_in_formats_blob,
             Blob {
@@ -727,7 +727,7 @@ impl Device {
         // The EDID tells gamescope whether this display is HDR10. Built once
         // per session from the capability the launcher passes in, so an SDR
         // panel gets no HDR static metadata block and gamescope stays in SDR.
-        let edid_blob = stores.alloc_blob().expect(&gndrm_obf::obf!("edid blob id"));
+        let edid_blob = stores.alloc_blob().expect("edid blob id");
         stores.blobs.insert(
             edid_blob,
             Blob {
@@ -737,12 +737,12 @@ impl Device {
         );
         let (commit_tx, commit_rx) = mpsc::channel();
         let flip_queue = Arc::new(Mutex::new(VecDeque::new()));
-        let flip_event_fd = new_eventfd(0).expect(&gndrm_obf::obf!("flip eventfd"));
+        let flip_event_fd = new_eventfd(0).expect("flip eventfd");
         let in_flight = Arc::new(Mutex::new(HashSet::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger: Arc<Mutex<Option<LogFn>>> = Arc::new(Mutex::new(None));
         // The worker owns the presenter and signals a dup of the flip eventfd.
-        let worker_fd = dup_fd(flip_event_fd, 0).expect(&gndrm_obf::obf!("dup flip eventfd"));
+        let worker_fd = dup_fd(flip_event_fd, 0).expect("dup flip eventfd");
         // The event clock is shared with the commit worker, which re-stamps a
         // page-flip event when it emits it (see `commit_worker_loop`).
         let clock: SharedClock = Arc::new(Mutex::new(Box::new(monotonic_now)));
@@ -819,9 +819,8 @@ impl Device {
 
     /// Emit the commit probe through the ungated sink, if one is installed.
     ///
-    /// `msg` is a thunk so the message (and any `obf!` literal in it, which is a
-    /// stack decode) is built only at the probe's own rate limit, never per
-    /// frame. See [`Device::set_always_logger`].
+    /// `msg` is a thunk so the message is built only at the probe's own rate
+    /// limit, never per frame. See [`Device::set_always_logger`].
     pub(crate) fn always_log(&self, msg: impl FnOnce() -> String) {
         if let Some(log) = &self.always_logger {
             log(&msg());
@@ -871,19 +870,16 @@ impl Device {
     fn note_exhausted(&mut self, space: &'static str) -> i32 {
         if !self.logged_exhaustion.contains(&space) {
             self.logged_exhaustion.push(space);
-            self.diag(|| format!("{}", gndrm_obf::obf!(
-                "resource: {space} exhausted; returning ENOSPC (display path degraded, app continues)"
-            )));
+            self.diag(|| format!("{}", format_args!("resource: {space} exhausted; returning ENOSPC (display path degraded, app continues)")));
         }
         errno::ENOSPC
     }
 
     /// Emit a diagnostic through the installed logger, if any.
     ///
-    /// `msg` is a thunk: the message (and any `obf!` literal in it, which is a
-    /// stack decode) is built only when a logger is installed. The app installs
-    /// the logger only when `GNDRM_LOG_DAEMON` is on, so a disabled daemon never
-    /// decodes a line it would drop.
+    /// `msg` is a thunk: the message is built only when a logger is installed.
+    /// The app installs the logger only when `GNDRM_LOG_DAEMON` is on, so a
+    /// disabled daemon never formats a line it would drop.
     pub(crate) fn diag(&self, msg: impl FnOnce() -> String) {
         if let Some(log) = self
             .logger
@@ -1070,7 +1066,7 @@ impl Device {
             self.diag(|| {
                 format!(
                     "{}",
-                    gndrm_obf::obf!("ioctl: first {} (0x{ioctl_nr:08x})", ioctl_name(ioctl_nr))
+                    format_args!("ioctl: first {} (0x{ioctl_nr:08x})", ioctl_name(ioctl_nr))
                 )
             });
         }
@@ -1081,10 +1077,8 @@ impl Device {
             self.diag(|| {
                 format!(
                     "{}",
-                    gndrm_obf::obf!(
-                        "render node: refused {} (0x{ioctl_nr:08x})",
-                        ioctl_name(ioctl_nr)
-                    )
+                    format_args!("render node: refused {} (0x{ioctl_nr:08x})",
+                        ioctl_name(ioctl_nr))
                 )
             });
             DispatchResult::err(errno::EACCES)
@@ -1212,12 +1206,10 @@ impl Device {
                     self.always_log(|| {
                         format!(
                             "{}",
-                            gndrm_obf::obf!(
-                                "cursor: cursor layer {} (max {}x{})",
+                            format_args!("cursor: cursor layer {} (max {}x{})",
                                 if on { "on" } else { "off" },
                                 self.cursor_limit(),
-                                self.cursor_limit()
-                            )
+                                self.cursor_limit())
                         )
                     });
                 }
@@ -1974,10 +1966,8 @@ impl Device {
                 self.diag(|| {
                     format!(
                         "{}",
-                        gndrm_obf::obf!(
-                            "addfb2: refused {}x{} pitch={} offset={}: buffer ino {ino} is {gem_size} bytes, the image needs {need}",
-                            cmd.width, cmd.height, cmd.pitches[0], cmd.offsets[0]
-                        )
+                        format_args!("addfb2: refused {}x{} pitch={} offset={}: buffer ino {ino} is {gem_size} bytes, the image needs {need}",
+                            cmd.width, cmd.height, cmd.pitches[0], cmd.offsets[0])
                     )
                 });
             }
@@ -2027,10 +2017,8 @@ impl Device {
             self.diag(|| {
                 format!(
                     "{}",
-                    gndrm_obf::obf!(
-                "addfb2: fb {}x{} fmt={:#x} gem={} modifier={:#x} registered into the length index",
-                cmd.width, cmd.height, cmd.pixel_format, gem_size, modifier
-            )
+                    format_args!("addfb2: fb {}x{} fmt={:#x} gem={} modifier={:#x} registered into the length index",
+                cmd.width, cmd.height, cmd.pixel_format, gem_size, modifier)
                 )
             });
         }
@@ -2657,7 +2645,7 @@ mod tests {
         };
         let r = dev.dispatch(DRM_IOCTL_GET_CAP, &body_of(&c), None);
         assert_eq!(r.ret, 0, "GET_CAP 0x{cap:x} failed");
-        c = pod_read::<DrmGetCap>(&r.body).expect(&gndrm_obf::obf!("GET_CAP body"));
+        c = pod_read::<DrmGetCap>(&r.body).expect("GET_CAP body");
         c.value
     }
 
@@ -2681,7 +2669,7 @@ mod tests {
         };
         let r = d.dispatch(DRM_IOCTL_VERSION, &body_of(&v), None);
         assert_eq!(r.ret, 0);
-        v = pod_read::<DrmVersion>(&r.body).expect(&gndrm_obf::obf!("VERSION body"));
+        v = pod_read::<DrmVersion>(&r.body).expect("VERSION body");
         assert_eq!(v.version_major, DRIVER_VERSION.0);
         assert!(v.name_len > 0);
 
@@ -2740,7 +2728,7 @@ mod tests {
         };
         let r = d.dispatch(DRM_IOCTL_GEM_CREATE, &body_of(&req), None);
         assert_eq!(r.ret, 0, "GEM_CREATE failed");
-        let created = pod_read::<DrmGemCreate>(&r.body).expect(&gndrm_obf::obf!("GEM_CREATE body"));
+        let created = pod_read::<DrmGemCreate>(&r.body).expect("GEM_CREATE body");
         assert!(created.handle > 0, "GEM_CREATE must return a handle");
         assert_eq!(created.size, 4096);
 
@@ -2753,7 +2741,7 @@ mod tests {
         };
         let r = d.dispatch(DRM_IOCTL_GEM_MMAP, &body_of(&m), None);
         assert_eq!(r.ret, 0, "GEM_MMAP failed");
-        m = pod_read::<DrmGemMmap>(&r.body).expect(&gndrm_obf::obf!("GEM_MMAP body"));
+        m = pod_read::<DrmGemMmap>(&r.body).expect("GEM_MMAP body");
         assert_eq!(m.size, 4096);
         assert_eq!(m.offset & GEM_MMAP_OFFSET_BASE, GEM_MMAP_OFFSET_BASE);
         assert_eq!(m.offset & GEM_MMAP_HANDLE_MASK, u64::from(created.handle));
@@ -2768,7 +2756,7 @@ mod tests {
         assert_eq!(r.ret, 0, "PRIME_HANDLE_TO_FD failed");
         let exported = r
             .fd_out
-            .expect(&gndrm_obf::obf!("export must attach an fd"));
+            .expect("export must attach an fd");
         assert!(exported >= 0);
         // It is a real, sized file: fstat succeeds and reports the size.
         assert_eq!(fstat_fd(exported).map(|(_, sz)| sz), Some(4096));

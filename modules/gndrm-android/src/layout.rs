@@ -76,11 +76,11 @@ impl core::fmt::Display for Decision {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let layout = self.layout.as_env_value();
         match self.source {
-            Source::Env => write!(f, "{}", gndrm_obf::obf!("{layout} (env)")),
+            Source::Env => write!(f, "{}", format_args!("{layout} (env)")),
             Source::Rule { sdk, re } => write!(
                 f,
                 "{}",
-                gndrm_obf::obf!("{layout} (rule: sdk={sdk} re={})", re.name())
+                format_args!("{layout} (rule: sdk={sdk} re={})", re.name())
             ),
         }
     }
@@ -250,7 +250,7 @@ mod device {
         }
         let (sdk, re) = device_state();
         let d = decide(gndrm_daemon::scanout_layout_from_env(), sdk, re);
-        crate::log_always!("{}", gndrm_obf::obf!("gndrm-daemon: scan-out layout {d}"));
+        crate::log_always!("{}", format_args!("gndrm-daemon: scan-out layout {d}"));
         *slot = Some(d);
         d.layout
     }

@@ -150,11 +150,9 @@ fn apply_note(note: FrameCapNote) {
     CAP_FPS.store(note.fps, Ordering::Relaxed);
     // 0 while frame generation paces the session: log what is actually in force
     // now that the note is adopted, not what it carried.
-    crate::logf!(gndrm_obf::obf!(
-        "scanout frame cap: fps={} effective={}",
+    crate::logf!("scanout frame cap: fps={} effective={}",
         note.fps,
-        target_fps()
-    ));
+        target_fps());
 }
 
 /// The target in force, [`FPS_UNCAPPED`] when none has: read by the shim's
@@ -585,9 +583,7 @@ fn exchange_req(fd: RawFd, req: ScanoutAllocReq) -> Result<ScanoutBuf, Failure> 
                         let got = ahb_recv_api()
                             .map_or(-1, |api| (api.recv)(fd, &mut ahb));
                         if got != 0 || ahb.is_null() {
-                            crate::logf!(gndrm_obf::obf!(
-                                "scan-out: AHardwareBuffer handle not received ({got})"
-                            ));
+                            crate::logf!("scan-out: AHardwareBuffer handle not received ({got})");
                             libc::close(recv_fd);
                             return Err(Failure::Dead);
                         }
@@ -626,11 +622,9 @@ fn note_pool_fd_kind(fd: RawFd, ino: u64) {
         let size = if libc::fstat(fd, &mut st) == 0 { st.st_size as u64 } else { 0 };
         (magic, size)
     };
-    crate::logf!(gndrm_obf::obf!(
-        "scan-out: pool fd ino={ino} size={size} fs={magic:#x} dma-buf={} link={}",
+    crate::logf!("scan-out: pool fd ino={ino} size={size} fs={magic:#x} dma-buf={} link={}",
         magic == 0x444d_4142,
-        fd_link(fd)
-    ));
+        fd_link(fd));
 }
 
 /// The `/proc/self/fd` link of `fd` (`/dmabuf:…` for a dma-buf), empty when it
@@ -795,7 +789,7 @@ mod tests {
             let mut buf = [0u8; FrameCapSubscribe::LEN];
             let n = libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0);
             assert_eq!(n as usize, FrameCapSubscribe::LEN);
-            let sub = FrameCapSubscribe::decode(&buf).expect(&gndrm_obf::obf!("subscribe frame"));
+            let sub = FrameCapSubscribe::decode(&buf).expect("subscribe frame");
             assert_eq!(sub.caps & CAP_FRAME_CAP, CAP_FRAME_CAP);
         }
     }
@@ -816,7 +810,7 @@ mod tests {
     /// with a `/dev/null` descriptor, which is all the transport needs.
     #[test]
     fn connect_and_exchange_receive_a_pool_buffer() {
-        let name = format!("{}", gndrm_obf::obf!("gndrm-icdsc-{}", std::process::id()));
+        let name = format!("{}", format_args!("gndrm-icdsc-{}", std::process::id()));
         let listener = listen(&name);
         let server = std::thread::spawn(move || {
             // SAFETY: accept on the listener created above, then recv/send on
@@ -833,7 +827,7 @@ mod tests {
                 let mut buf = [0u8; ScanoutAllocReq::LEN];
                 let n = libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0);
                 assert_eq!(n as usize, ScanoutAllocReq::LEN);
-                let req = ScanoutAllocReq::decode(&buf).expect(&gndrm_obf::obf!("request frame"));
+                let req = ScanoutAllocReq::decode(&buf).expect("request frame");
                 assert_eq!((req.width, req.height), (1280, 960));
                 assert_eq!(req.format, scanout_ahb_format(ScanoutLayout::Bgra8888));
                 assert_eq!(req.len, 1280 * 960 * 4);
@@ -859,7 +853,7 @@ mod tests {
         assert!(fd >= 0, "connect: {}", std::io::Error::last_os_error());
         let got = exchange(fd, 1280, 960)
             .ok()
-            .expect(&gndrm_obf::obf!("exchange"));
+            .expect("exchange");
         assert_eq!(got.stride, 5120);
         // The received descriptor is the one the daemon sent, and the reply's
         // identity is that descriptor's inode — the registration key.
@@ -871,7 +865,7 @@ mod tests {
             libc::close(got.fd);
             libc::close(fd);
         }
-        server.join().expect(&gndrm_obf::obf!("server thread"));
+        server.join().expect("server thread");
     }
 
     /// The frame-cap note stands ahead of the hand-out reply, where the shim
@@ -879,7 +873,7 @@ mod tests {
     /// magic, so the target is adopted and the reply is still the reply.
     #[test]
     fn exchange_sorts_the_frame_cap_note_from_the_reply() {
-        let name = format!("{}", gndrm_obf::obf!("gndrm-icdcap-{}", std::process::id()));
+        let name = format!("{}", format_args!("gndrm-icdcap-{}", std::process::id()));
         let listener = listen(&name);
         let server = std::thread::spawn(move || {
             // SAFETY: accept on the listener created above; every frame is a
@@ -924,8 +918,8 @@ mod tests {
         assert!(fd >= 0, "connect: {}", std::io::Error::last_os_error());
         let got = exchange(fd, 1280, 960)
             .ok()
-            .expect(&gndrm_obf::obf!("exchange"));
-        let ino = server.join().expect(&gndrm_obf::obf!("server thread"));
+            .expect("exchange");
+        let ino = server.join().expect("server thread");
         assert_eq!(got.ino, ino);
         // The note ahead of the reply set the target.
         assert_eq!(target_fps(), 120);

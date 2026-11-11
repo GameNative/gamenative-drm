@@ -58,7 +58,7 @@ pub type SharedLog = Arc<dyn Fn(&str) + Send + Sync>;
 /// card listener's scan-out allocator.
 #[must_use]
 pub fn render_socket_name(main: &str) -> String {
-    format!("{}", gndrm_obf::obf!("{main}-render"))
+    format!("{}", format_args!("{main}-render"))
 }
 
 /// Resolve `name` into a bound + listening `SOCK_SEQPACKET` fd.
@@ -262,11 +262,11 @@ pub fn serve_render_listener(
             if e.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            log(&format!("{}", gndrm_obf::obf!("render listener poll: {e}")));
+            log(&format!("{}", format_args!("render listener poll: {e}")));
             break;
         }
         if pfds[1].revents != 0 {
-            log(&gndrm_obf::obf!("render listener stopping"));
+            log("render listener stopping");
             break;
         }
         if pfds[0].revents == 0 {
@@ -277,7 +277,7 @@ pub fn serve_render_listener(
             Err(e) => {
                 log(&format!(
                     "{}",
-                    gndrm_obf::obf!("render listener accept: {e}")
+                    format_args!("render listener accept: {e}")
                 ));
                 break;
             }
@@ -288,7 +288,7 @@ pub fn serve_render_listener(
                 // Second half of this client: its event channel. Serve the pair.
                 log(&format!(
                     "{}",
-                    gndrm_obf::obf!("render client paired (pid {pid})")
+                    format_args!("render client paired (pid {pid})")
                 ));
                 clients
                     .lock()
@@ -297,7 +297,7 @@ pub fn serve_render_listener(
                 let make_device = Arc::clone(&make_device);
                 let thread_log = Arc::clone(&log);
                 let thread_clients = Arc::clone(&clients);
-                let name = format!("{}", gndrm_obf::obf!("gndrm-rn{next_id}"));
+                let name = format!("{}", format_args!("gndrm-rn{next_id}"));
                 next_id += 1;
                 let spawned = thread::Builder::new().name(name).spawn(move || {
                     let mut dev = make_device();
@@ -319,7 +319,7 @@ pub fn serve_render_listener(
                 match spawned {
                     Ok(h) => handles.push(h),
                     Err(e) => {
-                        log(&format!("{}", gndrm_obf::obf!("render client spawn: {e}")));
+                        log(&format!("{}", format_args!("render client spawn: {e}")));
                         if let Ok(mut c) = clients.lock() {
                             c.retain(|(r, ev)| !(*r == rpc && *ev == fd));
                         }
@@ -341,9 +341,7 @@ pub fn serve_render_listener(
                 // the daemon half of that handshake.
                 log(&format!(
                     "{}",
-                    gndrm_obf::obf!(
-                        "render client rpc accepted (pid {pid}), awaiting event channel"
-                    )
+                    format_args!("render client rpc accepted (pid {pid}), awaiting event channel")
                 ));
                 pending.insert(pid, fd);
             }
@@ -405,7 +403,7 @@ pub fn serve(dev: &mut Device, rpc_fd: RawFd, event_fd: RawFd, log: Log) {
             if e.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            log(&format!("{}", gndrm_obf::obf!("poll: {e}")));
+            log(&format!("{}", format_args!("poll: {e}")));
             return;
         }
         // Flip events are ready: write them to the client's event channel in
@@ -415,7 +413,7 @@ pub fn serve(dev: &mut Device, rpc_fd: RawFd, event_fd: RawFd, log: Log) {
                 let mut bytes = Vec::new();
                 pod_write(&mut bytes, &ev);
                 if let Err(e) = send_frame(event_fd, &bytes, None) {
-                    log(&format!("{}", gndrm_obf::obf!("event send failed: {e}")));
+                    log(&format!("{}", format_args!("event send failed: {e}")));
                     return;
                 }
             }
@@ -426,16 +424,16 @@ pub fn serve(dev: &mut Device, rpc_fd: RawFd, event_fd: RawFd, log: Log) {
         let (n, fd_in) = match recv_frame(rpc_fd, &mut buf) {
             Ok(v) => v,
             Err(e) => {
-                log(&format!("{}", gndrm_obf::obf!("recv: {e}")));
+                log(&format!("{}", format_args!("recv: {e}")));
                 return;
             }
         };
         if n == 0 {
-            log(&gndrm_obf::obf!("peer closed"));
+            log("peer closed");
             return;
         }
         let Ok(hdr) = ReqHdr::decode(&buf[..n]) else {
-            log(&gndrm_obf::obf!("bad request header, dropping"));
+            log("bad request header, dropping");
             return;
         };
         let payload = &buf[REQ_HDR_LEN..hdr.total_len as usize];
@@ -459,7 +457,7 @@ pub fn serve(dev: &mut Device, rpc_fd: RawFd, event_fd: RawFd, log: Log) {
             close_fd(fd);
         }
         if let Err(e) = sent {
-            log(&format!("{}", gndrm_obf::obf!("send failed: {e}")));
+            log(&format!("{}", format_args!("send failed: {e}")));
             return;
         }
     }
@@ -577,11 +575,9 @@ mod tests {
         static N: AtomicU32 = AtomicU32::new(0);
         format!(
             "{}",
-            gndrm_obf::obf!(
-                "gndrm-srv-{}-{}",
+            format_args!("gndrm-srv-{}-{}",
                 std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            )
+                N.fetch_add(1, Ordering::Relaxed))
         )
     }
 
@@ -592,11 +588,11 @@ mod tests {
     #[test]
     fn accept_newest_adopts_the_latest_and_drops_the_superseded() {
         let name = unique_name();
-        let listener = listen_seqpacket(&name).expect(&gndrm_obf::obf!("listen"));
+        let listener = listen_seqpacket(&name).expect("listen");
         let old = client_connect(&name);
         let new = client_connect(&name);
 
-        let adopted = accept_newest(listener).expect(&gndrm_obf::obf!("accept_newest"));
+        let adopted = accept_newest(listener).expect("accept_newest");
 
         // The adopted fd is the newest client: a byte it sends is readable here.
         let marker = [0xA5u8];
@@ -631,10 +627,10 @@ mod tests {
     #[test]
     fn accept_newest_adopts_a_lone_connection() {
         let name = unique_name();
-        let listener = listen_seqpacket(&name).expect(&gndrm_obf::obf!("listen"));
+        let listener = listen_seqpacket(&name).expect("listen");
         let client = client_connect(&name);
 
-        let adopted = accept_newest(listener).expect(&gndrm_obf::obf!("accept_newest"));
+        let adopted = accept_newest(listener).expect("accept_newest");
 
         let marker = [0x11u8];
         // SAFETY: valid sockets and a one-byte buffer.
@@ -681,7 +677,7 @@ mod tests {
         let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
         assert!(n > 0, "recv: {}", io::Error::last_os_error());
         let n = n as usize;
-        let hdr = RespHdr::decode(&buf[..n]).expect(&gndrm_obf::obf!("response header"));
+        let hdr = RespHdr::decode(&buf[..n]).expect("response header");
         (hdr.ret, buf[RESP_HDR_LEN..n].to_vec())
     }
 
@@ -699,8 +695,8 @@ mod tests {
         use gndrm_uapi::wire::errno;
 
         let name = unique_name();
-        let listener = listen_seqpacket(&name).expect(&gndrm_obf::obf!("listen"));
-        let stop_fd = new_stop_eventfd().expect(&gndrm_obf::obf!("stop eventfd"));
+        let listener = listen_seqpacket(&name).expect("listen");
+        let stop_fd = new_stop_eventfd().expect("stop eventfd");
         let log: SharedLog = Arc::new(|_| {});
         let acceptor = thread::spawn(move || {
             serve_render_listener(
@@ -740,7 +736,7 @@ mod tests {
         );
         let (ret, out) = exchange(rpc, &req(DRM_IOCTL_GEM_CREATE, &body, 2));
         assert_eq!(ret, 0, "GEM_CREATE on a render node");
-        let created: DrmGemCreate = pod_read(&out).expect(&gndrm_obf::obf!("GEM_CREATE body"));
+        let created: DrmGemCreate = pod_read(&out).expect("GEM_CREATE body");
         assert!(created.handle > 0, "GEM_CREATE returned a handle");
 
         // Modesetting is refused on a render node (DRM_RENDER_ALLOW gate).
@@ -761,7 +757,7 @@ mod tests {
         signal_stop(stop_fd);
         acceptor
             .join()
-            .expect(&gndrm_obf::obf!("render acceptor thread"));
+            .expect("render acceptor thread");
     }
 
     /// The render listener name the shim and the daemon must agree on.

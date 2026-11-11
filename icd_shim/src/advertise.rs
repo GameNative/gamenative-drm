@@ -167,10 +167,8 @@ pub fn mask(c: &mut CoreFeatures, base: &CoreFeatures) -> Vec<&'static str> {
     // same at its create ("Faking feature support for ..."); here it is the
     // calibration signal when a game misbehaves under a lift the driver gated.
     if !cleared.is_empty() && !MASKED.swap(true, Ordering::Relaxed) {
-        crate::logf!(gndrm_obf::obf!(
-            "feature lift masked back to the driver's answer: {}",
-            cleared.join(" ")
-        ));
+        crate::logf!("feature lift masked back to the driver's answer: {}",
+            cleared.join(" "));
     }
     cleared
 }
@@ -220,14 +218,10 @@ pub unsafe fn features(f: *mut c_void) {
     let zero = zeros(c);
     let raised = lift_core(c);
     if !LOGGED.swap(true, Ordering::Relaxed) {
-        crate::logf!(gndrm_obf::obf!(
-            "driver core features zero: {}",
-            zero.join(" ")
-        ));
-        crate::logf!(gndrm_obf::obf!(
-            "wrapper-style feature lift over the driver's zeros: {}",
-            raised.join(" ")
-        ));
+        crate::logf!("driver core features zero: {}",
+            zero.join(" "));
+        crate::logf!("wrapper-style feature lift over the driver's zeros: {}",
+            raised.join(" "));
     }
 }
 
@@ -264,10 +258,8 @@ pub fn request_mismatch(c: &CoreFeatures, base: &CoreFeatures) -> Vec<&'static s
         inheritedQueries,
     );
     if !bad.is_empty() && !MISMATCH.swap(true, Ordering::Relaxed) {
-        crate::logf!(gndrm_obf::obf!(
-            "guest requests features the driver answers zero: {}",
-            bad.join(" ")
-        ));
+        crate::logf!("guest requests features the driver answers zero: {}",
+            bad.join(" "));
     }
     bad
 }

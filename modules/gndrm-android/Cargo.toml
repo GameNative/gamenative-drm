@@ -11,11 +11,6 @@ authors.workspace = true
 name = "gamenative_drm"
 crate-type = ["cdylib"]
 
-# `gndrm-obf` is target-independent (pure std) and used by the Android cdylib
-# and by the host integration tests that include `src/*.rs` verbatim.
-[dependencies]
-gndrm-obf = { path = "../gndrm-obf" }
-
 # Everything Android-specific is an android-only dependency: on the host the
 # crate compiles to an empty stub so workspace-wide fmt/clippy/test stay green
 # (real verification of this module is `tools/build-android.sh` + on-device).

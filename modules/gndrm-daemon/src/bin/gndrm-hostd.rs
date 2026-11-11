@@ -24,7 +24,7 @@ use gndrm_daemon::{Device, NullPresenter, PanelDesc};
 fn main() {
     let name = std::env::args()
         .nth(1)
-        .expect(&gndrm_obf::obf!("usage: gndrm-hostd <socket-name>"));
+        .expect("usage: gndrm-hostd <socket-name>");
     if name.starts_with('/') {
         let _ = std::fs::remove_file(&name);
     }
@@ -43,7 +43,7 @@ fn main() {
     // Render-node clients on their own listener: the device-side path, one
     // Device per RPC/event pair, on the same code `libgamenative_drm.so` runs.
     let render_log = Arc::clone(&log);
-    let stop_fd = server::new_stop_eventfd().expect(&gndrm_obf::obf!("stop eventfd"));
+    let stop_fd = server::new_stop_eventfd().expect("stop eventfd");
     thread::Builder::new()
         .name("gndrm-hostd-render".into())
         .spawn(move || {
@@ -54,7 +54,7 @@ fn main() {
                 render_log,
             );
         })
-        .expect(&gndrm_obf::obf!("render listener thread"));
+        .expect("render listener thread");
 
     // First connection = RPC, second = events (wire contract).
     let rpc = server::accept(listener).unwrap();

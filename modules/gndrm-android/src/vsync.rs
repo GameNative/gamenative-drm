@@ -265,10 +265,8 @@ pub(crate) fn sample(latch_ns: u64, applied_ns: u64) {
         if first && note.is_some() {
             log_info!(
                 "{}",
-                gndrm_obf::obf!(
-                    "vsync: panel latch grid period={}us; pushing it to the presenter",
-                    period / 1000
-                )
+                format_args!("vsync: panel latch grid period={}us; pushing it to the presenter",
+                    period / 1000)
             );
         }
         note

@@ -297,13 +297,11 @@ fn note_outcome(id: u64, what: &str, t0: std::time::Instant) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     if n < 8 || n.is_multiple_of(600) {
-        crate::logf!(gndrm_obf::obf!(
-            "present wait #{}: id={} {} after {} us",
+        crate::logf!("present wait #{}: id={} {} after {} us",
             n,
             id,
             what,
-            t0.elapsed().as_micros()
-        ));
+            t0.elapsed().as_micros());
     }
 }
 

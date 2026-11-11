@@ -45,13 +45,13 @@
 
 /// Emit a `gn-vkshim:` line to stderr, unless `GNDRM_LOG_VKSHIM` is off
 /// (unset, `""` or `"0"` — the default). `$e` is a ready-to-format value: a
-/// call site passes `gndrm_obf::obf!(...)` so the message text is decoded at
+/// call site passes `...` so the message text is decoded at
 /// runtime and never lands in `.rodata`. The prefix is decoded likewise.
 #[macro_export]
 macro_rules! logf {
-    ($e:expr) => {
+    ($($arg:tt)*) => {
         if $crate::vkshim_enabled() {
-            eprintln!("{} {}", ::gndrm_obf::obf!("gn-vkshim:"), $e);
+            eprintln!("{} {}", "gn-vkshim:", format_args!($($arg)*));
         }
     };
 }
@@ -62,8 +62,8 @@ macro_rules! logf {
 /// gamescope, so a gated line can never be turned on there.
 #[macro_export]
 macro_rules! logi {
-    ($e:expr) => {
-        eprintln!("{} {}", ::gndrm_obf::obf!("gn-vkshim:"), $e)
+    ($($arg:tt)*) => {
+        eprintln!("{} {}", "gn-vkshim:", format_args!($($arg)*))
     };
 }
 
@@ -71,10 +71,10 @@ macro_rules! logi {
 /// with no driver.
 #[macro_export]
 macro_rules! log_reason {
-    ($e:expr) => {{
-        let line = format!("{}", $e);
+    ($($arg:tt)*) => {{
+        let line = format!($($arg)*);
         $crate::note_reason(&line);
-        eprintln!("{} {}", ::gndrm_obf::obf!("gn-vkshim:"), line);
+        eprintln!("{} {}", "gn-vkshim:", line);
     }};
 }
 
@@ -150,14 +150,12 @@ fn announce(entry: &str) {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let comm = std::fs::read_to_string("/proc/self/comm").unwrap_or_default();
-        logi!(gndrm_obf::obf!(
-            "ICD loaded [shim {} {}] pid={} comm={} first entry {}",
+        logi!("ICD loaded [shim {} {}] pid={} comm={} first entry {}",
             SHIM_BUILD,
             SHIM_GIT,
             std::process::id(),
             comm.trim_end(),
-            entry
-        ));
+            entry);
     });
 }
 
@@ -346,9 +344,7 @@ fn negotiate_icd(h: *mut c_void) {
     let f: unsafe extern "C" fn(*mut u32) -> VkResult = unsafe { std::mem::transmute(sym) };
     let mut v: u32 = 5;
     let r = unsafe { f(&mut v) };
-    logf!(gndrm_obf::obf!(
-        "wrapper icd: negotiated interface {v} ({r})"
-    ));
+    logf!("wrapper icd: negotiated interface {v} ({r})");
 }
 
 fn try_system_driver() {
@@ -360,46 +356,34 @@ fn try_system_driver() {
     if let Some(w) = wrapper.as_deref() {
         let h = unsafe { libc::dlopen(w.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if h.is_null() {
-            logf!(gndrm_obf::obf!(
-                "wrapper icd: dlopen failed: {}",
-                dlerror_str()
-            ));
+            logf!("wrapper icd: dlopen failed: {}",
+                dlerror_str());
         } else {
-            logf!(gndrm_obf::obf!(
-                "wrapper icd: driving {}",
-                w.to_string_lossy()
-            ));
+            logf!("wrapper icd: driving {}",
+                w.to_string_lossy());
             negotiate_icd(h);
             match unsafe { resolve_gipa(h) } {
                 Some(gipa) if proxy::device_prereqs(gipa, allow_ahb) => {
                     opened = Some((h, gipa, true));
                 }
-                Some(_) => logf!(gndrm_obf::obf!(
-                    "wrapper icd fails the proxy's prerequisite probe (see 'proxy prereq' above) — opening the system vulkan loader directly"
-                )),
-                None => logf!(gndrm_obf::obf!(
-                    "wrapper icd exports no vkGetInstanceProcAddr — opening the system vulkan loader directly"
-                )),
+                Some(_) => logf!("wrapper icd fails the proxy's prerequisite probe (see 'proxy prereq' above) — opening the system vulkan loader directly"),
+                None => logf!("wrapper icd exports no vkGetInstanceProcAddr — opening the system vulkan loader directly"),
             }
         }
     }
     if opened.is_none() {
         let h = unsafe { libc::dlopen(SYSTEM_LOADER.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if h.is_null() {
-            log_reason!(gndrm_obf::obf!(
-                "dlopen system vulkan loader failed: {}",
-                dlerror_str()
-            ));
+            log_reason!("dlopen system vulkan loader failed: {}",
+                dlerror_str());
             return;
         }
         let Some(gipa) = (unsafe { resolve_gipa(h) }) else {
-            log_reason!(gndrm_obf::obf!(
-                "system vulkan loader exports no vkGetInstanceProcAddr"
-            ));
+            log_reason!("system vulkan loader exports no vkGetInstanceProcAddr");
             return;
         };
         if !proxy::device_prereqs(gipa, allow_ahb) {
-            logi!(gndrm_obf::obf!("system vulkan driver fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode"));
+            logi!("system vulkan driver fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode");
             return;
         }
         opened = Some((h, gipa, false));
@@ -424,15 +408,11 @@ fn try_system_driver() {
         DRIVER.handle = h;
     }
     if gamescope {
-        logi!(gndrm_obf::obf!(
-            "gamescope process: using system vulkan driver via WSI proxy [shim {}]",
-            SHIM_BUILD
-        ));
+        logi!("gamescope process: using system vulkan driver via WSI proxy [shim {}]",
+            SHIM_BUILD);
     } else {
-        logi!(gndrm_obf::obf!(
-            "guest process: using system vulkan driver via WSI proxy [shim {}]",
-            SHIM_BUILD
-        ));
+        logi!("guest process: using system vulkan driver via WSI proxy [shim {}]",
+            SHIM_BUILD);
     }
 }
 
@@ -443,24 +423,18 @@ fn try_adrenotools() {
     let hooks = std::env::var("ADRENOTOOLS_HOOKS_PATH").ok().or_else(|| {
         std::env::var("PREFIX")
             .ok()
-            .map(|p| format!("{}", gndrm_obf::obf!("{p}/lib")))
+            .map(|p| format!("{}", format_args!("{p}/lib")))
     });
     let Some(hooks) = hooks else {
-        logf!(gndrm_obf::obf!(
-            "ADRENOTOOLS_HOOKS_PATH unset and no PREFIX — skipping adrenotools"
-        ));
+        logf!("ADRENOTOOLS_HOOKS_PATH unset and no PREFIX — skipping adrenotools");
         return;
     };
     let Some(path) = path else {
-        logf!(gndrm_obf::obf!(
-            "ADRENOTOOLS_DRIVER_PATH unset — skipping adrenotools"
-        ));
+        logf!("ADRENOTOOLS_DRIVER_PATH unset — skipping adrenotools");
         return;
     };
     if !std::path::Path::new(&path).exists() {
-        logf!(gndrm_obf::obf!(
-            "ADRENOTOOLS_DRIVER_PATH {path} not accessible — skipping adrenotools"
-        ));
+        logf!("ADRENOTOOLS_DRIVER_PATH {path} not accessible — skipping adrenotools");
         return;
     }
     let at = unsafe {
@@ -470,10 +444,8 @@ fn try_adrenotools() {
         )
     };
     if at.is_null() {
-        logf!(gndrm_obf::obf!(
-            "dlopen libadrenotools.so failed: {}",
-            dlerror_str()
-        ));
+        logf!("dlopen libadrenotools.so failed: {}",
+            dlerror_str());
         return;
     }
     let open_vk: Option<AdrenotoolsOpenLibvulkanFn> = unsafe {
@@ -485,16 +457,14 @@ fn try_adrenotools() {
         }
     };
     let Some(open_vk) = open_vk else {
-        logf!(gndrm_obf::obf!(
-            "adrenotools_open_libvulkan not exported by libadrenotools.so"
-        ));
+        logf!("adrenotools_open_libvulkan not exported by libadrenotools.so");
         return;
     };
     // Patched copies live in a temp/ dir beside the driver (same layout the
     // wrapper creates); libadrenotools (re)generates them as needed.
     let tmp = format!(
         "{}",
-        gndrm_obf::obf!("{path}{}temp", if path.ends_with('/') { "" } else { "/" })
+        format_args!("{path}{}temp", if path.ends_with('/') { "" } else { "/" })
     );
     let _ = std::fs::create_dir_all(&tmp);
     let c_tmp = CString::new(tmp).unwrap();
@@ -515,11 +485,9 @@ fn try_adrenotools() {
         )
     };
     if h.is_null() {
-        logf!(gndrm_obf::obf!(
-            "adrenotools_open_libvulkan failed for {}{}",
+        logf!("adrenotools_open_libvulkan failed for {}{}",
             path,
-            name.as_deref().unwrap_or("")
-        ));
+            name.as_deref().unwrap_or(""));
         return;
     }
     let exts = driver_instance_exts(h);
@@ -527,32 +495,28 @@ fn try_adrenotools() {
     let has_headless = ext_list_has(&exts, c"VK_EXT_headless_surface");
     let label = name.as_deref().unwrap_or(path.as_str()).to_string();
     if has_wayland {
-        logf!(gndrm_obf::obf!(
-            "using adrenotools driver {label} (VK_KHR_wayland_surface present)"
-        ));
+        logf!("using adrenotools driver {label} (VK_KHR_wayland_surface present)");
         unsafe { DRIVER.handle = h };
         return;
     }
     // No wayland WSI (the whole adrenotools turnip family): present through
     // the WSI proxy (proxy.rs) on top of VK_EXT_headless_surface instead.
     if !has_headless || std::env::var_os("GN_VKSHIM_NO_PROXY").is_some() {
-        logf!(gndrm_obf::obf!(
-            "adrenotools driver {label} lacks VK_KHR_wayland_surface{} — not usable in GameScope mode",
+        logf!("adrenotools driver {label} lacks VK_KHR_wayland_surface{} — not usable in GameScope mode",
             if has_headless {
                 " (GN_VKSHIM_NO_PROXY set)"
             } else {
                 " and VK_EXT_headless_surface"
-            }
-        ));
+            });
         return;
     }
     let Some(gipa) = (unsafe { resolve_gipa(h) }) else {
-        logf!(gndrm_obf::obf!("adrenotools driver {label} fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode"));
+        logf!("adrenotools driver {label} fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode");
         return;
     };
     let gipa_fn: GipaFn = gipa;
     if !proxy::device_prereqs(gipa_fn, false) {
-        logf!(gndrm_obf::obf!("adrenotools driver {label} fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode"));
+        logf!("adrenotools driver {label} fails the proxy's prerequisite probe (see 'proxy prereq' above) — not usable in GameScope mode");
         return;
     }
     proxy::set_real_gipa(gipa_fn);
@@ -561,10 +525,8 @@ fn try_adrenotools() {
         DRIVER.proxy_active = true;
         DRIVER.handle = h;
     }
-    logf!(gndrm_obf::obf!(
-        "using adrenotools driver {label} via WSI proxy (headless surface + dma-buf export) [shim {}]",
-        SHIM_BUILD
-    ));
+    logf!("using adrenotools driver {label} via WSI proxy (headless surface + dma-buf export) [shim {}]",
+        SHIM_BUILD);
 }
 
 /// The real driver .so handle the shim opened (adrenotools- or freedreno-
@@ -593,13 +555,9 @@ fn init_once() {
     let kgsl = kgsl_present();
     if !kgsl || system_driver_forced() {
         if kgsl {
-            logi!(gndrm_obf::obf!(
-                "GN_VKSHIM_SYSTEM_DRIVER=1: using the system vulkan loader"
-            ));
+            logi!("GN_VKSHIM_SYSTEM_DRIVER=1: using the system vulkan loader");
         } else {
-            logi!(gndrm_obf::obf!(
-                "no /dev/kgsl-3d0: using the system vulkan loader"
-            ));
+            logi!("no /dev/kgsl-3d0: using the system vulkan loader");
         }
         try_system_driver();
     }
@@ -620,9 +578,7 @@ fn init_once() {
                 .and_then(is_wrapper_driver)
                 .unwrap_or(false)
         {
-            logf!(gndrm_obf::obf!(
-                "wrapper driver without adrenotools: trying the system vulkan driver"
-            ));
+            logf!("wrapper driver without adrenotools: trying the system vulkan driver");
             try_system_driver();
         }
         if unsafe { DRIVER.handle }.is_null() {
@@ -632,25 +588,21 @@ fn init_once() {
                     libc::RTLD_NOW | libc::RTLD_LOCAL,
                 )
             };
-            logf!(gndrm_obf::obf!(
-                "falling back to payload freedreno {}",
+            logf!("falling back to payload freedreno {}",
                 if h.is_null() {
                     dlerror_str()
                 } else {
                     "loaded".into()
-                }
-            ));
+                });
             unsafe { DRIVER.handle = h };
         }
     }
     let handle = unsafe { DRIVER.handle };
     if handle.is_null() {
-        logi!(gndrm_obf::obf!(
-            "no driver selected [shim {} {}]: every entry point resolves to NULL, so the loader skips this ICD and vkCreateInstance returns VK_ERROR_INCOMPATIBLE_DRIVER; reason: {}",
+        logi!("no driver selected [shim {} {}]: every entry point resolves to NULL, so the loader skips this ICD and vkCreateInstance returns VK_ERROR_INCOMPATIBLE_DRIVER; reason: {}",
             SHIM_BUILD,
             SHIM_GIT,
-            reason()
-        ));
+            reason());
         return;
     }
     unsafe {
@@ -665,9 +617,7 @@ fn init_once() {
             }
         };
         if (*drv).gipa.is_none() {
-            logf!(gndrm_obf::obf!(
-                "driver exports no instance proc addr — ICD unusable"
-            ));
+            logf!("driver exports no instance proc addr — ICD unusable");
         }
     }
 }
@@ -727,7 +677,7 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
         if name == c"vkCreateInstance" {
             note_null_create_instance(&format!(
                 "{}",
-                gndrm_obf::obf!("no driver selected ({})", reason())
+                format_args!("no driver selected ({})", reason())
             ));
         }
         return None;
@@ -738,10 +688,8 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
     if out.is_none() && name == c"vkCreateInstance" {
         note_null_create_instance(&format!(
             "{}",
-            gndrm_obf::obf!(
-                "the driver's vkGetInstanceProcAddr returned NULL (proxy {})",
-                if proxy_active() { "active" } else { "inactive" }
-            )
+            format_args!("the driver's vkGetInstanceProcAddr returned NULL (proxy {})",
+                if proxy_active() { "active" } else { "inactive" })
         ));
     }
     out
@@ -752,9 +700,7 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
 fn note_null_create_instance(why: &str) {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        logi!(gndrm_obf::obf!(
-            "vk_icdGetInstanceProcAddr(vkCreateInstance) -> NULL: {why}; the loader will report VK_ERROR_INCOMPATIBLE_DRIVER"
-        ));
+        logi!("vk_icdGetInstanceProcAddr(vkCreateInstance) -> NULL: {why}; the loader will report VK_ERROR_INCOMPATIBLE_DRIVER");
     });
 }
 

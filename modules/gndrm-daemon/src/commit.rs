@@ -64,11 +64,9 @@ impl Device {
             self.diag(|| {
                 format!(
                     "{}",
-                    gndrm_obf::obf!(
-                        "atomic: reject EINVAL unknown flags=0x{:x} reserved=0x{:x}",
+                    format_args!("atomic: reject EINVAL unknown flags=0x{:x} reserved=0x{:x}",
                         a.flags,
-                        a.reserved
-                    )
+                        a.reserved)
                 )
             });
             return DispatchResult::err(errno::EINVAL);
@@ -106,11 +104,9 @@ impl Device {
             self.diag(|| {
                 format!(
                     "{}",
-                    gndrm_obf::obf!(
-                        "atomic: reject EINVAL fence mismatch wants={} got={}",
+                    format_args!("atomic: reject EINVAL fence mismatch wants={} got={}",
                         parsed.wants_fence,
-                        fd_in.is_some()
-                    )
+                        fd_in.is_some())
                 )
             });
             return DispatchResult::err(errno::EINVAL);
@@ -155,12 +151,10 @@ impl Device {
             self.diag(|| {
                 format!(
                     "{}",
-                    gndrm_obf::obf!(
-                        "atomic: first commit queued (primary fb={}, {} props, flags=0x{:x})",
+                    format_args!("atomic: first commit queued (primary fb={}, {} props, flags=0x{:x})",
                         self.primary_state().fb_id,
                         parsed.sets.len(),
-                        parsed.flags
-                    )
+                        parsed.flags)
                 )
             });
         }
@@ -204,18 +198,15 @@ impl Device {
             self.always_log(|| {
                 format!(
                     "{}",
-                    gndrm_obf::obf!(
-                        "gndrm-daemon: commit #{} fb={} prev_fb={} crtc_on={} fbs={}",
+                    format_args!("gndrm-daemon: commit #{} fb={} prev_fb={} crtc_on={} fbs={}",
                         self.commit_count,
                         p.fb_id,
                         prev_primary_fb,
                         self.crtc_state().active,
-                        self.stores.fbs.len()
-                    )
+                        self.stores.fbs.len())
                 )
             });
-            self.diag(|| format!("{}", gndrm_obf::obf!(
-                "atomic #{}: fb={} {}x{} fmt={:#010x} pitch={} src=({},{}) {}x{} crtc=({},{}) {}x{}",
+            self.diag(|| format!("{}", format_args!("atomic #{}: fb={} {}x{} fmt={:#010x} pitch={} src=({},{}) {}x{} crtc=({},{}) {}x{}",
                 self.commit_count,
                 p.fb_id,
                 w,
@@ -229,8 +220,7 @@ impl Device {
                 p.crtc_x,
                 p.crtc_y,
                 p.crtc_w,
-                p.crtc_h,
-            )));
+                p.crtc_h,)));
         }
         // Plane census: the full plane set, on the same rate policy as the
         // `atomic #N:` line, plus every change at once — a plane that only
@@ -248,7 +238,7 @@ impl Device {
                 self.diag(|| {
                     format!(
                         "{}",
-                        gndrm_obf::obf!("planes #{}: {}", self.commit_count, census)
+                        format_args!("planes #{}: {}", self.commit_count, census)
                     )
                 });
             }
@@ -271,10 +261,9 @@ impl Device {
             .iter()
             .map(|(id, ty, p)| {
                 if p.fb_id == 0 {
-                    format!("{}", gndrm_obf::obf!("[{ty} id={id} fb=0 crtc={} zpos=- alpha=- **]", p.crtc_id))
+                    format!("{}", format_args!("[{ty} id={id} fb=0 crtc={} zpos=- alpha=- **]", p.crtc_id))
                 } else {
-                    format!("{}", gndrm_obf::obf!(
-                        "[{ty} id={id} fb={} crtc={} zpos=- alpha=- src={}x{}+({},{}) crtc={}x{}+({},{})]",
+                    format!("{}", format_args!("[{ty} id={id} fb={} crtc={} zpos=- alpha=- src={}x{}+({},{}) crtc={}x{}+({},{})]",
                         p.fb_id,
                         p.crtc_id,
                         p.src_w >> 16,
@@ -284,14 +273,13 @@ impl Device {
                         p.crtc_w,
                         p.crtc_h,
                         p.crtc_x,
-                        p.crtc_y,
-                    ))
+                        p.crtc_y,))
                 }
             })
             .collect();
         format!(
             "{}",
-            gndrm_obf::obf!("count={} {}", planes.len(), parts.join(" "))
+            format_args!("count={} {}", planes.len(), parts.join(" "))
         )
     }
 
@@ -368,9 +356,7 @@ impl Device {
                     self.diag(|| {
                         format!(
                             "{}",
-                            gndrm_obf::obf!(
-                            "atomic: reject ENOENT unresolved prop obj={obj_id} prop=0x{prop_id:x}"
-                        )
+                            format_args!("atomic: reject ENOENT unresolved prop obj={obj_id} prop=0x{prop_id:x}")
                         )
                     });
                     return Err(DispatchResult::err(errno::ENOENT));
@@ -402,11 +388,9 @@ impl Device {
                 self.diag(|| {
                     format!(
                         "{}",
-                        gndrm_obf::obf!(
-                            "atomic: reject EPERM immutable prop {} (idx {})",
+                        format_args!("atomic: reject EPERM immutable prop {} (idx {})",
                             props::PROPS[s.prop_index].0,
-                            s.prop_index
-                        )
+                            s.prop_index)
                     )
                 });
                 return Err(errno::EPERM);
@@ -430,13 +414,11 @@ impl Device {
                 self.diag(|| {
                     format!(
                         "{}",
-                        gndrm_obf::obf!(
-                            "atomic: reject errno={} invalid prop {} (idx {}) value={}",
+                        format_args!("atomic: reject errno={} invalid prop {} (idx {}) value={}",
                             e,
                             props::PROPS[s.prop_index].0,
                             s.prop_index,
-                            s.value
-                        )
+                            s.value)
                     )
                 });
                 return Err(e);
@@ -459,11 +441,9 @@ impl Device {
                 self.diag(|| {
                     format!(
                         "{}",
-                        gndrm_obf::obf!(
-                            "atomic: reject EINVAL fb={} without crtc (crtc_id={})",
+                        format_args!("atomic: reject EINVAL fb={} without crtc (crtc_id={})",
                             plane.fb_id,
-                            plane.crtc_id
-                        )
+                            plane.crtc_id)
                     )
                 });
                 return Err(errno::EINVAL);
@@ -490,8 +470,7 @@ impl Device {
             self.diag(|| {
                 format!(
                     "{}",
-                    gndrm_obf::obf!(
-                        "atomic: reject EINVAL cursor fb={} {}x{} src={}x{} crtc={}x{} exceeds {}x{}",
+                    format_args!("atomic: reject EINVAL cursor fb={} {}x{} src={}x{} crtc={}x{} exceeds {}x{}",
                         cursor.fb_id,
                         fb_dims.0,
                         fb_dims.1,
@@ -500,8 +479,7 @@ impl Device {
                         cursor.crtc_w,
                         cursor.crtc_h,
                         limit,
-                        limit
-                    )
+                        limit)
                 )
             });
             return Err(errno::EINVAL);

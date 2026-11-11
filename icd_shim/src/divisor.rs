@@ -16,9 +16,7 @@ static FAKED: AtomicBool = AtomicBool::new(false);
 
 pub fn note_faked() {
     if !FAKED.swap(true, Ordering::Relaxed) {
-        crate::logf!(gndrm_obf::obf!(
-            "proxy: advertised VK_EXT_vertex_attribute_divisor over the KHR extension"
-        ));
+        crate::logf!("proxy: advertised VK_EXT_vertex_attribute_divisor over the KHR extension");
     }
 }
 
