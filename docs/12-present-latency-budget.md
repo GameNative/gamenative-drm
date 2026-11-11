@@ -110,11 +110,18 @@ The paced path meets its target, and the
 uncapped rate is bounded upstream — the client's own present lap through the
 ICD shim to gamescope — not by the flip-event path.
 
-### The FIFO declaration is not the throughput cost
+### The FIFO declaration is not the throughput cost, and not a limiter
 
 The shim's per-commit `swapchain_set_present_mode(FIFO)` declaration does not
-bound the uncapped rate — removing both sites left it unchanged. It stays in the
-tree: the request/divisor cap needs it.
+bound the uncapped rate — removing both sites left it unchanged.
+
+It is not a limiter either, and the gate no longer stands down for it.
+gamescope's `steamcompmgr_should_vblank_window` withholds the window's frame
+callback, and this shim never requests one; the divisor also only acts when the
+cap is below the refresh AND divides it. A FIFO guest at 60 on a 60 Hz panel, or
+at 40 on 60 Hz, therefore had no cap at all — measured as a 26 fps Dishonored
+session whose Target FPS did nothing. Every declaration is gated now; gamescope's
+divisor is left as the pacer for content the shim does not present.
 
 ## The X11 arm as a control — pacing is deadline/timer-based, not deferral
 

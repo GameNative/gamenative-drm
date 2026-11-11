@@ -132,13 +132,14 @@ divisor cap reads its target exactly.
   presented frames, of which the compositor shows 60. An unreported panel imposes
   no limit rather than a wrong one, and a multiplier of 1 is not generation.
 
-  Who holds the acquire rate follows the declaration, not the cap. A FIFO
-  declaration is held by gamescope's limiter (`wlserver_surface_is_fifo`), which
-  latches one commit per limited vblank (`steamcompmgr.cpp`
-  `handle_done_commits_xwayland`); any other mode is taken at the next composite,
-  so the shim's acquire gate holds it, on the display's vblank grid. With
-  generation on, the gate holds the source rate on its own clock and the generator
-  places the batches on the latch grid (`docs/17`).
+  The shim's acquire gate holds the rate for every mode the guest declares. A
+  FIFO declaration is not held by gamescope's limiter: that limiter withholds the
+  window's frame callback, which the shim never requests, and its divisor only
+  acts when the cap is below the refresh and divides it — so `60` on a 60 Hz
+  panel and `40` on 60 Hz had no cap at all. gamescope's divisor remains the
+  pacer for frames the shim does not present. With generation on, the gate holds
+  the source rate on its own clock and the generator places the batches on the
+  latch grid (`docs/17`).
 
   The gate (`icd_shim/src/vsync_gate.rs`) releases acquires on the vblank grid
   gamescope composites from, not on a clock of its own: the daemon's `VsyncNote`

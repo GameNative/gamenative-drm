@@ -38,8 +38,9 @@
 //! and straddles the next composite: measured on a Retroid Pocket 6, 58.3 fps
 //! and 102 frames replaced in gamescope's mailbox per minute at a 60 cap on a
 //! 59.975 Hz panel, and 13 % of the daemon's publishes late at 120 Hz. Until
-//! then the shim declares FIFO under a cap and gamescope's limiter holds it
-//! (`proxy::choose_live_mode`).
+//! the gate runs on its own clock at the cap period. gamescope's limiter is not
+//! a substitute: it withholds a frame callback this shim never waits on, and its
+//! divisor only acts when the cap is below the refresh and divides it.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -203,6 +204,32 @@ const ON_TIME_NS: u64 = 500_000;
 static LATE_N: AtomicU64 = AtomicU64::new(0);
 static SKIPPED_N: AtomicU64 = AtomicU64::new(0);
 
+/// Which arm of [`Schedule::book`] booked the release: on time, late by less
+/// than a slot, late by a period or more. Census only — the three fire in
+/// different steady states, and which one fires is what decides whether the cap
+/// can hold at all.
+static ARM_ON_N: AtomicU64 = AtomicU64::new(0);
+static ARM_UNDER_N: AtomicU64 = AtomicU64::new(0);
+static ARM_LATE_N: AtomicU64 = AtomicU64::new(0);
+/// Bookings that ran on the shim's own clock because the grid had no period.
+static BOOK_CLOCK_N: AtomicU64 = AtomicU64::new(0);
+/// The furthest a booking ever put the next release *behind* now, ns; 0 when
+/// every booking put it ahead. A release point that lands behind now holds
+/// nothing, which is exactly the shape a cap that reads high has.
+static BOOK_BEHIND_MAX_NS: AtomicU64 = AtomicU64::new(0);
+
+/// `(on time, under a slot, a period or more late, gridless, furthest behind)`:
+/// [`Schedule::book`]'s four outcomes and the worst one, for the census.
+pub(crate) fn book_counts() -> (u64, u64, u64, u64, u64) {
+    (
+        ARM_ON_N.load(Ordering::Relaxed),
+        ARM_UNDER_N.load(Ordering::Relaxed),
+        ARM_LATE_N.load(Ordering::Relaxed),
+        BOOK_CLOCK_N.load(Ordering::Relaxed),
+        BOOK_BEHIND_MAX_NS.load(Ordering::Relaxed),
+    )
+}
+
 /// `(late, skipped)`: acquires that started after their release point, and the
 /// release points the schedule moved past for them.
 pub(crate) fn late_counts() -> (u64, u64) {
@@ -261,18 +288,28 @@ impl Schedule {
             SKIPPED_N.fetch_add(at.saturating_sub(due) / grid.period_ns, Ordering::Relaxed);
         }
         let (slot, ideal) = match due {
-            Some(due) if at <= due => (due, self.ideal_ns),
+            Some(due) if at <= due => {
+                ARM_ON_N.fetch_add(1, Ordering::Relaxed);
+                (due, self.ideal_ns)
+            }
             // Late by a period or more but still inside its slot: the slot's
             // timeline goes on, so the frame after this one is due where the
             // cap says, not a whole interval after a late start.
-            Some(_) if now_ns < self.ideal_ns.saturating_add(interval_ns) => (at, self.ideal_ns),
-            _ => (at, at),
+            Some(_) if now_ns < self.ideal_ns.saturating_add(interval_ns) => {
+                ARM_UNDER_N.fetch_add(1, Ordering::Relaxed);
+                (at, self.ideal_ns)
+            }
+            _ => {
+                ARM_LATE_N.fetch_add(1, Ordering::Relaxed);
+                (at, at)
+            }
         };
         let ideal_next = ideal.saturating_add(interval_ns);
         // Never two releases on one grid instant.
         let next = grid
             .nearest(ideal_next)
             .max(slot.saturating_add(grid.period_ns));
+        BOOK_BEHIND_MAX_NS.fetch_max(now_ns.saturating_sub(next), Ordering::Relaxed);
         self.ideal_ns = ideal_next;
         self.next_ns = next;
         next
@@ -281,7 +318,9 @@ impl Schedule {
     /// Book an acquire that started at `now_ns` on the shim's own clock
     /// ([`crate::scanout::next_acquire_after`]).
     pub(crate) fn book_clock(&mut self, now_ns: u64, period_ns: u64) -> u64 {
+        BOOK_CLOCK_N.fetch_add(1, Ordering::Relaxed);
         self.next_ns = crate::scanout::next_acquire_after(self.next_ns, now_ns, period_ns);
+        BOOK_BEHIND_MAX_NS.fetch_max(now_ns.saturating_sub(self.next_ns), Ordering::Relaxed);
         // `book` reads `ideal_ns` as an absolute instant: leaving it at 0
         // resolves `nearest(ideal_ns + interval)` near CLOCK_MONOTONIC zero and
         // the schedule collapses to one release per vblank.

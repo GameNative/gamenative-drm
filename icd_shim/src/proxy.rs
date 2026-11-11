@@ -185,7 +185,41 @@ static PRES_IV_LAST_NS: AtomicU64 = AtomicU64::new(0);
 // `gate_holds>0` with `acq_fps` short of the target is the gate binding and the
 // rate still below it, which is a schedule fault rather than a missing target.
 static GATE_HOLD_N: AtomicUsize = AtomicUsize::new(0);
+/// Acquires that ran with a gate, and acquires that ran without one. The cap
+/// can only hold on the gated ones, so the split is the first thing a cap that
+/// reads high has to explain.
+static ACQ_GATED_N: AtomicUsize = AtomicUsize::new(0);
+static ACQ_UNGATED_N: AtomicUsize = AtomicUsize::new(0);
 static GATE_HOLD_SUM_US: AtomicUsize = AtomicUsize::new(0);
+/// Time the guest actually spent parked by the gate, ns: what the cap costs the
+/// producer, as opposed to what it saves the display.
+static GATE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+/// Acquire spacing, in buckets of the panel period: `<14 ms`, `14-16.2`,
+/// `16.2-17.2`, `17.2-20`, `>20`. A cap that holds shows one bucket at the
+/// interval; a cap that leaks shows mass below it.
+static ACQ_SPACING: [AtomicUsize; 5] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
+static ACQ_LAST_NS: AtomicU64 = AtomicU64::new(0);
+/// Acquire *calls* that handed the guest an image, and calls that left without
+/// one (`VK_NOT_READY`/`VK_TIMEOUT`). A presentation rate is the first, never
+/// the call count: an engine that polls with a zero timeout retries, and a
+/// retry is not a frame.
+static ACQ_OK_N: AtomicUsize = AtomicUsize::new(0);
+static ACQ_RETRY_N: AtomicUsize = AtomicUsize::new(0);
+/// First instant this shim sized a swapchain, for the census's session age: a
+/// cumulative counter is only a rate once the denominator is known.
+static SHIM_T0_NS: AtomicU64 = AtomicU64::new(0);
+/// Release notes applied to a parked slot, and slots freed by
+/// [`RELEASE_NOTE_LIMIT_NS`] instead. The first is the measurement working; the
+/// second is a note that never came, and a session where it dominates is one
+/// where the daemon is not naming every buffer the guest holds.
+static NOTES_APPLIED: AtomicUsize = AtomicUsize::new(0);
+static PARK_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
 static GATE_HOLD_MAX_US: AtomicUsize = AtomicUsize::new(0);
 
 /// Record the interval since the previous present. Called once per present at
@@ -2651,12 +2685,15 @@ const REAP_SLICE: Duration = Duration::from_millis(4);
 /// release note before it is taken anyway, in nanoseconds.
 ///
 /// The note is a fence signal, so it arrives in microseconds once SurfaceFlinger
-/// releases the buffer. The bound exists for the two cases where it never does:
-/// a note lost to a full socket (the daemon's pushes are fire-and-forget), and a
-/// compositor that never releases. Holding the guest through either would be a
-/// hang, and a slot taken after a hundred milliseconds of silence is one frame
-/// that may tear against one guest that never runs again.
-const RELEASE_NOTE_LIMIT_NS: u64 = 100_000_000;
+/// releases the buffer. The bound exists for the case where it never does: the
+/// daemon emits a note for a buffer that is *replaced* on the layer, so a buffer
+/// its publish path coalesced away is never replaced and never gets one.
+///
+/// Two display periods, because that is the scale of the hold the note reports
+/// (measured 1.5-2.5 periods). A longer bound is not a safety net, it is a
+/// pacing rule: at 100 ms four slots cap the session at 40/s, and the guest's
+/// own over-production is what decides how many of those it pays.
+const RELEASE_NOTE_LIMIT_NS: u64 = 33_000_000;
 
 /// How long an acquire may sleep while a slot is parked on a release note.
 ///
@@ -2699,12 +2736,20 @@ unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
         // display's own release. The daemon's note is that release; a note that
         // never arrives must not strand the guest, so a slot parked longer than
         // the bound is taken anyway and counted.
+        let mut timed_out = false;
+        let released = unsafe {
+            (*s).parked_ns != 0 && crate::scanout::take_released((*s).ino, (*s).parked_ns)
+        };
+        if released {
+            NOTES_APPLIED.fetch_add(1, Ordering::Relaxed);
+        } else if unsafe { (*s).parked_ns != 0 }
+            && now.saturating_sub(unsafe { (*s).parked_ns }) >= RELEASE_NOTE_LIMIT_NS
+        {
+            timed_out = true;
+            PARK_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+        }
         let free = unsafe {
-            !(*s).acquired
-                && (!(*s).in_flight
-                    || ((*s).parked_ns != 0
-                        && (crate::scanout::take_released((*s).ino, (*s).parked_ns)
-                            || now.saturating_sub((*s).parked_ns) >= RELEASE_NOTE_LIMIT_NS)))
+            !(*s).acquired && (!(*s).in_flight || released || timed_out)
         };
         if free {
             *idx = k as i32;
@@ -2737,6 +2782,12 @@ unsafe fn gn_acquire_common(
     let gd = (*sc).dev;
     let acq_t0 = Instant::now();
     N_ACQ.fetch_add(1, Ordering::Relaxed);
+    let _ = SHIM_T0_NS.compare_exchange(
+        0,
+        monotonic_ns(),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
     ring_push(
         "vkAcquireNextImageKHR",
         [timeout as usize, sem as usize, fence as usize, 0, 0],
@@ -2746,6 +2797,11 @@ unsafe fn gn_acquire_common(
     // image. Which clock it runs on, if any, is `acquire_pacing`'s rule.
     let pacing = unsafe { acquire_pacing(sc) };
     let gated = pacing != crate::vsync_gate::Pacing::Off;
+    if gated {
+        ACQ_GATED_N.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ACQ_UNGATED_N.fetch_add(1, Ordering::Relaxed);
+    }
     let mut idx: i32 = -1;
     let mut timed_out = false;
     // First instant this acquire was parked by the deadline, 0 while it never
@@ -2782,9 +2838,27 @@ unsafe fn gn_acquire_common(
             }
             unsafe { acquire_take_free(sc, &mut idx) };
             if idx >= 0 {
+                ACQ_OK_N.fetch_add(1, Ordering::Relaxed);
                 let now_ns = monotonic_ns();
                 // For the census's acquire-to-commit time, gated or not.
                 (*(*sc).slots.as_mut_ptr().add(idx as usize)).acquired_ns = now_ns;
+                // The cadence the cap is supposed to set, measured where it is
+                // decided rather than downstream of the present.
+                let last = ACQ_LAST_NS.swap(now_ns, Ordering::Relaxed);
+                if last != 0 {
+                    let gap = now_ns.saturating_sub(last);
+                    let b = match gap {
+                        0..=13_999_999 => 0,
+                        14_000_000..=16_199_999 => 1,
+                        16_200_000..=17_199_999 => 2,
+                        17_200_000..=19_999_999 => 3,
+                        _ => 4,
+                    };
+                    ACQ_SPACING[b].fetch_add(1, Ordering::Relaxed);
+                }
+                if hold_from != 0 {
+                    GATE_WAIT_NS.fetch_add(now_ns.saturating_sub(hold_from), Ordering::Relaxed);
+                }
                 if gated {
                     // One timeline for the whole swapchain: the next frame may
                     // not start before the release this one was booked to.
@@ -2853,6 +2927,9 @@ unsafe fn gn_acquire_common(
             return VK_ERROR_OUT_OF_DATE_KHR;
         }
         drop(g);
+    }
+    if idx < 0 {
+        ACQ_RETRY_N.fetch_add(1, Ordering::Relaxed);
     }
     if idx >= 0 && hold_from != 0 {
         let held_us = monotonic_ns().saturating_sub(hold_from) as usize / 1_000;
@@ -6866,24 +6943,41 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_follows_the_declaration_and_the_acquire_limit() {
+    fn the_gate_follows_the_acquire_limit_whatever_the_declaration() {
         use crate::vsync_gate::{GateClock, Pacing};
-        let grid = Some(test_grid(16_675_004));
-        let (m, f) = (VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR);
-        // A FIFO declaration: gamescope's limiter is the pacer.
+        let g = test_grid(16_675_004);
+        let grid = Some(g);
+        // Every declaration the shim makes is gated: no mode is a pacer on this
+        // route (see `gamescope_route_pacing`). A cap on the panel's own rate is
+        // one release per vblank.
+        for declared in [Declared::Mode, Declared::Generating] {
+            let cpu = gamescope_route_pacing(declared, 60, grid);
+            assert_ne!(cpu, Pacing::Off, "{declared:?} 60 on a 60 Hz panel");
+        }
         assert_eq!(
-            gamescope_route_pacing((f, Declared::Mode), 60, grid),
-            Pacing::Off
+            gamescope_route_pacing(Declared::Mode, 60, grid),
+            Pacing::Grid {
+                grid: g,
+                interval_ns: 16_675_004
+            }
         );
-        // Mailbox, immediate, FIFO-relaxed: the gate holds the acquire limit on
-        // the display's grid.
+        // The cell gamescope's integer divisor cannot express: 60/40 truncates to
+        // 1, so nothing limits 40 on a 60 Hz panel but this gate.
         assert_eq!(
-            gamescope_route_pacing((m, Declared::Mode), 30, grid).clock(),
-            GateClock::Vsync
+            gamescope_route_pacing(Declared::Mode, 40, grid),
+            Pacing::Grid {
+                grid: g,
+                interval_ns: 25_000_000
+            }
+        );
+        // And a cap above the panel has no vblank to snap to: its own clock.
+        assert_eq!(
+            gamescope_route_pacing(Declared::Mode, 120, grid).clock(),
+            GateClock::Clock
         );
         // Generation holds the source rate on its own clock, whatever the mode.
         assert_eq!(
-            gamescope_route_pacing((m, Declared::Generating), 40, grid),
+            gamescope_route_pacing(Declared::Generating, 40, grid),
             Pacing::Clock {
                 period_ns: 25_000_000
             }
@@ -9895,8 +9989,13 @@ fn session_limits(sc: *mut GnSwapchain) -> crate::limits::Limits {
 ///
 /// - Off gamescope's override route (the X11 Present route) nothing else holds
 ///   the cap, so the gate does, on its own clock.
-/// - A FIFO declaration needs no gate: gamescope's limiter holds FIFO commits,
-///   one per limited vblank, which is the panel's rate by construction.
+/// - **Every declaration is gated.** gamescope's limiter withholds a window's
+///   frame callback, and this shim paces on its own schedule and the buffer
+///   release, never on that callback — so a FIFO declaration used to leave the
+///   guest with no cap at all: `steamcompmgr_should_vblank_window` acts only
+///   when the cap is below the refresh AND divides it, so 60 on 60 Hz and 40 on
+///   60 Hz were both unlimited, measured as a 26 fps session whose cap did
+///   nothing.
 /// - With generation on the gate holds the source rate on its own clock, and
 ///   the batches are placed on the latch grid by the generator itself.
 /// - Otherwise the gate holds the acquire limit on the display's vblank grid
@@ -9909,7 +10008,7 @@ unsafe fn acquire_pacing(sc: *mut GnSwapchain) -> crate::vsync_gate::Pacing {
     if unsafe { (*(*sc).surf).swapchain_obj.is_null() } {
         return crate::vsync_gate::Pacing::on_clock(acquire);
     }
-    let declared = unsafe { live_choice(sc) };
+    let (_, declared) = unsafe { live_choice(sc) };
     gamescope_route_pacing(declared, acquire, crate::vsync_gate::current_grid())
 }
 
@@ -9917,7 +10016,7 @@ unsafe fn acquire_pacing(sc: *mut GnSwapchain) -> crate::vsync_gate::Pacing {
 /// declares ([`choose_live_mode`]), the session's acquire limit and the
 /// display's vblank grid.
 fn gamescope_route_pacing(
-    (live, declared): (VkPresentModeKHR, Declared),
+    declared: Declared,
     acquire: u32,
     grid: Option<crate::vsync_gate::Grid>,
 ) -> crate::vsync_gate::Pacing {
@@ -9925,9 +10024,11 @@ fn gamescope_route_pacing(
         // Generated frames are placed on the latch grid by the generator, so
         // the gate holds the source rate on its own clock.
         Declared::Generating => crate::vsync_gate::Pacing::on_clock(acquire),
-        // gamescope's limiter holds FIFO commits, one per limited vblank, so it
-        // is the pacer and the gate would only stack on top of it.
-        Declared::Mode if live == VK_PRESENT_MODE_FIFO_KHR => crate::vsync_gate::Pacing::Off,
+        // Whatever the guest declared. A FIFO declaration is not a pacer:
+        // gamescope withholds the window's frame callback and this shim never
+        // waits on one, and its divisor only bites when the cap is below the
+        // refresh AND divides it. Standing down here is what left a 60/60 and a
+        // 40/60 session with no cap at all.
         Declared::Mode => crate::vsync_gate::pacing(acquire, grid),
     }
 }
@@ -10019,9 +10120,19 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
     }
     let (presented, discarded, fallback) = crate::present::feedback_counts();
     let (late, skipped) = crate::vsync_gate::late_counts();
+    let (book_on, book_under, book_late, book_clock, book_behind) =
+        crate::vsync_gate::book_counts();
+    // A cumulative counter is a rate only with its denominator: the session's
+    // own age, from the first acquire.
+    let t0 = SHIM_T0_NS.load(Ordering::Relaxed);
+    let age_s = if t0 == 0 {
+        0
+    } else {
+        monotonic_ns().saturating_sub(t0) / 1_000_000_000
+    };
     // Since the last line, so each line reads one window's cadence.
     let gaps = COMMIT_GAPS.each_ref().map(|b| b.swap(0, Ordering::Relaxed));
-    crate::logf!("present mode: declared={} source={} route={} cap={} gate={} lsfg={} acquire={} generate={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} at_queue={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}]",
+    crate::logf!("present mode: declared={} source={} route={} cap={} gate={} lsfg={} acquire={} generate={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} at_queue={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}] gated={} ungated={} book=[on:{} under:{} late:{} clock:{} behind_us:{}] gate_wait_us={} acq_spacing=[<14:{} 14-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}] age_s={} calls={} ok={} retry={} notes={} park_timeouts={}",
         mode_name(line.declared),
         line.source,
         if route { "gamescope" } else { "x11" },
@@ -10049,7 +10160,26 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
         gaps[1],
         gaps[2],
         gaps[3],
-        gaps[4],);
+        gaps[4],
+        ACQ_GATED_N.load(Ordering::Relaxed),
+        ACQ_UNGATED_N.load(Ordering::Relaxed),
+        book_on,
+        book_under,
+        book_late,
+        book_clock,
+        book_behind / 1_000,
+        GATE_WAIT_NS.load(Ordering::Relaxed) / 1_000,
+        ACQ_SPACING[0].load(Ordering::Relaxed),
+        ACQ_SPACING[1].load(Ordering::Relaxed),
+        ACQ_SPACING[2].load(Ordering::Relaxed),
+        ACQ_SPACING[3].load(Ordering::Relaxed),
+        ACQ_SPACING[4].load(Ordering::Relaxed),
+        age_s,
+        N_ACQ.load(Ordering::Relaxed),
+        ACQ_OK_N.load(Ordering::Relaxed),
+        ACQ_RETRY_N.load(Ordering::Relaxed),
+        NOTES_APPLIED.load(Ordering::Relaxed),
+        PARK_TIMEOUTS.load(Ordering::Relaxed),);
 }
 
 /// The wire value for `gamescope_swapchain.set_present_mode` that declares
