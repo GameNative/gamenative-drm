@@ -155,15 +155,9 @@ fn apply_note(note: FrameCapNote) {
         target_fps());
 }
 
-/// The target in force, [`FPS_UNCAPPED`] when none has: read by the shim's
-/// census and by the acquire gate.
+/// The cap the daemon's note carries, [`FPS_UNCAPPED`] when none: what the
+/// session's limits are computed from, and what the frame-cap line reports.
 pub(crate) fn target_fps() -> u32 {
-    // Frame generation owns the source rate while it is on: the app disarms
-    // gamescope's limiter in that case, so a zero from the daemon's cap note is
-    // not "uncapped", it is "paced by the presenter".
-    if let Some(cap) = crate::lsfg::source_cap() {
-        return cap;
-    }
     CAP_FPS.load(Ordering::Relaxed)
 }
 

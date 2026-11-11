@@ -266,15 +266,6 @@ pub fn wanted() -> Option<u32> {
     (enabled && multiplier >= 2).then_some(multiplier)
 }
 
-/// The rate generated frames are committed at: the source cap times the
-/// multiplier, or 0 when generation is off. This is the grid the generated
-/// commits are spaced on.
-#[must_use]
-pub fn output_rate() -> u32 {
-    let (_, output) = grid();
-    output
-}
-
 /// The settings epoch: equal to `wanted`'s generation changes.
 #[must_use]
 pub fn epoch() -> u32 {
@@ -335,36 +326,6 @@ pub fn skip(what: &str) -> bool {
 }
 
 /// The rate the guest should be paced to while frame generation runs.
-///
-/// `None` when generation is off or the user set no cap, in which case the
-/// daemon's own frame cap (if any) still applies. This is the first consumer of
-/// [`live`]: with the app's limiter disarmed for gamescope, the cap on the source
-/// comes from here, not from a `FrameCapNote`.
-#[must_use]
-pub fn source_cap() -> Option<u32> {
-    let (enabled, _multiplier, cap) = live();
-    // The user's cap, as asked: the display does not reshape it, so a 40 cap is
-    // 40 acquires a second on a 60 Hz panel as much as on a 120 Hz one, and the
-    // multiplier decides what is generated on top.
-    (enabled && cap > 0).then_some(cap)
-}
-
-/// `(source, output)` rates in whole hertz while generation is on.
-///
-/// The user's cap is the **source** rate: the guest renders that many frames, and
-/// the presenter presents `cap × multiplier` by inserting generated frames
-/// between them. Not clamped to the panel: the grid must hold every frame of a
-/// source period or the queue grows without bound; what the panel cannot show,
-/// the compositor drops. `(0, 0)` when generation is off or uncapped.
-#[must_use]
-pub fn grid() -> (u32, u32) {
-    let (enabled, multiplier, cap) = live();
-    if !enabled || cap == 0 {
-        return (0, 0);
-    }
-    (cap, cap.saturating_mul(multiplier.max(1)))
-}
-
 /// The panel's refresh in whole hertz, or 0 when the daemon has not reported it.
 #[must_use]
 pub fn refresh_hz() -> u32 {
@@ -557,12 +518,13 @@ impl Session {
             .map(|s| s.refresh_mhz as f32 / 1000.0)
             .unwrap_or(0.0);
         unsafe { (engine.api.configure)(root, multiplier, 0, flow, refresh) };
-        let (source, output) = grid();
-        crate::logf!("lsfg: ready multiplier={} fp16={} source={} output={} cache={}",
+        // What the session allows is `crate::limits`'s answer, printed by the
+        // shim's census; here the engine reports only its own configuration.
+        crate::logf!("lsfg: ready multiplier={} fp16={} cap={} refresh_hz={} cache={}",
             multiplier,
             fp16,
-            source,
-            output,
+            source_cap,
+            refresh,
             cache.display());
 
         // Seed the live state with this session's decision: a push only arrives

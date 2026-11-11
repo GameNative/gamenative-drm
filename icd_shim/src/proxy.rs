@@ -1331,7 +1331,15 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
     // The engine reports no generation until its frame history exists, and that
     // history is built by `process` — so the capture runs on every presented
     // frame and only generation and blit are gated on the plan.
+    // The engine plans by the multiplier; the session's generation limit is a
+    // rate, so a panel that cannot show `acquire × multiplier` frames leaves
+    // fewer per source frame ([`crate::limits::Limits::generate_per_source`]).
     let planned = unsafe { (*session).plan(capacity) };
+    let allowed = session_limits(sc).generate_per_source(multiplier);
+    let planned = match allowed {
+        Some(per) => planned.min(per),
+        None => 0,
+    };
     let guest = unsafe { gen_first_slot(sc) };
     // A destination is free once the compositor has released it and nothing
     // queued still points at it.
@@ -1632,13 +1640,11 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
         // One output slot per frame, the generated frames first and the source
         // frame last, spaced evenly over one source period: the engine's frames
         // sit between the previous source frame and this one. The period is the
-        // cap's, or the measured one when the guest runs slower than the cap or
-        // has none.
-        let rate = crate::lsfg::output_rate();
-        let cap_period = if rate > 0 {
-            1_000_000_000u64 / u64::from(rate) * u64::from(multiplier)
-        } else {
-            0
+        // session's acquire limit, or the measured one when the guest runs
+        // slower than that limit.
+        let cap_period = match session_limits(sc).acquire_per_s {
+            Some(acquire) if acquire > 0 => 1_000_000_000u64 / u64::from(acquire),
+            _ => 0,
         };
         let source_period = match (cap_period, period) {
             (0, 0) => 16_666_667,
@@ -1733,7 +1739,7 @@ unsafe fn lsfg_queue_real(sc: *mut GnSwapchain, src_idx: i32) -> bool {
     // the panel's.
     let source_period = {
         let measured = unsafe { (*gd).gen_period_ns };
-        match crate::lsfg::source_cap() {
+        match session_limits(sc).acquire_per_s {
             Some(cap) if cap > 0 => (1_000_000_000 / u64::from(cap)).max(measured),
             _ if measured != 0 => measured,
             _ => grid.map_or(16_666_667, |g| g.period_ns),
@@ -2067,10 +2073,10 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
             // A cap-rate-vsync frame's wait was answered when the guest queued
             // it (`present_dispatch`), so one still on the slot here is a frame
             // whose declaration changed since; it is answered now.
-            let (live, why) = live_choice(sc);
+            let (live, _why) = live_choice(sc);
             let at_commit = present_wait_answer(
                 !(*(*sc).surf).swapchain_obj.is_null(),
-                why,
+                acquire_pacing(sc) != crate::vsync_gate::Pacing::Off,
                 (*sc).present_mode,
                 live,
             ) != WaitAnswer::Later;
@@ -3063,22 +3069,21 @@ enum WaitAnswer {
 /// that goes out as `live`, declared for the reason `why`.
 ///
 /// One case is answered when the guest queues the present, before the frame's
-/// render fence: gamescope's route, a cap at the display's rate and a guest
-/// that asked for FIFO declared the container's mailbox with the vblank-grid
-/// gate (`Declared::CapRateVsync`). That guest waits on every frame (DXVK with
-/// VSync on), and answered after the fence its CPU and GPU alternated; at queue,
-/// as the X11 route answers (its X server sends PresentCompleteNotify while
-/// handling the PresentPixmap request), they overlap and the gate holds the
-/// rate. Everything else keeps the answer it had: a frame going out as mailbox
-/// or immediate, or from a guest that asked for either, at the commit; FIFO and
-/// FIFO-relaxed by the compositor.
+/// render fence: gamescope's route and a FIFO-relaxed guest whose rate the
+/// acquire gate holds. That guest waits on every frame (DXVK with VSync on),
+/// and answered after the fence its CPU and GPU alternated; at queue, as the
+/// X11 route answers (its X server sends PresentCompleteNotify while handling
+/// the PresentPixmap request), they overlap and the gate holds the rate.
+/// Everything else keeps the answer it had: a frame going out as mailbox or
+/// immediate, or from a guest that asked for either, at the commit; FIFO by
+/// the compositor.
 fn present_wait_answer(
     gamescope_route: bool,
-    why: Declared,
+    paced: bool,
     requested: VkPresentModeKHR,
     live: VkPresentModeKHR,
 ) -> WaitAnswer {
-    if gamescope_route && why == Declared::CapRateVsync {
+    if gamescope_route && paced && requested == VK_PRESENT_MODE_FIFO_RELAXED_KHR {
         WaitAnswer::AtQueue
     } else if answers_present_wait_at_commit(requested) || answers_present_wait_at_commit(live) {
         WaitAnswer::AtCommit
@@ -3090,10 +3095,10 @@ fn present_wait_answer(
 /// Route a present to the discipline its effective present mode names.
 unsafe fn present_dispatch(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
     mode_census(sc);
-    let (live, why) = unsafe { live_choice(sc) };
+    let (live, _why) = unsafe { live_choice(sc) };
     let answer = present_wait_answer(
         unsafe { !(*(*sc).surf).swapchain_obj.is_null() },
-        why,
+        unsafe { acquire_pacing(sc) } != crate::vsync_gate::Pacing::Off,
         unsafe { (*sc).present_mode },
         live,
     );
@@ -6783,110 +6788,44 @@ mod tests {
     }
 
     #[test]
-    fn the_declared_mode_follows_the_swapchain_the_cap_and_the_lead() {
+    fn the_declaration_is_the_guest_mode_except_for_generation() {
         let (m, f, i, r) = (
             VK_PRESENT_MODE_MAILBOX_KHR,
             VK_PRESENT_MODE_FIFO_KHR,
             VK_PRESENT_MODE_IMMEDIATE_KHR,
             VK_PRESENT_MODE_FIFO_RELAXED_KHR,
         );
-        let g60 = Some(test_grid(16_675_004)); // 59.97 Hz
-        let g120 = Some(test_grid(8_333_333));
-        for mode in [m, i, r] {
-            // No cap: the swapchain's mode, lead or no lead.
+        // Nothing rewrites the request: not the cap, not the panel, not the
+        // lead. A generated frame is the one exception, and it is not the
+        // guest's present at all.
+        for mode in [m, f, i, r] {
+            assert_eq!(choose_live_mode(mode, false), (mode, Declared::Mode));
             assert_eq!(
-                choose_live_mode(mode, false, 0, g60),
-                (mode, Declared::Mode)
-            );
-            assert_eq!(
-                choose_live_mode(mode, false, 0, None),
-                (mode, Declared::Mode)
-            );
-            // A cap at the display's rate: FIFO for a guest that asked for
-            // mailbox or immediate, the swapchain's mode (with the gate) for
-            // one that asked for FIFO-relaxed.
-            let at_rate = if mode == r {
-                (r, Declared::CapRateVsync)
-            } else {
-                (f, Declared::CapRate)
-            };
-            assert_eq!(
-                choose_live_mode(mode, false, 60, g60),
-                at_rate
-            );
-            // A cap below it: the swapchain's mode.
-            assert_eq!(
-                choose_live_mode(mode, false, 60, g120),
-                (mode, Declared::Mode)
-            );
-            assert_eq!(
-                choose_live_mode(mode, false, 30, g60),
-                (mode, Declared::Mode)
-            );
-            // Capped without the lead: FIFO, gamescope's limiter.
-            assert_eq!(
-                choose_live_mode(mode, false, 60, None),
-                (f, Declared::CapCompat)
+                choose_live_mode(mode, true),
+                (VK_PRESENT_MODE_MAILBOX_KHR, Declared::Generating)
             );
         }
-        // A FIFO swapchain: FIFO, whatever the cap or the lead.
-        for (cap, grid) in [(0, g60), (60, g60), (30, g60), (60, None)] {
-            assert_eq!(
-                choose_live_mode(f, false, cap, grid),
-                (f, Declared::Mode)
-            );
-        }
-        // Frame generation: mailbox, whatever the mode.
-        assert_eq!(
-            choose_live_mode(f, true, 60, g60),
-            (m, Declared::Generating)
-        );
-        assert_eq!(
-            choose_live_mode(m, true, 0, None),
-            (m, Declared::Generating)
-        );
     }
 
     #[test]
-    fn the_gate_on_the_gamescope_route_follows_the_declaration() {
+    fn the_gate_follows_the_declaration_and_the_acquire_limit() {
         use crate::vsync_gate::{GateClock, Pacing};
-        let g = test_grid(16_675_004);
-        let grid = Some(g);
+        let grid = Some(test_grid(16_675_004));
         let (m, f) = (VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR);
-        // A FIFO swapchain, or FIFO for want of the lead: gamescope's limiter.
+        // A FIFO declaration: gamescope's limiter is the pacer.
         assert_eq!(
-            gamescope_route_pacing((f, Declared::Mode), None, 60, grid),
+            gamescope_route_pacing((f, Declared::Mode), 60, grid),
             Pacing::Off
         );
+        // Mailbox, immediate, FIFO-relaxed: the gate holds the acquire limit on
+        // the display's grid.
         assert_eq!(
-            gamescope_route_pacing((f, Declared::CapCompat), None, 60, None),
-            Pacing::Off
+            gamescope_route_pacing((m, Declared::Mode), 30, grid).clock(),
+            GateClock::Vsync
         );
-        // FIFO at the display's rate: no gate either; gamescope's limiter
-        // (divisor 1) paces it, as on master.
+        // Generation holds the source rate on its own clock, whatever the mode.
         assert_eq!(
-            gamescope_route_pacing((f, Declared::CapRate), None, 60, grid),
-            Pacing::Off
-        );
-        // Mailbox, immediate, FIFO-relaxed under a cap: the gate, on the grid.
-        for mode in [
-            m,
-            VK_PRESENT_MODE_IMMEDIATE_KHR,
-            VK_PRESENT_MODE_FIFO_RELAXED_KHR,
-        ] {
-            assert_eq!(
-                gamescope_route_pacing((mode, Declared::Mode), None, 30, grid).clock(),
-                GateClock::Vsync
-            );
-            // Uncapped: nobody limits.
-            assert_eq!(
-                gamescope_route_pacing((mode, Declared::Mode), None, 0, grid),
-                Pacing::Off
-            );
-        }
-        // Frame generation's source cap: the cap's own clock.
-        assert_eq!(
-            gamescope_route_pacing((m, Declared::Generating), Some(40), 0, grid),
+            gamescope_route_pacing((m, Declared::Generating), 40, grid),
             Pacing::Clock {
                 period_ns: 25_000_000
             }
@@ -6894,57 +6833,33 @@ mod tests {
     }
 
     #[test]
-    fn the_present_wait_answer_point_follows_the_declaration() {
+    fn the_present_wait_is_answered_at_queue_only_under_the_gate() {
         let (m, f, i, r) = (
             VK_PRESENT_MODE_MAILBOX_KHR,
             VK_PRESENT_MODE_FIFO_KHR,
             VK_PRESENT_MODE_IMMEDIATE_KHR,
             VK_PRESENT_MODE_FIFO_RELAXED_KHR,
         );
-        use Declared::{CapCompat, CapRate, CapRateVsync, Generating, Mode};
-        // The one case answered at queue: cap-rate-vsync on gamescope's route.
-        for requested in [f, r] {
+        // A gated FIFO-relaxed guest on gamescope's route: answered when it
+        // queues, so its CPU and GPU overlap and the gate holds the rate.
+        assert_eq!(
+            present_wait_answer(true, true, r, r),
+            WaitAnswer::AtQueue
+        );
+        // The same guest ungated is the compositor's to answer.
+        assert_eq!(present_wait_answer(true, false, r, r), WaitAnswer::Later);
+        // A mailbox or immediate guest, whether it asked for it or is declared
+        // it: answered at the commit.
+        for requested in [m, i] {
             assert_eq!(
-                present_wait_answer(true, CapRateVsync, requested, m),
-                WaitAnswer::AtQueue
-            );
-        }
-        // Every other mailbox or immediate presentation keeps master's answer
-        // at the commit: below-rate caps and no cap (the container's mode),
-        // frame generation, and a guest that asked for mailbox or immediate
-        // (declared FIFO under cap-rate or cap-compat).
-        for requested in [f, r, m, i] {
-            for live in [m, i] {
-                assert_eq!(
-                    present_wait_answer(true, Mode, requested, live),
-                    WaitAnswer::AtCommit
-                );
-            }
-            assert_eq!(
-                present_wait_answer(true, Generating, requested, m),
+                present_wait_answer(true, true, requested, m),
                 WaitAnswer::AtCommit
             );
         }
-        for requested in [m, i] {
-            for why in [CapRate, CapCompat] {
-                assert_eq!(
-                    present_wait_answer(true, why, requested, f),
-                    WaitAnswer::AtCommit
-                );
-            }
-        }
-        // FIFO and FIFO-relaxed out of a FIFO guest: the compositor answers.
-        assert_eq!(present_wait_answer(true, Mode, f, f), WaitAnswer::Later);
-        assert_eq!(present_wait_answer(true, CapRate, f, f), WaitAnswer::Later);
-        assert_eq!(
-            present_wait_answer(true, CapCompat, r, f),
-            WaitAnswer::Later
-        );
-        assert_eq!(present_wait_answer(true, Mode, r, r), WaitAnswer::Later);
-        // Off gamescope's route: as on master.
-        assert_eq!(present_wait_answer(false, Mode, f, m), WaitAnswer::AtCommit);
-        assert_eq!(present_wait_answer(false, Mode, i, i), WaitAnswer::AtCommit);
-        assert_eq!(present_wait_answer(false, Mode, f, f), WaitAnswer::Later);
+        // FIFO keeps the compositor's answer.
+        assert_eq!(present_wait_answer(true, false, f, f), WaitAnswer::Later);
+        // Off gamescope's route the gate is the cap, but nothing queues early.
+        assert_eq!(present_wait_answer(false, true, r, r), WaitAnswer::Later);
     }
 
     #[test]
@@ -9843,57 +9758,24 @@ enum Declared {
     Mode,
     /// Mailbox for frame generation (`source=generating`).
     Generating,
-    /// FIFO for want of the daemon's stamp lead (`source=cap-compat`).
-    CapCompat,
-    /// FIFO because the cap is the display's rate and the guest asked for
-    /// mailbox or immediate (`source=cap-rate`).
-    CapRate,
-    /// The guest's mode with the vblank-grid gate because the cap is the
-    /// display's rate and the guest asked for FIFO-relaxed
-    /// (`source=cap-rate-vsync`).
-    CapRateVsync,
 }
 
-/// The mode a present on `sc` runs under and declares, decided per present.
+/// The mode a present on `sc` declares to gamescope.
 ///
-/// On the override route:
-/// - frame generation on: mailbox. Generated frames are committed with no
-///   declaration, and a real frame declared FIFO would queue behind them.
-/// - a cap set, a mode other than FIFO, and no stamp lead from the daemon yet
-///   (`crate::vsync_gate::current_grid` is `None`: no note yet, or a daemon
-///   that predates the field): FIFO, so gamescope's limiter is the cap. The
-///   vblank-grid gate is not run without the lead: released on the latch
-///   points themselves, frames straddle gamescope's composite and are
-///   replaced in its mailbox. The census reads `source=cap-compat`.
-/// - a cap at the display's rate and a guest that asked for FIFO-relaxed:
-///   the guest's mode with the vblank-grid gate, one release per vblank
-///   (`source=cap-rate-vsync`). The guest's present wait is then answered at
-///   commit and the gate paces it. Declared FIFO it was serialised behind
-///   gamescope's `presented` for each frame, and with ~16 ms of work per frame
-///   and three images it fell to 40 fps at 60 Hz.
-/// - a cap at the display's rate and a guest that asked for mailbox or
-///   immediate (self-paced): FIFO, with no acquire gate
-///   (`source=cap-rate`), as on master. At that cap one
-///   frame per vblank is all the panel shows under either mode, and under
-///   mailbox the shim would have to keep two commits out of one gamescope
-///   composite without knowing when gamescope latches: its wakeup moves with
-///   its rolling draw time (vblankmanager.cpp). A guest that paces itself just
-///   below the display's rate had ~1 frame a second replaced in gamescope's
-///   mailbox that way. Under FIFO gamescope latches one commit per vblank at
-///   its own wakeup and its limiter (divisor 1) paces the guest. The gate is
-///   not kept on top: FIFO's back-pressure already holds the guest, and the two
-///   stacked turned a guest whose acquire-to-commit grew past a period into a
-///   40 fps session on a 60 Hz panel.
-/// - otherwise: the guest's mode ([`guest_present_mode`]), with nothing
-///   overriding the request. A FIFO
-///   swapchain is held by gamescope's limiter, one commit per limited vblank;
-///   under any other mode the acquire gate is the cap, on the display's vblank
-///   grid (`acquire_pacing`).
+/// gamescope is told what the guest asked for: the container cannot override it
+/// (`MESA_VK_WSI_PRESENT_MODE` is not read anywhere), and neither can the cap,
+/// the panel's refresh or frame generation. What those decide is the rate the
+/// guest may acquire at and the frames the generator may add, which is
+/// [`crate::limits`] — one rule for both.
 ///
-/// The rule is read per present, so a lead or a cap that changes mid-session
-/// moves the declaration on the next commit. Off the override route there is
-/// nothing to declare it to, and the mode is the one the swapchain was made
-/// with.
+/// The single exception is a generated frame: it declares mailbox, because
+/// generated commits carry no declaration of their own and a real frame
+/// declared FIFO would queue behind them in gamescope's limiter.
+///
+/// The rule is read per present, so a cap, a multiplier or a panel rate that
+/// changes mid-session moves the declaration on the next commit. Off the
+/// override route there is nothing to declare it to, and the mode is the one
+/// the swapchain was made with.
 pub(crate) unsafe fn live_present_mode(sc: *mut GnSwapchain) -> VkPresentModeKHR {
     unsafe { live_choice(sc) }.0
 }
@@ -9904,93 +9786,76 @@ unsafe fn live_choice(sc: *mut GnSwapchain) -> (VkPresentModeKHR, Declared) {
     if unsafe { (*(*sc).surf).swapchain_obj.is_null() } {
         return (mode, Declared::Mode);
     }
-    choose_live_mode(
-        mode,
-        crate::lsfg::live().0,
-        crate::scanout::cap_fps_note(),
-        crate::vsync_gate::current_grid(),
-    )
+    choose_live_mode(mode, crate::lsfg::wanted().is_some())
 }
 
-/// [`live_present_mode`]'s rule on the override route, for the guest's `mode`,
-/// frame generation's state, the daemon's cap and the display's vblank grid
-/// (`None` without the stamp lead).
-///
-/// The guest's mode is the one the shim keeps — there is no override above it —
-/// so an uncapped session declares exactly what the game asked for. What the cap
-/// can still change is the *declaration*: a capped commit that gamescope's
-/// limiter cannot hold (it holds FIFO only) is declared FIFO when the cap is the
-/// display's rate, or keeps the guest's mode and is paced by the acquire gate.
-fn choose_live_mode(
-    mode: VkPresentModeKHR,
-    generating: bool,
-    cap_fps: u32,
-    grid: Option<crate::vsync_gate::Grid>,
-) -> (VkPresentModeKHR, Declared) {
-    let capped = cap_fps != gndrm_uapi::wire::FPS_UNCAPPED;
-    // A FIFO guest is already held by gamescope's limiter, and an uncapped
-    // session has nothing to hold: both declare the guest's own mode.
+/// [`live_choice`]'s rule: the guest's mode, except for a generated frame.
+fn choose_live_mode(mode: VkPresentModeKHR, generating: bool) -> (VkPresentModeKHR, Declared) {
     if generating {
         (VK_PRESENT_MODE_MAILBOX_KHR, Declared::Generating)
-    } else if mode == VK_PRESENT_MODE_FIFO_KHR || !capped {
-        (mode, Declared::Mode)
     } else {
-        match grid {
-            None => (VK_PRESENT_MODE_FIFO_KHR, Declared::CapCompat),
-            Some(g) if crate::vsync_gate::at_display_rate(cap_fps, g) => {
-                if mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR {
-                    (mode, Declared::CapRateVsync)
-                } else {
-                    (VK_PRESENT_MODE_FIFO_KHR, Declared::CapRate)
-                }
-            }
-            Some(_) => (mode, Declared::Mode),
-        }
+        (mode, Declared::Mode)
     }
 }
 
-/// How the acquire gate paces `sc` now.
-///
-/// - Off gamescope's override route (the X11 Present route) nothing holds the
-///   cap but the gate, on the cap's own clock, as before.
-/// - On the override route see [`gamescope_route_pacing`].
-unsafe fn acquire_pacing(sc: *mut GnSwapchain) -> crate::vsync_gate::Pacing {
-    if unsafe { (*(*sc).surf).swapchain_obj.is_null() } {
-        return crate::vsync_gate::Pacing::on_clock(crate::scanout::target_fps());
-    }
-    gamescope_route_pacing(
-        unsafe { live_choice(sc) },
-        crate::lsfg::source_cap(),
-        crate::scanout::cap_fps_note(),
-        crate::vsync_gate::current_grid(),
+/// What this swapchain's session allows ([`crate::limits::limits`]): the
+/// guest's own mode decides whether the panel is a ceiling, the daemon's cap
+/// note and the generator's multiplier decide the rest.
+fn session_limits(sc: *mut GnSwapchain) -> crate::limits::Limits {
+    let mode = unsafe { (*sc).present_mode };
+    let vsync = matches!(
+        mode,
+        VK_PRESENT_MODE_FIFO_KHR | VK_PRESENT_MODE_FIFO_RELAXED_KHR
+    );
+    let cap = crate::scanout::cap_fps_note();
+    crate::limits::limits(
+        vsync,
+        (cap != gndrm_uapi::wire::FPS_UNCAPPED).then_some(cap),
+        crate::lsfg::wanted(),
+        crate::lsfg::refresh_hz(),
     )
 }
 
-/// [`acquire_pacing`]'s rule on gamescope's override route, for the declared
-/// mode and why ([`choose_live_mode`]), frame generation's source cap, the
-/// daemon's cap and the display's vblank grid:
-/// - frame generation sets the source rate: the gate holds it on the cap's own
-///   clock (the app disarms gamescope's limiter then; generation paces the
-///   output on the latch grid itself);
-/// - any FIFO declaration (a FIFO swapchain, FIFO for want of the stamp lead,
-///   FIFO because the cap is the display's rate): no gate. gamescope's limiter
-///   holds FIFO commits, one per limited vblank, and is the cap;
-/// - mailbox, immediate, FIFO-relaxed: gamescope's limiter does not hold them
-///   (`wlserver_surface_is_fifo` is FIFO only), so the gate is the cap, on the
-///   display's vblank grid (`crate::vsync_gate`).
+/// How the acquire gate paces `sc` now: to the session's acquire limit
+/// ([`session_limits`]), on whichever clock can hold it.
+///
+/// - Off gamescope's override route (the X11 Present route) nothing else holds
+///   the cap, so the gate does, on its own clock.
+/// - A FIFO declaration needs no gate: gamescope's limiter holds FIFO commits,
+///   one per limited vblank, which is the panel's rate by construction.
+/// - With generation on the gate holds the source rate on its own clock, and
+///   the batches are placed on the latch grid by the generator itself.
+/// - Otherwise the gate holds the acquire limit on the display's vblank grid
+///   (`crate::vsync_gate`), snapping to a whole number of vblanks when it can.
+unsafe fn acquire_pacing(sc: *mut GnSwapchain) -> crate::vsync_gate::Pacing {
+    let limits = session_limits(sc);
+    let Some(acquire) = limits.acquire_per_s else {
+        return crate::vsync_gate::Pacing::Off;
+    };
+    if unsafe { (*(*sc).surf).swapchain_obj.is_null() } {
+        return crate::vsync_gate::Pacing::on_clock(acquire);
+    }
+    let declared = unsafe { live_choice(sc) };
+    gamescope_route_pacing(declared, acquire, crate::vsync_gate::current_grid())
+}
+
+/// [`acquire_pacing`]'s rule on gamescope's override route, for what the commit
+/// declares ([`choose_live_mode`]), the session's acquire limit and the
+/// display's vblank grid.
 fn gamescope_route_pacing(
-    (live, _): (VkPresentModeKHR, Declared),
-    source_cap: Option<u32>,
-    cap_fps: u32,
+    (live, declared): (VkPresentModeKHR, Declared),
+    acquire: u32,
     grid: Option<crate::vsync_gate::Grid>,
 ) -> crate::vsync_gate::Pacing {
-    if let Some(cap) = source_cap {
-        return crate::vsync_gate::Pacing::on_clock(cap);
+    match declared {
+        // Generated frames are placed on the latch grid by the generator, so
+        // the gate holds the source rate on its own clock.
+        Declared::Generating => crate::vsync_gate::Pacing::on_clock(acquire),
+        // gamescope's limiter holds FIFO commits, one per limited vblank, so it
+        // is the pacer and the gate would only stack on top of it.
+        Declared::Mode if live == VK_PRESENT_MODE_FIFO_KHR => crate::vsync_gate::Pacing::Off,
+        Declared::Mode => crate::vsync_gate::pacing(acquire, grid),
     }
-    if live == VK_PRESENT_MODE_FIFO_KHR {
-        return crate::vsync_gate::Pacing::Off;
-    }
-    crate::vsync_gate::pacing(cap_fps, grid)
 }
 
 /// The mode a commit on `sc` declares to gamescope, counted for the census.
@@ -10024,6 +9889,11 @@ struct ModeLine {
     cap: u32,
     gate: &'static str,
     lsfg: bool,
+    /// The session's limits ([`crate::limits`]), `FPS_UNCAPPED`/`0` for none:
+    /// the acquire ceiling and the frames the generator may add, in frames per
+    /// second. Printed because the declaration no longer says what the cap did.
+    acquire: u32,
+    generate: u32,
 }
 
 /// The last [`ModeLine`] printed.
@@ -10039,12 +9909,10 @@ static MODE_LINE: Mutex<Option<ModeLine>> = Mutex::new(None);
 unsafe fn mode_census(sc: *mut GnSwapchain) {
     let route = unsafe { !(*(*sc).surf).swapchain_obj.is_null() };
     let (declared, why) = unsafe { live_choice(sc) };
+    let limits = session_limits(sc);
     let line = ModeLine {
         declared,
         source: match why {
-            Declared::CapCompat => "cap-compat",
-            Declared::CapRate => "cap-rate",
-            Declared::CapRateVsync => "cap-rate-vsync",
             Declared::Generating => "generating",
             Declared::Mode => "guest",
         },
@@ -10052,18 +9920,24 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
         cap: crate::scanout::cap_fps_note(),
         gate: unsafe { acquire_pacing(sc) }.clock().name(),
         lsfg: crate::lsfg::live().0,
+        acquire: limits
+            .acquire_per_s
+            .unwrap_or(gndrm_uapi::wire::FPS_UNCAPPED),
+        generate: limits.generate_per_s.unwrap_or(0),
     };
     {
         let mut last = MODE_LINE.lock().unwrap_or_else(|e| e.into_inner());
         if *last != Some(line) {
             *last = Some(line);
-            crate::logi!("present mode: declared={} source={} route={} cap={} gate={} lsfg={}",
+            crate::logi!("present mode: declared={} source={} route={} cap={} gate={} lsfg={} acquire={} generate={}",
                 mode_name(line.declared),
                 line.source,
                 if route { "gamescope" } else { "x11" },
                 line.cap,
                 line.gate,
-                u8::from(line.lsfg),);
+                u8::from(line.lsfg),
+                line.acquire,
+                line.generate);
         }
     }
     if !crate::vkshim_enabled() || !rate_ok(&RATE_MODE, MODE_CENSUS_EVERY) {
@@ -10073,13 +9947,15 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
     let (late, skipped) = crate::vsync_gate::late_counts();
     // Since the last line, so each line reads one window's cadence.
     let gaps = COMMIT_GAPS.each_ref().map(|b| b.swap(0, Ordering::Relaxed));
-    crate::logf!("present mode: declared={} source={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} at_queue={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}]",
+    crate::logf!("present mode: declared={} source={} route={} cap={} gate={} lsfg={} acquire={} generate={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} at_queue={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}]",
         mode_name(line.declared),
         line.source,
         if route { "gamescope" } else { "x11" },
         line.cap,
         line.gate,
         u8::from(line.lsfg),
+        line.acquire,
+        line.generate,
         N_ACQ.load(Ordering::Relaxed),
         N_COMMIT_OK.load(Ordering::Relaxed),
         DECL_FIFO_N.load(Ordering::Relaxed),
