@@ -21,6 +21,33 @@ emitted with the publish, so a paced frame's present does not wait it out.
 Buffer reuse still rides it — the next publish onto a slot waits on the previous
 release fence the completion stored.
 
+## SurfaceFlinger's hold on a buffer (which release rule is safe)
+
+The page-flip event says the frame was *published*, not that SurfaceFlinger has
+finished with it. A producer handed its buffer at that event may still be
+writing into a buffer on the panel — a scan-out tear, and one no screen
+recording can show, because the buffer is repainted before anything reads it
+again. Deferring the release by one flip removes the tear by removing a buffer
+from every producer: a 3-image swapchain keeps one in flight instead of two, so
+a producer can no longer run ahead of the flip and a late frame has no cushion.
+
+The number that decides between that and SurfaceFlinger's own fence is how long
+the buffer is actually held. `sf hold:` measures it where the daemon already
+waits: the publish reusing a registration waits on the release fence the
+previous completion stored, and the gap from that frame's latch to the wait
+returning is the hold.
+
+```
+gndrm-daemon: sf hold: n=<samples> <half=<n> half-one=<n> one-1.5=<n> 1.5-2.5=<n> over-2.5=<n> max=<us>us period=<us>us timeouts=<n>
+```
+
+Buckets are halves of one display period, and the period is the latch grid's own
+(gap between consecutive latches; over 100 ms counts as a stall, not a period).
+`one-1.5` and above is the share a one-flip deferral does **not** cover: while
+those are zero the deferral is sufficient on that device, and once they are not,
+only the release fence is exact. `timeouts` counts waits that hit
+`RELEASE_FENCE_TIMEOUT_MS` and produced no sample. One line per 10 s.
+
 ## Why the event is emitted with the publish
 
 `commit_worker_loop` emits the page-flip event immediately after the publish
@@ -96,6 +123,8 @@ number into the arm asymmetry from this.
 
 ## What is NOT proven / open
 
+- `sf hold:` has no device capture yet: the buckets say which release rule is
+  sufficient, and nothing has read them on hardware.
 - The uncapped ceiling (~259 /s on this scene) is **not** the flip-event path;
   it is the client↔gamescope lap (`vkAcquireNextImageKHR` in the ICD shim
   blocking on the compositor's `wl_buffer.release`). Not measured end to end;

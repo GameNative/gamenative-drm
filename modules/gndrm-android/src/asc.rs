@@ -144,6 +144,103 @@ macro_rules! asc_log {
 /// rather than once per commit; the flag clears when the layer leaves PQ.
 static PQ_METADATA_SET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+// ---------------------------------------------------------------------------
+// the release hold probe
+//
+// How long does SurfaceFlinger keep a buffer after showing it? The publisher
+// only learns it where it waits for the previous release fence before reusing a
+// registration, and the answer decides which release rule is safe: gamescope's
+// page-flip event is emitted at publish, so a producer given a buffer at that
+// event may still be writing into a buffer on the panel. Holding the release
+// one flip longer (gamescope A56) fixes that by taking a buffer away from every
+// producer — a 3-image swapchain loses half its depth. This measures the real
+// number instead: hold / one display period. Below one period, that deferral is
+// sufficient; above it, only SurfaceFlinger's own fence is.
+// ---------------------------------------------------------------------------
+
+/// The last latch the completion callback reported, for the flip period.
+static HOLD_LAST_LATCH_NS: AtomicU64 = AtomicU64::new(0);
+/// One display period as the latch grid delivered it, 0 until two latches.
+static HOLD_PERIOD_NS: AtomicU64 = AtomicU64::new(0);
+/// Release-fence waits that produced a sample.
+static HOLD_N: AtomicU64 = AtomicU64::new(0);
+/// Waits that hit `RELEASE_FENCE_TIMEOUT_MS`: no hold, no sample.
+static HOLD_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+static HOLD_MAX_US: AtomicU64 = AtomicU64::new(0);
+/// Hold as a percentage of one period, bucketed: <50, 50-100, 100-150,
+/// 150-250, >250.
+static HOLD_BUCKETS: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static HOLD_LAST_REPORT_NS: AtomicU64 = AtomicU64::new(0);
+
+/// One measured hold: `latch_ns` is when SurfaceFlinger showed the frame the
+/// buffer carried, `released_ns` when its release fence signalled.
+fn note_hold(latch_ns: u64, released_ns: u64) {
+    let hold_ns = released_ns.saturating_sub(latch_ns);
+    let hold_us = hold_ns / 1000;
+    HOLD_N.fetch_add(1, Ordering::Relaxed);
+    HOLD_MAX_US.fetch_max(hold_us, Ordering::Relaxed);
+    let period_ns = HOLD_PERIOD_NS.load(Ordering::Relaxed);
+    if period_ns == 0 {
+        return;
+    }
+    let percent = hold_ns.saturating_mul(100) / period_ns;
+    let bucket = match percent {
+        0..=49 => 0,
+        50..=99 => 1,
+        100..=149 => 2,
+        150..=249 => 3,
+        _ => 4,
+    };
+    HOLD_BUCKETS[bucket].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The release-fence wait ran out of budget, so this frame has no hold sample.
+fn note_hold_timeout() {
+    HOLD_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One line per 10 s naming SurfaceFlinger's hold distribution. Counts, not
+/// percentages, so a run can be added up; `period` is the latch grid's own, and
+/// the buckets are in halves of it.
+fn report_hold(now_ns: u64) {
+    let last = HOLD_LAST_REPORT_NS.load(Ordering::Relaxed);
+    if last != 0 && now_ns.saturating_sub(last) < 10_000_000_000 {
+        return;
+    }
+    if HOLD_LAST_REPORT_NS
+        .compare_exchange(last, now_ns, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let n = HOLD_N.load(Ordering::Relaxed);
+    if n == 0 {
+        return;
+    }
+    let b = |i: usize| HOLD_BUCKETS[i].load(Ordering::Relaxed);
+    log_info!(
+        "{}",
+        format_args!(
+            "sf hold: n={} <half={} half-one={} one-1.5={} 1.5-2.5={} over-2.5={} max={}us period={}us timeouts={}",
+            n,
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+            HOLD_MAX_US.load(Ordering::Relaxed),
+            HOLD_PERIOD_NS.load(Ordering::Relaxed) / 1000,
+            HOLD_TIMEOUTS.load(Ordering::Relaxed)
+        )
+    );
+}
+
 /// The dump directory if the environment requests one.
 fn dump_dir() -> Option<&'static std::ffi::OsString> {
     DUMP_DIR
@@ -251,6 +348,11 @@ struct ReleaseCtx {
     release_fd: AtomicI32,
     /// The latch-time query, when the platform has it.
     latch_time: Option<ffi::FnStStatsGetLatchTime>,
+    /// The latch SurfaceFlinger took the frame in this registration at,
+    /// `CLOCK_MONOTONIC` ns; 0 before the first. The publish that reuses the
+    /// registration reads it to measure how long SurfaceFlinger held the buffer
+    /// after showing it (see [`note_hold`]).
+    latch_ns: AtomicU64,
     /// When the daemon's apply of the transaction this registration was last
     /// published in returned, `CLOCK_MONOTONIC` ns; 0 before the first.
     applied_ns: AtomicU64,
@@ -443,6 +545,14 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
         if latch > 0 {
             latch_ns = latch as u64;
             crate::vsync::sample(latch_ns, ctx.applied_ns.load(Ordering::Relaxed));
+            // The flip cadence, for the release-hold probe: the gap between
+            // consecutive latches is one display period, which is what a hold
+            // is measured against. A gap over 100 ms is a stall, not a period.
+            let prev = HOLD_LAST_LATCH_NS.swap(latch_ns, Ordering::Relaxed);
+            if prev != 0 && latch_ns > prev && latch_ns - prev < 100_000_000 {
+                HOLD_PERIOD_NS.store(latch_ns - prev, Ordering::Relaxed);
+            }
+            ctx.latch_ns.store(latch_ns, Ordering::Relaxed);
         }
     }
     note_present_done(ctx.present_id.swap(0, Ordering::AcqRel), latch_ns);
@@ -849,6 +959,7 @@ fn new_release_ctx(api: &ffi::ScApi) -> (*mut ReleaseCtx, Arc<AtomicBool>) {
         previous_release: api.st_stats_previous_release_fence_fd,
         release_fd: AtomicI32::new(-1),
         latch_time: api.st_stats_latch_time,
+        latch_ns: AtomicU64::new(0),
         applied_ns: AtomicU64::new(0),
         present_id: AtomicU64::new(0),
         latched: Arc::clone(&latched),
@@ -1409,7 +1520,19 @@ impl AscState {
                 // SAFETY: `ctx` points at the leaked mailbox of this slot.
                 let pending = unsafe { (*ctx).release_fd.swap(-1, Ordering::AcqRel) };
                 if pending >= 0 {
-                    if wait_fence(pending) && !self.warned_fence_timeout {
+                    // The wait returning is the release: SurfaceFlinger has
+                    // finished with the buffer this registration carried, so the
+                    // gap from that frame's latch is its hold (see `note_hold`).
+                    let latch = unsafe { (*ctx).latch_ns.load(Ordering::Relaxed) };
+                    let timed_out = wait_fence(pending);
+                    let now = crate::vsync::now_ns();
+                    if timed_out {
+                        note_hold_timeout();
+                    } else if latch != 0 {
+                        note_hold(latch, now);
+                    }
+                    report_hold(now);
+                    if timed_out && !self.warned_fence_timeout {
                         self.warned_fence_timeout = true;
                         log_warn!("{}", "asc: previous release fence timed out; reusing buffer anyway (logged once)");
                     }
