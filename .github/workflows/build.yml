@@ -37,6 +37,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The guest-side clients link the host's Vulkan, wayland and xcb:
+      # `utils/src/{vk,wlproto}.rs` and `icd_shim/src/x11.rs` carry the `#[link]`
+      # attributes, so a runner without the -dev packages fails at link time with
+      # `unable to find library -lvulkan` rather than in the code.
+      - name: system libraries the clients link
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            libvulkan-dev libwayland-dev \
+            libxcb1-dev libxcb-dri3-dev libxcb-present-dev libxcb-sync-dev
+
       # `--all-targets` compiles the test and bench targets too, so a change
       # that only breaks a test build fails here rather than at review.
       - name: cargo build (workspace, all targets, warnings are errors)
