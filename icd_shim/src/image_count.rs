@@ -105,7 +105,7 @@ pub unsafe fn note_instance(app: *const VkApplicationInfo) {
     let comm = std::fs::read_to_string("/proc/self/comm").unwrap_or_default();
     if let Some(game) = find_strict_game(comm.trim_end(), app_name, engine_name, engine_version) {
         if MATCHED.set(game).is_ok() {
-            crate::logi!(gndrm_obf::obf!("strict image count on: {:?}", game));
+            crate::logi!("strict image count on: {:?}", game);
         }
     }
 }

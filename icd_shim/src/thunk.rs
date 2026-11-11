@@ -173,10 +173,8 @@ pub fn thunk_for(name: &str, target: PFN_vkVoidFunction) -> PFN_vkVoidFunction {
                     libc::mprotect(st.page.cast(), PAGE, libc::PROT_READ | libc::PROT_EXEC)
                 };
                 if ret != 0 {
-                    crate::logf!(gndrm_obf::obf!(
-                        "proxy: thunk page mprotect failed: {}",
-                        errno_str()
-                    ));
+                    crate::logf!("proxy: thunk page mprotect failed: {}",
+                        errno_str());
                 }
             }
             let fnptr = Some(f);
@@ -187,19 +185,15 @@ pub fn thunk_for(name: &str, target: PFN_vkVoidFunction) -> PFN_vkVoidFunction {
     drop(guard);
     log_retarget(name, served, addr);
     if cached.is_none() || served == Served::First {
-        crate::logf!(gndrm_obf::obf!(
-            "proxy: thunk -> {name} = {addr:#x} {}",
-            describe(addr)
-        ));
+        crate::logf!("proxy: thunk -> {name} = {addr:#x} {}",
+            describe(addr));
     }
     fnptr
 }
 
 fn log_retarget(name: &str, served: Served, addr: usize) {
     if let Served::Retarget(old) = served {
-        crate::logf!(gndrm_obf::obf!(
-            "proxy: thunk retarget {name}: {old:#x} -> {addr:#x}"
-        ));
+        crate::logf!("proxy: thunk retarget {name}: {old:#x} -> {addr:#x}");
     }
 }
 
@@ -209,15 +203,15 @@ fn describe(addr: usize) -> String {
     let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
     let found = unsafe { libc::dladdr(addr as *const libc::c_void, &raw mut info) };
     if found == 0 || info.dli_fname.is_null() {
-        return gndrm_obf::obf!("anon").to_string();
+        return "anon".to_string();
     }
     let lib = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy();
     if info.dli_sname.is_null() {
         let off = addr.wrapping_sub(info.dli_fbase as usize);
-        return format!("{}", gndrm_obf::obf!("{lib}+{off:#x}"));
+        return format!("{}", format_args!("{lib}+{off:#x}"));
     }
     let sym = unsafe { std::ffi::CStr::from_ptr(info.dli_sname) }.to_string_lossy();
-    format!("{}", gndrm_obf::obf!("{sym} ({lib})"))
+    format!("{}", format_args!("{sym} ({lib})"))
 }
 
 pub fn errno_str() -> String {

@@ -275,12 +275,10 @@ fn spoof_identity(p: &mut VkPhysicalDeviceProperties) {
     }
     static LOGGED: AtomicBool = AtomicBool::new(false);
     if !LOGGED.swap(true, Ordering::Relaxed) {
-        crate::logi!(gndrm_obf::obf!(
-            "proxy: guest sees device '{}' vendor {:#x} device {:#x}",
+        crate::logi!("proxy: guest sees device '{}' vendor {:#x} device {:#x}",
             unsafe { CStr::from_ptr(p.deviceName.as_ptr()) }.to_string_lossy(),
             p.vendorID,
-            p.deviceID
-        ));
+            p.deviceID);
     }
 }
 
@@ -446,9 +444,7 @@ pub unsafe fn try_allocate(
         || unsafe { (api.allocate)(&desc, &mut ahb) } != 0
         || ahb.is_null()
     {
-        crate::logf!(gndrm_obf::obf!(
-            "placed: AHB allocation of {size} bytes failed"
-        ));
+        crate::logf!("placed: AHB allocation of {size} bytes failed");
         return None;
     }
     let mut props = AhbProperties {
@@ -473,10 +469,8 @@ pub unsafe fn try_allocate(
         unsafe { *(*nh).data.as_ptr() }
     };
     let (Some(chosen), VK_SUCCESS, true) = (chosen, pres, fd >= 0) else {
-        crate::logf!(gndrm_obf::obf!(
-            "placed: AHB unusable (props {pres}, types {:#x}, fd {fd}) for type {ty}",
-            props.memoryTypeBits
-        ));
+        crate::logf!("placed: AHB unusable (props {pres}, types {:#x}, fd {fd}) for type {ty}",
+            props.memoryTypeBits);
         unsafe { (api.release)(ahb) };
         return None;
     };
@@ -493,11 +487,9 @@ pub unsafe fn try_allocate(
     };
     let res = unsafe { alloc_mem(dev, &ai2, alloc, out) };
     if LOG_N.fetch_add(1, Ordering::Relaxed) < 4 {
-        crate::logf!(gndrm_obf::obf!(
-            "placed: AHB-backed alloc {} -> {} bytes type {ty}->{chosen} fd {fd}: {res}",
+        crate::logf!("placed: AHB-backed alloc {} -> {} bytes type {ty}->{chosen} fd {fd}: {res}",
             ai_ref.allocationSize,
-            props.allocationSize
-        ));
+            props.allocationSize);
     }
     if res != VK_SUCCESS {
         unsafe { (api.release)(ahb) };
@@ -565,10 +557,8 @@ pub unsafe extern "C" fn gn_vkMapMemory2KHR(
     };
     let Some(b) = v.iter_mut().find(|b| b.mem == mi.memory) else {
         drop(v);
-        crate::logf!(gndrm_obf::obf!(
-            "placed: mem {:#x} is not AHB-backed; placed map refused",
-            mi.memory
-        ));
+        crate::logf!("placed: mem {:#x} is not AHB-backed; placed map refused",
+            mi.memory);
         return VK_ERROR_MEMORY_MAP_FAILED;
     };
     let size = if mi.size == WHOLE_SIZE {
@@ -588,11 +578,9 @@ pub unsafe extern "C" fn gn_vkMapMemory2KHR(
         )
     };
     if r != want {
-        crate::logf!(gndrm_obf::obf!(
-            "placed: mmap of AHB fd {} at {want:p} failed: {}",
+        crate::logf!("placed: mmap of AHB fd {} at {want:p} failed: {}",
             b.fd,
-            std::io::Error::last_os_error()
-        ));
+            std::io::Error::last_os_error());
         return VK_ERROR_MEMORY_MAP_FAILED;
     }
     b.mapped = want as usize;

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 macro_rules! log {
     ($e:expr) => {
         if $crate::logging() {
-            eprintln!("{} {}", ::gndrm_obf::obf!("gn-vkshim:"), $e);
+            eprintln!("{} {}", "gn-vkshim:", $e);
         }
     };
 }

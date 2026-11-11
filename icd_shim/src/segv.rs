@@ -53,9 +53,7 @@ pub fn install() {
     #[cfg(target_arch = "aarch64")]
     imp::install();
     #[cfg(not(target_arch = "aarch64"))]
-    crate::logf!(gndrm_obf::obf!(
-        "segv: register dump is aarch64-only; inert on this build"
-    ));
+    crate::logf!("segv: register dump is aarch64-only; inert on this build");
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -97,7 +95,7 @@ mod imp {
         // Escape hatch: GN_VKSHIM_SEGV=0 keeps the handler out entirely.
         if let Some(v) = std::env::var_os("GN_VKSHIM_SEGV") {
             if v == "0" || v.is_empty() {
-                crate::logf!(gndrm_obf::obf!("segv: dump disabled by GN_VKSHIM_SEGV"));
+                crate::logf!("segv: dump disabled by GN_VKSHIM_SEGV");
                 return;
             }
         }
@@ -120,9 +118,7 @@ mod imp {
                 core::ptr::addr_of_mut!(PREV_BUS).cast::<libc::sigaction>(),
             );
         }
-        crate::logf!(gndrm_obf::obf!(
-            "segv: chaining dump installed (segv per-pc {PER_PC}, {NPCS} pcs, max {MAX_TOTAL}; sigbus sampled {MAX_BUS})"
-        ));
+        crate::logf!("segv: chaining dump installed (segv per-pc {PER_PC}, {NPCS} pcs, max {MAX_TOTAL}; sigbus sampled {MAX_BUS})");
     }
 
     /// Bounded, per-PC rate limit. Async-signal-safe (atomics only).

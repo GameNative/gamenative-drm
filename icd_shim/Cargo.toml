@@ -35,5 +35,4 @@ libc = "0.2"
 # LD_PRELOAD shim's — a second, hand-mirrored set of structs is how the two
 # sides drift apart.
 gndrm-lsfg = { path = "../modules/gndrm-lsfg" }
-gndrm-obf = { path = "../modules/gndrm-obf" }
 gndrm-uapi = { path = "../modules/gndrm-uapi" }

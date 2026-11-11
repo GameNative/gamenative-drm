@@ -376,11 +376,9 @@ pub fn build(dll_path: &Path, cache_path: &Path, prefer_fp16: bool) -> LsfgStatu
             _ => None,
         };
         let Some(words) = words else {
-            log!(::gndrm_obf::obf!(
-                "lsfg: shader {} failed ({})",
+            log!(format_args!("lsfg: shader {} failed ({})",
                 id,
-                if translating { "dxbc" } else { "spirv" }
-            ));
+                if translating { "dxbc" } else { "spirv" }));
             return LsfgStatus::TranslationFailed;
         };
         modules.push(Module { id, words });
@@ -397,11 +395,9 @@ pub fn build(dll_path: &Path, cache_path: &Path, prefer_fp16: bool) -> LsfgStatu
     if !write_atomic(cache_path, &encoded) {
         return LsfgStatus::CacheUnusable;
     }
-    log!(::gndrm_obf::obf!(
-        "lsfg: cached {} modules (source={})",
+    log!(format_args!("lsfg: cached {} modules (source={})",
         modules.len(),
-        header.variant.name()
-    ));
+        header.variant.name()));
     LsfgStatus::Ok
 }
 

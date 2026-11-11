@@ -108,7 +108,7 @@ impl PanelDesc {
         let clock =
             (u64::from(htotal) * u64::from(vtotal) * u64::from(refresh_mhz) / 1_000_000) as u32;
         let mut name = [0u8; DRM_DISPLAY_MODE_LEN];
-        let label = format!("{}", gndrm_obf::obf!("{}x{}", self.width, self.height));
+        let label = format!("{}", format_args!("{}x{}", self.width, self.height));
         name[..label.len()].copy_from_slice(label.as_bytes());
         DrmModeModeinfo {
             clock,

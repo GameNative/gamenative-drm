@@ -241,7 +241,7 @@ pub unsafe fn for_pd(pd: VkPhysicalDevice) -> Option<Arc<Outcome>> {
     let driver_api = props.apiVersion;
     let instance_api = unsafe { (*gi).forwarded_api };
     let outcome = if let Some(why) = skip_reason(driver_api, instance_api) {
-        crate::logi!(gndrm_obf::obf!("proxy pd: resolve probe: skipped ({why})"));
+        crate::logi!("proxy pd: resolve probe: skipped ({why})");
         Outcome::default()
     } else {
         let t = Instant::now();
@@ -250,17 +250,13 @@ pub unsafe fn for_pd(pd: VkPhysicalDevice) -> Option<Arc<Outcome>> {
         match r {
             Ok(v) => {
                 let o = Outcome::from_verdict(&v, driver_api);
-                crate::logi!(gndrm_obf::obf!(
-                    "proxy pd: resolve probe: {} ({ms:.1} ms)",
-                    o.describe(driver_api)
-                ));
+                crate::logi!("proxy pd: resolve probe: {} ({ms:.1} ms)",
+                    o.describe(driver_api));
                 o
             }
             Err(why) => {
-                crate::logi!(gndrm_obf::obf!(
-                    "proxy pd: resolve probe: did not run ({why}); core version {} kept ({ms:.1} ms)",
-                    ver(driver_api)
-                ));
+                crate::logi!("proxy pd: resolve probe: did not run ({why}); core version {} kept ({ms:.1} ms)",
+                    ver(driver_api));
                 Outcome::default()
             }
         }

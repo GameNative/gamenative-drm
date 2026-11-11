@@ -20,13 +20,9 @@ export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=
 # -ffile-prefix-map scrubs the build-host path from __FILE__/debug records so it
 # cannot leak into the shipped .so (the Rust side has --remap-path-prefix).
 CFLAGS="-Wall -Wextra -Werror -O2 -fPIC -ffile-prefix-map=$ROOT=. -ffile-prefix-map=$PWD=."
-# The shim's log text is obfuscated at build time: obf-shim.py rewrites each
-# LOG(...) site to decode an XOR-encoded literal, so `strings` on the shipped
-# .so no longer recovers the messages. The .c stays the readable source.
-GEN="$OUT/gen"
-mkdir -p "$GEN"
-CSRC="$GEN/gndrm_shim.c"
-python3 "$ROOT/tools/obf-shim.py" "$SRC" "$CSRC"
+# The .c is compiled as written: the project is open source, so its log text is
+# a plain literal and `strings` on the shipped .so is expected to find it.
+CSRC="$SRC"
 # NOTE: no -fvisibility=hidden — the interposed symbols (open/ioctl/close)
 # must stay exported for LD_PRELOAD interposition to work at all. What pins the
 # exported set is the linker version script below: it makes everything except

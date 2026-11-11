@@ -172,10 +172,7 @@ pub(crate) fn stop() {
 fn run() {
     let Some(api) = Api::load() else {
         crate::log_always!(
-            "{}",
-            gndrm_obf::obf!(
-                "vsync: no Choreographer vsync callback here; flip events follow the latch grid"
-            )
+            "vsync: no Choreographer vsync callback here; flip events follow the latch grid"
         );
         return;
     };
@@ -186,8 +183,7 @@ fn run() {
     let ch = unsafe { (api.get_instance)() };
     if looper.is_null() || ch.is_null() {
         crate::log_always!(
-            "{}",
-            gndrm_obf::obf!("vsync: Choreographer unavailable; flip events follow the latch grid")
+            "vsync: Choreographer unavailable; flip events follow the latch grid"
         );
         return;
     }
@@ -240,10 +236,7 @@ fn run() {
             if !logged_lost {
                 logged_lost = true;
                 crate::log_always!(
-                    "{}",
-                    gndrm_obf::obf!(
-                        "vsync: no Choreographer callback for 1 s; posting again, flip events follow the latch grid meanwhile"
-                    )
+                    "vsync: no Choreographer callback for 1 s; posting again, flip events follow the latch grid meanwhile"
                 );
             }
             OUTSTANDING.store(false, Ordering::Relaxed);
@@ -291,13 +284,11 @@ fn feed(vsync_ns: u64, deadline_ns: Option<u64>) {
     if let Some((fit, mode)) = vblank::take_rejected_fit() {
         crate::log_always!(
             "{}",
-            gndrm_obf::obf!(
-                "vsync: measured period {}.{:03}us is more than 2% from the mode's {}.{:03}us; kept the previous period",
+            format_args!("vsync: measured period {}.{:03}us is more than 2% from the mode's {}.{:03}us; kept the previous period",
                 fit / 1000,
                 fit % 1000,
                 mode / 1000,
-                mode % 1000
-            )
+                mode % 1000)
         );
     }
 }
@@ -310,13 +301,12 @@ fn log_lock(lock: &VsyncLock) {
     let mode_mhz = crate::panel_refresh_mhz();
     let rate_mhz = 1_000_000_000_000 / p.max(1);
     let offset = match lock.latch_offset_ns {
-        Some(o) => gndrm_obf::obf!("{:+}us", o / 1000).to_string(),
-        None => gndrm_obf::obf!("none yet").to_string(),
+        Some(o) => format_args!("{:+}us", o / 1000).to_string(),
+        None => "none yet".to_string(),
     };
     crate::log_always!(
         "{}",
-        gndrm_obf::obf!(
-            "vsync: flip events on the display's vsync: source={} period={}.{:03}us ({}.{:03} Hz, mode {}.{:03} Hz) latch-vs-grid={}",
+        format_args!("vsync: flip events on the display's vsync: source={} period={}.{:03}us ({}.{:03} Hz, mode {}.{:03} Hz) latch-vs-grid={}",
             lock.grid.source.name(),
             p / 1000,
             p % 1000,
@@ -324,8 +314,7 @@ fn log_lock(lock: &VsyncLock) {
             rate_mhz % 1000,
             mode_mhz / 1000,
             mode_mhz % 1000,
-            offset
-        )
+            offset)
     );
 }
 
@@ -333,7 +322,7 @@ fn log_lock(lock: &VsyncLock) {
 fn ms(ns: i64) -> String {
     let sign = if ns < 0 { '-' } else { '+' };
     let a = ns.unsigned_abs();
-    gndrm_obf::obf!("{sign}{}.{:03}ms", a / 1_000_000, (a / 1000) % 1000).to_string()
+    format_args!("{sign}{}.{:03}ms", a / 1_000_000, (a / 1000) % 1000).to_string()
 }
 
 /// The cross-check, once per 10 s while publishes complete (see
@@ -344,12 +333,11 @@ pub(crate) fn log_report(r: &VsyncReport) {
     let rate_mhz = 1_000_000_000_000 / p.max(1);
     let lad = match r.latch_after_deadline_ns {
         Some(d) => ms(d),
-        None => gndrm_obf::obf!("n/a").to_string(),
+        None => "n/a".to_string(),
     };
     crate::log_always!(
         "{}",
-        gndrm_obf::obf!(
-            "vsync: check source={} period={}.{:03}us ({}.{:03} Hz) publishes={} vsyncs={} late={} pushed={} margin p10/p50/p90={}/{}/{} lead={} latch-after-deadline={}",
+        format_args!("vsync: check source={} period={}.{:03}us ({}.{:03} Hz) publishes={} vsyncs={} late={} pushed={} margin p10/p50/p90={}/{}/{} lead={} latch-after-deadline={}",
             r.source.map_or("none", |s| s.name()),
             p / 1000,
             p % 1000,
@@ -363,7 +351,6 @@ pub(crate) fn log_report(r: &VsyncReport) {
             ms(r.margin_ns[1]),
             ms(r.margin_ns[2]),
             ms(r.lead_ns as i64),
-            lad
-        )
+            lad)
     );
 }

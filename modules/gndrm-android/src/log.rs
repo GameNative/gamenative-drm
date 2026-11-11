@@ -6,9 +6,7 @@
 //! call returns before formatting; cold paths only — the per-frame hot path
 //! never logs.
 //!
-//! The logcat tag is decoded at runtime from an obfuscated literal
-//! ([`gndrm_obf::obfc`]), so the shipped library's tag strings are not
-//! recoverable with `strings`.
+//! The logcat tag is a C string literal chosen by the gate.
 
 use std::fmt;
 
@@ -41,21 +39,20 @@ fn emit(prio: i32, gate: Gate, text: &str) {
     let c = std::ffi::CString::new(text)
         .unwrap_or_else(|_| std::ffi::CString::new("<log error>").unwrap());
     macro_rules! tag {
-        ($t:literal) => {{
-            let t = gndrm_obf::obfc!($t);
-            // SAFETY: `t` and `c` are NUL-terminated and outlive the call.
+        ($t:expr) => {{
+            // SAFETY: `$t` and `c` are NUL-terminated and outlive the call.
             unsafe {
-                crate::ffi::__android_log_write(prio, t.as_cstr().as_ptr(), c.as_ptr());
+                crate::ffi::__android_log_write(prio, $t.as_ptr(), c.as_ptr());
             }
         }};
     }
     match gate {
-        Gate::Daemon => tag!("gndrm-daemon"),
-        Gate::Asc => tag!("gndrm-asc"),
-        Gate::Input => tag!("gndrm-input"),
-        Gate::Vkshim => tag!("gn-vkshim"),
-        Gate::Shim => tag!("gndrm-shim"),
-        Gate::Fallback => tag!("gndrm"),
+        Gate::Daemon => tag!(c"gndrm-daemon"),
+        Gate::Asc => tag!(c"gndrm-asc"),
+        Gate::Input => tag!(c"gndrm-input"),
+        Gate::Vkshim => tag!(c"gn-vkshim"),
+        Gate::Shim => tag!(c"gndrm-shim"),
+        Gate::Fallback => tag!(c"gndrm"),
     }
 }
 
@@ -84,10 +81,9 @@ pub(crate) fn daemon_always(text: &str) {
 /// call site's module path is classified at compile time (`const`), so it is
 /// never stored in the binary.
 ///
-/// The gate is tested *before* `format_args!`: an `obf!` literal at the call
-/// site is a stack decode, so a disabled line must not build the arguments at
-/// all. `write` re-checks (it is also the entry for the daemon's forwarded
-/// lines); this only short-circuits the decode.
+/// The gate is tested *before* `format_args!`, so a disabled line never builds
+/// its arguments. `write` re-checks (it is also the entry for the daemon's
+/// forwarded lines); this only short-circuits the formatting.
 #[macro_export]
 macro_rules! alog {
     ($prio:expr, $($arg:tt)*) => {{

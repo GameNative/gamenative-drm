@@ -30,6 +30,6 @@ License text: `lsfg/thirdparty/dxbc/LICENSE.md`. Also recorded in GameNative's
 ---
 
 The `LICENSE` in this repository covers its own code — the daemon, the DRM UAPI
-crate, the obfuscation crates and the tools — under GPL-3.0-or-later, the same
-license as the library the engine is linked into. Copyright (C) 2026 Joshua Tam
+crate, the ICD shim and the tools — under GPL-3.0-or-later, the same license as
+the library the engine is linked into. Copyright (C) 2026 Joshua Tam
 and Utkarsh Dalal.

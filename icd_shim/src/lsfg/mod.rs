@@ -132,28 +132,24 @@ pub fn open() -> Option<Engine> {
     // generated frame.
     let handle = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
     if handle.is_null() {
-        crate::logf!(gndrm_obf::obf!(
-            "lsfg: cannot load {}: {}",
+        crate::logf!("lsfg: cannot load {}: {}",
             library,
-            dlerror_text()
-        ));
+            dlerror_text());
         return None;
     }
 
     let abi = unsafe { resolve_one::<AbiFn>(handle, "lsfg_engine_abi") };
     let set_host = unsafe { resolve_one::<SetHostFn>(handle, "lsfg_engine_set_host") };
     let (Some(abi), Some(set_host)) = (abi, set_host) else {
-        crate::logf!(gndrm_obf::obf!("lsfg: {} is not an engine", library));
+        crate::logf!("lsfg: {} is not an engine", library);
         return None;
     };
     let revision = unsafe { abi() };
     if revision != EXPECTED_ABI {
-        crate::logf!(gndrm_obf::obf!(
-            "lsfg: {} speaks ABI {}, this build speaks {}",
+        crate::logf!("lsfg: {} speaks ABI {}, this build speaks {}",
             library,
             revision,
-            EXPECTED_ABI
-        ));
+            EXPECTED_ABI);
         return None;
     }
 
@@ -165,7 +161,7 @@ pub fn open() -> Option<Engine> {
     // Before any create: the engine loads its shader modules through here.
     unsafe { set_host(&gndrm_lsfg::HOST_OPS) };
     let api = unsafe { Api::resolve(handle) }?;
-    crate::logf!(gndrm_obf::obf!("lsfg: engine ready ({})", library));
+    crate::logf!("lsfg: engine ready ({})", library);
     Some(Engine { api, library })
 }
 
@@ -301,13 +297,11 @@ pub fn apply(config: gndrm_uapi::wire::LsfgConfig) {
     LIVE.refresh_mhz.store(config.refresh_mhz, Relaxed);
     let now = (config.enabled != 0, config.multiplier, config.fps_limit);
     if previous != now {
-        crate::logf!(gndrm_obf::obf!(
-            "lsfg: settings enabled={} multiplier={} source_cap={} refresh_hz={}",
+        crate::logf!("lsfg: settings enabled={} multiplier={} source_cap={} refresh_hz={}",
             now.0,
             now.1,
             now.2,
-            refresh_hz()
-        ));
+            refresh_hz());
     }
 }
 
@@ -387,11 +381,9 @@ pub fn apply_vsync(note: gndrm_uapi::wire::VsyncNote) {
     LIVE.vsync_period_ns.store(note.period_ns, Relaxed);
     LIVE.vsync_lead_ns.store(note.lead_ns, Relaxed);
     if had != note.period_ns {
-        crate::logf!(gndrm_obf::obf!(
-            "lsfg: panel grid period={}us lead={}us",
+        crate::logf!("lsfg: panel grid period={}us lead={}us",
             note.period_ns / 1000,
-            note.lead_ns / 1000
-        ));
+            note.lead_ns / 1000);
     }
 }
 
@@ -493,12 +485,12 @@ impl Session {
         // was captured at launch.
         if let Some(config) = from_daemon {
             if config.enabled == 0 || config.multiplier < 2 {
-                crate::logf!(gndrm_obf::obf!("lsfg: disabled by the app"));
+                crate::logf!("lsfg: disabled by the app");
                 return None;
             }
         }
         let Some(multiplier) = from_daemon.map(|s| s.multiplier) else {
-            crate::logf!(gndrm_obf::obf!("lsfg: the app has sent no settings"));
+            crate::logf!("lsfg: the app has sent no settings");
             return None;
         };
         if multiplier < 2 {
@@ -512,22 +504,18 @@ impl Session {
                 .map(|p| std::path::PathBuf::from(p.to_string_lossy().into_owned()))
         });
         let Some(dll) = dll else {
-            crate::logf!(gndrm_obf::obf!("lsfg: no Lossless.dll path from the app"));
+            crate::logf!("lsfg: no Lossless.dll path from the app");
             return None;
         };
         if !dll.is_file() {
-            crate::logf!(gndrm_obf::obf!(
-                "lsfg: no Lossless.dll at {}; frame generation off",
-                dll.display()
-            ));
+            crate::logf!("lsfg: no Lossless.dll at {}; frame generation off",
+                dll.display());
             return None;
         }
 
         let engine = open()?;
         if !unsafe { (engine.api.vkd_load)(instance, device, gipa) } {
-            crate::logf!(gndrm_obf::obf!(
-                "lsfg: dispatch load failed; frame generation off"
-            ));
+            crate::logf!("lsfg: dispatch load failed; frame generation off");
             return None;
         }
 
@@ -543,10 +531,8 @@ impl Session {
         });
         let status = gndrm_lsfg::ensure_cache(&dll, &cache, fp16);
         if status != gndrm_lsfg::LsfgStatus::Ok {
-            crate::logf!(gndrm_obf::obf!(
-                "lsfg: shader cache unusable ({:?}); frame generation off",
-                status
-            ));
+            crate::logf!("lsfg: shader cache unusable ({:?}); frame generation off",
+                status);
             return None;
         }
 
@@ -555,9 +541,7 @@ impl Session {
         };
         let root = unsafe { (engine.api.create)(device, physical, cache_c.as_ptr()) };
         if root.is_null() {
-            crate::logf!(gndrm_obf::obf!(
-                "lsfg: engine create failed; frame generation off"
-            ));
+            crate::logf!("lsfg: engine create failed; frame generation off");
             return None;
         }
 
@@ -574,14 +558,12 @@ impl Session {
             .unwrap_or(0.0);
         unsafe { (engine.api.configure)(root, multiplier, 0, flow, refresh) };
         let (source, output) = grid();
-        crate::logf!(gndrm_obf::obf!(
-            "lsfg: ready multiplier={} fp16={} source={} output={} cache={}",
+        crate::logf!("lsfg: ready multiplier={} fp16={} source={} output={} cache={}",
             multiplier,
             fp16,
             source,
             output,
-            cache.display()
-        ));
+            cache.display());
 
         // Seed the live state with this session's decision: a push only arrives
         // when the user changes something, so `live()` must already be right.
@@ -733,7 +715,7 @@ impl Session {
             if unsafe { create_image(device, &ici, std::ptr::null(), &mut image) }
                 != crate::vk::VK_SUCCESS
             {
-                crate::logf!(gndrm_obf::obf!("lsfg: target image create failed"));
+                crate::logf!("lsfg: target image create failed");
                 return false;
             }
 
@@ -769,13 +751,13 @@ impl Session {
             let mut mem: crate::vk::VkDeviceMemory = 0;
             if unsafe { alloc(device, &ai, std::ptr::null(), &mut mem) } != crate::vk::VK_SUCCESS {
                 unsafe { destroy_image(device, image, std::ptr::null()) };
-                crate::logf!(gndrm_obf::obf!("lsfg: target memory alloc failed"));
+                crate::logf!("lsfg: target memory alloc failed");
                 return false;
             }
             if unsafe { bind(device, image, mem, 0) } != crate::vk::VK_SUCCESS {
                 unsafe { free(device, mem, std::ptr::null()) };
                 unsafe { destroy_image(device, image, std::ptr::null()) };
-                crate::logf!(gndrm_obf::obf!("lsfg: target bind failed"));
+                crate::logf!("lsfg: target bind failed");
                 return false;
             }
 
@@ -793,7 +775,7 @@ impl Session {
             {
                 unsafe { free(device, mem, std::ptr::null()) };
                 unsafe { destroy_image(device, image, std::ptr::null()) };
-                crate::logf!(gndrm_obf::obf!("lsfg: target view create failed"));
+                crate::logf!("lsfg: target view create failed");
                 return false;
             }
 
@@ -806,13 +788,11 @@ impl Session {
                 format,
             });
         }
-        crate::logf!(gndrm_obf::obf!(
-            "lsfg: {} target(s) {}x{} fmt {}",
+        crate::logf!("lsfg: {} target(s) {}x{} fmt {}",
             self.targets.len(),
             width,
             height,
-            format
-        ));
+            format);
         true
     }
 

@@ -32,7 +32,7 @@ frame, i.e. ~340 Hz, on a path the doc calls **exactly one deep**: every µs her
 | — | `PresentDone::encode()` (`wire.rs:727`) | **refuted** | — | — | returns `[u8; 24]`, stack |
 | — | `server.rs` serve pollfd array (`:386`) | **refuted** | — | — | fixed `[pollfd; 2]` on the stack |
 | — | `dump_published` env lookup (`asc.rs:149`) | **refuted** | — | — | `OnceLock`, one lookup per process |
-| — | log macros on the hot path | **refuted** | `log.rs:20` | — | gate is tested before `fmt::format`; `obf!` decodes into a stack array (`gndrm-obf/src/lib.rs:46`), no heap |
+| — | log macros on the hot path | **refuted** | `log.rs:20` | — | gate is tested before `fmt::format`, so a disabled line formats nothing |
 
 Non-allocation hot-path cost found while verifying, listed for completeness, **not** in this
 plan item: `Device::diag_on()` (`lib.rs:903`) takes the logger `Mutex` once per commit — a
