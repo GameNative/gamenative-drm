@@ -114,16 +114,33 @@ divisor cap reads its target exactly.
   multiplier and the panel's refresh into the frames per second the guest may
   acquire and the frames per second the generator may add:
 
-  | present | cap | LSFG | acquire | generated | total | show in HUD |
-  |---|---|---|---|---|---|---|
-  | synced | on | off | cap | — | `cap` | `cap` |
-  | synced | off | off | refresh | — | `refresh` | `refresh` |
-  | synced | on | on | cap | `cap × (m−1)`, at most `refresh` | `cap + min(cap × (m−1), refresh)` | total |
-  | synced | off | on | `refresh / m` | `acquire × (m−1)` | `acquire × m` | total |
-  | unsynced | on | off | cap | — | `cap` | `cap` |
-  | unsynced | off | off | none | — | none | measured |
-  | unsynced | on | on | cap | `cap × (m−1)` | `cap × m` | total |
-  | unsynced | off | on | `refresh / m` | `acquire × (m−1)` | `acquire × m` | total |
+  | present | cap | LSFG | acquire | generated | total | hold | show in HUD |
+  |---|---|---|---|---|---|---|---|
+  | synced | on | off | cap | — | `cap` | note | `cap` |
+  | synced | off | off | refresh | — | `refresh` | note | `refresh` |
+  | synced | on | on | cap | `cap × (m−1)`, at most `refresh` | `cap + min(cap × (m−1), refresh)` | note | total |
+  | synced | off | on | `refresh / m` | `acquire × (m−1)` | `acquire × m` | note | total |
+  | unsynced | on | off | cap | — | `cap` | none | `cap` |
+  | unsynced | off | off | none | — | none | none | measured |
+  | unsynced | on | on | cap | `cap × (m−1)` | `cap × m` | none | total |
+  | unsynced | off | on | `refresh / m` | `acquire × (m−1)` | `acquire × m` | none | total |
+
+  `hold` is when an acquired image may be drawn into again, and it follows the
+  same split as the rate because `VkPresentModeKHR` is a contract about exactly
+  that: FIFO (and FIFO-relaxed) returns an image when a latched frame replaces
+  it, so the image is held until the compositor's own release report *and* the
+  display's scan-out release after it — `note`. IMMEDIATE returns it once it is
+  handed over and MAILBOX as soon as a newer one replaces it, so `none`: the slot
+  is free at the compositor's release, and a guest that asked for those modes has
+  already accepted the frames that get dropped. Applying `note` to them applies
+  FIFO's lifetime to a mode that promised none, and the cost is the rate:
+  `min(cap, depth × refresh / hold)` — 106 on a 120 Hz panel at depth 3 where an
+  uncapped immediate session should have been free.
+
+  Below the fold, `depth` has to exceed the hold for the rate column to be the
+  binding one; at depth 3 against a 3.4-period hold the pool caps the session
+  instead, which is the 106 above and the 100<->120 oscillation around the
+  crossover at `depth / refresh`.
 
   `total` is what the rule lets the session produce: acquired plus generated. It
   is not always what reaches the screen — the synced rows still cap generation at

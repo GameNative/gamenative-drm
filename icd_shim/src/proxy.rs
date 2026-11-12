@@ -7920,7 +7920,22 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
         // the daemon reports the scan-out release, and freed on that note. A
         // buffer the daemon does not track (a local allocation, or a daemon too
         // old to send notes) is freed here, as before.
-        if (*slot).ino != 0 && crate::scanout::release_notes_live() {
+        //
+        // Only for a synced declaration. `VkPresentModeKHR` is a contract about
+        // when an image comes back, and FIFO is the only one that promises the
+        // client a display-bound return: IMMEDIATE returns the image once it is
+        // handed over, MAILBOX as soon as a newer one replaces it. Parking those
+        // applies FIFO's lifetime to a mode that promised none, and the cost is
+        // measurable — an uncapped immediate session on a 120 Hz panel ran at
+        // `depth x refresh / hold` = 106 instead of free, with `slot_waits` at
+        // 99 % and `in_flight` pinned at the depth. FIFO_RELAXED stays synced:
+        // the spec lets it return a late frame early, and holding it to the note
+        // is the conservative side of a row the table already calls synced.
+        let synced = matches!(
+            (*sc).present_mode,
+            VK_PRESENT_MODE_FIFO_KHR | VK_PRESENT_MODE_FIFO_RELAXED_KHR
+        );
+        if synced && (*slot).ino != 0 && crate::scanout::release_notes_live() {
             (*slot).parked_ns = monotonic_ns();
         } else {
             (*slot).in_flight = false;
