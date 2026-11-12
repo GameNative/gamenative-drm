@@ -903,6 +903,7 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
                 xfence: 0,
                 present_id: 0,
                 wait_id: 0,
+                wait_registered: false,
                 fence: 0,
                 sem: 0,
                 fence_sem: 0,
@@ -2122,31 +2123,20 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
         // that names its buffer in an atomic commit. The worker may wait for an
         // allocation exchange in flight, which is bounded by that exchange's own
         // timeout; a mark that never arrives would leave a wait hanging.
+        // Both ids this commit acts on are read here, once: `send_present_mark`
+        // below is a blocking send, and the release handler on the dispatch
+        // thread writes `wait_id` while it blocks.
         let presented_id = (*s).present_id;
-        if presented_id != 0 && (*s).wait_id == 0 {
-            // The present set both, so an id with no wait here means something
-            // cleared `wait_id` before this commit ran — the release handler,
-            // which reads and clears it from the dispatch thread.
-            NOID_AT_COMMIT.fetch_add(1, Ordering::Relaxed);
-        }
-        if (*s).present_id != 0 && (*s).ino != 0 {
-            crate::scanout::send_present_mark((*s).ino, (*s).present_id);
-            // One mark per frame: a guest that stops chaining ids must not keep
-            // marking later frames with the last one it sent.
-            (*s).present_id = 0;
-        }
-        // The frame goes to the compositor now. Under FIFO a wait on it is
-        // answered at the latest when the refresh after this commit has
-        // passed: a frame that nothing replaces is never released, and the
-        // guest may wait on it before presenting again (vkd3d-proton does, on
-        // its first frame). Under an effective mailbox or immediate mode the
-        // wait is answered here: a guest that knew its real mode would not
-        // wait at all, and holding it couples the guest's frame-latency loop
-        // to a refresh period it does not pace by.
-        // The present id this commit asks gamescope's presentation feedback for,
-        // 0 when none (see `crate::present`).
+        let wait_id = {
+            let _g = (*sc).shared.lock().unwrap();
+            (*s).wait_id
+        };
+        // This frame's present wait, registered before anything that can block.
+        // The bound that answers a wait nobody else answers is measured from
+        // this commit instant, so registering after the mark would put the whole
+        // mark's latency into every frame the guest is waiting on.
         let mut feedback_token = 0u64;
-        if (*s).wait_id != 0 {
+        if wait_id != 0 {
             // A guest that asked for mailbox or immediate does not wait, and
             // neither would one whose frames go out as mailbox or immediate
             // (the container's mode, or frame generation): both are answered
@@ -2161,24 +2151,48 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
                 (*sc).present_mode,
                 live,
             ) != WaitAnswer::Later;
-            let id = if at_commit {
+            if at_commit {
                 let _g = (*sc).shared.lock().unwrap();
-                core::mem::replace(&mut (*s).wait_id, 0)
+                (*s).wait_id = 0;
+                (*s).wait_registered = false;
             } else {
-                (*s).wait_id
-            };
-            // A FIFO wait on the override route is answered by gamescope's
-            // presentation feedback, as in Mesa's Wayland WSI. Registered
-            // before the commit, so neither the release nor the grace can
-            // answer it first.
-            if !at_commit
-                && !(*(*sc).surf).swapchain_obj.is_null()
-                && !PRESENTATION.load(Ordering::Acquire).is_null()
-            {
-                feedback_token = crate::present::expect_feedback(id, sc as usize);
+                // A FIFO wait on the override route is answered by gamescope's
+                // presentation feedback, as in Mesa's Wayland WSI, and by the
+                // grace behind it. Marked registered first, so the release that
+                // follows the commit may answer it and the one that preceded
+                // the commit could not.
+                let _g = (*sc).shared.lock().unwrap();
+                (*s).wait_registered = true;
+                drop(_g);
+                if !(*(*sc).surf).swapchain_obj.is_null()
+                    && !PRESENTATION.load(Ordering::Acquire).is_null()
+                {
+                    feedback_token = crate::present::expect_feedback(wait_id, sc as usize);
+                }
             }
-            crate::present::committed(id, sc as usize, monotonic_ns(), at_commit);
+            crate::present::committed(wait_id, sc as usize, now, at_commit);
         }
+        if presented_id != 0 && wait_id == 0 {
+            // The present sets both ids, and only a commit takes them again
+            // (`at_commit`) or a re-present of the slot discards them — so a
+            // frame that arrives here with a present id and no wait id lost it
+            // on the way. Counted because the loss leaves its wait with no
+            // commit to bound it, which is what made the compositor's feedback
+            // the only answer: 2975 of 3407 waits before this was fixed.
+            NOID_AT_COMMIT.fetch_add(1, Ordering::Relaxed);
+        }
+        if (*s).present_id != 0 && (*s).ino != 0 {
+            crate::scanout::send_present_mark((*s).ino, (*s).present_id);
+            // One mark per frame: a guest that stops chaining ids must not keep
+            // marking later frames with the last one it sent.
+            (*s).present_id = 0;
+        }
+        // The frame goes to the compositor now. Under FIFO a wait on it is
+        // answered at the latest when the refresh after this commit has
+        // passed: a frame that nothing replaces is never released, and the
+        // guest may wait on it before presenting again (vkd3d-proton does, on
+        // its first frame). Its wait was registered above, and the feedback
+        // request a `feedback_token` names rides the commit below.
         // X11 route: the window carries its own content, so the frame is
         // presented into it (DRI3 + Present) instead of committed to a
         // wl_surface. The slot stays in flight until its idle fence
@@ -2461,6 +2475,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             xfence: 0,
             present_id: 0,
             wait_id: 0,
+            wait_registered: false,
             fence: 0,
             sem: 0,
             fence_sem: 0,
@@ -3192,6 +3207,7 @@ unsafe fn present_mailbox(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
             let os = (*sc).slots.as_mut_ptr().add(old as usize);
             (*os).in_flight = false;
             (*os).present_id = 0;
+            (*os).wait_registered = false;
             replaced_id = core::mem::replace(&mut (*os).wait_id, 0);
         }
         (*sc).cv_free.notify_all();
@@ -3530,6 +3546,7 @@ unsafe fn present_body(queue: VkQueue, pi: *const VkPresentInfoKHR) -> VkResult 
         let stale_id = unsafe {
             let _g = (*sc).shared.lock().unwrap();
             if (*slot).wait_id != 0 && (*slot).wait_id != present_id {
+                (*slot).wait_registered = false;
                 core::mem::replace(&mut (*slot).wait_id, 0)
             } else {
                 0
@@ -3542,6 +3559,7 @@ unsafe fn present_body(queue: VkQueue, pi: *const VkPresentInfoKHR) -> VkResult 
             unsafe {
                 (*slot).present_id = present_id;
                 (*slot).wait_id = present_id;
+                (*slot).wait_registered = false;
             }
             crate::present::arm(present_id, sc as usize);
         }
@@ -7496,6 +7514,12 @@ pub struct GnSlot {
     // the one completion every route observes, so a wait on it is answered
     // there when the daemon's latch report has not arrived first.
     pub wait_id: u64,
+    // Whether the commit that carries `wait_id` has registered it with
+    // `crate::present` yet. The compositor's release of this slot's buffer can
+    // arrive between the present that armed the id and the commit that
+    // registers it — it may belong to an earlier use of the same buffer — and
+    // consuming the id there left the wait with no commit, no grace and no bound.
+    pub wait_registered: bool,
     // The daemon's scan-out inode for this slot's buffer, or 0 when the buffer
     // was allocated locally. Identity and logging only: the release floor is
     // this shim's own, one period after the last release, and is not filed
@@ -7902,7 +7926,17 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
             (*slot).in_flight = false;
         }
         (*sc).cv_free.notify_all();
-        let wait_id = core::mem::replace(&mut (*slot).wait_id, 0);
+        // Only a frame whose commit has registered its wait is answered here.
+        // This release may belong to an earlier use of the same buffer: it can
+        // land between the present arming the id and the worker registering it,
+        // and consuming the id there is what left 87 % of waits with no commit
+        // to bound them — the guest then waited out the compositor's feedback.
+        let wait_id = if (*slot).wait_registered {
+            (*slot).wait_registered = false;
+            core::mem::replace(&mut (*slot).wait_id, 0)
+        } else {
+            0
+        };
         drop(_g);
         REL_ALL_N.fetch_add(1, Ordering::Relaxed);
         if wait_id != 0 {
