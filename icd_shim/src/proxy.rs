@@ -225,7 +225,7 @@ static ACQ_RETRY_N: AtomicUsize = AtomicUsize::new(0);
 /// cumulative counter is only a rate once the denominator is known.
 static SHIM_T0_NS: AtomicU64 = AtomicU64::new(0);
 /// Release notes applied to a parked slot, and slots freed by
-/// [`RELEASE_NOTE_LIMIT_NS`] instead. The first is the measurement working; the
+/// [`release_note_limit_ns`] instead. The first is the measurement working; the
 /// second is a note that never came, and a session where it dominates is one
 /// where the daemon is not naming every buffer the guest holds.
 static NOTES_APPLIED: AtomicUsize = AtomicUsize::new(0);
@@ -313,6 +313,10 @@ static SLOT_WAIT_N: AtomicUsize = AtomicUsize::new(0);
 // cadence as it reaches gamescope (`commit_spacing_bucket`).
 static COMMIT_GAPS: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
 static LAST_COMMIT_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The commit interval, smoothed, in nanoseconds: the cadence whose slowness
+/// causes the compositor's hold. Zero until a second commit has been seen.
+static COMMIT_SPACING_NS: AtomicU64 = AtomicU64::new(0);
 
 /// The `COMMIT_GAPS` bucket of a spacing of `gap_ns`.
 fn commit_spacing_bucket(gap_ns: u64) -> usize {
@@ -2107,7 +2111,13 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
         let now = monotonic_ns();
         let last = LAST_COMMIT_NS.swap(now, Ordering::Relaxed);
         if last != 0 && now > last {
-            COMMIT_GAPS[commit_spacing_bucket(now - last)].fetch_add(1, Ordering::Relaxed);
+            let gap = now - last;
+            COMMIT_GAPS[commit_spacing_bucket(gap)].fetch_add(1, Ordering::Relaxed);
+            let est = COMMIT_SPACING_NS.load(Ordering::Relaxed);
+            COMMIT_SPACING_NS.store(
+                crate::vsync_gate::smooth_latency(est, gap),
+                Ordering::Relaxed,
+            );
         }
         // How long the frame took from the gate's release to here, its render
         // fence waited, for the census.
@@ -2754,7 +2764,28 @@ const REAP_SLICE: Duration = Duration::from_millis(4);
 /// (measured 1.5-2.5 periods). A longer bound is not a safety net, it is a
 /// pacing rule: at 100 ms four slots cap the session at 40/s, and the guest's
 /// own over-production is what decides how many of those it pays.
-const RELEASE_NOTE_LIMIT_NS: u64 = 33_000_000;
+/// How long a parked slot waits for the daemon's release note before it is taken
+/// anyway.
+///
+/// Four latch periods, and nothing else. A FIFO hold is measured in latch gaps,
+/// not in display periods: a title producing 40 fps on a 60 Hz panel holds a
+/// buffer for ~66 ms, so a two-period bound expired before every note and
+/// `park_timeouts` read 12 203 against 3 623 slot waits — the reuse guarantee
+/// silently reduced to a timeout. Four periods covers the hold at any producer
+/// rate down to half the panel's.
+fn release_note_limit_ns() -> u64 {
+    // Two producer intervals, floored by two panel periods. The hold is caused by
+    // the producer's cadence — a buffer stays on the layer until the next frame
+    // replaces it — so a bound measured in *panel* periods expires early exactly
+    // for the slow producers it exists to cover (40 fps on 60 Hz held ~66 ms
+    // against a 33 ms bound, and `park_timeouts` read 12 203 against 3 623 slot
+    // waits). Nothing here is a literal round number: the interval is measured
+    // from the commits, the floor from the panel's rate.
+    let hz = u64::from(crate::lsfg::panel_hz().max(1));
+    let floor = 2 * (1_000_000_000 / hz);
+    let spacing = COMMIT_SPACING_NS.load(Ordering::Relaxed);
+    (spacing.saturating_mul(2)).max(floor)
+}
 
 /// How long an acquire may sleep while a slot is parked on a release note.
 ///
@@ -2806,7 +2837,7 @@ unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
             let lag = now.saturating_sub(unsafe { (*s).parked_ns });
             NOTELAG[note_lag_bucket(lag)].fetch_add(1, Ordering::Relaxed);
         } else if unsafe { (*s).parked_ns != 0 }
-            && now.saturating_sub(unsafe { (*s).parked_ns }) >= RELEASE_NOTE_LIMIT_NS
+            && now.saturating_sub(unsafe { (*s).parked_ns }) >= release_note_limit_ns()
         {
             timed_out = true;
             PARK_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
