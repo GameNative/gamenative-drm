@@ -114,16 +114,22 @@ divisor cap reads its target exactly.
   multiplier and the panel's refresh into the frames per second the guest may
   acquire and the frames per second the generator may add:
 
-  | present | cap | LSFG | acquire | generated |
-  |---|---|---|---|---|
-  | synced | on | off | cap | — |
-  | synced | off | off | refresh | — |
-  | synced | on | on | cap | `cap × (m−1)`, at most `refresh` |
-  | synced | off | on | `refresh / m` | `acquire × (m−1)` |
-  | unsynced | on | off | cap | — |
-  | unsynced | off | off | none | — |
-  | unsynced | on | on | cap | `cap × (m−1)` |
-  | unsynced | off | on | `refresh / m` | `acquire × (m−1)` |
+  | present | cap | LSFG | acquire | generated | total | show in HUD |
+  |---|---|---|---|---|---|---|
+  | synced | on | off | cap | — | `cap` | `cap` |
+  | synced | off | off | refresh | — | `refresh` | `refresh` |
+  | synced | on | on | cap | `cap × (m−1)`, at most `refresh` | `cap + min(cap × (m−1), refresh)` | total |
+  | synced | off | on | `refresh / m` | `acquire × (m−1)` | `acquire × m` | total |
+  | unsynced | on | off | cap | — | `cap` | `cap` |
+  | unsynced | off | off | none | — | none | measured |
+  | unsynced | on | on | cap | `cap × (m−1)` | `cap × m` | total |
+  | unsynced | off | on | `refresh / m` | `acquire × (m−1)` | `acquire × m` | total |
+
+  `total` is what the rule lets the session produce: acquired plus generated. It
+  is not always what reaches the screen — the synced rows still cap generation at
+  the panel, so 40 + 40 at ×4 on a 60 Hz panel is 40 + 20. The HUD shows `total`,
+  because that is the number the user asked the multiplier for; the cap in force
+  is a separate figure and governs acquires only.
 
   "Synced" is FIFO and FIFO-relaxed, where the panel is the ceiling in both
   directions; "unsynced" is immediate and mailbox, where the guest asked to run
@@ -140,6 +146,26 @@ divisor cap reads its target exactly.
   pacer for frames the shim does not present. With generation on, the gate holds
   the source rate on its own clock and the generator places the batches on the
   latch grid (`docs/17`).
+
+  **What the code does today, which is narrower than the table.** The table is
+  the rule `limits.rs` encodes; the sessions that run are a subset of it:
+
+  - The app disarms the cap when frame generation is armed (`XServerScreen.kt`:
+    `setFpsLimit(if (lsfg) 0 else limit)`), so a gamescope session at cap 60 with
+    ×2 reaches the shim as `cap=0` and takes the *no cap* row: `refresh / m`
+    acquires. The `cap + cap × (m−1)` rows are unreachable from the UI today.
+  - The generator in use is the guest-side layer (`VkrLsfg`), not `flush_due`. Its
+    frames are presented on the same swapchain and are neither an acquire nor a
+    `GEN_COMMITS` entry, so the gate holds that single stream at `acquire_per_s`
+    and the doubling does not happen: measured at cap 30, `guest=29.0 loop=29.9
+    needs=59.9Hz drawn=1` — the layer asks for 60 Hz and 30 get through.
+  - Because `note_produced` counts `Δacquires + ΔGEN_COMMITS`, the app's ring sees
+    source frames only. The HUD is the app's, and it strides the ring by the
+    multiplier, so it cannot read the doubled total either.
+
+  Until a present can be identified as generated, `generate_per_s` is a limit
+  nothing consumes on that path and the table's rightmost rows describe the intent
+  rather than the behaviour.
 
   The gate (`icd_shim/src/vsync_gate.rs`) is one regulator and one rule: a frame
   may start `1e9 / limit` after the previous frame started, and not before.
