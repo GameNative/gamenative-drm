@@ -234,6 +234,13 @@ fn period_ns(now_ns: u64) -> u64 {
     }
 }
 
+/// The panel period now, for callers that need the grid's granularity rather than
+/// a note (the release watcher's slice). Zero when nothing has reported a rate.
+#[cfg(target_os = "android")]
+pub(crate) fn period_now_ns() -> u64 {
+    period_ns(now_ns())
+}
+
 /// How far ahead of its latch the flip events are stamped at `now_ns`, 0 while
 /// they follow no display grid (`gndrm_daemon::vblank::display_grid`). At least
 /// 1 ns while they do, so 0 always means "not known" to the shim, which does not
@@ -296,6 +303,11 @@ pub(crate) fn note() -> Option<VsyncNote> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .note(period, stamp_lead)
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) fn period_now_ns() -> u64 {
+    0
 }
 
 #[cfg(test)]

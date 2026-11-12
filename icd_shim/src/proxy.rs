@@ -3339,12 +3339,17 @@ fn present_wait_answer(
     requested: VkPresentModeKHR,
     live: VkPresentModeKHR,
 ) -> WaitAnswer {
-    if gamescope_route && paced && requested == VK_PRESENT_MODE_FIFO_RELAXED_KHR {
-        WaitAnswer::AtQueue
-    } else if answers_present_wait_at_commit(requested) || answers_present_wait_at_commit(live) {
+    // The override route answers at the commit, for every mode: FIFO's throttle in
+    // native Vulkan is inside `vkQueuePresentKHR`, and `VK_KHR_present_wait` is a
+    // report of scan-out that the client paces itself with. Making the report the
+    // throttle cost a full latch inside every frame — Dave at 40 fps spent ~11 ms
+    // of 24.6 blocked here. The X11 route answers at queue, where its X server
+    // sends PresentCompleteNotify while handling the request.
+    let _ = (paced, requested, live);
+    if gamescope_route {
         WaitAnswer::AtCommit
     } else {
-        WaitAnswer::Later
+        WaitAnswer::AtQueue
     }
 }
 
@@ -7109,41 +7114,35 @@ mod tests {
     }
 
     #[test]
-    fn the_present_wait_is_answered_at_queue_only_under_the_gate() {
+    fn the_present_wait_is_answered_at_the_commit_on_the_override_route() {
         let (m, f, i, r) = (
             VK_PRESENT_MODE_MAILBOX_KHR,
             VK_PRESENT_MODE_FIFO_KHR,
             VK_PRESENT_MODE_IMMEDIATE_KHR,
             VK_PRESENT_MODE_FIFO_RELAXED_KHR,
         );
-        // A gated FIFO-relaxed guest on gamescope's route: answered when it
-        // queues, so its CPU and GPU overlap and the gate holds the rate.
-        assert_eq!(
-            present_wait_answer(true, true, r, r),
-            WaitAnswer::AtQueue
-        );
-        // The same guest ungated is the compositor's to answer.
-        assert_eq!(present_wait_answer(true, false, r, r), WaitAnswer::Later);
-        // A mailbox or immediate guest, whether it asked for it or is declared
-        // it: answered at the commit.
-        for requested in [m, i] {
+        // Every mode on the override route, and with or without a gate: the wait
+        // reports the handover, and the gate and the ring are what pace.
+        for mode in [m, f, i, r] {
+            for paced in [true, false] {
+                assert_eq!(
+                    present_wait_answer(true, paced, mode, mode),
+                    WaitAnswer::AtCommit
+                );
+            }
+        }
+        // The X11 route answers when the guest queues, where its X server already
+        // sends PresentCompleteNotify.
+        for mode in [m, f, i, r] {
             assert_eq!(
-                present_wait_answer(true, true, requested, m),
-                WaitAnswer::AtCommit
+                present_wait_answer(false, false, mode, mode),
+                WaitAnswer::AtQueue
             );
         }
-        // FIFO keeps the compositor's answer.
-        assert_eq!(present_wait_answer(true, false, f, f), WaitAnswer::Later);
-        // Off gamescope's route the gate is the cap, but nothing queues early.
-        assert_eq!(present_wait_answer(false, true, r, r), WaitAnswer::Later);
     }
 
     #[test]
     fn present_wait_is_answered_at_commit_only_for_unpaced_modes() {
-        assert!(answers_present_wait_at_commit(VK_PRESENT_MODE_MAILBOX_KHR));
-        assert!(answers_present_wait_at_commit(VK_PRESENT_MODE_IMMEDIATE_KHR));
-        assert!(!answers_present_wait_at_commit(VK_PRESENT_MODE_FIFO_KHR));
-        assert!(!answers_present_wait_at_commit(VK_PRESENT_MODE_FIFO_RELAXED_KHR));
     }
 
     /// The offered list keeps the served order and always offers FIFO, once.
@@ -10075,13 +10074,6 @@ fn guest_present_mode(ci: &VkSwapchainCreateInfoKHR) -> VkPresentModeKHR {
     }
 }
 
-/// Whether a present wait on a frame of a swapchain in effective `mode` is
-/// answered when the frame is committed. True for mailbox and immediate, where
-/// a guest that knew its real mode would not wait (DXVK skips the present wait
-/// for both); FIFO and FIFO_RELAXED keep the release-or-grace answer.
-fn answers_present_wait_at_commit(mode: VkPresentModeKHR) -> bool {
-    mode == VK_PRESENT_MODE_MAILBOX_KHR || mode == VK_PRESENT_MODE_IMMEDIATE_KHR
-}
 
 /// Why a present declares the mode it does, on the override route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

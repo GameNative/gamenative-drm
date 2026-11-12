@@ -770,7 +770,12 @@ fn release_watcher() {
         }));
         // SAFETY: `pfds` holds one entry per live fence plus the wake fd, all
         // valid for the call; the timeout bounds a fence that never signals.
-        let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as _, 50) };
+        // One latch period, not a fixed 50 ms: the slice is how late a note can be
+        // after its fence has already signalled, so a constant puts that constant
+        // into every producer's park. The panel's own period is the finest useful
+        // granularity — a note is worth nothing sooner than the buffer changes.
+        let slice_ms = (crate::vsync::period_now_ns() / 1_000_000).clamp(1, 50) as c_int;
+        let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as _, slice_ms) };
         if pfds[0].revents != 0 {
             drain_eventfd(wake);
         }
