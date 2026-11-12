@@ -13,16 +13,16 @@ cursor, scan-out and mode patches.
 |---|---|---|
 | the shim's declared present mode | the mode the guest asked for; FIFO under a cap at the display's rate when the guest asked for mailbox or immediate; mailbox under frame generation | the guest and the cap (`docs/10`) |
 | gamescope's own limiter | `nRefreshHz / nTargetFPS`, a divisor of the mode's rate; acts only when the cap is below the refresh and divides it, and only for clients that wait on a frame callback | `debug_set_fps_limit`, sent only when generation is off |
-| the shim's acquire gate | the cap, on the display's vblank grid, for every declared mode | `FrameCapNote{fps}` and `VsyncNote` from the daemon |
+| the shim's acquire gate | the cap, one release per `1e9 / cap`, for every declared mode | `FrameCapNote{fps}` |
 | the presenter's latch grid | the display's latch points, as measured | `VsyncNote` from the daemon (`docs/17`) |
 
-The shim's gate holds the acquire limit whatever the declared mode. gamescope's
-limiter is not a fallback for it: it passes every `nRefreshHz / limit`-th vblank
-(`nVblankDivisor = nRefreshHz / min(limit, nRefreshHz)`) to a client that waits on
-its frame callback, which the shim never does, and the truncating divisor means
-`40` on 60 Hz passes every one of them. It stays as the pacer for content the
-shim does not present; the gate releases the guest's frames on the display's
-vblank grid. What the limit *is* comes from one place — the guest's present mode, the cap,
+The shim's gate holds the acquire limit whatever the declared mode, and it is the
+only regulator: one release per `1e9 / cap`, booked from the release that just
+happened. gamescope's limiter is not a fallback for it — it passes every
+`nRefreshHz / limit`-th vblank (`nVblankDivisor = nRefreshHz / min(limit,
+nRefreshHz)`) to a client that waits on its frame callback, which the shim never
+does, and the truncating divisor means `40` on 60 Hz passes every one of them. It
+stays as the pacer for content the shim does not present. What the limit *is* comes from one place — the guest's present mode, the cap,
 the multiplier and the panel's refresh (`docs/10`, `icd_shim/src/limits.rs`) — and
 the declaration is the guest's own in every case, so the cap never moves it. Under
 frame generation the app disarms gamescope's limiter and the shim's gate holds the

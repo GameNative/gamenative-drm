@@ -149,6 +149,16 @@ static ACQ_SEQ: AtomicUsize = AtomicUsize::new(0);
 // line is itself logf!-gated. Microseconds because the signal being chased (a
 // missed 8.33 ms vblank) is sub-ms at the acquire itself: a 0.5 ms wait is
 // invisible at millisecond resolution.
+/// Time spent inside `vkQueuePresentKHR`, in microseconds: the frame's own
+/// window, between the acquire returning and the next one starting. `acqus`
+/// covers only the acquire, so a guest that stalls in present showed up as an
+/// unexplained gap between two fast acquires.
+static PRESENT_US_N: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_US_SUM: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_US_MAX: AtomicUsize = AtomicUsize::new(0);
+/// Presents that took at least one 60 Hz vblank, the scale at which a present
+/// stall is visible to the panel.
+static PRESENT_US_GE_VBLANK: AtomicUsize = AtomicUsize::new(0);
 static ACQ_US_N: AtomicUsize = AtomicUsize::new(0);
 static ACQ_US_SUM: AtomicUsize = AtomicUsize::new(0);
 static ACQ_US_MAX: AtomicUsize = AtomicUsize::new(0);
@@ -220,6 +230,7 @@ static SHIM_T0_NS: AtomicU64 = AtomicU64::new(0);
 /// where the daemon is not naming every buffer the guest holds.
 static NOTES_APPLIED: AtomicUsize = AtomicUsize::new(0);
 static PARK_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+
 static GATE_HOLD_MAX_US: AtomicUsize = AtomicUsize::new(0);
 
 /// Record the interval since the previous present. Called once per present at
@@ -437,7 +448,7 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
 fn counters() -> String {
     format!(
         "{}",
-        format_args!("acq={} pres={} rel={} commit={} starved={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} acq_fps={:.2}]",
+        format_args!("acq={} pres={} rel={} commit={} starved={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} acq_fps={:.2}] presus=[n={} sum={} max={} ge16667={}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
@@ -463,7 +474,11 @@ fn counters() -> String {
                 GATE_HOLD_SUM_US.load(Ordering::Relaxed),
                 gate_hold_avg_us(),
                 GATE_HOLD_MAX_US.load(Ordering::Relaxed),
-                acq_fps(),)
+                acq_fps(),
+                PRESENT_US_N.load(Ordering::Relaxed),
+                PRESENT_US_SUM.load(Ordering::Relaxed),
+                PRESENT_US_MAX.load(Ordering::Relaxed),
+                PRESENT_US_GE_VBLANK.load(Ordering::Relaxed),)
     )
 }
 
@@ -2772,6 +2787,68 @@ unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
     }
 }
 
+/// What a wait ended as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waited {
+    /// The span elapsed (or something woke it).
+    Slept,
+    /// The caller's own `timeout` ran out first.
+    Expired,
+}
+
+/// Why an acquire is blocked, for the census.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Blocked {
+    /// It was not blocked: the image was free and the schedule allowed it.
+    None,
+    /// The cap: the schedule had not reached this frame's release point.
+    Rate,
+    /// The pipeline: every image was held by the compositor.
+    Slot,
+}
+
+/// The one sleep in the acquire: `ns` on the swapchain's free-slot condition, or
+/// until the caller's `deadline` if that comes first.
+///
+/// Both conditions use it, so the deadline arithmetic exists once and a wake-up
+/// can never be mistaken for a decision.
+unsafe fn sleep_ns(
+    sc: *mut GnSwapchain,
+    g: MutexGuard<'_, ScShared>,
+    ns: u64,
+    deadline: Option<Instant>,
+) -> (MutexGuard<'_, ScShared>, Waited) {
+    let mut wait = Duration::from_nanos(ns);
+    if let Some(dl) = deadline {
+        let left = dl.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return (g, Waited::Expired);
+        }
+        wait = wait.min(left);
+    }
+    // SAFETY: `sc` is live for the call and `g` is the guard being released.
+    let (guard, _) = unsafe { (*sc).cv_free.wait_timeout(g, wait) }.unwrap();
+    (guard, Waited::Slept)
+}
+
+/// One acquired frame: the totals and the cadence the census reads.
+fn note_acquire_granted(now_ns: u64) {
+    ACQ_OK_N.fetch_add(1, Ordering::Relaxed);
+    let last = ACQ_LAST_NS.swap(now_ns, Ordering::Relaxed);
+    if last == 0 {
+        return;
+    }
+    let gap = now_ns.saturating_sub(last);
+    let bucket = match gap {
+        0..=13_999_999 => 0,
+        14_000_000..=16_199_999 => 1,
+        16_200_000..=17_199_999 => 2,
+        17_200_000..=19_999_999 => 3,
+        _ => 4,
+    };
+    ACQ_SPACING[bucket].fetch_add(1, Ordering::Relaxed);
+}
+
 unsafe fn gn_acquire_common(
     sc: *mut GnSwapchain,
     timeout: u64,
@@ -2793,8 +2870,9 @@ unsafe fn gn_acquire_common(
         [timeout as usize, sem as usize, fence as usize, 0, 0],
     );
     let deadline = (timeout != u64::MAX).then(|| Instant::now() + Duration::from_nanos(timeout));
-    // The time gate: a frame that may not start yet waits before it is given an
-    // image. Which clock it runs on, if any, is `acquire_pacing`'s rule.
+    // Two things hold a frame, and they are independent: the schedule (the cap)
+    // and an image being free (the pipeline). The loop asks each in turn, in that
+    // order, and sleeps in exactly one place.
     let pacing = unsafe { acquire_pacing(sc) };
     let gated = pacing != crate::vsync_gate::Pacing::Off;
     if gated {
@@ -2803,124 +2881,77 @@ unsafe fn gn_acquire_common(
         ACQ_UNGATED_N.fetch_add(1, Ordering::Relaxed);
     }
     let mut idx: i32 = -1;
-    let mut timed_out = false;
-    // First instant this acquire was parked by the deadline, 0 while it never
-    // was: the census reads one park per acquire, not one per wait, because a
-    // wake-up that finds the deadline still ahead parks again.
-    let mut hold_from: u64 = 0;
-    let mut slot_waited = false;
+    // Why this acquire waited, and since when: one census sample per acquire,
+    // never one per turn of the loop.
+    let mut blocked = Blocked::None;
+    let mut blocked_at = 0u64;
     {
         let mut g = (*sc).shared.lock().unwrap();
         loop {
-            if gated && !g.stopping {
-                let now_ns = monotonic_ns();
-                let next_ns = (*sc).release.next_ns;
-                if next_ns != 0 && now_ns < next_ns {
+            if idx >= 0 || g.stopping {
+                break;
+            }
+            // 1. The cap. A frame may not start before the schedule says.
+            if gated {
+                let due = (*sc).release.next_ns;
+                let now = monotonic_ns();
+                if due != 0 && now < due {
                     if timeout == 0 {
                         break;
                     }
-                    if hold_from == 0 {
-                        hold_from = now_ns;
+                    if blocked == Blocked::None {
+                        blocked = Blocked::Rate;
+                        blocked_at = now;
                     }
-                    let mut wait = Duration::from_nanos(next_ns - now_ns);
-                    if let Some(dl) = deadline {
-                        let left = dl.saturating_duration_since(Instant::now());
-                        if left.is_zero() {
-                            timed_out = true;
-                            break;
-                        }
-                        wait = wait.min(left);
-                    }
-                    let (guard, _res) = (*sc).cv_free.wait_timeout(g, wait).unwrap();
+                    let (guard, waited) =
+                        unsafe { sleep_ns(sc, g, due.saturating_sub(now), deadline) };
                     g = guard;
-                    continue;
+                    match waited {
+                        Waited::Slept => continue,
+                        Waited::Expired => break,
+                    }
                 }
             }
+            // 2. An image.
             unsafe { acquire_take_free(sc, &mut idx) };
             if idx >= 0 {
-                ACQ_OK_N.fetch_add(1, Ordering::Relaxed);
-                let now_ns = monotonic_ns();
-                // For the census's acquire-to-commit time, gated or not.
-                (*(*sc).slots.as_mut_ptr().add(idx as usize)).acquired_ns = now_ns;
-                // The cadence the cap is supposed to set, measured where it is
-                // decided rather than downstream of the present.
-                let last = ACQ_LAST_NS.swap(now_ns, Ordering::Relaxed);
-                if last != 0 {
-                    let gap = now_ns.saturating_sub(last);
-                    let b = match gap {
-                        0..=13_999_999 => 0,
-                        14_000_000..=16_199_999 => 1,
-                        16_200_000..=17_199_999 => 2,
-                        17_200_000..=19_999_999 => 3,
-                        _ => 4,
-                    };
-                    ACQ_SPACING[b].fetch_add(1, Ordering::Relaxed);
-                }
-                if hold_from != 0 {
-                    GATE_WAIT_NS.fetch_add(now_ns.saturating_sub(hold_from), Ordering::Relaxed);
-                }
-                if gated {
-                    // One timeline for the whole swapchain: the next frame may
-                    // not start before the release this one was booked to.
-                    (*sc).release.book_paced(now_ns, pacing);
-                }
                 break;
             }
-            if !slot_waited {
-                // Past the gate (if any) with no image free: this acquire waits
-                // on the compositor's release.
-                slot_waited = true;
+            if blocked == Blocked::None {
+                blocked = Blocked::Slot;
+                blocked_at = monotonic_ns();
                 SLOT_WAIT_N.fetch_add(1, Ordering::Relaxed);
-            }
-            if g.stopping {
-                break;
             }
             if timeout == 0 {
                 break;
             }
-            if let Some(dl) = deadline {
-                if Instant::now() >= dl {
-                    timed_out = true;
-                    break;
-                }
-            }
-            // Blocked here the guest is waiting for exactly a slot release. The
-            // present worker only reaps X11 Present idle fences on its 2 s idle
-            // tick, so left to it the acquire always ends on that timeout — a
-            // self-throttle at ~1/2 s per freed slot. Drop the lock and poll the
-            // fences directly so a slot frees as soon as the server drops its
-            // pixmap, instead of a timer.
+            // Nothing free: let the release side make one free, then sleep a
+            // slice on the event that will.
             drop(g);
             unsafe { x11_reap(sc) };
-            // Read what the daemon has pushed while the guest was blocked here:
-            // a release note is what frees a parked slot, and a guest waiting on
-            // one produces no other event that would read it.
             crate::scanout::poll_notes();
             g = (*sc).shared.lock().unwrap();
-            unsafe { acquire_take_free(sc, &mut idx) };
-            if idx >= 0 || g.stopping {
+            if g.stopping {
                 break;
             }
-            // A parked slot can only be freed by a note, so the wait is a poll
-            // of the channel at the note's own scale rather than the idle slice.
-            let base = if unsafe { any_parked(sc) } {
+            // The release side has had its turn: a slot it freed is taken here,
+            // without paying for another trip round the loop.
+            unsafe { acquire_take_free(sc, &mut idx) };
+            if idx >= 0 {
+                break;
+            }
+            // A parked slot is freed by a note, so that wait is a poll of the
+            // channel at the note's own scale; otherwise the idle slice.
+            let slice = if unsafe { any_parked(sc) } {
                 PARKED_SLICE
             } else {
                 REAP_SLICE
             };
-            let slice = match deadline {
-                Some(dl) => {
-                    let now = Instant::now();
-                    if now >= dl {
-                        timed_out = true;
-                        break;
-                    }
-                    (dl - now).min(base)
-                }
-                None => base,
-            };
-            let (guard, _res) = (*sc).cv_free.wait_timeout(g, slice).unwrap();
+            let (guard, waited) = unsafe { sleep_ns(sc, g, slice.as_nanos() as u64, deadline) };
             g = guard;
+            if waited == Waited::Expired {
+                break;
+            }
         }
         if g.stopping && idx < 0 {
             drop(g);
@@ -2928,16 +2959,26 @@ unsafe fn gn_acquire_common(
         }
         drop(g);
     }
-    if idx < 0 {
+    if idx >= 0 {
+        let now = monotonic_ns();
+        // What this acquire produced, and the cadence it produced it at.
+        note_acquire_granted(now);
+        // One timeline for the whole swapchain: the next frame may not start
+        // before one period after this one *actually* started.
+        if gated {
+            (*sc).release.book_paced(now, pacing);
+        }
+        // SAFETY: `idx` is a slot of this swapchain.
+        (*(*sc).slots.as_mut_ptr().add(idx as usize)).acquired_ns = now;
+        if blocked == Blocked::Rate {
+            let us = now.saturating_sub(blocked_at) as usize / 1_000;
+            GATE_HOLD_N.fetch_add(1, Ordering::Relaxed);
+            GATE_HOLD_SUM_US.fetch_add(us, Ordering::Relaxed);
+            GATE_HOLD_MAX_US.fetch_max(us, Ordering::Relaxed);
+        }
+    } else {
         ACQ_RETRY_N.fetch_add(1, Ordering::Relaxed);
     }
-    if idx >= 0 && hold_from != 0 {
-        let held_us = monotonic_ns().saturating_sub(hold_from) as usize / 1_000;
-        GATE_HOLD_N.fetch_add(1, Ordering::Relaxed);
-        GATE_HOLD_SUM_US.fetch_add(held_us, Ordering::Relaxed);
-        GATE_HOLD_MAX_US.fetch_max(held_us, Ordering::Relaxed);
-    }
-    let _ = timed_out;
     if idx < 0 {
         // Every slot is held by the compositor. This is the signature to look
         // for when the game goes silent: an app that spins here is waiting for
@@ -3350,6 +3391,24 @@ unsafe extern "C" fn gn_vkReleaseSwapchainImagesKHR(
 }
 
 unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentInfoKHR) -> VkResult {
+    // The present's own duration, the analogue of `acqus`: the acquire is
+    // microseconds, so where a frame actually goes is this.
+    if !crate::vkshim_enabled() {
+        return unsafe { present_body(queue, pi) };
+    }
+    let t0 = Instant::now();
+    let res = unsafe { present_body(queue, pi) };
+    let us = t0.elapsed().as_micros() as usize;
+    PRESENT_US_N.fetch_add(1, Ordering::Relaxed);
+    PRESENT_US_SUM.fetch_add(us, Ordering::Relaxed);
+    PRESENT_US_MAX.fetch_max(us, Ordering::Relaxed);
+    if us >= 16_667 {
+        PRESENT_US_GE_VBLANK.fetch_add(1, Ordering::Relaxed);
+    }
+    res
+}
+
+unsafe fn present_body(queue: VkQueue, pi: *const VkPresentInfoKHR) -> VkResult {
     // The WSI census exists to be read under `GNDRM_LOG_VKSHIM`, and every line
     // that prints it is gated the same way, so its accounting is skipped when
     // the gate is off: a present would otherwise be a clock read and five
@@ -6914,14 +6973,6 @@ mod tests {
         }
     }
 
-    fn test_grid(period_ns: u64) -> crate::vsync_gate::Grid {
-        crate::vsync_gate::Grid {
-            anchor_ns: 1_000_000_000,
-            period_ns,
-            clock: crate::vsync_gate::GateClock::Vsync,
-        }
-    }
-
     #[test]
     fn the_declaration_is_the_guest_mode_except_for_generation() {
         let (m, f, i, r) = (
@@ -6945,43 +6996,27 @@ mod tests {
     #[test]
     fn the_gate_follows_the_acquire_limit_whatever_the_declaration() {
         use crate::vsync_gate::{GateClock, Pacing};
-        let g = test_grid(16_675_004);
-        let grid = Some(g);
         // Every declaration the shim makes is gated: no mode is a pacer on this
-        // route (see `gamescope_route_pacing`). A cap on the panel's own rate is
-        // one release per vblank.
+        // route (see `gamescope_route_pacing`), and the period is the cap's own
+        // whatever the panel is doing.
         for declared in [Declared::Mode, Declared::Generating] {
-            let cpu = gamescope_route_pacing(declared, 60, grid);
-            assert_ne!(cpu, Pacing::Off, "{declared:?} 60 on a 60 Hz panel");
+            assert_eq!(
+                gamescope_route_pacing(declared, 60),
+                Pacing::Clock {
+                    period_ns: 16_666_666
+                }
+            );
         }
-        assert_eq!(
-            gamescope_route_pacing(Declared::Mode, 60, grid),
-            Pacing::Grid {
-                grid: g,
-                interval_ns: 16_675_004
-            }
-        );
         // The cell gamescope's integer divisor cannot express: 60/40 truncates to
         // 1, so nothing limits 40 on a 60 Hz panel but this gate.
         assert_eq!(
-            gamescope_route_pacing(Declared::Mode, 40, grid),
-            Pacing::Grid {
-                grid: g,
-                interval_ns: 25_000_000
-            }
-        );
-        // And a cap above the panel has no vblank to snap to: its own clock.
-        assert_eq!(
-            gamescope_route_pacing(Declared::Mode, 120, grid).clock(),
-            GateClock::Clock
-        );
-        // Generation holds the source rate on its own clock, whatever the mode.
-        assert_eq!(
-            gamescope_route_pacing(Declared::Generating, 40, grid),
+            gamescope_route_pacing(Declared::Mode, 40),
             Pacing::Clock {
                 period_ns: 25_000_000
             }
         );
+        // And a cap above the panel is the same rule, not a special case.
+        assert_eq!(gamescope_route_pacing(Declared::Mode, 120).clock(), GateClock::Clock);
     }
 
     #[test]
@@ -7071,7 +7106,7 @@ mod tests {
 // present -> worker commit -> compositor release). Bounded counters, so
 // steady-state frame pacing stays silent in logcat.
 use std::ptr;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const GN_MAX_SC_IMAGES: usize = 8;
@@ -10009,17 +10044,13 @@ unsafe fn acquire_pacing(sc: *mut GnSwapchain) -> crate::vsync_gate::Pacing {
         return crate::vsync_gate::Pacing::on_clock(acquire);
     }
     let (_, declared) = unsafe { live_choice(sc) };
-    gamescope_route_pacing(declared, acquire, crate::vsync_gate::current_grid())
+    gamescope_route_pacing(declared, acquire)
 }
 
 /// [`acquire_pacing`]'s rule on gamescope's override route, for what the commit
 /// declares ([`choose_live_mode`]), the session's acquire limit and the
 /// display's vblank grid.
-fn gamescope_route_pacing(
-    declared: Declared,
-    acquire: u32,
-    grid: Option<crate::vsync_gate::Grid>,
-) -> crate::vsync_gate::Pacing {
+fn gamescope_route_pacing(declared: Declared, acquire: u32) -> crate::vsync_gate::Pacing {
     match declared {
         // Generated frames are placed on the latch grid by the generator, so
         // the gate holds the source rate on its own clock.
@@ -10029,7 +10060,7 @@ fn gamescope_route_pacing(
         // waits on one, and its divisor only bites when the cap is below the
         // refresh AND divides it. Standing down here is what left a 60/60 and a
         // 40/60 session with no cap at all.
-        Declared::Mode => crate::vsync_gate::pacing(acquire, grid),
+        Declared::Mode => crate::vsync_gate::pacing(acquire),
     }
 }
 
@@ -10120,8 +10151,6 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
     }
     let (presented, discarded, fallback) = crate::present::feedback_counts();
     let (late, skipped) = crate::vsync_gate::late_counts();
-    let (book_on, book_under, book_late, book_clock, book_behind) =
-        crate::vsync_gate::book_counts();
     // A cumulative counter is a rate only with its denominator: the session's
     // own age, from the first acquire.
     let t0 = SHIM_T0_NS.load(Ordering::Relaxed);
@@ -10132,7 +10161,7 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
     };
     // Since the last line, so each line reads one window's cadence.
     let gaps = COMMIT_GAPS.each_ref().map(|b| b.swap(0, Ordering::Relaxed));
-    crate::logf!("present mode: declared={} source={} route={} cap={} gate={} lsfg={} acquire={} generate={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} at_queue={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}] gated={} ungated={} book=[on:{} under:{} late:{} clock:{} behind_us:{}] gate_wait_us={} acq_spacing=[<14:{} 14-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}] age_s={} calls={} ok={} retry={} notes={} park_timeouts={}",
+    crate::logf!("present mode: declared={} source={} route={} cap={} gate={} lsfg={} acquire={} generate={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} at_queue={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}] gated={} ungated={} gate_wait_us={} acq_spacing=[<14:{} 14-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}] age_s={} calls={} ok={} retry={} notes={} park_timeouts={}",
         mode_name(line.declared),
         line.source,
         if route { "gamescope" } else { "x11" },
@@ -10163,11 +10192,6 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
         gaps[4],
         ACQ_GATED_N.load(Ordering::Relaxed),
         ACQ_UNGATED_N.load(Ordering::Relaxed),
-        book_on,
-        book_under,
-        book_late,
-        book_clock,
-        book_behind / 1_000,
         GATE_WAIT_NS.load(Ordering::Relaxed) / 1_000,
         ACQ_SPACING[0].load(Ordering::Relaxed),
         ACQ_SPACING[1].load(Ordering::Relaxed),

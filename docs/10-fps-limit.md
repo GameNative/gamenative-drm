@@ -141,23 +141,29 @@ divisor cap reads its target exactly.
   the source rate on its own clock and the generator places the batches on the
   latch grid (`docs/17`).
 
-  The gate (`icd_shim/src/vsync_gate.rs`) releases acquires on the vblank grid
-  gamescope composites from, not on a clock of its own: the daemon's `VsyncNote`
-  latch grid (measured period and phase) moved earlier by the lead the daemon
-  stamps flip events with (`stamp_lead_ns`). A limit that is the display's rate
-  releases every vblank; one that divides the rate, every `refresh / limit`-th
-  vblank; any other limit below the rate, the vblank nearest each instant of an
-  ideal timeline, which averages the limit on vblank boundaries (45 on 60 releases
-  3 of 4 vblanks); one above the rate, its own clock. A frame that arrives after
-  its release point starts at once, and the release after it is never more than
-  one grid instant after it, so a game below the limit keeps its own rate. A gate
-  on the shim's own `1e9 / N` clock, as before 7bdcbae, beat against the panel:
-  57-59 fps on `SurfaceFlinger` at a 60 cap on a 59.97 Hz panel.
+  The gate (`icd_shim/src/vsync_gate.rs`) is one regulator and one rule: a frame
+  may start `1e9 / limit` after the previous frame started, and not before.
 
-  Until a note carrying the lead has arrived (no note yet, or a daemon that
-  predates the field and sends 0) the gate cannot run on the grid and paces on its
-  own clock, `gate=clock`. A swapchain created before the lead is known keeps the
-  slot count of the guest's own request until it is recreated.
+  ```
+  gate:  while now < next_ns { wait until next_ns }
+  book:  next_ns = now + period        (now is the release just granted)
+  ```
+
+  So the limit is a maximum by construction — two releases are never closer than
+  one period, because the second is booked one period after the first actually
+  happened — a stall carries no debt (a late frame books the next one after
+  itself, never a catch-up), and a game slower than the limit is never held (its
+  next acquire is already past `next_ns`).
+
+  Releases are *not* snapped to the display's vblank grid. A grid-snapped release
+  holds the phase but bounds only the average rate: a release a slot wait delayed
+  lands between vblanks, and the next booking on the following vblank could be a
+  fraction of a period later. Measured on this path at a 60 limit: 74.7 frames/s
+  with the gate holding 8 % of acquires. The daemon's latch grid is still used
+  where a phase is what is wanted — frame generation places its batches on it
+  (`docs/17`) — not to limit a rate.
+
+  `gate=clock` is every gated session now; `gate=off` means no limit.
 
   The census says which path ran. Ungated, once when frames first flow and again
   whenever the declaration, its source, the cap, the limits or the gate changes:

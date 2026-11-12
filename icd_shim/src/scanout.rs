@@ -123,28 +123,6 @@ pub(crate) fn period_ns(target_fps: u32) -> u64 {
     NANOS_PER_SECOND / u64::from(target_fps)
 }
 
-/// The instant the next acquire may start, given the previous one and now.
-///
-/// The cap is applied here rather than to a release: a frame that may not start
-/// yet is the only point where waiting costs neither rendered work nor display
-/// latency. `prev + period` holds the interval at the target while the guest
-/// keeps up: the wait for `prev` returns a hair late, and that hair must not
-/// become the cadence (it did, as `max(prev, now) + period`: a 60 cap ran at
-/// 59.4). Once the guest is a whole period behind it is its own rate again,
-/// `now + period` — never two frames closer than one period, and no debt
-/// carried out of a stall.
-#[must_use]
-pub(crate) fn next_acquire_after(prev_ns: u64, now_ns: u64, period_ns: u64) -> u64 {
-    if period_ns == 0 {
-        return prev_ns;
-    }
-    if prev_ns != 0 && now_ns < prev_ns.saturating_add(period_ns) {
-        prev_ns + period_ns
-    } else {
-        now_ns.saturating_add(period_ns)
-    }
-}
-
 /// Adopt one frame-cap note: the target it carries.
 fn apply_note(note: FrameCapNote) {
     NOTES_N.fetch_add(1, Ordering::Relaxed);
@@ -171,7 +149,6 @@ pub(crate) fn cap_fps_note() -> u32 {
 /// latch grid, and the acquire gate releases on the vblank grid it gives.
 fn apply_vsync(note: VsyncNote) {
     crate::lsfg::apply_vsync(note);
-    crate::vsync_gate::apply_note(note);
 }
 
 /// How many frame-cap notes have been adopted on this connection, for the same
@@ -1037,38 +1014,11 @@ mod tests {
         }
     }
 
-    /// The acquire schedule: one period after the previous start, never closer,
-    /// and never later than the guest's own next frame when it is slower.
+    /// The cap's period is truncated, never rounded up past `1 / target`, and no
+    /// cap has none. The schedule built on it lives in `crate::vsync_gate`.
     #[test]
-    fn the_cadence_does_not_carry_the_wakeup_overshoot() {
-        let period = 16_666_666;
-        let first = next_acquire_after(0, 1_000_000_000, period);
-        assert_eq!(first, 1_016_666_666);
-        // The wait returned 150 us late: the next deadline is still one period on.
-        let second = next_acquire_after(first, first + 150_000, period);
-        assert_eq!(second, first + period);
-        // A whole period late: no debt.
-        let third = next_acquire_after(second, second + period + 5_000_000, period);
-        assert_eq!(third, second + period + 5_000_000 + period);
-    }
-
-    #[test]
-    fn the_acquire_schedule_spaces_frame_starts() {
-        let period = period_ns(40);
-        assert_eq!(period, 25_000_000);
-        // The first acquire schedules the next one a period later.
-        let first = next_acquire_after(0, 1_000_000_000, period);
-        assert_eq!(first, 1_025_000_000);
-        // A guest faster than the target: every start is exactly one period on.
-        assert_eq!(next_acquire_after(first, 1_001_000_000, period), 1_050_000_000);
-        assert_eq!(next_acquire_after(1_050_000_000, 1_002_000_000, period), 1_075_000_000);
-        // A guest slower than the target keeps its own rate: the gate is a lower
-        // bound, not a delay.
-        assert_eq!(next_acquire_after(1_075_000_000, 1_200_000_000, period), 1_225_000_000);
-        // No cap: the schedule is left alone, so enabling one later does not
-        // inherit a stale deadline.
-        assert_eq!(next_acquire_after(1_225_000_000, 5, 0), 1_225_000_000);
-        // A period is truncated, never rounded up past `1 / target`.
+    fn a_caps_period_is_truncated_and_no_cap_has_none() {
+        assert_eq!(period_ns(40), 25_000_000);
         assert_eq!(period_ns(FPS_UNCAPPED), 0);
         assert_eq!(period_ns(3), 333_333_333);
     }
