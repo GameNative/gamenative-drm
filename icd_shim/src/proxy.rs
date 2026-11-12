@@ -231,6 +231,30 @@ static SHIM_T0_NS: AtomicU64 = AtomicU64::new(0);
 static NOTES_APPLIED: AtomicUsize = AtomicUsize::new(0);
 static PARK_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
 
+/// Commits whose slot carried a present id but no wait id: the present armed the
+/// id, so something cleared it between the present and the commit. The release
+/// handler is the only other writer, and a frame that loses its id this way is
+/// one `present::committed` never registers, leaving its wait with no bound.
+static NOID_AT_COMMIT: AtomicUsize = AtomicUsize::new(0);
+
+/// How long after its park the note that freed a slot arrived, bucketed at 5 ms,
+/// 33 ms (the park bound) and 100 ms. `notes=` alone cannot tell a note that
+/// arrived in time from one that arrived after the guest had already gone on.
+static NOTELAG: [AtomicUsize; 4] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
+
+fn note_lag_bucket(ns: u64) -> usize {
+    match ns {
+        0..5_000_000 => 0,
+        5_000_000..33_000_000 => 1,
+        33_000_000..100_000_000 => 2,
+        _ => 3,
+    }
+}
 static GATE_HOLD_MAX_US: AtomicUsize = AtomicUsize::new(0);
 
 /// Record the interval since the previous present. Called once per present at
@@ -2098,6 +2122,13 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
         // that names its buffer in an atomic commit. The worker may wait for an
         // allocation exchange in flight, which is bounded by that exchange's own
         // timeout; a mark that never arrives would leave a wait hanging.
+        let presented_id = (*s).present_id;
+        if presented_id != 0 && (*s).wait_id == 0 {
+            // The present set both, so an id with no wait here means something
+            // cleared `wait_id` before this commit ran — the release handler,
+            // which reads and clears it from the dispatch thread.
+            NOID_AT_COMMIT.fetch_add(1, Ordering::Relaxed);
+        }
         if (*s).present_id != 0 && (*s).ino != 0 {
             crate::scanout::send_present_mark((*s).ino, (*s).present_id);
             // One mark per frame: a guest that stops chaining ids must not keep
@@ -2757,6 +2788,8 @@ unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
         };
         if released {
             NOTES_APPLIED.fetch_add(1, Ordering::Relaxed);
+            let lag = now.saturating_sub(unsafe { (*s).parked_ns });
+            NOTELAG[note_lag_bucket(lag)].fetch_add(1, Ordering::Relaxed);
         } else if unsafe { (*s).parked_ns != 0 }
             && now.saturating_sub(unsafe { (*s).parked_ns }) >= RELEASE_NOTE_LIMIT_NS
         {
@@ -10150,6 +10183,7 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
         return;
     }
     let (presented, discarded, fallback) = crate::present::feedback_counts();
+    let wait_census = crate::present::wait_census();
     let (late, skipped) = crate::vsync_gate::late_counts();
     // A cumulative counter is a rate only with its denominator: the session's
     // own age, from the first acquire.
@@ -10161,7 +10195,7 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
     };
     // Since the last line, so each line reads one window's cadence.
     let gaps = COMMIT_GAPS.each_ref().map(|b| b.swap(0, Ordering::Relaxed));
-    crate::logf!("present mode: declared={} source={} route={} cap={} gate={} lsfg={} acquire={} generate={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} at_queue={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}] gated={} ungated={} gate_wait_us={} acq_spacing=[<14:{} 14-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}] age_s={} calls={} ok={} retry={} notes={} park_timeouts={}",
+    crate::logf!("present mode: declared={} source={} route={} cap={} gate={} lsfg={} acquire={} generate={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} at_queue={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}] gated={} ungated={} gate_wait_us={} acq_spacing=[<14:{} 14-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}] age_s={} calls={} ok={} retry={} notes={} park_timeouts={} rnotes={} noid={} notelag=[<5:{} <33:{} <100:{} >100:{}] waitans=[n:{} q:{} commit:{} fb:{} daemon:{} grace:{} release:{} discard:{} unarmed:{} timeout:{} nocommit:{}]",
         mode_name(line.declared),
         line.source,
         if route { "gamescope" } else { "x11" },
@@ -10203,7 +10237,24 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
         ACQ_OK_N.load(Ordering::Relaxed),
         ACQ_RETRY_N.load(Ordering::Relaxed),
         NOTES_APPLIED.load(Ordering::Relaxed),
-        PARK_TIMEOUTS.load(Ordering::Relaxed),);
+        PARK_TIMEOUTS.load(Ordering::Relaxed),
+        crate::scanout::release_notes_received(),
+        NOID_AT_COMMIT.load(Ordering::Relaxed),
+        NOTELAG[0].load(Ordering::Relaxed),
+        NOTELAG[1].load(Ordering::Relaxed),
+        NOTELAG[2].load(Ordering::Relaxed),
+        NOTELAG[3].load(Ordering::Relaxed),
+        wait_census[0],
+        wait_census[1],
+        wait_census[2],
+        wait_census[3],
+        wait_census[4],
+        wait_census[5],
+        wait_census[6],
+        wait_census[7],
+        wait_census[8],
+        wait_census[9],
+        wait_census[10],);
 }
 
 /// The wire value for `gamescope_swapchain.set_present_mode` that declares

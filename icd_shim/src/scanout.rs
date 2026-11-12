@@ -698,6 +698,13 @@ pub(crate) fn release_notes_live() -> bool {
     RELEASE_NOTES.load(Ordering::Relaxed) != 0
 }
 
+/// Release notes received this session, for the census: the denominator of
+/// `notes=` (parks a note resolved), which says whether a park that timed out
+/// lost the note or was never sent one.
+pub(crate) fn release_notes_received() -> u64 {
+    RELEASE_NOTES.load(Ordering::Relaxed)
+}
+
 /// Take a release note for `ino` that arrived at or after `since_ns`, and drop
 /// every older note for the same buffer.
 ///
