@@ -111,6 +111,7 @@ static LSFG_SETTINGS: Mutex<LsfgConfig> = Mutex::new(LsfgConfig {
     flow_per_mille: 0,
     performance: 0,
     fps_limit: 0,
+    present_mode: 0,
     dll: [0; gndrm_uapi::wire::LSFG_DLL_PATH_MAX],
     refresh_mhz: 0,
 });
@@ -142,7 +143,8 @@ pub(crate) fn panel_refresh_mhz() -> u32 {
     gndrm_daemon::advertised_refresh_mhz()
 }
 
-/// `GameNativeDrm.nativeSetLsfgConfig(enabled, multiplier, flowPerMille, performance, fpsLimit, dllPath)`.
+/// `GameNativeDrm.nativeSetLsfgConfig(enabled, multiplier, flowPerMille,
+/// performance, fpsLimit, presentMode, dllPath)`.
 ///
 /// Called by the app before or during a session; the value is read when the
 /// shim asks, so a change reaches the next device the guest creates.
@@ -155,6 +157,7 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetLsfgCo
     flow_per_mille: jint,
     performance: jboolean,
     fps_limit: jint,
+    present_mode: jint,
     dll: JString,
 ) {
     // Read the string before the guarded section: `JNIEnv` is not unwind-safe.
@@ -169,6 +172,11 @@ pub extern "system" fn Java_app_gamenative_display_GameNativeDrm_nativeSetLsfgCo
         settings.flow_per_mille = flow_per_mille.clamp(0, 1000) as u32;
         settings.performance = u32::from(performance != 0);
         settings.fps_limit = fps_limit.max(0) as u32;
+        // The QuickMenu's present mode for generation: 1 = fifo, anything else
+        // mailbox. Generation has no third option — a generated frame cannot be
+        // told apart from a tear if it is flipped mid-scan — so the range is
+        // pinned here rather than trusted from the caller.
+        settings.present_mode = u32::from(present_mode == 1);
         // The presenter cannot read the container's environment, so the path of
         // the DLL it has to read the shaders from rides with the settings.
         settings.set_dll_path(&dll_path);

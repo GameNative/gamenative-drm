@@ -7033,10 +7033,17 @@ mod tests {
             VK_PRESENT_MODE_FIFO_RELAXED_KHR,
         );
         // Nothing rewrites the request: not the cap, not the panel, not the
-        // lead. A generated frame is the one exception, and it is not the
-        // guest's present at all.
-        for mode in [m, f, i, r] {
+        // lead. Two exceptions, neither of them the guest's present as asked: a
+        // generated frame, and `IMMEDIATE`, which is served as MAILBOX so a frame
+        // that cannot be shown is dropped rather than scanned out mid-flip.
+        for mode in [m, f, r] {
             assert_eq!(choose_live_mode(mode, false), (mode, Declared::Mode));
+        }
+        assert_eq!(
+            choose_live_mode(i, false),
+            (VK_PRESENT_MODE_MAILBOX_KHR, Declared::Mode)
+        );
+        for mode in [m, f, i, r] {
             assert_eq!(
                 choose_live_mode(mode, true),
                 (VK_PRESENT_MODE_MAILBOX_KHR, Declared::Generating)
@@ -7931,9 +7938,18 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
         // 99 % and `in_flight` pinned at the depth. FIFO_RELAXED stays synced:
         // the spec lets it return a late frame early, and holding it to the note
         // is the conservative side of a row the table already calls synced.
+        // The *served* mode, not the declared one: an immediate guest is served as
+        // mailbox above, and a mailbox frame is replaced at a vblank rather than
+        // shown mid-scan — so its buffer still has to survive its scan-out, exactly
+        // as a FIFO frame's does. Keying this on the declaration would free the slot
+        // at the compositor's release again and let the guest write into a buffer
+        // the display is reading.
+        let served = live_choice(sc).0;
         let synced = matches!(
-            (*sc).present_mode,
-            VK_PRESENT_MODE_FIFO_KHR | VK_PRESENT_MODE_FIFO_RELAXED_KHR
+            served,
+            VK_PRESENT_MODE_FIFO_KHR
+                | VK_PRESENT_MODE_FIFO_RELAXED_KHR
+                | VK_PRESENT_MODE_MAILBOX_KHR
         );
         if synced && (*slot).ino != 0 && crate::scanout::release_notes_live() {
             (*slot).parked_ns = monotonic_ns();
@@ -10074,10 +10090,28 @@ unsafe fn live_choice(sc: *mut GnSwapchain) -> (VkPresentModeKHR, Declared) {
     choose_live_mode(mode, crate::lsfg::wanted().is_some())
 }
 
-/// [`live_choice`]'s rule: the guest's mode, except for a generated frame.
+/// [`live_choice`]'s rule: the guest's mode, except for a generated frame, and
+/// except that `IMMEDIATE` is served as `MAILBOX`.
+///
+/// `IMMEDIATE` and `MAILBOX` differ only in what happens to a frame that cannot
+/// be shown: immediate presents it anyway and tears, mailbox replaces the pending
+/// one. A guest that asks immediate therefore gets its frames dropped for it
+/// instead of being shown mid-scan, which is what the container used to do with
+/// `MESA_VK_WSI_PRESENT_MODE` and no longer may. The declaration follows the same
+/// mode, so gamescope is told what is actually served.
 fn choose_live_mode(mode: VkPresentModeKHR, generating: bool) -> (VkPresentModeKHR, Declared) {
     if generating {
-        (VK_PRESENT_MODE_MAILBOX_KHR, Declared::Generating)
+        // The QuickMenu offers mailbox and fifo for generation and nothing else,
+        // and the note carries the choice (`LsfgConfig::present_mode`); anything
+        // unknown is mailbox.
+        let served = if crate::lsfg::generating_present_mode() == 1 {
+            VK_PRESENT_MODE_FIFO_KHR
+        } else {
+            VK_PRESENT_MODE_MAILBOX_KHR
+        };
+        (served, Declared::Generating)
+    } else if mode == VK_PRESENT_MODE_IMMEDIATE_KHR {
+        (VK_PRESENT_MODE_MAILBOX_KHR, Declared::Mode)
     } else {
         (mode, Declared::Mode)
     }

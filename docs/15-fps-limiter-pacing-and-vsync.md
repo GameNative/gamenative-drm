@@ -11,7 +11,7 @@ cursor, scan-out and mode patches.
 
 | place | what it holds | set by |
 |---|---|---|
-| the shim's declared present mode | the mode the guest asked for; FIFO under a cap at the display's rate when the guest asked for mailbox or immediate; mailbox under frame generation | the guest and the cap (`docs/10`) |
+| the shim's declared present mode | the mode the guest asked for, except `IMMEDIATE` which is served as `MAILBOX`; FIFO under a cap at the display's rate when the guest asked for mailbox; mailbox under frame generation | the guest, the served mode and the cap (`docs/10`) |
 | gamescope's own limiter | `nRefreshHz / nTargetFPS`, a divisor of the mode's rate; acts only when the cap is below the refresh and divides it, and only for clients that wait on a frame callback | `debug_set_fps_limit`, sent only when generation is off |
 | the shim's acquire gate | the cap, one release per `1e9 / cap`, for every declared mode | `FrameCapNote{fps}` |
 | the presenter's latch grid | the display's latch points, as measured | `VsyncNote` from the daemon (`docs/17`) |
@@ -68,7 +68,7 @@ that rate is the display's.
   session takes (the `fallback=` counter of the periodic `present mode:` line counts it; that line repeats with `GNDRM_LOG_VKSHIM=1`, while the ungated one prints at session start and on a change of the declared mode, its source, the cap or the gate, `docs/10`). Without the global
   (or off the override route) the wait is answered on the release, or two refresh
   periods after the commit when no release report arrives first.
-- **Mailbox and immediate.** A guest that asked for either does not wait, and neither
+- **Mailbox, and immediate (served as mailbox).** A guest that asked for either does not wait, and neither
   would one whose frames go out as mailbox or immediate (frame generation, or the
   container's env while the guest believes it has FIFO), so those waits are not held for
   the compositor: they are answered at the commit, after the frame's render fence
@@ -174,8 +174,7 @@ that rate is the display's.
 
 - **The guest's present mode is what gets declared.** There is no environment
   override above it, so a game's own VSync request is never turned into a mailbox
-  session and an immediate request stays immediate — and no cap or multiplier
-  changes it either: they set the acquire and generation limits (`docs/10`,
+  session — and no cap or multiplier changes it either: they set the acquire and generation limits (`docs/10`,
   `icd_shim/src/limits.rs`).
 - **A game below the cap keeps its own rate under mailbox** (caps below the display's
   rate). Under FIFO and gamescope's
@@ -197,6 +196,13 @@ that rate is the display's.
 - **Toggling frame generation** sends the cap change and the generation settings
   separately; between the two, for a moment, the swapchain's mode is declared with no
   cap, so a mailbox/immediate swapchain can run uncapped for a few frames.
+
+- **`IMMEDIATE` is served as `MAILBOX`.** The one substitution the layer makes
+  (`choose_live_mode`): a frame that cannot be shown is dropped for the client
+  instead of being scanned out mid-flip, and the declaration follows the served
+  mode. Its hold is the served mode's too (`note`), so the buffer still waits out
+  its own scan-out — a mode override that changed only the present path would
+  leave the reuse tear open.
 
 ## 4. What the daemon owns
 

@@ -896,6 +896,12 @@ pub struct LsfgConfig {
     /// with the settings because the presenter runs in the app's process, where
     /// the container's environment is not present.
     pub dll: [u8; LSFG_DLL_PATH_MAX],
+    /// The present mode generation is served with: 0 = mailbox, 1 = fifo. The
+    /// `QuickMenu` offers those two and nothing else, because a generated frame
+    /// cannot be told apart from a tear if it is flipped mid-scan, so
+    /// `IMMEDIATE` is never a legal value here and an unknown one falls back to
+    /// mailbox.
+    pub present_mode: u32,
     /// The panel's refresh in millihertz. The engine paces against it and clamps
     /// its generations to what the display can afford (`floor(refresh/source)`
     /// frames per source frame); zero means unknown, which leaves it unclamped.
@@ -911,13 +917,21 @@ impl Default for LsfgConfig {
             performance: 0,
             fps_limit: 0,
             dll: [0; LSFG_DLL_PATH_MAX],
+            present_mode: 0,
             refresh_mhz: 0,
         }
     }
 }
 
 impl LsfgConfig {
-    pub const LEN: usize = 24 + LSFG_DLL_PATH_MAX + 4;
+    pub const LEN: usize = 24 + LSFG_DLL_PATH_MAX + 8;
+
+    /// The present mode generation is served with, as the two values the
+    /// `QuickMenu` offers. Anything unknown is mailbox.
+    #[must_use]
+    pub fn generating_present_mode(&self) -> u32 {
+        u32::from(self.present_mode == 1)
+    }
 
     /// The DLL path as a string, or `None` when it is empty.
     #[must_use]
@@ -960,7 +974,9 @@ impl LsfgConfig {
         b[16..20].copy_from_slice(&self.performance.to_le_bytes());
         b[20..24].copy_from_slice(&self.fps_limit.to_le_bytes());
         b[24..24 + LSFG_DLL_PATH_MAX].copy_from_slice(&self.dll);
-        b[24 + LSFG_DLL_PATH_MAX..].copy_from_slice(&self.refresh_mhz.to_le_bytes());
+        b[24 + LSFG_DLL_PATH_MAX..24 + LSFG_DLL_PATH_MAX + 4]
+            .copy_from_slice(&self.present_mode.to_le_bytes());
+        b[24 + LSFG_DLL_PATH_MAX + 4..].copy_from_slice(&self.refresh_mhz.to_le_bytes());
         b
     }
 
@@ -981,7 +997,14 @@ impl LsfgConfig {
                 dll.copy_from_slice(&b[24..24 + LSFG_DLL_PATH_MAX]);
                 dll
             },
-            refresh_mhz: u32::from_le_bytes(b[24 + LSFG_DLL_PATH_MAX..].try_into().ok()?),
+            present_mode: u32::from_le_bytes(
+                b[24 + LSFG_DLL_PATH_MAX..24 + LSFG_DLL_PATH_MAX + 4]
+                    .try_into()
+                    .ok()?,
+            ),
+            refresh_mhz: u32::from_le_bytes(
+                b[24 + LSFG_DLL_PATH_MAX + 4..].try_into().ok()?,
+            ),
         })
     }
 }

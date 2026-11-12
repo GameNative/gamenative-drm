@@ -167,3 +167,12 @@ being created — the feature has to be on the device the pipelines are built on
 - Frame generation for X11 sessions: `legacy` and `native` keep that path.
 - Sharing one engine copy between GameNative and this repo: the copies are
   independent, so an algorithm fix has to be applied in both.
+
+## The served mode with generation on
+
+Generation has exactly two permitted declares: `MAILBOX` and `FIFO`, and which of
+them is served follows the user's QuickMenu setting rather than a hardcoded
+choice. `MAILBOX` is the default because the generated frame must replace the
+pending one rather than queue behind it; `FIFO` is the option for a session that
+wants the output paced by the panel with no drops. `IMMEDIATE` is never served
+here — generation cannot be told apart from a tear if frames are flipped mid-scan.

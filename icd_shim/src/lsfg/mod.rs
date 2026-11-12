@@ -221,6 +221,8 @@ struct Live {
     multiplier: std::sync::atomic::AtomicU32,
     flow_per_mille: std::sync::atomic::AtomicU32,
     fps_limit: std::sync::atomic::AtomicU32,
+    /// The QuickMenu's present mode for generation: 0 mailbox, 1 fifo.
+    present_mode: std::sync::atomic::AtomicU32,
     refresh_mhz: std::sync::atomic::AtomicU32,
     /// The panel's latch grid as the daemon last reported it; a period of 0
     /// means no report yet.
@@ -234,6 +236,7 @@ static LIVE: Live = Live {
     multiplier: std::sync::atomic::AtomicU32::new(0),
     flow_per_mille: std::sync::atomic::AtomicU32::new(0),
     fps_limit: std::sync::atomic::AtomicU32::new(0),
+    present_mode: std::sync::atomic::AtomicU32::new(0),
     refresh_mhz: std::sync::atomic::AtomicU32::new(0),
     vsync_anchor_ns: std::sync::atomic::AtomicU64::new(0),
     vsync_period_ns: std::sync::atomic::AtomicU32::new(0),
@@ -285,6 +288,7 @@ pub fn apply(config: gndrm_uapi::wire::LsfgConfig) {
     LIVE.multiplier.store(config.multiplier, Relaxed);
     LIVE.flow_per_mille.store(config.flow_per_mille, Relaxed);
     LIVE.fps_limit.store(config.fps_limit, Relaxed);
+    LIVE.present_mode.store(config.present_mode, Relaxed);
     LIVE.refresh_mhz.store(config.refresh_mhz, Relaxed);
     let now = (config.enabled != 0, config.multiplier, config.fps_limit);
     if previous != now {
@@ -536,6 +540,9 @@ impl Session {
             performance: from_daemon.map_or(0, |s| s.performance),
             fps_limit: source_cap,
             dll: [0; gndrm_uapi::wire::LSFG_DLL_PATH_MAX],
+            // Mailbox unless the settings ask for fifo; the QuickMenu's choice
+            // travels on the note, so it reaches here through `from_daemon`.
+            present_mode: from_daemon.map_or(0, |s| s.present_mode),
             refresh_mhz: (refresh * 1000.0) as u32,
         };
         current.set_dll_path(&dll.to_string_lossy());
@@ -807,4 +814,11 @@ impl Drop for Session {
             self.root = std::ptr::null_mut();
         }
     }
+}
+
+
+/// The present mode the QuickMenu chose for generation: 0 = mailbox, 1 = fifo.
+/// Zero until a config arrives, which is mailbox — the default the app ships.
+pub(crate) fn generating_present_mode() -> u32 {
+    LIVE.present_mode.load(std::sync::atomic::Ordering::Relaxed)
 }

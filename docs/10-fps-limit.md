@@ -120,16 +120,20 @@ divisor cap reads its target exactly.
   | synced | off | off | refresh | — | `refresh` | note | `refresh` |
   | synced | on | on | cap | `cap × (m−1)`, at most `refresh` | `cap + min(cap × (m−1), refresh)` | note | total |
   | synced | off | on | `refresh / m` | `acquire × (m−1)` | `acquire × m` | note | total |
-  | unsynced | on | off | cap | — | `cap` | none | `cap` |
-  | unsynced | off | off | none | — | none | none | measured |
-  | unsynced | on | on | cap | `cap × (m−1)` | `cap × m` | none | total |
-  | unsynced | off | on | `refresh / m` | `acquire × (m−1)` | `acquire × m` | none | total |
+  | unsynced | on | off | cap | — | `cap` | note | `cap` |
+  | unsynced | off | off | none | — | none | note | measured |
+  | unsynced | on | on | cap | `cap × (m−1)` | `cap × m` | note | total |
+  | unsynced | off | on | `refresh / m` | `acquire × (m−1)` | `acquire × m` | note | total |
 
   `hold` is when an acquired image may be drawn into again, and it follows the
   same split as the rate because `VkPresentModeKHR` is a contract about exactly
   that: FIFO (and FIFO-relaxed) returns an image when a latched frame replaces
   it, so the image is held until the compositor's own release report *and* the
-  display's scan-out release after it — `note`. IMMEDIATE returns it once it is
+  display's scan-out release after it — `note`. `IMMEDIATE` is served as
+  `MAILBOX` on this route (`choose_live_mode`), which is the one mode
+  substitution the layer makes: a frame that cannot be shown is dropped for the
+  client instead of being scanned out mid-flip, and its hold is `note` because
+  the served mode is mailbox. IMMEDIATE returns it once it is
   handed over and MAILBOX as soon as a newer one replaces it, so `none`: the slot
   is free at the compositor's release, and a guest that asked for those modes has
   already accepted the frames that get dropped. Applying `note` to them applies
