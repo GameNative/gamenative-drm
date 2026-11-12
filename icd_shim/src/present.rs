@@ -55,10 +55,9 @@ struct Waits {
     /// answered is two refresh periods after that. `(id, swapchain, ns)`.
     committed: Vec<(u64, usize, u64)>,
     /// Commits that asked gamescope for presentation feedback that has not
-    /// arrived: only `presented` / `discarded` answers them (or, should it
-    /// never come, [`FEEDBACK_SAFETY_NS`] after the commit). `(token, id,
-    /// swapchain)`; the token is the feedback listener's data, unique per
-    /// request.
+    /// arrived: `presented` / `discarded` answers them, and so does the
+    /// two-period grace its frame's commit carries. `(token, id, swapchain)`;
+    /// the token is the feedback listener's data, unique per request.
     feedback: Vec<(u64, u64, usize)>,
 }
 
@@ -75,11 +74,6 @@ static WAITS: Mutex<Waits> = Mutex::new(Waits {
     committed: Vec::new(),
     feedback: Vec::new(),
 });
-
-/// How long after its commit an id whose feedback never came is answered
-/// anyway: far beyond any presentation gamescope makes, so it never answers
-/// early, and well inside the guest's one-second bound.
-const FEEDBACK_SAFETY_NS: u64 = 100_000_000;
 
 /// Presentation feedback outcomes, and waits answered by a fallback (release,
 /// grace or the feedback safety), for the shim's ungated census.
@@ -441,14 +435,15 @@ pub(crate) fn wait(id: u64, sc: usize, timeout_ns: u64) -> bool {
             note_outcome(id, "unarmed", t0);
             return true;
         }
-        // A committed frame counts as latched two refresh periods after its
-        // commit, whether or not its buffer ever comes back; one whose
-        // presentation feedback is pending only at the feedback safety.
-        let grace = if feedback_pending(&w, id, sc) {
-            FEEDBACK_SAFETY_NS
-        } else {
-            commit_grace_ns()
-        };
+        // Every committed frame counts as latched two refresh periods after its
+        // commit, whether or not its buffer comes back and whether or not the
+        // compositor answers. A longer bound for a frame whose feedback was
+        // pending made the answer depend on the compositor: on a title whose
+        // feedback stopped arriving 30 s into a session, every frame then cost
+        // 100 ms — a 10 fps ceiling this shim imposed on itself. The acquire gate
+        // is what paces the guest, so a wait that outlives two periods is not
+        // measuring a presentation any more.
+        let grace = commit_grace_ns();
         let latch_by = w
             .committed
             .iter()
@@ -704,13 +699,15 @@ mod tests {
     }
 
     #[test]
-    fn a_feedback_that_never_comes_is_answered_by_the_safety() {
+    fn a_feedback_that_never_comes_is_answered_by_the_grace() {
         arm(601, 10);
         expect_feedback(601, 10);
+        // The same two periods every other frame gets: a compositor that stops
+        // answering must not lengthen the guest's frame.
         committed(
             601,
             10,
-            crate::proxy::monotonic_ns().saturating_sub(FEEDBACK_SAFETY_NS + 1),
+            crate::proxy::monotonic_ns().saturating_sub(commit_grace_ns() + 1),
             false,
         );
         assert!(wait(601, 10, 0));

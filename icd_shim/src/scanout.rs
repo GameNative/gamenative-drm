@@ -637,17 +637,21 @@ pub(crate) fn send_frame_acquired(count: u64, generated: u64) {
 }
 
 /// Mark a frame's present id for the daemon, immediately before the commit that
-/// presents it: the daemon answers when that transaction latches. Best effort by
-/// construction — the channel is shared with the allocator, so an exchange in
-/// flight is waited for (bounded by the exchange's own timeout) rather than
-/// skipped, because a mark that never arrives leaves `vkWaitForPresentKHR`
-/// waiting for a frame the daemon cannot name.
+/// presents it: the daemon answers when that transaction latches.
+///
+/// Sent without blocking. This runs on the present worker for every frame, so a
+/// send that waited for the daemon to make room would put the daemon's read rate
+/// into the frame time — measured as a flat 277 ms on a title running at 60 fps
+/// on the route that sends no marks at all. A mark that does not fit is dropped:
+/// its frame's wait is then answered by the compositor's feedback or by the
+/// two-period grace, both of which are bounded, so the cost of a lost mark is a
+/// latch report in the census and nothing the guest can feel.
 pub(crate) fn send_present_mark(ino: u64, id: u64) {
     let ch = CHAN.lock().unwrap_or_else(|e| e.into_inner());
     if *ch < 0 {
         return;
     }
-    send_frame(*ch, &gndrm_uapi::wire::PresentMark { ino, id }.encode());
+    send_frame_nb(*ch, &gndrm_uapi::wire::PresentMark { ino, id }.encode());
 }
 
 // ------------------------------------------------------ scan-out releases
