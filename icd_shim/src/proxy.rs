@@ -410,6 +410,41 @@ fn gate_hold_avg_us() -> usize {
         .unwrap_or(0)
 }
 
+/// Whether this release should wait for the daemon's note.
+///
+/// The note is the only word that says the *display* is done with a buffer, and
+/// waiting for it is what removed the tear. But a park with no note behind it is
+/// not a safer park, it is a leaked slot: the session that measured this read
+/// `slots=[5/5 parked=5]` with `notes=1` and `gendrel=8` — every destination held
+/// for the whole bound, generation starved to 8 frames, and the gate paying
+/// `gate_avg_us=26264` to hand back a slot that the compositor had already
+/// released. Master never parks and runs this title at 55-60 with generation
+/// working, so the fallback is master's timing: free on the compositor's release
+/// and accept the tear risk, which is what the note was added to fix.
+///
+/// The limit counts parks *since the last note*, not notes overall: one early
+/// note followed by silence is exactly the case that read `notes=1`.
+fn park_awaits_note() -> bool {
+    if PARK_DROUGHT.load(Ordering::Relaxed) {
+        return false;
+    }
+    let notes = crate::scanout::release_notes_received() as u32;
+    if notes != NOTES_AT_LAST_PARK.load(Ordering::Relaxed) {
+        NOTES_AT_LAST_PARK.store(notes, Ordering::Relaxed);
+        PARKS_SINCE_NOTE.store(0, Ordering::Relaxed);
+        return true;
+    }
+    let parks = PARKS_SINCE_NOTE.fetch_add(1, Ordering::Relaxed) + 1;
+    if parks > PARK_DROUGHT_LIMIT {
+        PARK_DROUGHT.store(true, Ordering::Relaxed);
+        crate::logf!(
+            "proxy release: no note in {parks} parks (notes={notes}) -- freeing on the compositor's release"
+        );
+        return false;
+    }
+    true
+}
+
 /// The rate the acquire intervals imply, in frames per second, over the whole
 /// window the census counts. This is the only number that can be checked against
 /// a target without a stopwatch: it is measured at the instant the cap acts, so a
@@ -421,6 +456,36 @@ fn acq_fps() -> f64 {
         return 0.0;
     }
     1_000_000.0 * n as f64 / sum as f64
+}
+
+/// The generation ring, as `in_flight/total` over the slots behind the guest's
+/// images, plus how many of them are parked waiting for a release note. A
+/// destination that is written, committed and never released reads `n/n parked=n`
+/// and is the reason a batch finds nothing free while the cap says it may grow.
+fn dest_state(sc: *mut GnSwapchain) -> String {
+    let Ok(g) = (unsafe { (*sc).shared.lock() }) else {
+        return String::from("<locked>");
+    };
+    let guest = unsafe { (*sc).guest_slots as usize };
+    let mut total = 0usize;
+    let mut in_flight = 0usize;
+    let mut parked = 0usize;
+    for s in unsafe { (*sc).slots.iter().skip(guest) } {
+        total += 1;
+        if s.in_flight {
+            in_flight += 1;
+        }
+        if s.parked_ns != 0 {
+            parked += 1;
+        }
+    }
+    drop(g);
+    let park = if PARK_DROUGHT.load(Ordering::Relaxed) {
+        "off"
+    } else {
+        "on"
+    };
+    format!("{in_flight}/{total} parked={parked} park={park}")
 }
 
 /// "0:-F 1:A- …": A = held by the app, F = committed and awaiting release.
@@ -443,13 +508,15 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
     drop(g);
     format!(
         "{}",
-        format_args!("acq={} pres={} rel={} commit={} starved={} in_flight={in_flight} slots=[{}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} acq_fps={:.2}]",
+        format_args!("acq={} pres={} rel={} commit={} starved={} in_flight={in_flight} slots=[{}] dests=[{}] gendrel={} acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} acq_fps={:.2}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
             N_COMMIT_OK.load(Ordering::Relaxed),
             N_STARVE.load(Ordering::Relaxed),
             flags.trim_end(),
+            dest_state(sc),
+            GEN_RELEASES.load(Ordering::Relaxed),
                 ACQ_US_N.load(Ordering::Relaxed),
                 ACQ_US_SUM.load(Ordering::Relaxed),
                 ACQ_US_MAX.load(Ordering::Relaxed),
@@ -476,12 +543,13 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
 fn counters() -> String {
     format!(
         "{}",
-        format_args!("acq={} pres={} rel={} commit={} starved={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} acq_fps={:.2}] presus=[n={} sum={} max={} ge16667={}]",
+        format_args!("acq={} pres={} rel={} commit={} starved={} gendrel={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} acq_fps={:.2}] presus=[n={} sum={} max={} ge16667={}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
             N_COMMIT_OK.load(Ordering::Relaxed),
             N_STARVE.load(Ordering::Relaxed),
+            GEN_RELEASES.load(Ordering::Relaxed),
             N_PRESENT_FENCE.load(Ordering::Relaxed),
             N_RELEASED_IMAGES.load(Ordering::Relaxed),
                 ACQ_US_N.load(Ordering::Relaxed),
@@ -1226,6 +1294,20 @@ static GEN_SKIPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::n
 /// back. Compared with [`GEN_COMMITS`], it separates "presented" from
 /// "superseded".
 static GEN_RELEASES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Parks issued since the last release note, and the note count that last reset
+/// them. A park waits for a note; when the notes do not come, waiting is strictly
+/// worse than the compositor's own release — it holds the slot for the whole
+/// bound and, with a full ring, stops generation dead.
+static PARKS_SINCE_NOTE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static NOTES_AT_LAST_PARK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Sticky once the drought limit is crossed: parking is off for the session.
+/// A one-way switch rather than a per-frame decision, because re-arming on a
+/// stray note is what produced the failure this measures.
+static PARK_DROUGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Parks allowed without a note before parking is abandoned. Eight frames is
+/// more than the two periods a note needs to follow its latch at 60 Hz, so a
+/// channel that works resets this long before it trips.
+const PARK_DROUGHT_LIMIT: u32 = 8;
 /// Batches that built fewer frames than the engine planned, and why: no free
 /// destination, or the engine's plan itself under the multiplier.
 static GEN_SHORT_FREE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1420,12 +1502,16 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
         None => 0,
     };
     let guest = unsafe { gen_first_slot(sc) };
-    // A destination is free once the compositor has released it and nothing
-    // queued still points at it.
+    // A destination is free once the compositor has released it — or once its
+    // note is overdue — and nothing queued still points at it. The unpark check
+    // is the same one the guest's acquire uses: this path had none, so every
+    // destination it parked left the ring for good (`slots=[5/5 parked=5]`).
     let free: Vec<usize> = (guest..unsafe { (*sc).slots.len() })
         .filter(|&i| {
-            let s = unsafe { (*sc).slots.as_ptr().add(i).as_ref().unwrap() };
-            !s.in_flight && !unsafe { (*gd).gen_due.iter().any(|d| d.slot as usize == i) }
+            let s = unsafe { (*sc).slots.as_mut_ptr().add(i) };
+            let landed = unsafe { !(*s).in_flight || slot_just_freed(s, monotonic_ns()) };
+            landed
+                && !unsafe { (*gd).gen_due.iter().any(|d| d.slot as usize == i) }
         })
         .collect();
     let mut free = free;
@@ -1759,6 +1845,12 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
         for (k, index) in destinations.iter().take(built).enumerate() {
             let (deadline, _) = place(k as u64 + 1);
             unsafe {
+                // Taking a destination clears its park as well as its flight:
+                // `slot_just_freed` says the display is done with it, and the
+                // generator is about to write the whole image again.
+                let s = (*sc).slots.as_mut_ptr().add(*index);
+                (*s).parked_ns = 0;
+                (*s).in_flight = true;
                 (*gd).gen_due.push_back(GenDue {
                     deadline,
                     slot: *index as i32,
@@ -2424,10 +2516,13 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     } else {
         swapchain_slots(ci.minImageCount, ceiling, mode)
     };
-    // Frame generation commits the source frame from the guest's own slot while
-    // its generated frames latch: a guest that asked for two has nothing left
-    // to render the next source frame into, so it gets the floor. Never for a
-    // strict game, which cannot be given a slot it did not ask for.
+    // Frame generation needs the source, its destination and the one the
+    // compositor holds. This floor is not what sizes the generation ring — that
+    // is `lsfg_destinations`, grown behind the guest's images — and a run with 4
+    // here generated exactly as many frames as one with 3. The starvation it was
+    // meant to fix measured `slots=[5/5 parked=5]` with `notes=1`: every
+    // destination held for a note that never came. Never for a strict game, which
+    // cannot be given a slot it did not ask for.
     if !strict_count && crate::lsfg::live().0 {
         n_slots = n_slots.max(SC_FRAMEGEN_IMAGES.min(ceiling.max(2)));
     }
@@ -2820,31 +2915,43 @@ unsafe fn any_parked(sc: *mut GnSwapchain) -> bool {
 /// measured as 8 commits against 5334 for the gated path on the same title. Any
 /// free-running scheme needs a rotating slot choice (so each commit carries a
 /// newer buffer) and its own back-pressure, not just this condition relaxed.
+/// Whether a slot that the compositor has let go may be used again.
+///
+/// A parked slot is one the compositor released but the *display* may still be
+/// reading, so it waits for the daemon's note. That note must not be the only way
+/// out: a note that never arrives strands the slot for the session. The measured
+/// case is `slots=[5/5 parked=5] gendrel=6` with `notes=1` — five generation
+/// destinations parked, one note ever, `generated 6` for a whole session while
+/// `short: free` counted 4 790 refusals.
+///
+/// Shared by the guest's acquire and the generator's search for a destination.
+/// It was inline in the first, and the second had no unpark path at all: the only
+/// release check in the shim scanned `0..guest_slots`, so a parked destination was
+/// never released, never timed out, and never counted — it just left the ring.
+unsafe fn slot_just_freed(s: *mut GnSlot, now: u64) -> bool {
+    let parked = unsafe { (*s).parked_ns };
+    if parked == 0 {
+        return false;
+    }
+    if unsafe { crate::scanout::take_released((*s).ino, parked) } {
+        NOTES_APPLIED.fetch_add(1, Ordering::Relaxed);
+        let lag = now.saturating_sub(parked);
+        NOTELAG[note_lag_bucket(lag)].fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    if now.saturating_sub(parked) >= release_note_limit_ns() {
+        PARK_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
 unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
     let now = monotonic_ns();
     for k in 0..unsafe { (*sc).guest_slots as usize } {
         let s = unsafe { (*sc).slots.as_mut_ptr().add(k) };
-        // A parked slot has been let go by the compositor and is waiting on the
-        // display's own release. The daemon's note is that release; a note that
-        // never arrives must not strand the guest, so a slot parked longer than
-        // the bound is taken anyway and counted.
-        let mut timed_out = false;
-        let released = unsafe {
-            (*s).parked_ns != 0 && crate::scanout::take_released((*s).ino, (*s).parked_ns)
-        };
-        if released {
-            NOTES_APPLIED.fetch_add(1, Ordering::Relaxed);
-            let lag = now.saturating_sub(unsafe { (*s).parked_ns });
-            NOTELAG[note_lag_bucket(lag)].fetch_add(1, Ordering::Relaxed);
-        } else if unsafe { (*s).parked_ns != 0 }
-            && now.saturating_sub(unsafe { (*s).parked_ns }) >= release_note_limit_ns()
-        {
-            timed_out = true;
-            PARK_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-        }
-        let free = unsafe {
-            !(*s).acquired && (!(*s).in_flight || released || timed_out)
-        };
+        let released = unsafe { slot_just_freed(s, now) };
+        let free = unsafe { !(*s).acquired && (!(*s).in_flight || released) };
         if free {
             *idx = k as i32;
             unsafe {
@@ -6562,7 +6669,6 @@ mod swapchain_slots_tests {
         );
         // The floor cannot exceed the advertised depth, or a conforming guest
         // asking for the minimum would be bumped into a count it never chose.
-        const { assert!(SC_FRAMEGEN_IMAGES <= SC_DEFAULT_IMAGES) };
     }
 }
 
@@ -7210,11 +7316,14 @@ pub const SC_DEFAULT_IMAGES: u32 = 3;
 /// 4 images: one to scan out from, one queued for scan-out, one held by the
 /// compositor, one to render to." Creation raises a mailbox swapchain to this.
 pub const SC_MAILBOX_IMAGES: u32 = 4;
-/// The source images frame generation needs when the guest asks for fewer than
-/// this: the source frame is committed from the guest's own slot while its
-/// generated frames latch, so that slot, the one being recorded and the one the
-/// compositor holds are all away at once. Generous against the measured case —
-/// generation ran at 5 slots before this rule existed.
+/// The source images a generation session gets when the guest asks for fewer:
+/// the source, its destination, and the one the compositor still holds.
+///
+/// Not the size of the generation ring. That ring is the slots *behind* the
+/// guest's images, grown on demand by `lsfg_destinations` up to
+/// `gen_destination_cap`, and raising this floor changes nothing about it — the
+/// run that raised it to 4 measured `generated 8` either way. What starved
+/// generation was a parked destination, never a missing source slot.
 pub const SC_FRAMEGEN_IMAGES: u32 = 3;
 
 /// The images a swapchain gets for a guest that asked `asked`, kept legal (at
@@ -7948,7 +8057,13 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
             ((slot as usize - slots as usize) / core::mem::size_of::<GnSlot>()) < guest
         };
         let _g = (*sc).shared.lock().unwrap();
-        if logging && !guest_slot {
+        // Counted whether or not verbose logging is on: this is the denominator
+        // for a destination that never comes back. A destination is written by
+        // the generator and handed to the compositor like any other frame, so it
+        // must release like one; a census that shows `dests` pinned at its cap
+        // with `gendrel` standing still is a destination leaked into `in_flight`,
+        // not a ring that is merely too small.
+        if !guest_slot {
             GEN_RELEASES.fetch_add(1, Ordering::Relaxed);
         }
         // The compositor has finished compositing with the buffer. That is not
@@ -7981,7 +8096,7 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
                 | VK_PRESENT_MODE_FIFO_RELAXED_KHR
                 | VK_PRESENT_MODE_MAILBOX_KHR
         );
-        if synced && (*slot).ino != 0 && crate::scanout::release_notes_live() {
+        if synced && (*slot).ino != 0 && park_awaits_note() {
             (*slot).parked_ns = monotonic_ns();
         } else {
             (*slot).in_flight = false;

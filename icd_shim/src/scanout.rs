@@ -698,6 +698,12 @@ pub(crate) fn note_buffer_released(ino: u64) {
 
 /// Whether the daemon sends release notes at all. Until one has arrived, a slot
 /// frees on the compositor's release exactly as it did before this note existed.
+/// Whether any note has ever arrived.
+///
+/// The shim no longer decides a park from this: one note followed by silence is
+/// a channel that does not work, and `proxy::park_awaits_note` counts the parks
+/// since the last note instead. Kept as the test-side predicate.
+#[cfg(test)]
 pub(crate) fn release_notes_live() -> bool {
     RELEASE_NOTES.load(Ordering::Relaxed) != 0
 }
@@ -811,9 +817,13 @@ mod tests {
         assert!(!take_released(0, 0));
     }
 
+    /// Its own note, not one an earlier test happened to leave: the suite runs
+    /// these in parallel, so a test that reads a static another test writes is a
+    /// test that passes by scheduler luck.
     #[test]
     fn release_notes_are_bounded_and_observed() {
-        assert!(release_notes_live(), "a note was recorded above");
+        note_buffer_released(6_999);
+        assert!(release_notes_live(), "the note above is recorded");
         for ino in 0..(RELEASED_CAP as u64 + 8) {
             note_buffer_released(7_000 + ino);
         }
