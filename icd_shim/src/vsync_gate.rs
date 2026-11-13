@@ -116,20 +116,46 @@ impl Schedule {
     /// Book a release that happened at `now_ns` and return the instant the next
     /// one may happen.
     ///
-    /// One line, deliberately. Booking from the instant this release was
-    /// *supposed* to happen (or from a grid point near it) is what let the cap
-    /// leak on a late frame and drift on an early one; booking from the release
-    /// itself cannot.
+    /// One line, on a grid. Booking from the released instant (`now + period`)
+    /// keeps no grid at all: every frame that starts late hands its lateness to
+    /// the frame after it, forever, so a 30 cap settles at `30 / (1 + e)` for
+    /// whatever jitter `e` the guest has. Measured on Witcher 3 at
+    /// `acq_fps=27.74` against `acquire=30` — 7 % lost with the CPU and the GPU
+    /// idle — and it is the same defect `A52` fixed in gamescope's limiter, in
+    /// the same shape: a release grid in time, where a late frame delays one
+    /// release and the grid absorbs it on the next.
+    ///
+    /// So the next release is one period after the previous *release point*, not
+    /// after the moment this frame happened to start. A frame that is late by
+    /// less than a period gets a proportionally shorter next hold, which is how
+    /// the average rate stays the target.
+    ///
+    /// A frame late by a whole period or more is a lost frame, not a debt: the
+    /// grid steps past `now` to the first point still in the future rather than
+    /// repaying with back-to-back releases. Repaying would put every frame in the
+    /// stall's shadow into the following period, which is exactly the burst this
+    /// rule exists to prevent.
     pub(crate) fn book(&mut self, now_ns: u64, period_ns: u64) -> u64 {
         let period_ns = period_ns.max(1);
-        if self.next_ns != 0 && now_ns > self.next_ns.saturating_add(period_ns) {
-            LATE_N.fetch_add(1, Ordering::Relaxed);
-            SKIPPED_N.fetch_add(
-                now_ns.saturating_sub(self.next_ns) / period_ns,
-                Ordering::Relaxed,
-            );
+        if self.next_ns == 0 {
+            // First release: the grid is anchored here and nowhere else.
+            self.next_ns = now_ns.saturating_add(period_ns);
+            return self.next_ns;
         }
-        self.next_ns = now_ns.saturating_add(period_ns);
+        let target = self.next_ns.saturating_add(period_ns);
+        if target <= now_ns {
+            // Behind the grid by a period or more: this frame is late by more
+            // than the release it was owed, so that release is a lost frame and
+            // the grid re-anchors here. Re-anchoring rather than stepping to the
+            // next grid point keeps the hold at exactly one period in both cases,
+            // and it cannot burst: `now + period` is at least a period away.
+            let late = now_ns.saturating_sub(self.next_ns);
+            LATE_N.fetch_add(1, Ordering::Relaxed);
+            SKIPPED_N.fetch_add((late / period_ns).max(1), Ordering::Relaxed);
+            self.next_ns = now_ns.saturating_add(period_ns);
+            return self.next_ns;
+        }
+        self.next_ns = target;
         self.next_ns
     }
 
@@ -197,6 +223,36 @@ mod tests {
             released = start;
             due = s.book(start, p);
         }
+    }
+
+    /// A release that overshoots its grid point does not move the grid.
+    ///
+    /// This is the defect the grid exists for: with `next = now + period`, every
+    /// frame whose sleep woke late pushed the next release back by that lateness,
+    /// so it accumulated. Witcher 3 measured `acq_fps=27.74` against a 30 cap —
+    /// 7 % lost to a few hundred microseconds of scheduling per frame.
+    #[test]
+    fn an_overshoot_does_not_move_the_grid() {
+        let p = period(30);
+        let overshoot = 2_000_000;
+        let mut s = Schedule::default();
+        let mut released = 0u64;
+        let mut due = s.book(released, p);
+        for _ in 0..100 {
+            // The schedule held the frame to `due`; the thread woke 2 ms late.
+            released = due + overshoot;
+            due = s.book(released, p);
+        }
+        // 101 periods of grid for 100 frames — not 101 periods plus 100
+        // overshoots, which is what `now + period` produced.
+        assert_eq!(due, 101 * p, "the grid moved by the overshoot");
+        assert_eq!(released, 100 * p + overshoot);
+        // The rate over the span is 30/s with one constant offset, so the error
+        // is bounded by the overshoot and does not grow with the frame count.
+        let span = released;
+        let fps = 1_000_000_000.0 * 100.0 / span as f64;
+        assert!((fps - 30.0).abs() < 0.05, "{fps}");
+        assert!(30.0 - fps < 0.02, "lost {:.3} fps to a 2 ms overshoot", 30.0 - fps);
     }
 
     /// A stall costs the frames it swallowed and nothing bursts after it: the
