@@ -833,6 +833,28 @@ fn lsfg_barrier(
     b
 }
 
+/// Report one generated frame the moment it is on the compositor's surface.
+///
+/// The daemon counts produced frames from the deltas of the two totals an
+/// acquire message carries, and that message is sent once per *acquired* frame.
+/// A generated frame therefore reached the app's frame ring only when the guest
+/// next acquired: up to a multiplier's worth late, coalesced into a burst, and
+/// then spread over the interval by `note_produced`. The ring's own reading of
+/// that was a HUD that jumped by several fps while the session's rate did not
+/// move (`acq_fps=29.00, 29.01, 29.00` over 7 000 frames).
+///
+/// Sent here instead — one message per generated frame, acquire total unchanged —
+/// so `note_produced` sees a delta of exactly one generated frame and calls
+/// `notify_frame_published` once per frame, at the frame's own commit.
+///
+/// `send_frame_nb` is non-blocking and the totals are cumulative, so a refused
+/// message costs one ring sample and carries the frame on the next one.
+fn note_frame_generated() {
+    let generated = GEN_COMMITS.fetch_add(1, Ordering::Relaxed) + 1;
+    let acquired = ACQ_COUNT.load(Ordering::Relaxed);
+    crate::scanout::send_frame_acquired(acquired, u64::from(generated));
+}
+
 /// Commit a slot the present path did not produce (a generation destination).
 /// The caller has already waited the submission that wrote it.
 unsafe fn commit_generated(sc: *mut GnSwapchain, slot_index: usize) {
@@ -846,6 +868,7 @@ unsafe fn commit_generated(sc: *mut GnSwapchain, slot_index: usize) {
     }
     if unsafe { (*(*sc).surf).parent.is_null() } {
         unsafe { x11_present_slot(sc, s, slot_index as i32) };
+        note_frame_generated();
         return;
     }
     if unsafe { (*s).buf.is_null() } {
@@ -874,6 +897,7 @@ unsafe fn commit_generated(sc: *mut GnSwapchain, slot_index: usize) {
         wlproto::surface_commit(parent);
         wlproto::wl_display_flush((*(*sc).surf).dpy);
     }
+    note_frame_generated();
 }
 
 /// The device's generation session, opened or replaced when the settings call
@@ -1944,7 +1968,6 @@ unsafe fn flush_due(sc: *mut GnSwapchain) {
     if unsafe { (*gd).gen_sc } != sc {
         return;
     }
-    let mut committed = 0u32;
     while let Some((deadline, slot, batch, drop_at)) =
         (unsafe { (*gd).gen_due.front() }).map(|d| (d.deadline, d.slot, d.batch, d.drop_at))
     {
@@ -1986,12 +2009,11 @@ unsafe fn flush_due(sc: *mut GnSwapchain) {
         if batch == GEN_NO_BATCH {
             unsafe { commit_real(sc, slot, 0) };
         } else {
+            // `commit_generated` counts the frame itself, one message per frame,
+            // so the batch adds nothing here: a batch-level total would be a
+            // second, duplicate report for every frame it contains.
             unsafe { commit_generated(sc, slot as usize) };
-            committed += 1;
         }
-    }
-    if committed > 0 {
-        GEN_COMMITS.fetch_add(committed, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
