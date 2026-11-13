@@ -2493,6 +2493,23 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     if !strict_count && crate::lsfg::live().0 {
         n_slots = n_slots.max(SC_FRAMEGEN_IMAGES.min(ceiling.max(2)));
     }
+    // The count is decided once, here, and cannot follow the settings afterwards:
+    // the app's frame can arrive after the swapchain exists. Printed at the
+    // default level because the session's whole depth follows from it — a session
+    // whose settings came late ran on three images and could not reach its cap,
+    // and the only way to see that was to subtract the generation ring from a
+    // slot count in the census.
+    crate::logi!(
+        "proxy swapchain create: {} images for asked={} ceiling={} declared={} counted={} live={} generating={} strict={}",
+        n_slots,
+        ci.minImageCount,
+        ceiling,
+        mode,
+        count_present_mode(mode),
+        crate::lsfg::live().0,
+        crate::lsfg::wanted().is_some(),
+        strict_count
+    );
     if strict_count {
         crate::logi!("proxy swapchain create: strict image count: requested {} gives {n_slots} images, mode={}",
             ci.minImageCount,
