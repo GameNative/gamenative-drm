@@ -215,6 +215,11 @@ static ACQ_SPACING: [AtomicUsize; 5] = [
     AtomicUsize::new(0),
 ];
 static ACQ_LAST_NS: AtomicU64 = AtomicU64::new(0);
+/// The first grant's timestamp, so the census divides frames by elapsed time
+/// rather than by the sum of their own waits.
+static ACQ_FIRST_NS: AtomicU64 = AtomicU64::new(0);
+/// Schedule bookings, for the census's `books=` next to the grant count.
+static BOOK_N: AtomicUsize = AtomicUsize::new(0);
 /// Acquire *calls* that handed the guest an image, and calls that left without
 /// one (`VK_NOT_READY`/`VK_TIMEOUT`). A presentation rate is the first, never
 /// the call count: an engine that polls with a zero timeout retries, and a
@@ -410,17 +415,24 @@ fn gate_hold_avg_us() -> usize {
         .unwrap_or(0)
 }
 
-/// The rate the acquire intervals imply, in frames per second, over the whole
-/// window the census counts. This is the only number that can be checked against
-/// a target without a stopwatch: it is measured at the instant the cap acts, so a
-/// display-side frame count reading low cannot be mistaken for the cap's rate.
+/// Grants per second over the window the census counts: the first grant
+/// timestamp and the last one, against how many frames were handed out.
+///
+/// This used to be `1e6 * n / sum(acq_us)` — the reciprocal of the mean
+/// `vkAcquireNextImageKHR` *duration*, which is a service time and not a rate. It
+/// read 88.98 on a session whose limit was 30 acquires/s, and I read that as the
+/// guest running three times over its cap; the sessions it "measured" as 34.4,
+/// 41.7, 49.7 and 64.3 were all that same mistake. A rate has to divide frames by
+/// elapsed time, and elapsed time has to come from the clock, not from the thing
+/// being measured.
 fn acq_fps() -> f64 {
-    let n = ACQ_US_N.load(Ordering::Relaxed);
-    let sum = ACQ_US_SUM.load(Ordering::Relaxed);
-    if n == 0 || sum == 0 {
+    let n = ACQ_OK_N.load(Ordering::Relaxed);
+    let first = ACQ_FIRST_NS.load(Ordering::Relaxed);
+    let last = ACQ_LAST_NS.load(Ordering::Relaxed);
+    if n < 2 || first == 0 || last <= first {
         return 0.0;
     }
-    1_000_000.0 * n as f64 / sum as f64
+    1_000_000_000.0 * (n - 1) as f64 / (last - first) as f64
 }
 
 /// The generation ring, as `in_flight/total` over the slots behind the guest's
@@ -503,7 +515,7 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
 fn counters() -> String {
     format!(
         "{}",
-        format_args!("acq={} pres={} rel={} commit={} starved={} gendrel={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} acq_fps={:.2}] presus=[n={} sum={} max={} ge16667={}]",
+        format_args!("acq={} pres={} rel={} commit={} starved={} gendrel={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} acq_fps={:.2} books={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={}] presus=[n={} sum={} max={} ge16667={}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
@@ -526,11 +538,12 @@ fn counters() -> String {
                 PRES_IV_GE_33333.load(Ordering::Relaxed),
                 crate::scanout::target_fps(),
                 crate::scanout::notes_seen(),
+                acq_fps(),
+                BOOK_N.load(Ordering::Relaxed),
                 GATE_HOLD_N.load(Ordering::Relaxed),
                 GATE_HOLD_SUM_US.load(Ordering::Relaxed),
                 gate_hold_avg_us(),
                 GATE_HOLD_MAX_US.load(Ordering::Relaxed),
-                acq_fps(),
                 PRESENT_US_N.load(Ordering::Relaxed),
                 PRESENT_US_SUM.load(Ordering::Relaxed),
                 PRESENT_US_MAX.load(Ordering::Relaxed),
@@ -2974,6 +2987,12 @@ unsafe fn sleep_ns(
 /// One acquired frame: the totals and the cadence the census reads.
 fn note_acquire_granted(now_ns: u64) {
     ACQ_OK_N.fetch_add(1, Ordering::Relaxed);
+    let _ = ACQ_FIRST_NS.compare_exchange(
+        0,
+        now_ns,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
     let last = ACQ_LAST_NS.swap(now_ns, Ordering::Relaxed);
     if last == 0 {
         return;
@@ -3107,6 +3126,12 @@ unsafe fn gn_acquire_common(
         // before one period after this one *actually* started.
         if gated {
             (*sc).release.book_paced(now, pacing);
+            // Counted against the grants to answer one question the census could
+            // not: a schedule that books once per grant can never let a grant see
+            // its deadline already past, so `books` equal to the grant count with
+            // ungated-looking acquires means the schedule is being re-anchored,
+            // and `books` short of it means some grants skip the book.
+            BOOK_N.fetch_add(1, Ordering::Relaxed);
         }
         // SAFETY: `idx` is a slot of this swapchain.
         (*(*sc).slots.as_mut_ptr().add(idx as usize)).acquired_ns = now;
@@ -6615,6 +6640,25 @@ mod swapchain_slots_tests {
             swapchain_slots(3, 8, count_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)),
             4
         );
+    }
+
+    /// The census's rate is frames over elapsed time, and a bare sum of waits
+    /// cannot supply it: 89 "fps" on a 30 cap was the reciprocal of a service
+    /// time. This pins the arithmetic on the counters it now reads.
+    #[test]
+    fn the_census_rate_divides_frames_by_elapsed_time() {
+        // Three grants 16.667 ms apart: two intervals over 33.333 ms = 60/s.
+        ACQ_OK_N.store(3, Ordering::Relaxed);
+        ACQ_FIRST_NS.store(1_000_000_000, Ordering::Relaxed);
+        ACQ_LAST_NS.store(1_033_333_333, Ordering::Relaxed);
+        let fps = acq_fps();
+        assert!((fps - 60.0).abs() < 0.01, "{fps}");
+        // One grant is not a rate, and neither is a window that never advanced.
+        ACQ_OK_N.store(1, Ordering::Relaxed);
+        assert_eq!(acq_fps(), 0.0);
+        ACQ_OK_N.store(2, Ordering::Relaxed);
+        ACQ_LAST_NS.store(1_000_000_000, Ordering::Relaxed);
+        assert_eq!(acq_fps(), 0.0);
     }
 
     /// Two is the floor and the ceiling is the ceiling, whatever the ask.
