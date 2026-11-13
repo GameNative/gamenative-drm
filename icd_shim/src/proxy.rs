@@ -410,41 +410,6 @@ fn gate_hold_avg_us() -> usize {
         .unwrap_or(0)
 }
 
-/// Whether this release should wait for the daemon's note.
-///
-/// The note is the only word that says the *display* is done with a buffer, and
-/// waiting for it is what removed the tear. But a park with no note behind it is
-/// not a safer park, it is a leaked slot: the session that measured this read
-/// `slots=[5/5 parked=5]` with `notes=1` and `gendrel=8` — every destination held
-/// for the whole bound, generation starved to 8 frames, and the gate paying
-/// `gate_avg_us=26264` to hand back a slot that the compositor had already
-/// released. Master never parks and runs this title at 55-60 with generation
-/// working, so the fallback is master's timing: free on the compositor's release
-/// and accept the tear risk, which is what the note was added to fix.
-///
-/// The limit counts parks *since the last note*, not notes overall: one early
-/// note followed by silence is exactly the case that read `notes=1`.
-fn park_awaits_note() -> bool {
-    if PARK_DROUGHT.load(Ordering::Relaxed) {
-        return false;
-    }
-    let notes = crate::scanout::release_notes_received() as u32;
-    if notes != NOTES_AT_LAST_PARK.load(Ordering::Relaxed) {
-        NOTES_AT_LAST_PARK.store(notes, Ordering::Relaxed);
-        PARKS_SINCE_NOTE.store(0, Ordering::Relaxed);
-        return true;
-    }
-    let parks = PARKS_SINCE_NOTE.fetch_add(1, Ordering::Relaxed) + 1;
-    if parks > PARK_DROUGHT_LIMIT {
-        PARK_DROUGHT.store(true, Ordering::Relaxed);
-        crate::logf!(
-            "proxy release: no note in {parks} parks (notes={notes}) -- freeing on the compositor's release"
-        );
-        return false;
-    }
-    true
-}
-
 /// The rate the acquire intervals imply, in frames per second, over the whole
 /// window the census counts. This is the only number that can be checked against
 /// a target without a stopwatch: it is measured at the instant the cap acts, so a
@@ -480,12 +445,7 @@ fn dest_state(sc: *mut GnSwapchain) -> String {
         }
     }
     drop(g);
-    let park = if PARK_DROUGHT.load(Ordering::Relaxed) {
-        "off"
-    } else {
-        "on"
-    };
-    format!("{in_flight}/{total} parked={parked} park={park}")
+    format!("{in_flight}/{total} parked={parked}")
 }
 
 /// "0:-F 1:A- …": A = held by the app, F = committed and awaiting release.
@@ -1294,20 +1254,14 @@ static GEN_SKIPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::n
 /// back. Compared with [`GEN_COMMITS`], it separates "presented" from
 /// "superseded".
 static GEN_RELEASES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// Parks issued since the last release note, and the note count that last reset
-/// them. A park waits for a note; when the notes do not come, waiting is strictly
-/// worse than the compositor's own release — it holds the slot for the whole
-/// bound and, with a full ring, stops generation dead.
-static PARKS_SINCE_NOTE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static NOTES_AT_LAST_PARK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// Sticky once the drought limit is crossed: parking is off for the session.
-/// A one-way switch rather than a per-frame decision, because re-arming on a
-/// stray note is what produced the failure this measures.
-static PARK_DROUGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Parks allowed without a note before parking is abandoned. Eight frames is
-/// more than the two periods a note needs to follow its latch at 60 Hz, so a
-/// channel that works resets this long before it trips.
-const PARK_DROUGHT_LIMIT: u32 = 8;
+/// No drought counter: parking is unconditional for a synced mode, and
+/// [`slot_just_freed`]'s bound is what stops a missing note from stranding a
+/// slot. A heuristic on the parks-since-the-last-note was tried and removed —
+/// parks arrive per release event while notes are drained per poll, so nine
+/// releases can legitimately precede one note. It tripped at `notes=5754` on a
+/// channel that went on to deliver 9 811 (`rnotes=9811`), and being sticky it
+/// turned the tear fix off for the rest of the session: `park=off`,
+/// `acq_fps=64.33` on a 60 Hz panel, visible tearing.
 /// Batches that built fewer frames than the engine planned, and why: no free
 /// destination, or the engine's plan itself under the multiplier.
 static GEN_SHORT_FREE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -8096,7 +8050,14 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
                 | VK_PRESENT_MODE_FIFO_RELAXED_KHR
                 | VK_PRESENT_MODE_MAILBOX_KHR
         );
-        if synced && (*slot).ino != 0 && park_awaits_note() {
+        // A synced slot waits for the display's own release, which is the note.
+        // No capability check stands in front of it: the note may never come (a
+        // buffer the daemon's publish path coalesced away is never replaced), and
+        // `slot_just_freed`'s bound is what answers that case — for the guest's
+        // acquire and for the generator's destinations alike. A latch that
+        // enabled parking only after one note arrived was removed for the same
+        // reason: it turned a one-off note into a session-long decision.
+        if synced && (*slot).ino != 0 {
             (*slot).parked_ns = monotonic_ns();
         } else {
             (*slot).in_flight = false;
