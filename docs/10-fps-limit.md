@@ -132,7 +132,10 @@ divisor cap reads its target exactly.
   `FIFO_RELAXED` (`choose_live_mode`). Both are synced, so the hold is `note` on every row: the
   image comes back only when the compositor reports its release *and* the display
   reports its scan-out release after that — measured at 1.5-2.5 display periods
-  (`sf hold`).
+  (`sf hold`). [24-release-notes.md](24-release-notes.md) describes that channel:
+  the note names the commit's ticket, so the pairing is exact where it once needed
+  an inode, an order window and a bound, and a park whose note never arrives is
+  released on its fence after four tries (`channel=[unanswered:… dead:…]`).
 
   `FIFO_RELAXED` is the second substitution, and a different bargain: served as
   itself it costs a whole vblank per frame that lands after the compositor's latch
