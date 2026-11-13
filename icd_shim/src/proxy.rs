@@ -406,6 +406,22 @@ fn rate_ok(slot: &'static Mutex<Option<Instant>>, every: Duration) -> bool {
     true
 }
 
+/// Slot time, kept apart from the rate's: an acquire that waited for the cap and
+/// then for an image used to have the whole span filed under the rate, which read
+/// as `gate_avg_us=333460` at a 16.7 ms period — 20 periods of "cap" that were
+/// really one image's hold.
+static SLOT_HOLD_N: AtomicUsize = AtomicUsize::new(0);
+static SLOT_HOLD_SUM_US: AtomicUsize = AtomicUsize::new(0);
+static SLOT_HOLD_MAX_US: AtomicUsize = AtomicUsize::new(0);
+
+/// The mean slot hold per acquire that paid one, or 0.
+fn slot_hold_avg_us() -> usize {
+    SLOT_HOLD_SUM_US
+        .load(Ordering::Relaxed)
+        .checked_div(SLOT_HOLD_N.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 /// The mean park per delayed acquire, or 0 while none has been delayed — the
 /// aggregate `gate_us=` divided by `gate_holds=`.
 fn gate_hold_avg_us() -> usize {
@@ -515,7 +531,7 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
 fn counters() -> String {
     format!(
         "{}",
-        format_args!("acq={} pres={} rel={} commit={} starved={} gendrel={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} acq_fps={:.2} books={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={}] presus=[n={} sum={} max={} ge16667={}]",
+        format_args!("acq={} pres={} rel={} commit={} starved={} gendrel={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} acq_fps={:.2} books={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} slot_holds={} slot_us={} slot_avg_us={} slot_max_us={}] presus=[n={} sum={} max={} ge16667={}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
@@ -544,6 +560,10 @@ fn counters() -> String {
                 GATE_HOLD_SUM_US.load(Ordering::Relaxed),
                 gate_hold_avg_us(),
                 GATE_HOLD_MAX_US.load(Ordering::Relaxed),
+                SLOT_HOLD_N.load(Ordering::Relaxed),
+                SLOT_HOLD_SUM_US.load(Ordering::Relaxed),
+                slot_hold_avg_us(),
+                SLOT_HOLD_MAX_US.load(Ordering::Relaxed),
                 PRESENT_US_N.load(Ordering::Relaxed),
                 PRESENT_US_SUM.load(Ordering::Relaxed),
                 PRESENT_US_MAX.load(Ordering::Relaxed),
@@ -864,6 +884,11 @@ unsafe fn commit_generated(sc: *mut GnSwapchain, slot_index: usize) {
         unsafe {
             (*s).in_flight = true;
             (*s).acquired = false;
+            // A destination's note is matched against its commit too, and a zero
+            // here would make `slot_just_freed`'s anchor `min(0, parked) = 0` —
+            // i.e. accept any note ever sent for this ino, including one for an
+            // earlier frame of the same buffer.
+            (*s).commit_ns = monotonic_ns();
         }
     }
     if unsafe { (*(*sc).surf).parent.is_null() } {
@@ -979,6 +1004,7 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
                 acquired: false,
                 in_flight: false,
                 parked_ns: 0,
+                commit_ns: 0,
                 acq_seq: 0,
                 acquired_ns: 0,
                 ino: 0,
@@ -2190,6 +2216,9 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
     unsafe {
         let s = (*sc).slots.as_mut_ptr().add(idx as usize);
         let now = monotonic_ns();
+        // The instant a release note for this frame will be about. Set here, not
+        // at the park: the note can precede the park (see `commit_ns`).
+        (*s).commit_ns = now;
         let last = LAST_COMMIT_NS.swap(now, Ordering::Relaxed);
         if last != 0 && now > last {
             let gap = now - last;
@@ -2593,6 +2622,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             acquired: false,
             in_flight: false,
             parked_ns: 0,
+                commit_ns: 0,
             acq_seq: 0,
             acquired_ns: 0,
             ino: 0,
@@ -2868,24 +2898,31 @@ const REAP_SLICE: Duration = Duration::from_millis(4);
 /// How long a parked slot waits for the daemon's release note before it is taken
 /// anyway.
 ///
-/// Four latch periods, and nothing else. A FIFO hold is measured in latch gaps,
-/// not in display periods: a title producing 40 fps on a 60 Hz panel holds a
-/// buffer for ~66 ms, so a two-period bound expired before every note and
-/// `park_timeouts` read 12 203 against 3 623 slot waits — the reuse guarantee
-/// silently reduced to a timeout. Four periods covers the hold at any producer
-/// rate down to half the panel's.
+/// How long a parked slot waits for the daemon's release note before it is taken
+/// anyway: two producer intervals, kept between two and four panel periods.
+///
+/// The producer interval is the right scale for the *hold* — a buffer stays on
+/// the layer until the next frame replaces it, so a bound measured in panel
+/// periods alone expires before every note for a slow producer (40 fps on 60 Hz
+/// held ~66 ms against a 33 ms bound; `park_timeouts` read 12 203 against 3 623
+/// slot waits).
+///
+/// It must not be the only scale, though, because the bound then depends on the
+/// interval it governs. A session that has already slowed lengthens the hold that
+/// keeps it slow — measured on Witcher 3 under Odin 3, where no note matched its
+/// slot: 3 fps → 318 ms spacing → 636 ms bound → three images per 0.64 s → 3 fps.
+/// Four panel periods is the ceiling; it is still twice the 1.5-2.5-period hold
+/// SurfaceFlinger was measured to take, so a working note path never reaches it.
 fn release_note_limit_ns() -> u64 {
-    // Two producer intervals, floored by two panel periods. The hold is caused by
-    // the producer's cadence — a buffer stays on the layer until the next frame
-    // replaces it — so a bound measured in *panel* periods expires early exactly
-    // for the slow producers it exists to cover (40 fps on 60 Hz held ~66 ms
-    // against a 33 ms bound, and `park_timeouts` read 12 203 against 3 623 slot
-    // waits). Nothing here is a literal round number: the interval is measured
-    // from the commits, the floor from the panel's rate.
-    let hz = u64::from(crate::lsfg::panel_hz().max(1));
-    let floor = 2 * (1_000_000_000 / hz);
+    let hz = match crate::lsfg::panel_hz() {
+        0 => 60,
+        hz => u64::from(hz),
+    };
+    let period = 1_000_000_000 / hz;
+    let floor = 2 * period;
+    let ceiling = 4 * period;
     let spacing = COMMIT_SPACING_NS.load(Ordering::Relaxed);
-    (spacing.saturating_mul(2)).max(floor)
+    spacing.saturating_mul(2).clamp(floor, ceiling)
 }
 
 /// How long an acquire may sleep while a slot is parked on a release note.
@@ -2939,14 +2976,33 @@ unsafe fn slot_just_freed(s: *mut GnSlot, now: u64) -> bool {
     if parked == 0 {
         return false;
     }
-    if unsafe { crate::scanout::take_released((*s).ino, parked) } {
+    // A note describes the frame that was committed, and it can arrive before the
+    // compositor's release that parks the slot. Anchoring on the commit is what
+    // pairs them; anchoring on the park dropped the note for this very frame as
+    // stale and left every slot on the bound.
+    let since = unsafe { (*s).commit_ns }.min(parked);
+    if unsafe { crate::scanout::take_released((*s).ino, since) } {
         NOTES_APPLIED.fetch_add(1, Ordering::Relaxed);
         let lag = now.saturating_sub(parked);
         NOTELAG[note_lag_bucket(lag)].fetch_add(1, Ordering::Relaxed);
         return true;
     }
+
     if now.saturating_sub(parked) >= release_note_limit_ns() {
         PARK_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+        // Once per process: the slot's identity beside the notes the daemon sent.
+        // A session that reads `park_timeouts == acquires` with `notelag` empty
+        // needs this line to say whether the identities differ or the note list
+        // was empty when the park expired.
+        static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !REPORTED.swap(true, Ordering::Relaxed) {
+            crate::logf!(
+                "proxy park timeout: slot ino={} parked {} us ago; released=[{}]",
+                unsafe { (*s).ino },
+                now.saturating_sub(parked) / 1_000,
+                crate::scanout::released_snapshot()
+            );
+        }
         return true;
     }
     false
@@ -3083,6 +3139,8 @@ unsafe fn gn_acquire_common(
     // never one per turn of the loop.
     let mut blocked = Blocked::None;
     let mut blocked_at = 0u64;
+    // When the rate condition was satisfied, 0 while it still is not.
+    let mut rate_done_ns = 0u64;
     {
         let mut g = (*sc).shared.lock().unwrap();
         loop {
@@ -3109,6 +3167,12 @@ unsafe fn gn_acquire_common(
                         Waited::Expired => break,
                     }
                 }
+            }
+            // 1 ended: if this frame was held for the cap, its rate time stops
+            // here. Recorded once, so the slot wait that follows is counted as a
+            // slot wait instead of being filed under the rate.
+            if blocked == Blocked::Rate && rate_done_ns == 0 {
+                rate_done_ns = monotonic_ns();
             }
             // 2. An image.
             unsafe { acquire_take_free(sc, &mut idx) };
@@ -3174,11 +3238,22 @@ unsafe fn gn_acquire_common(
         }
         // SAFETY: `idx` is a slot of this swapchain.
         (*(*sc).slots.as_mut_ptr().add(idx as usize)).acquired_ns = now;
+        // Two waits, two totals. A frame held by the cap and then by an image is
+        // charged to each for the part it actually spent there.
+        let rate_end = if rate_done_ns != 0 { rate_done_ns } else { now };
         if blocked == Blocked::Rate {
-            let us = now.saturating_sub(blocked_at) as usize / 1_000;
+            let us = rate_end.saturating_sub(blocked_at) as usize / 1_000;
             GATE_HOLD_N.fetch_add(1, Ordering::Relaxed);
             GATE_HOLD_SUM_US.fetch_add(us, Ordering::Relaxed);
             GATE_HOLD_MAX_US.fetch_max(us, Ordering::Relaxed);
+        }
+        if blocked != Blocked::None {
+            let slot_us = now.saturating_sub(rate_end) as usize / 1_000;
+            if slot_us > 0 {
+                SLOT_HOLD_N.fetch_add(1, Ordering::Relaxed);
+                SLOT_HOLD_SUM_US.fetch_add(slot_us, Ordering::Relaxed);
+                SLOT_HOLD_MAX_US.fetch_max(slot_us, Ordering::Relaxed);
+            }
         }
     } else {
         ACQ_RETRY_N.fetch_add(1, Ordering::Relaxed);
@@ -6681,6 +6756,34 @@ mod swapchain_slots_tests {
         );
     }
 
+    /// The park bound may not be derived from the interval it governs: a session
+    /// that has slowed lengthens the hold that keeps it slow. Measured on Witcher
+    /// 3 under Odin 3 at 3 fps — spacing 318 ms, bound 636 ms, three images per
+    /// 0.64 s, 3 fps.
+    #[test]
+    fn the_park_bound_is_clamped_to_the_panel() {
+        // The floor calibrates the test to whatever rate this process reports,
+        // rather than assuming 60 Hz: with no spacing the bound is two panel
+        // periods by definition.
+        COMMIT_SPACING_NS.store(0, Ordering::Relaxed);
+        let floor = release_note_limit_ns();
+        let period = floor / 2;
+        assert!(period > 0, "no panel period to work from");
+        // A pathological spacing cannot stretch the bound past four periods.
+        COMMIT_SPACING_NS.store(400_000_000, Ordering::Relaxed);
+        assert_eq!(release_note_limit_ns(), 4 * period);
+        // A fast producer is floored at two periods: the hold is a latch gap, and
+        // a bound below it would expire before every note.
+        COMMIT_SPACING_NS.store(1_000_000, Ordering::Relaxed);
+        assert_eq!(release_note_limit_ns(), floor);
+        // In between, the producer's own interval decides: a spacing of 1.5
+        // periods doubles to 3, which sits inside the clamp and is returned as is.
+        let spacing = period + period / 2;
+        COMMIT_SPACING_NS.store(spacing, Ordering::Relaxed);
+        assert_eq!(release_note_limit_ns(), spacing * 2);
+        COMMIT_SPACING_NS.store(0, Ordering::Relaxed);
+    }
+
     /// The census's rate is frames over elapsed time, and a bare sum of waits
     /// cannot supply it: 89 "fps" on a 30 cap was the reciprocal of a service
     /// time. This pins the arithmetic on the counters it now reads.
@@ -7699,6 +7802,18 @@ pub struct GnSlot {
     // before the display is done *scanning* it out (see `crate::scanout`), so the
     // slot stays busy until the note arrives or this ages out.
     pub parked_ns: u64,
+    /// When this slot's frame was committed to the compositor, mono ns.
+    ///
+    /// The anchor a release note is matched against. Not `parked_ns`: the park is
+    /// taken on the compositor's own release, while the daemon's note comes from
+    /// SurfaceFlinger's previous-release fence, which signals when the *next*
+    /// buffer latches — before the compositor tells us it is done with this one.
+    /// Measured on Witcher 3 under Odin 3: notes and park timeouts paired 1:1
+    /// (`rnotes=707`, `park_timeouts=705`) with `notelag` empty on every bucket,
+    /// i.e. the note describing each frame arrived before the park and was dropped
+    /// as stale, leaving every slot to wait out the bound (23.6 fps, slot wait
+    /// 25 ms per frame).
+    pub commit_ns: u64,
     // Guest-side trace: the acquire sequence that filled this slot, so a
     // present can be tied back to the acquire that handed the guest the image.
     pub acq_seq: u64,

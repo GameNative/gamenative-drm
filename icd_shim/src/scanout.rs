@@ -696,6 +696,25 @@ pub(crate) fn note_buffer_released(ino: u64) {
     q.push((ino, crate::proxy::monotonic_ns()));
 }
 
+/// The inos of the notes currently held, up to eight, oldest first.
+///
+/// For the one case worth a log line: a park that expired while notes were being
+/// received. Printed beside the slot's own `ino`, it says whether the daemon keys
+/// buffers by an identity this process never holds (a different allocator path on
+/// this SoC) or whether the note list was simply empty by then, which is a timing
+/// question instead.
+pub(crate) fn released_snapshot() -> String {
+    let q = RELEASED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = String::new();
+    for (ino, _) in q.iter().take(8) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!("{ino}"));
+    }
+    out
+}
+
 /// Whether the daemon sends release notes at all. Until one has arrived, a slot
 /// frees on the compositor's release exactly as it did before this note existed.
 /// Whether any note has ever arrived.
