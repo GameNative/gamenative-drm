@@ -236,6 +236,44 @@ static SHIM_T0_NS: AtomicU64 = AtomicU64::new(0);
 static NOTES_APPLIED: AtomicUsize = AtomicUsize::new(0);
 static PARK_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
 
+/// Parks that ended on the bound, with no note, in a row.
+///
+/// The release note is news from a producer that may not be there. RP6 runs
+/// gamescope on this payload with no daemon at all: `rnotes=132` against
+/// `park_timeouts=14544`, no `sf hold:` and no `release note ino=` line in 20 000
+/// logcat lines, and only `gamescope`/`gamescopereaper` in `ps`. Every park there
+/// is a hold with nobody to end it, and the acquire polled a 250 us slice until
+/// the bound — 9.6 ms inside `vkAcquireNextImageKHR` of a 28.1 ms frame, while
+/// the gate (1.15 ms) and the slot bound (0.93 ms) accounted for 2.1 ms of it.
+///
+/// Four unanswered parks in a row is enough to stop betting: the slot is freed on
+/// its fence instead, which is what the commit before the park did and what ran
+/// Dave at 50-60 on that device. Any message on the note socket resets this, so a
+/// producer that comes back re-arms parking on its own — there is no probation
+/// timer to tune, and a channel that never appears costs nothing after the fourth
+/// frame.
+static PARK_UNANSWERED: AtomicUsize = AtomicUsize::new(0);
+const PARK_DEAD_AFTER: usize = 4;
+
+/// The note channel is dead: the last `PARK_DEAD_AFTER` parks went unanswered.
+fn park_channel_dead() -> bool {
+    PARK_UNANSWERED.load(Ordering::Relaxed) >= PARK_DEAD_AFTER
+}
+
+/// A message arrived on the note socket, so parking is worth a bet again.
+pub(crate) fn note_channel_alive() {
+    PARK_UNANSWERED.store(0, Ordering::Relaxed);
+}
+
+/// The lock wait the acquire cannot otherwise name.
+///
+/// The acquire's total and the waits it names did not add up on RP6: 9.6 ms a
+/// frame inside `vkAcquireNextImageKHR`, against 2.1 ms of gate and slot time.
+/// The only other place the rest can be is the swapchain lock, held by the worker
+/// across its commit.
+static LOCK_WAIT_N: AtomicUsize = AtomicUsize::new(0);
+static LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+
 /// Commits whose slot carried a present id but no wait id: the present armed the
 /// id, so something cleared it between the present and the commit. The release
 /// handler is the only other writer, and a frame that loses its id this way is
@@ -538,7 +576,7 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
 fn counters() -> String {
     format!(
         "{}",
-        format_args!("acq={} pres={} rel={} commit={} starved={} gendrel={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} acq_fps={:.2} books={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} slot_holds={} slot_us={} slot_avg_us={} slot_max_us={} by_order={}] presus=[n={} sum={} max={} ge16667={}]",
+        format_args!("acq={} pres={} rel={} commit={} starved={} gendrel={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} acq_fps={:.2} books={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} slot_holds={} slot_us={} slot_avg_us={} slot_max_us={} by_order={}] presus=[n={} sum={} max={} ge16667={}] channel=[unanswered:{} dead:{}] lock=[n:{} us:{}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
@@ -575,8 +613,26 @@ fn counters() -> String {
                 PRESENT_US_N.load(Ordering::Relaxed),
                 PRESENT_US_SUM.load(Ordering::Relaxed),
                 PRESENT_US_MAX.load(Ordering::Relaxed),
-                PRESENT_US_GE_VBLANK.load(Ordering::Relaxed),)
+                PRESENT_US_GE_VBLANK.load(Ordering::Relaxed),
+                PARK_UNANSWERED.load(Ordering::Relaxed),
+                park_channel_dead(),
+                LOCK_WAIT_N.load(Ordering::Relaxed),
+                LOCK_WAIT_NS.load(Ordering::Relaxed) / 1_000,)
     )
+}
+
+/// The swapchain lock, with the wait it cost counted when it is worth naming.
+///
+/// The acquire's total and the waits it names did not add up on RP6: 9.6 ms a
+/// frame inside `vkAcquireNextImageKHR`, of which the gate (1.15 ms) and the slot
+/// bound (0.93 ms) were 2.1 ms. The only other thing it can be is this lock, held
+/// by the worker across its commit.
+fn note_lock_wait(t0: Instant) {
+    let ns = t0.elapsed().as_nanos() as u64;
+    if ns > 1_000_000 {
+        LOCK_WAIT_N.fetch_add(1, Ordering::Relaxed);
+        LOCK_WAIT_NS.fetch_add(ns, Ordering::Relaxed);
+    }
 }
 
 /// Serializes every send-side wl_connection access (request marshaling +
@@ -993,6 +1049,7 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
         let index = unsafe { (*sc).slots.len() };
         unsafe {
             (*sc).slots.push(GnSlot {
+                park_expired: false,
                 owner: sc,
                 image: 0,
                 mem: 0,
@@ -1887,6 +1944,7 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
                 // generator is about to write the whole image again.
                 let s = (*sc).slots.as_mut_ptr().add(*index);
                 (*s).parked_ns = 0;
+                (*s).park_expired = false;
                 (*s).in_flight = true;
                 (*gd).gen_due.push_back(GenDue {
                     deadline,
@@ -2623,6 +2681,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     let scp: *mut GnSwapchain = &mut *sc;
     for _ in 0..n_slots {
         sc.slots.push(GnSlot {
+            park_expired: false,
             owner: scp,
             image: 0,
             mem: 0,
@@ -3042,6 +3101,7 @@ unsafe fn answer_park_from_notes(
     let s = unsafe { (*sc).slots.as_mut_ptr().add(oldest as usize) };
     unsafe {
         (*s).parked_ns = 0;
+        (*s).park_expired = false;
         (*s).in_flight = false;
     }
     unsafe { (*sc).cv_free.notify_all() };
@@ -3067,6 +3127,10 @@ unsafe fn slot_just_freed(s: *mut GnSlot, now: u64) -> bool {
     if parked == 0 {
         return false;
     }
+    // The bound already answered this park: say so without counting it again.
+    if unsafe { (*s).park_expired } {
+        return true;
+    }
     // A note describes the frame that was committed, and it can arrive before the
     // compositor's release that parks the slot. Anchoring on the commit is what
     // pairs them; anchoring on the park dropped the note for this very frame as
@@ -3074,6 +3138,7 @@ unsafe fn slot_just_freed(s: *mut GnSlot, now: u64) -> bool {
     let since = unsafe { (*s).commit_ns }.min(parked);
     if unsafe { crate::scanout::take_released((*s).ino, since) } {
         NOTES_APPLIED.fetch_add(1, Ordering::Relaxed);
+        PARK_UNANSWERED.store(0, Ordering::Relaxed);
         let lag = now.saturating_sub(parked);
         NOTELAG[note_lag_bucket(lag)].fetch_add(1, Ordering::Relaxed);
         return true;
@@ -3081,6 +3146,8 @@ unsafe fn slot_just_freed(s: *mut GnSlot, now: u64) -> bool {
 
     if now.saturating_sub(parked) >= release_note_limit_ns() {
         PARK_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+        PARK_UNANSWERED.fetch_add(1, Ordering::Relaxed);
+        unsafe { (*s).park_expired = true };
         // Once per process: the slot's identity beside the notes the daemon sent.
         // A session that reads `park_timeouts == acquires` with `notelag` empty
         // needs this line to say whether the identities differ or the note list
@@ -3132,6 +3199,7 @@ unsafe fn acquire_scan_identity(sc: *mut GnSwapchain, idx: &mut i32) {
                 (*s).acquired = true;
                 (*s).in_flight = false;
                 (*s).parked_ns = 0;
+                (*s).park_expired = false;
             }
             let seq = ACQ_SEQ.fetch_add(1, Ordering::Relaxed);
             unsafe {
@@ -3254,7 +3322,9 @@ unsafe fn gn_acquire_common(
     // When the rate condition was satisfied, 0 while it still is not.
     let mut rate_done_ns = 0u64;
     {
-        let mut g = (*sc).shared.lock().unwrap();
+        let lock_t0 = Instant::now();
+        let mut g = unsafe { (*sc).shared.lock().unwrap() };
+        note_lock_wait(lock_t0);
         loop {
             if idx >= 0 || g.stopping {
                 break;
@@ -3304,7 +3374,9 @@ unsafe fn gn_acquire_common(
             drop(g);
             unsafe { x11_reap(sc) };
             crate::scanout::poll_notes();
-            g = (*sc).shared.lock().unwrap();
+            let lock_t0 = Instant::now();
+            g = unsafe { (*sc).shared.lock().unwrap() };
+            note_lock_wait(lock_t0);
             if g.stopping {
                 break;
             }
@@ -7919,6 +7991,14 @@ pub struct GnSlot {
     // before the display is done *scanning* it out (see `crate::scanout`), so the
     // slot stays busy until the note arrives or this ages out.
     pub parked_ns: u64,
+    /// The bound has already decided this park, so it is answered once.
+    ///
+    /// `slot_just_freed` is asked about a slot on every pass of the acquire loop,
+    /// and the bound is a moving target, so counting per call made
+    /// `park_timeouts` a count of loop turns. Measured on RP6: 14 544 timeouts
+    /// against 14 679 acquires while the total slot wait was 14.5 s — under a
+    /// millisecond per park it claimed to have timed out.
+    pub park_expired: bool,
     /// When this slot's frame was committed to the compositor, mono ns.
     ///
     /// The anchor a release note is matched against. Not `parked_ns`: the park is
@@ -8402,8 +8482,12 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
             let slots = (*sc).slots.as_ptr();
             ((slot as usize - slots as usize) / core::mem::size_of::<GnSlot>()) >= guest
         };
-        if synced && (*slot).ino != 0 && !hidden_slot {
+        // A park is a bet that a note will end it, so it is only placed while the
+        // channel is paying out. On a session with no producer the slot is freed
+        // here instead, on its fence, which is the pre-park behaviour.
+        if synced && (*slot).ino != 0 && !hidden_slot && !park_channel_dead() {
             (*slot).parked_ns = monotonic_ns();
+            (*slot).park_expired = false;
         } else {
             (*slot).in_flight = false;
         }

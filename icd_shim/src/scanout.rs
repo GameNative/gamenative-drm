@@ -848,6 +848,13 @@ pub(crate) fn poll_notes() {
         // SurfaceFlinger is finished with this scan-out buffer: the producer may
         // write into it again (see `note_buffer_released`).
         note_buffer_released(released.ino);
+        // A release note is the only message that can end a park, so it is the
+        // only one that says parking is worth a bet again. Liveness keyed on the
+        // socket itself is a lie on a device whose daemon still pushes the panel
+        // grid: RP6 sent ~5 000 `VsyncNote`s while releasing nothing, and
+        // `channel=[unanswered:2 dead:false]` never armed the fail-open with
+        // `park_timeouts=5181` of 5 210 acquires.
+        crate::proxy::note_channel_alive();
     } else if let Some(acq) = gndrm_uapi::wire::FrameAcquired::decode(&buf[..len]) {
         // Sent from the acquire path; nothing to apply here. Accepted so the
         // log does not report it as an unknown frame.
