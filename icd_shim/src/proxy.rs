@@ -2468,7 +2468,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     let mut n_slots = if strict_count {
         ci.minImageCount.clamp(2, ceiling.max(2))
     } else {
-        swapchain_slots(ci.minImageCount, ceiling, mode)
+        swapchain_slots(ci.minImageCount, ceiling, count_present_mode(mode))
     };
     // Frame generation needs the source, its destination and the one the
     // compositor holds. This floor is not what sizes the generation ring — that
@@ -6600,6 +6600,23 @@ mod swapchain_slots_tests {
         assert_eq!(swapchain_slots(6, 8, VK_PRESENT_MODE_MAILBOX_KHR), 6);
     }
 
+    /// The count follows the mode that will be *served*, so a generation session
+    /// gets the mailbox depth even when the guest asks FIFO — the case Witcher 3
+    /// measured at 3 guest slots against a 1.5-2.5-period hold.
+    #[test]
+    fn the_count_is_sized_for_the_served_mode() {
+        // Not generating: the declaration decides, with immediate served as
+        // mailbox, so an immediate guest gets four rather than its own two.
+        assert_eq!(count_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR), VK_PRESENT_MODE_MAILBOX_KHR);
+        assert_eq!(count_present_mode(VK_PRESENT_MODE_FIFO_KHR), VK_PRESENT_MODE_FIFO_KHR);
+        // The mailbox floor then applies to the served mode, which is the whole
+        // point: the same guest ask yields four images.
+        assert_eq!(
+            swapchain_slots(3, 8, count_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)),
+            4
+        );
+    }
+
     /// Two is the floor and the ceiling is the ceiling, whatever the ask.
     #[test]
     fn stays_inside_two_and_the_ceiling() {
@@ -10198,6 +10215,27 @@ unsafe fn live_choice(sc: *mut GnSwapchain) -> (VkPresentModeKHR, Declared) {
 /// instead of being shown mid-scan, which is what the container used to do with
 /// `MESA_VK_WSI_PRESENT_MODE` and no longer may. The declaration follows the same
 /// mode, so gamescope is told what is actually served.
+/// The mode a swapchain's image count is sized for: the one this session will
+/// serve, not the one the guest declared.
+///
+/// The two differ in exactly two cases, and both are ours: a generation session
+/// is served mailbox or fifo from the QuickMenu whatever the guest asked, and a
+/// declared IMMEDIATE is served as mailbox. Sizing the count from the declaration
+/// therefore sizes it for a mode nobody runs — measured on Witcher 3, whose guest
+/// asks FIFO (`min=3 mode=2`) while it is served and held as mailbox:
+///
+/// ```text
+/// slots=[3 guest + 8 destinations]  sf hold 1.5-2.5 periods  acq_fps 49.7
+/// ```
+///
+/// Three guest slots under a two-period hold cap at `depth x refresh / hold` = 54,
+/// and the mailbox floor of four — the whole reason `SC_MAILBOX_IMAGES` exists —
+/// never applied. The hold already follows the served mode (`on_buffer_release`);
+/// this makes the depth follow it too.
+fn count_present_mode(declared: VkPresentModeKHR) -> VkPresentModeKHR {
+    choose_live_mode(declared, crate::lsfg::live().0).0
+}
+
 fn choose_live_mode(mode: VkPresentModeKHR, generating: bool) -> (VkPresentModeKHR, Declared) {
     if generating {
         // The QuickMenu offers mailbox and fifo for generation and nothing else,
