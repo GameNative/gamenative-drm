@@ -2675,9 +2675,18 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     // destinations themselves created up front, before the first present.
     sc.guest_slots = n_slots;
     // Hidden slots only on gamescope's route, the one where a slot comes back on
-    // the compositor's release. The guest never sees them (`spare_begin`).
-    let hidden = if strict_count && gamescope_route {
-        crate::image_count::hidden_slot_count(n_slots) as usize
+    // the compositor's release. The guest never sees them (`spare_begin`): it is
+    // answered `n_slots` and binds `n_slots`, so the count rule of #56 is
+    // untouched and the ring exists only past the guest's own images.
+    //
+    // Keyed on the *ask*, not on `n_slots`. A guest that insists on a small image
+    // count is the case this exists for, and the served mode may have already
+    // raised `n_slots` past the ask: Doom 2016 asks for two and is served mailbox,
+    // which floors the count at four. Sizing the ring from the ask keeps the
+    // pipeline behind that guest; sizing it from `n_slots` would read four, decide
+    // the guest "has an image to spare" and give it none.
+    let hidden = if gamescope_route {
+        crate::image_count::hidden_slot_count(ci.minImageCount) as usize
     } else {
         0
     };
@@ -2699,10 +2708,9 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     }
     sc.spare_slots = hidden as u32;
     if hidden != 0 {
-        crate::logi!("proxy swapchain create: strict image count: {} images, {} of {} ring slot(s) for hidden copies",
+        crate::logi!("proxy swapchain create: {} images for asked={}, {hidden} of {ring} ring slot(s) for hidden copies",
             n_slots,
-            hidden,
-            ring);
+            ci.minImageCount);
     }
 
     // What the guest was told the surface can be, next to what the slot images
@@ -7436,16 +7444,21 @@ mod tests {
             VK_PRESENT_MODE_FIFO_RELAXED_KHR,
         );
         // Nothing rewrites the request: not the cap, not the panel, not the
-        // lead. Two exceptions, neither of them the guest's present as asked: a
-        // generated frame, and `IMMEDIATE`, which is served as MAILBOX so a frame
-        // that cannot be shown is dropped rather than scanned out mid-flip.
-        for mode in [m, f, r] {
+        // lead. `FIFO` and `MAILBOX` are served as asked. Three exceptions, none
+        // of them the guest's present as asked: a generated frame, `IMMEDIATE`
+        // (tears by construction) and `FIFO_RELAXED`, which costs a whole vblank
+        // per frame it lands late — 28.8 fps against a 60 cap on Doom 2016 with
+        // the GPU at 41 % and no busy component.
+        for mode in [m, f] {
             assert_eq!(choose_live_mode(mode, false), (mode, Declared::Mode));
         }
-        assert_eq!(
-            choose_live_mode(i, false),
-            (VK_PRESENT_MODE_MAILBOX_KHR, Declared::Mode)
-        );
+        for mode in [i, r] {
+            assert_eq!(
+                choose_live_mode(mode, false),
+                (VK_PRESENT_MODE_MAILBOX_KHR, Declared::Mode),
+                "mode {mode} is served as mailbox"
+            );
+        }
         for mode in [m, f, i, r] {
             assert_eq!(
                 choose_live_mode(mode, true),
@@ -8376,7 +8389,20 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
         // acquire and for the generator's destinations alike. A latch that
         // enabled parking only after one note arrived was removed for the same
         // reason: it turned a one-off note into a session-long decision.
-        if synced && (*slot).ino != 0 {
+        // Hidden slots are never parked. They are copies this layer owns, made so
+        // the guest's own images do not have to wait for the compositor, and the
+        // ring's order is what bounds their reuse. Parking them defeats the whole
+        // mechanism: four hidden slots go in_flight, `spare_begin` finds none free,
+        // the frame falls back to a guest slot, and the guest slot parks — with two
+        // of those the session lands on `2 / hold` = 30 fps. Measured on Doom 2016
+        // (Odin 3): six slots, `dests=[4/4 parked=4]`, 29.9 fps; the same title on
+        // the commit before the park existed ran 50-60.
+        let hidden_slot = {
+            let guest = (*sc).guest_slots as usize;
+            let slots = (*sc).slots.as_ptr();
+            ((slot as usize - slots as usize) / core::mem::size_of::<GnSlot>()) >= guest
+        };
+        if synced && (*slot).ino != 0 && !hidden_slot {
             (*slot).parked_ns = monotonic_ns();
         } else {
             (*slot).in_flight = false;
@@ -10538,6 +10564,36 @@ fn count_present_mode(declared: VkPresentModeKHR) -> VkPresentModeKHR {
     choose_live_mode(declared, crate::lsfg::live().0).0
 }
 
+/// What this session serves for a declared mode.
+///
+/// Two declarations are served as `MAILBOX`, and both for the same reason: the
+/// mode the guest asked for cannot be honoured without costing frames it would
+/// not otherwise lose.
+///
+/// - `IMMEDIATE` tears by construction: the image is handed over for display the
+///   moment it is presented. Served as mailbox it is superseded at a vblank
+///   instead, so the guest gets the pacing it asked for (no wait on the client)
+///   and the panel gets a buffer it can latch whole. Measured on Portal 2: the
+///   tear under direct scan-out disappears.
+/// - `FIFO_RELAXED` gives up a whole vblank per frame when a frame lands after the
+///   compositor's latch point, because the next one cannot be taken until the
+///   following vblank. Measured on Doom 2016 at 28.8 fps against a 60 cap with the
+///   GPU at 41 % and the CPU at 26 % — nothing busy, each frame costing `2T`.
+///   Served as mailbox the newest frame replaces the pending one, so a missed
+///   latch is superseded rather than deferred: `period = max(render, T)` instead
+///   of `2T`. The same title ran near 60 on the commit before this override was
+///   removed, when the app set `MESA_VK_WSI_PRESENT_MODE=mailbox` and this layer
+///   obeyed it.
+///
+/// The cost of the second is that a superseded frame is dropped rather than shown
+/// late, which `FIFO_RELAXED` itself would not do — it permits tearing, not loss.
+/// At a render time below the panel period nothing is superseded, so the two are
+/// indistinguishable; above it, mailbox is what the guest would have got had it
+/// asked for mailbox.
+///
+/// `FIFO` is served as itself. It promises every frame on a vblank and its frames
+/// arrive before the latch point by construction, which is the case the mailbox
+/// discipline would damage.
 fn choose_live_mode(mode: VkPresentModeKHR, generating: bool) -> (VkPresentModeKHR, Declared) {
     if generating {
         // The QuickMenu offers mailbox and fifo for generation and nothing else,
@@ -10549,7 +10605,9 @@ fn choose_live_mode(mode: VkPresentModeKHR, generating: bool) -> (VkPresentModeK
             VK_PRESENT_MODE_MAILBOX_KHR
         };
         (served, Declared::Generating)
-    } else if mode == VK_PRESENT_MODE_IMMEDIATE_KHR {
+    } else if mode == VK_PRESENT_MODE_IMMEDIATE_KHR
+        || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR
+    {
         (VK_PRESENT_MODE_MAILBOX_KHR, Declared::Mode)
     } else {
         (mode, Declared::Mode)

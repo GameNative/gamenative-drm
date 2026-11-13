@@ -128,11 +128,21 @@ divisor cap reads its target exactly.
   `hold` is when an acquired image may be drawn into again. It follows the
   **served** mode — the same one `on_buffer_release` keys on — and on this route
   every declaration is served as FIFO or MAILBOX: FIFO for a guest that asked for
-  it, MAILBOX for a generation session and for a declared `IMMEDIATE`
-  (`choose_live_mode`). Both are synced, so the hold is `note` on every row: the
+  it, MAILBOX for a generation session and for a declared `IMMEDIATE` or
+  `FIFO_RELAXED` (`choose_live_mode`). Both are synced, so the hold is `note` on every row: the
   image comes back only when the compositor reports its release *and* the display
   reports its scan-out release after that — measured at 1.5-2.5 display periods
   (`sf hold`).
+
+  `FIFO_RELAXED` is the second substitution, and a different bargain: served as
+  itself it costs a whole vblank per frame that lands after the compositor's latch
+  point, because the next frame cannot be taken until the following vblank. Doom
+  2016 measured 28.8 fps against a 60 cap with the GPU at 41 % and the CPU at 26 %
+  — `2T` per frame, nothing busy. Served as mailbox the newest frame supersedes
+  the pending one, so a missed latch is dropped rather than deferred. That is what
+  `MAILBOX` promises and not what `FIFO_RELAXED` promises (it permits tearing, not
+  loss), which is why the substitution is a judgement: at a render time below the
+  panel period nothing is superseded and the two are indistinguishable.
 
   That substitution is what makes a single `note` column possible. Serving a
   declared `IMMEDIATE` as itself would return the image the moment it was handed
