@@ -410,6 +410,11 @@ fn rate_ok(slot: &'static Mutex<Option<Instant>>, every: Duration) -> bool {
 /// then for an image used to have the whole span filed under the rate, which read
 /// as `gate_avg_us=333460` at a 16.7 ms period — 20 periods of "cap" that were
 /// really one image's hold.
+/// Parks answered by order rather than by the note's inode (`notelag`'s
+/// counterpart): a count above zero means this device does not key notes by the
+/// parked buffer, and the order path is what is keeping the pipeline moving.
+static NOTES_BY_ORDER: AtomicUsize = AtomicUsize::new(0);
+
 static SLOT_HOLD_N: AtomicUsize = AtomicUsize::new(0);
 static SLOT_HOLD_SUM_US: AtomicUsize = AtomicUsize::new(0);
 static SLOT_HOLD_MAX_US: AtomicUsize = AtomicUsize::new(0);
@@ -496,7 +501,7 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
     drop(g);
     format!(
         "{}",
-        format_args!("acq={} pres={} rel={} commit={} starved={} in_flight={in_flight} slots=[{}] dests=[{}] gendrel={} acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} acq_fps={:.2}]",
+        format_args!("acq={} pres={} rel={} commit={} starved={} in_flight={in_flight} slots=[{}] dests=[{}] gendrel={} acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} slot_avg_us={} by_order={} acq_fps={:.2}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
@@ -523,6 +528,8 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
                 GATE_HOLD_SUM_US.load(Ordering::Relaxed),
                 gate_hold_avg_us(),
                 GATE_HOLD_MAX_US.load(Ordering::Relaxed),
+                slot_hold_avg_us(),
+                NOTES_BY_ORDER.load(Ordering::Relaxed),
                 acq_fps(),)
     )
 }
@@ -531,7 +538,7 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
 fn counters() -> String {
     format!(
         "{}",
-        format_args!("acq={} pres={} rel={} commit={} starved={} gendrel={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} acq_fps={:.2} books={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} slot_holds={} slot_us={} slot_avg_us={} slot_max_us={}] presus=[n={} sum={} max={} ge16667={}]",
+        format_args!("acq={} pres={} rel={} commit={} starved={} gendrel={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} acq_fps={:.2} books={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} slot_holds={} slot_us={} slot_avg_us={} slot_max_us={} by_order={}] presus=[n={} sum={} max={} ge16667={}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
@@ -564,6 +571,7 @@ fn counters() -> String {
                 SLOT_HOLD_SUM_US.load(Ordering::Relaxed),
                 slot_hold_avg_us(),
                 SLOT_HOLD_MAX_US.load(Ordering::Relaxed),
+                NOTES_BY_ORDER.load(Ordering::Relaxed),
                 PRESENT_US_N.load(Ordering::Relaxed),
                 PRESENT_US_SUM.load(Ordering::Relaxed),
                 PRESENT_US_MAX.load(Ordering::Relaxed),
@@ -1523,7 +1531,7 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
     // note is overdue — and nothing queued still points at it. The unpark check
     // is the same one the guest's acquire uses: this path had none, so every
     // destination it parked left the ring for good (`slots=[5/5 parked=5]`).
-    let free: Vec<usize> = (guest..unsafe { (*sc).slots.len() })
+    let mut free: Vec<usize> = (guest..unsafe { (*sc).slots.len() })
         .filter(|&i| {
             let s = unsafe { (*sc).slots.as_mut_ptr().add(i) };
             let landed = unsafe { !(*s).in_flight || slot_just_freed(s, monotonic_ns()) };
@@ -1531,7 +1539,19 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
                 && !unsafe { (*gd).gen_due.iter().any(|d| d.slot as usize == i) }
         })
         .collect();
-    let mut free = free;
+    // Identity found too few: spend notes by order and look again, so a device
+    // whose notes name another buffer still gets its destinations back.
+    if free.len() < planned as usize
+        && unsafe { answer_park_from_notes(sc, guest, (*sc).slots.len(), false) } >= 0
+    {
+        free = (guest..unsafe { (*sc).slots.len() })
+            .filter(|&i| {
+                let s = unsafe { (*sc).slots.as_mut_ptr().add(i) };
+                let landed = unsafe { !(*s).in_flight || slot_just_freed(s, monotonic_ns()) };
+                landed && !unsafe { (*gd).gen_due.iter().any(|d| d.slot as usize == i) }
+            })
+            .collect();
+    }
     if free.len() < planned as usize {
         GEN_SHORT_FREE.fetch_add(1, Ordering::Relaxed);
         // The compositor returns buffers later than the ring assumed: add what
@@ -2958,6 +2978,69 @@ unsafe fn any_parked(sc: *mut GnSwapchain) -> bool {
 /// measured as 8 commits against 5334 for the gated path on the same title. Any
 /// free-running scheme needs a rotating slot choice (so each commit carries a
 /// newer buffer) and its own back-pressure, not just this condition relaxed.
+/// Free the oldest parked slot if a release note older than nothing is in hand.
+///
+/// The order fallback, for a device whose notes name a different buffer than the
+/// one parked (see `scanout::take_any_released`). It lives here rather than in the
+/// per-slot scan because that scan visits slots by index, not by age: with three
+/// parks it would free slot 0 while the oldest frame sits on slot 2, and the note
+/// would then be spent on the wrong frame.
+///
+/// Returns the slot freed, or -1. Called before the acquire scan and before the
+/// destination search, so both consumers see the freed slot without knowing about
+/// notes.
+unsafe fn answer_park_from_notes(
+    sc: *mut GnSwapchain,
+    first: usize,
+    end: usize,
+    locked: bool,
+) -> i32 {
+    let mut oldest = -1i32;
+    let mut oldest_commit = u64::MAX;
+    {
+        let slots = unsafe { (*sc).slots.as_ptr() };
+        for k in first..end {
+            let s = unsafe { slots.add(k) };
+            let parked = unsafe { (*s).parked_ns };
+            // Only a slot whose own identity did not match is a candidate: the
+            // identity path has already had its turn.
+            if parked == 0 {
+                continue;
+            }
+            let commit = unsafe { (*s).commit_ns };
+            if commit < oldest_commit {
+                oldest_commit = commit;
+                oldest = k as i32;
+            }
+        }
+    }
+    if oldest < 0 {
+        return -1;
+    }
+    if !crate::scanout::take_any_released(oldest_commit) {
+        return -1;
+    }
+    NOTES_APPLIED.fetch_add(1, Ordering::Relaxed);
+    NOTES_BY_ORDER.fetch_add(1, Ordering::Relaxed);
+    // `shared` is not reentrant: the acquire path already holds it, the present
+    // worker's destination search does not. Taking it twice hangs the acquire
+    // thread inside `vkAcquireNextImageKHR`, which is what a session reads as a
+    // frozen counter (`acq=5` for ten seconds, guest waiting on a semaphore).
+    let _g = if locked {
+        None
+    } else {
+        Some(unsafe { (*sc).shared.lock().unwrap() })
+    };
+    let s = unsafe { (*sc).slots.as_mut_ptr().add(oldest as usize) };
+    unsafe {
+        (*s).parked_ns = 0;
+        (*s).in_flight = false;
+    }
+    unsafe { (*sc).cv_free.notify_all() };
+    drop(_g);
+    oldest
+}
+
 /// Whether a slot that the compositor has let go may be used again.
 ///
 /// A parked slot is one the compositor released but the *display* may still be
@@ -3008,7 +3091,28 @@ unsafe fn slot_just_freed(s: *mut GnSlot, now: u64) -> bool {
     false
 }
 
+/// Called with `shared` **held**: nothing reached from here may lock it again.
+///
+/// That is not a style rule — `std::sync::Mutex` is not reentrant, so a second
+/// `lock()` on the same guard hangs the acquire thread inside
+/// `vkAcquireNextImageKHR`. Measured: a session froze at `acq=5` with the guest
+/// parked on a timeline semaphore and `park_timeouts=0`, because the order
+/// fallback locked `shared` while the caller already held it.
 unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
+    // Identity first: a note that names this slot is the sharper pairing, and on a
+    // device where inodes line up it is the only path that runs.
+    unsafe { acquire_scan_identity(sc, idx) };
+    if *idx >= 0 {
+        return;
+    }
+    // Nothing matched by identity. A note that names no parked buffer may still
+    // answer the oldest park, so spend one that way and look again.
+    if unsafe { answer_park_from_notes(sc, 0, (*sc).guest_slots as usize, true) } >= 0 {
+        unsafe { acquire_scan_identity(sc, idx) };
+    }
+}
+
+unsafe fn acquire_scan_identity(sc: *mut GnSwapchain, idx: &mut i32) {
     let now = monotonic_ns();
     for k in 0..unsafe { (*sc).guest_slots as usize } {
         let s = unsafe { (*sc).slots.as_mut_ptr().add(k) };

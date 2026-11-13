@@ -734,6 +734,53 @@ pub(crate) fn release_notes_received() -> u64 {
     RELEASE_NOTES.load(Ordering::Relaxed)
 }
 
+/// Take the oldest release note at or after `since_ns`, whatever buffer it names.
+///
+/// The fallback for a device whose notes do not carry the parked buffer's
+/// identity. A note is emitted from SurfaceFlinger's previous-release fence, which
+/// signals when a *later* buffer latches, so under a multi-image rotation the note
+/// names the buffer that replaced ours rather than ours. Measured on Odin 3:
+/// `rnotes=702` with `park_timeouts=700`, `notelag` empty on every bucket, and a
+/// park timeout line reading `slot ino=11411 … released=[11366 11368 11370]` —
+/// same allocator, never the same buffer.
+///
+/// Safe to pair by order because notes arrive one per commit and in commit order:
+/// the oldest outstanding note belongs to the oldest outstanding frame, so freeing
+/// the oldest parked slot with it cannot free a slot the display is still reading.
+/// It is a weaker pairing than the identity match — one frame's worth of margin
+/// traded for a pipeline that works — so identity stays the first attempt.
+///
+/// The margin is exactly one display period: a note may be up to one frame older
+/// than the park's commit and still count, because that is how much later the
+/// note for a frame arrives (it rides the latch of the frame that replaced it).
+/// Without the margin, depth is effectively one image short — measured at 44 fps
+/// with a 60 cap on a three-image FIFO swapchain.
+pub(crate) fn take_any_released(since_ns: u64) -> bool {
+    // One display period of margin, and no more. The note that answers a park is
+    // emitted when the *next* frame latches, so it legitimately predates the
+    // commit by up to one frame; a floor at the commit itself rejects it and
+    // leaves every park to its bound. Anything older than a period describes a
+    // frame this slot was not part of.
+    let hz = u64::from(crate::lsfg::panel_hz().max(1));
+    let floor = since_ns.saturating_sub(1_000_000_000 / hz);
+    let mut q = RELEASED.lock().unwrap_or_else(|e| e.into_inner());
+    q.retain(|&(_, at)| at >= floor);
+    let had = !q.is_empty();
+    if had {
+        // The oldest note, unconditionally. It describes the frame that latched
+        // when this slot's buffer was replaced, which is the frame *before* the
+        // one parked here — so a floor at the commit would reject the only note
+        // that will ever mention that buffer and leave the park to its bound.
+        //
+        // The margin this gives up is one frame: slot N may be freed by the
+        // release of frame N+1. Both are in order, so the reuse is still older
+        // than the display's newest frame; the stricter identity match above is
+        // unaffected and still runs first where inodes line up.
+        q.remove(0);
+    }
+    had
+}
+
 /// Take a release note for `ino` that arrived at or after `since_ns`, and drop
 /// every older note for the same buffer.
 ///
@@ -820,6 +867,7 @@ mod tests {
     /// earlier frame of the same buffer and must not free this one.
     #[test]
     fn a_release_note_only_applies_to_the_frame_it_describes() {
+        let _serial = fresh_notes();
         note_buffer_released(9_001);
         assert!(take_released(9_001, 0), "a note after the park frees the slot");
         assert!(!take_released(9_001, 0), "and is consumed by it");
@@ -839,8 +887,61 @@ mod tests {
     /// Its own note, not one an earlier test happened to leave: the suite runs
     /// these in parallel, so a test that reads a static another test writes is a
     /// test that passes by scheduler luck.
+    /// Serialises the tests that inject and consume release notes: `RELEASED` is a
+    /// process-wide queue, so two of them running at once consume each other's
+    /// notes and pass or fail by scheduler luck.
+    static NOTE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Empty the queue so a test starts from a known state whatever ran before.
+    fn fresh_notes() -> std::sync::MutexGuard<'static, ()> {
+        let g = NOTE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        RELEASED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        g
+    }
+
+    /// A note that names no parked slot is still usable by order: notes arrive one
+    /// per commit, so the oldest outstanding one belongs to the oldest outstanding
+    /// frame. This is the Odin 3 path — `slot ino=11411` against
+    /// `released=[11366 11368 11370]`.
+    #[test]
+    fn a_note_can_be_taken_by_order_when_its_inode_matches_nothing() {
+        let _serial = fresh_notes();
+        // Notes for buffers the caller will never ask about, newest last.
+        for ino in 8_001..=8_003u64 {
+            note_buffer_released(ino);
+        }
+        // Identity never matches this ino, so the slot would wait out its bound.
+        assert!(!take_released(9_999, 0), "no note names this inode");
+        // By order the oldest note is spent, and only one per call.
+        assert!(take_any_released(0), "the oldest note is available");
+        assert!(take_any_released(0));
+        assert!(take_any_released(0));
+        assert!(!take_any_released(0), "and the list is spent");
+    }
+
+    /// A note may be up to one display period older than the park's commit — the
+    /// note for a frame rides the latch of the frame that replaced it — and no
+    /// more.
+    #[test]
+    fn a_note_more_than_one_period_older_than_the_commit_is_not_taken() {
+        let _serial = fresh_notes();
+        let hz = u64::from(super::super::lsfg::panel_hz().max(1));
+        let period = 1_000_000_000 / hz;
+        note_buffer_released(8_500);
+        // Parked two periods after the note: out of the margin, and dropped.
+        let parked = crate::proxy::monotonic_ns() + 2 * period;
+        assert!(!take_any_released(parked), "older than one frame");
+        assert!(!take_any_released(parked), "and it is dropped, not kept");
+
+        // Within the margin it is usable: that is the case the floor exists for.
+        note_buffer_released(8_501);
+        let within = crate::proxy::monotonic_ns() + period / 2;
+        assert!(take_any_released(within), "inside the one-frame margin");
+    }
+
     #[test]
     fn release_notes_are_bounded_and_observed() {
+        let _serial = fresh_notes();
         note_buffer_released(6_999);
         assert!(release_notes_live(), "the note above is recorded");
         for ino in 0..(RELEASED_CAP as u64 + 8) {
