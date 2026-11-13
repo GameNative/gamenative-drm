@@ -672,20 +672,33 @@ pub const CAP_PRESENT_ID: u32 = 1 << 2;
 
 /// A frame's present id, shim -> daemon.
 ///
-/// Encoded little-endian, 24 bytes:
-/// `magic:u32, reserved:u32, ino:u64, id:u64`. `ino` is the scan-out inode the
-/// frame's slot was allocated from; `id` is the present id the guest chained in
-/// `VkPresentIdKHR`.
+/// Encoded little-endian, 32 bytes:
+/// `magic:u32, reserved:u32, ino:u64, id:u64, ticket:u64`. `ino` is the
+/// scan-out inode the frame's slot was allocated from; `id` is the present id
+/// the guest chained in `VkPresentIdKHR`, 0 when it chained none.
+///
+/// `ticket` is the shim's own monotonic id for this commit, and it is the
+/// pairing key for every note that follows. Not `ino`: an inode is a property of
+/// the dma-buf the *allocator* handed out, and it survives only while gralloc
+/// hands the same object through to `SurfaceFlinger` — which it does on one device
+/// and not on the next, and, measured on Nova, for one title and not another
+/// (6 % of parks paired by identity on Portal 2, 84 % by order on Dave). Not
+/// `id`: most guests never chain a present id, so it is 0 on every frame of a
+/// session that does not use `VK_KHR_present_id`. A ticket always exists, is
+/// unique for the session, and cannot be recycled into a live slot the way a
+/// freed dma-buf's inode can.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PresentMark {
     /// The scan-out inode of the buffer being committed.
     pub ino: u64,
-    /// The guest's present id for this frame.
+    /// The guest's present id for this frame, 0 when it chained none.
     pub id: u64,
+    /// The shim's own id for this commit: monotonic, never reused.
+    pub ticket: u64,
 }
 
 impl PresentMark {
-    pub const LEN: usize = 24;
+    pub const LEN: usize = 32;
 
     #[must_use]
     pub fn encode(self) -> [u8; Self::LEN] {
@@ -693,6 +706,7 @@ impl PresentMark {
         b[0..4].copy_from_slice(&PRESENT_MARK_MAGIC.to_le_bytes());
         b[8..16].copy_from_slice(&self.ino.to_le_bytes());
         b[16..24].copy_from_slice(&self.id.to_le_bytes());
+        b[24..32].copy_from_slice(&self.ticket.to_le_bytes());
         b
     }
 
@@ -704,9 +718,39 @@ impl PresentMark {
         Some(Self {
             ino: u64::from_le_bytes(b[8..16].try_into().ok()?),
             id: u64::from_le_bytes(b[16..24].try_into().ok()?),
+            ticket: u64::from_le_bytes(b[24..32].try_into().ok()?),
         })
     }
 }
+
+/// The largest frame the daemon reads from a shim connection.
+///
+/// Every inbound type must fit, because `SOCK_SEQPACKET` preserves boundaries but
+/// **truncates a frame to the receive buffer and discards the rest** — so a reader
+/// sized for the wrong type does not fail, it silently drops the message. That is
+/// what happened when [`PresentMark`] grew to carry the ticket: the daemon still
+/// read into `ScanoutAllocReq::LEN` (24), every 32-byte mark arrived truncated,
+/// `decode` returned `None`, and the marks never reached `note_present_mark` —
+/// measured on RP6 as `sf mark: hit=0 order=0 miss=3 skew=0 pending=0 last=0` with
+/// `tick=[n:0]` on every census line, i.e. the ticket mechanism was inert on every
+/// device while looking no different from a daemon that does not send tickets.
+///
+/// Derived from the types rather than written as a number, so a struct that grows
+/// past it is a compile-time failure at the `const` rather than a silent drop at
+/// runtime. `INBOUND_MAX` is enforced by a test in this module.
+pub const INBOUND_MAX: usize = {
+    let mut m = ScanoutAllocReq::LEN;
+    if FrameCapSubscribe::LEN > m {
+        m = FrameCapSubscribe::LEN;
+    }
+    if FrameAcquired::LEN > m {
+        m = FrameAcquired::LEN;
+    }
+    if PresentMark::LEN > m {
+        m = PresentMark::LEN;
+    }
+    m
+};
 
 /// A completed present, daemon -> shim.
 ///
@@ -766,23 +810,57 @@ pub const CAP_RELEASE_NOTE: u32 = 1 << 3;
 
 /// A scan-out buffer `SurfaceFlinger` is finished with, daemon -> shim.
 ///
-/// Encoded little-endian, 16 bytes: `magic:u32, reserved:u32, ino:u64`. `ino` is
-/// the scan-out inode the buffer was registered under, the same identity a
-/// [`PresentMark`] carries and the shim's slot was allocated from.
+/// Encoded little-endian, 40 bytes:
+/// `magic:u32, reserved:u32, ticket:u64, ino:u64, latch_ns:u64, source:u64`.
+///
+/// `ticket` is the [`PresentMark`] ticket of the frame this buffer carried, and
+/// it is what the shim frees the slot by. It was the one message of the three
+/// that did not carry the token, and every arm of the shim's park existed to
+/// compensate: identity matching on an inode the allocator decides, an order
+/// fallback with a reorder window and a one-period floor, and a bound derived
+/// from the very interval it governed.
+///
+/// `source` says what the release rests on, so a session can tell "the fence
+/// signalled" from "the fence never signalled and we gave up" from "there was
+/// nothing to watch" — which is exactly the distinction that was invisible on
+/// RP6, where 198 notes arrived with no latch time and the census read the same
+/// as a device with no producer at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BufferReleased {
+    /// The shim's own ticket for the frame, 0 when the mark carried none.
+    pub ticket: u64,
     /// The scan-out inode of the buffer that may be written again.
     pub ino: u64,
+    /// The panel's latch time for the frame, 0 when the platform reported none.
+    pub latch_ns: u64,
+    /// What the release rests on; one of the `RELEASE_*` values.
+    pub source: u64,
 }
 
+/// `source`: `SurfaceFlinger`'s release fence signalled.
+pub const RELEASE_FENCE: u64 = 0;
+/// `source`: the fence did not signal within the watcher's budget, so the buffer
+/// was reported released anyway — the compositor is stuck, and holding the
+/// producer behind it would be a hang rather than a tear.
+pub const RELEASE_FENCE_TIMEOUT: u64 = 1;
+/// `source`: the pool copied into the buffer, so nothing outside holds it and
+/// there was no fence to watch.
+pub const RELEASE_POOL_COPY: u64 = 2;
+/// `source`: a buffer no subscription was watching, reported so the shim learns
+/// the buffer is free rather than inferring it from silence.
+pub const RELEASE_UNWATCHED: u64 = 3;
+
 impl BufferReleased {
-    pub const LEN: usize = 16;
+    pub const LEN: usize = 40;
 
     #[must_use]
     pub fn encode(self) -> [u8; Self::LEN] {
         let mut b = [0u8; Self::LEN];
         b[0..4].copy_from_slice(&BUFFER_RELEASED_MAGIC.to_le_bytes());
-        b[8..16].copy_from_slice(&self.ino.to_le_bytes());
+        b[8..16].copy_from_slice(&self.ticket.to_le_bytes());
+        b[16..24].copy_from_slice(&self.ino.to_le_bytes());
+        b[24..32].copy_from_slice(&self.latch_ns.to_le_bytes());
+        b[32..40].copy_from_slice(&self.source.to_le_bytes());
         b
     }
 
@@ -793,7 +871,10 @@ impl BufferReleased {
             return None;
         }
         Some(Self {
-            ino: u64::from_le_bytes(b[8..16].try_into().ok()?),
+            ticket: u64::from_le_bytes(b[8..16].try_into().ok()?),
+            ino: u64::from_le_bytes(b[16..24].try_into().ok()?),
+            latch_ns: u64::from_le_bytes(b[24..32].try_into().ok()?),
+            source: u64::from_le_bytes(b[32..40].try_into().ok()?),
         })
     }
 }
@@ -1012,6 +1093,30 @@ impl LsfgConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every inbound frame must fit the reader's buffer.
+    ///
+    /// On `SOCK_SEQPACKET` a receive buffer shorter than the frame truncates it
+    /// and discards the rest, so the reader does not fail — it silently drops the
+    /// message. That is how the ticket never reached the presenter: `PresentMark`
+    /// grew to 32 bytes and the daemon still read into `ScanoutAllocReq::LEN`
+    /// (24), which measured as `sf mark: hit=0 order=0 miss=3 skew=0 pending=0`
+    /// and `tick=[n:0]` on every census line, with the code looking correct at
+    /// both ends.
+    #[test]
+    fn every_inbound_frame_fits_the_readers_buffer() {
+        for len in [
+            ScanoutAllocReq::LEN,
+            FrameCapSubscribe::LEN,
+            FrameAcquired::LEN,
+            PresentMark::LEN,
+        ] {
+            assert!(
+                len <= INBOUND_MAX,
+                "an inbound frame of {len} bytes does not fit INBOUND_MAX {INBOUND_MAX}"
+            );
+        }
+    }
 
     #[test]
     fn vsync_note_round_trips_and_rejects_other_magics() {
@@ -1281,7 +1386,12 @@ mod tests {
 
     #[test]
     fn buffer_released_round_trip() {
-        let note = BufferReleased { ino: 0x1234_5678_9abc };
+        let note = BufferReleased {
+            ticket: 0xfeed,
+            ino: 0x1234_5678_9abc,
+            latch_ns: 0x99,
+            source: RELEASE_FENCE_TIMEOUT,
+        };
         let enc = note.encode();
         assert_eq!(enc.len(), BufferReleased::LEN);
         assert_eq!(enc[0..4], BUFFER_RELEASED_MAGIC.to_le_bytes());
@@ -1308,8 +1418,21 @@ mod tests {
         // An inode of 0 is never a buffer the daemon registered, so a zeroed
         // note cannot be mistaken for a real release.
         assert_eq!(
-            BufferReleased::decode(&BufferReleased { ino: 0 }.encode()),
-            Some(BufferReleased { ino: 0 })
+            BufferReleased::decode(
+                &BufferReleased {
+                    ticket: 0,
+                    ino: 0,
+                    latch_ns: 0,
+                    source: RELEASE_FENCE
+                }
+                .encode()
+            ),
+            Some(BufferReleased {
+                ticket: 0,
+                ino: 0,
+                latch_ns: 0,
+                source: RELEASE_FENCE
+            })
         );
     }
 

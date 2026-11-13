@@ -235,6 +235,30 @@ fn report_hold(now_ns: u64) {
     {
         return;
     }
+    // Marks, before the hold: a session whose marks do not resolve sends notes
+    // with no ticket, and that is invisible in every other counter.
+    let settled = MARK_HIT.load(Ordering::Relaxed)
+        + MARK_ORDER.load(Ordering::Relaxed)
+        + MARK_MISS.load(Ordering::Relaxed)
+        + MARK_SKEW.load(Ordering::Relaxed);
+    if settled != MARK_REPORTED.swap(settled, Ordering::Relaxed) {
+        let depth = PRESENT_PENDING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        log_always!(
+            "{}",
+            format_args!(
+                "sf mark: hit={} order={} miss={} skew={} pending={} last={}",
+                MARK_HIT.load(Ordering::Relaxed),
+                MARK_ORDER.load(Ordering::Relaxed),
+                MARK_MISS.load(Ordering::Relaxed),
+                MARK_SKEW.load(Ordering::Relaxed),
+                depth,
+                MARK_LAST_TICKET.load(Ordering::Relaxed)
+            )
+        );
+    }
     let n = HOLD_N.load(Ordering::Relaxed);
     if n == 0 {
         return;
@@ -380,6 +404,11 @@ struct ReleaseCtx {
     /// when the app did not chain one. Written by the publish path, consumed by
     /// the completion callback, which reports it with the latch time.
     present_id: AtomicU64,
+    /// The shim's ticket for the frame currently in this registration: the key
+    /// its release note is filed under, and 0 before the first publish. This is
+    /// what makes a release note exact — the ticket is minted by the process
+    /// that owns the slot, so it cannot be ambiguous the way a dma-buf inode can.
+    ticket: AtomicU64,
     /// Set by the completion callback: SurfaceFlinger reported the flip event
     /// for this registration, so the buffer is safe to hand back out (the
     /// reuse cache keys on it). Never cleared: the flag belongs to this
@@ -417,7 +446,7 @@ unsafe impl Sync for ReleaseCtx {}
 /// publishes them. One frame per buffer is in flight at a time, so a plain map
 /// is enough; it is bounded because a mark for a buffer that never gets
 /// committed must not accumulate.
-static PRESENT_PENDING: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+static PRESENT_PENDING: Mutex<Vec<(u64, u64, u64)>> = Mutex::new(Vec::new());
 
 /// Completions not yet written to the shim: the callback runs on SurfaceFlinger's
 /// thread, the channel on the scan-out thread, and only the latter may send.
@@ -468,27 +497,78 @@ static PRESENT_AWARE: AtomicBool = AtomicBool::new(false);
 /// marks frames and never waits cannot grow either list without bound.
 const PRESENT_QUEUE_CAP: usize = 64;
 
+/// How marks resolve when a registration is published.
+///
+/// `hit` matched by inode; `order` matched the oldest unclaimed mark because the
+/// inode did not; `miss` found no mark at all; `skew` found one that would move
+/// the ticket backwards and refused it. The first two are the pairing rule, the
+/// last two are the two ways it can fail — and until they were counted, a session
+/// that sent notes with `ticket: 0` was indistinguishable from one that sent no
+/// notes: RP6 ran sixty seconds at 60 fps with `tick=[n:0]`, every release note
+/// carrying no ticket because this lookup missed.
+static MARK_HIT: AtomicU64 = AtomicU64::new(0);
+static MARK_ORDER: AtomicU64 = AtomicU64::new(0);
+static MARK_MISS: AtomicU64 = AtomicU64::new(0);
+static MARK_SKEW: AtomicU64 = AtomicU64::new(0);
+/// The highest ticket assigned to a registration: the order fallback may only
+/// move it forward, so a lost or late mark cannot pair every later frame with the
+/// one before it.
+static MARK_LAST_TICKET: AtomicU64 = AtomicU64::new(0);
+/// Marks reported so far, for the once-every-ten-seconds line.
+static MARK_REPORTED: AtomicU64 = AtomicU64::new(0);
+
 /// Record a frame's present id against the buffer carrying it.
 fn note_present_mark(mark: PresentMark) {
-    if mark.id == 0 || mark.ino == 0 {
+    // A mark with no ticket and no guest id says nothing: the shim sends one per
+    // commit now, so the guest id is usually 0 and only the ticket is present.
+    if (mark.id == 0 && mark.ticket == 0) || mark.ino == 0 {
         return;
     }
     let mut pending = PRESENT_PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    pending.retain(|&(ino, _)| ino != mark.ino);
+    pending.retain(|&(ino, _, _)| ino != mark.ino);
     if pending.len() >= PRESENT_QUEUE_CAP {
         pending.remove(0);
     }
-    pending.push((mark.ino, mark.id));
+    pending.push((mark.ino, mark.id, mark.ticket));
 }
 
-/// Take the id marked for `ino`, if any: the commit naming that buffer is the
-/// frame the id belongs to.
-fn take_present_mark(ino: u64) -> u64 {
+/// Take the `(id, ticket)` marked for `ino`: the commit naming that buffer is the
+/// frame they belong to.
+///
+/// Identity first, then order. The inode is the sharper match and is all that runs
+/// where the shim's slot inode and this registration's inode are the same object —
+/// true for Portal 2 on Nova, where only 6 % of parks needed a fallback.
+///
+/// It is not available everywhere: the same device needed it for 84 % of Dave's
+/// parks, and RP6 and Odin 3 needed it for all of them, so the mark that carries
+/// the ticket would be dropped on exactly the devices the ticket exists for. Both
+/// ends see the same commit sequence, so the oldest unclaimed mark belongs to the
+/// publish being made now — no window, no floor, no reordering, unlike the shim's
+/// own order arm, which pairs frames that have already been shown.
+///
+/// The one guard is that order may only move the ticket *forward*. A mark lost to
+/// the queue's cap would otherwise leave every later frame carrying the previous
+/// frame's ticket, which frees the wrong slot one frame early.
+fn take_present_mark(ino: u64) -> (u64, u64) {
     let mut pending = PRESENT_PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    match pending.iter().position(|&(marked, _)| marked == ino) {
-        Some(i) => pending.remove(i).1,
-        None => 0,
+    if let Some(i) = pending.iter().position(|&(marked, _, _)| marked == ino) {
+        let (_, id, ticket) = pending.remove(i);
+        MARK_HIT.fetch_add(1, Ordering::Relaxed);
+        MARK_LAST_TICKET.fetch_max(ticket, Ordering::Relaxed);
+        return (id, ticket);
     }
+    let Some(&(_, id, ticket)) = pending.first() else {
+        MARK_MISS.fetch_add(1, Ordering::Relaxed);
+        return (0, 0);
+    };
+    if ticket == 0 || ticket <= MARK_LAST_TICKET.load(Ordering::Relaxed) {
+        MARK_SKEW.fetch_add(1, Ordering::Relaxed);
+        return (0, 0);
+    }
+    pending.remove(0);
+    MARK_ORDER.fetch_add(1, Ordering::Relaxed);
+    MARK_LAST_TICKET.store(ticket, Ordering::Relaxed);
+    (id, ticket)
 }
 
 /// Report a completed present to the shim: queued here, written by the channel.
@@ -578,7 +658,12 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
             unsafe {
                 let watch = libc::dup(fd);
                 if watch >= 0 {
-                    watch_release((*prev).ino, watch, (*prev).latch_ns.load(Ordering::Relaxed));
+                    watch_release(
+                        (*prev).ino,
+                        (*prev).ticket.load(Ordering::Relaxed),
+                        watch,
+                        (*prev).latch_ns.load(Ordering::Relaxed),
+                    );
                 }
                 if (*prev)
                     .release_fd
@@ -653,7 +738,7 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
 /// Added by the completion callback, which must not block: a fence is waited on
 /// here instead, and the latch travels with it so the hold is measured where it
 /// ends rather than when the buffer happens to come round again.
-static RELEASE_WATCH: Mutex<Vec<(u64, RawFd, u64)>> = Mutex::new(Vec::new());
+static RELEASE_WATCH: Mutex<Vec<(u64, u64, RawFd, u64)>> = Mutex::new(Vec::new());
 
 /// Eventfd the callback writes to wake the watcher, so a fence added between
 /// polls is picked up at once rather than at the end of one. -1 until the
@@ -676,7 +761,7 @@ const RELEASE_WATCH_CAP: usize = 32;
 
 /// Hand one release fence to the watcher. `ino` 0 is a buffer the pool copied
 /// into (nothing outside holds it), so its fence is only ever closed.
-fn watch_release(ino: u64, fd: RawFd, latch_ns: u64) {
+fn watch_release(ino: u64, ticket: u64, fd: RawFd, latch_ns: u64) {
     // Nobody reads release notes: the producer is not a shim that gates on them,
     // so the fence is worth nothing here. Checked per fence rather than per
     // session, because the subscriber that matters may connect after the first
@@ -694,7 +779,7 @@ fn watch_release(ino: u64, fd: RawFd, latch_ns: u64) {
     RELEASE_WATCH
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((ino, fd, latch_ns));
+        .push((ino, ticket, fd, latch_ns));
     let wake = RELEASE_WAKE.load(Ordering::Relaxed);
     if wake >= 0 {
         // SAFETY: `wake` is this module's eventfd, created non-blocking; an
@@ -709,7 +794,7 @@ fn watch_release(ino: u64, fd: RawFd, latch_ns: u64) {
 /// Report one buffer as released to the producers that gate on it, and close its
 /// fence. Every path that retires a watch goes through here, so exactly one note
 /// is sent per fence.
-fn report_release(ino: u64, fd: RawFd, latch_ns: u64) {
+fn report_release(ino: u64, ticket: u64, fd: RawFd, latch_ns: u64, source: u64) {
     // SAFETY: the descriptor was created for the watcher and is closed once.
     unsafe { libc::close(fd) };
     // The hold: from the panel taking this buffer to SurfaceFlinger letting it
@@ -720,7 +805,16 @@ fn report_release(ino: u64, fd: RawFd, latch_ns: u64) {
         note_hold(latch_ns, now);
     }
     report_hold(now);
-    gndrm_daemon::pushes::push(CAP_RELEASE_NOTE, &BufferReleased { ino }.encode());
+    gndrm_daemon::pushes::push(
+        CAP_RELEASE_NOTE,
+        &BufferReleased {
+            ticket,
+            ino,
+            latch_ns,
+            source,
+        }
+        .encode(),
+    );
 }
 
 /// Wait on the release fences the producers are owed, and report each one as it
@@ -732,16 +826,24 @@ fn report_release(ino: u64, fd: RawFd, latch_ns: u64) {
 fn release_watcher() {
     let wake = eventfd_new();
     RELEASE_WAKE.store(wake, Ordering::Relaxed);
-    let mut live: Vec<(u64, RawFd, u64, Instant)> = Vec::new();
+    let mut live: Vec<(u64, u64, RawFd, u64, Instant)> = Vec::new();
     loop {
         {
             let mut queued = RELEASE_WATCH.lock().unwrap_or_else(|e| e.into_inner());
-            for (ino, fd, latch_ns) in queued.drain(..) {
+            for (ino, ticket, fd, latch_ns) in queued.drain(..) {
                 if live.len() >= RELEASE_WATCH_CAP {
-                    let (old_ino, old_fd, old_latch, _) = live.remove(0);
-                    report_release(old_ino, old_fd, old_latch);
+                    // Evicted, not signalled: the same guarantee as a timeout,
+                    // because the buffer is being handed back without its fence.
+                    let (old_ino, old_ticket, old_fd, old_latch, _) = live.remove(0);
+                    report_release(
+                        old_ino,
+                        old_ticket,
+                        old_fd,
+                        old_latch,
+                        gndrm_uapi::wire::RELEASE_FENCE_TIMEOUT,
+                    );
                 }
-                live.push((ino, fd, latch_ns, Instant::now()));
+                live.push((ino, ticket, fd, latch_ns, Instant::now()));
             }
         }
         if live.is_empty() {
@@ -763,7 +865,7 @@ fn release_watcher() {
             events: libc::POLLIN,
             revents: 0,
         });
-        pfds.extend(live.iter().map(|&(_, fd, _, _)| libc::pollfd {
+        pfds.extend(live.iter().map(|&(_, _, fd, _, _)| libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
@@ -784,16 +886,21 @@ fn release_watcher() {
         for i in (0..live.len()).rev() {
             let mut ready = n > 0 && pfds[i + 1].revents != 0;
             let mut timed_out = false;
-            if !ready && now.duration_since(live[i].3) >= RELEASE_WATCH_MAX {
+            if !ready && now.duration_since(live[i].4) >= RELEASE_WATCH_MAX {
                 ready = true;
                 timed_out = true;
             }
             if ready {
-                let (ino, fd, latch_ns, _) = live.swap_remove(i);
+                let (ino, ticket, fd, latch_ns, _) = live.swap_remove(i);
                 if timed_out {
                     note_hold_timeout();
                 }
-                report_release(ino, fd, latch_ns);
+                let source = if timed_out {
+                    gndrm_uapi::wire::RELEASE_FENCE_TIMEOUT
+                } else {
+                    gndrm_uapi::wire::RELEASE_FENCE
+                };
+                report_release(ino, ticket, fd, latch_ns, source);
             }
         }
     }
@@ -1196,6 +1303,7 @@ fn new_release_ctx(api: &ffi::ScApi, ino: u64) -> (*mut ReleaseCtx, Arc<AtomicBo
         release_fd: AtomicI32::new(-1),
         latch_time: api.st_stats_latch_time,
         latch_ns: AtomicU64::new(0),
+        ticket: AtomicU64::new(0),
         applied_ns: AtomicU64::new(0),
         present_id: AtomicU64::new(0),
         latched: Arc::clone(&latched),
@@ -1721,11 +1829,11 @@ impl AscState {
                 // The frame this registration is about to carry: its present id
                 // was marked against the buffer before the commit that named it.
                 // SAFETY: `ctx` is the leaked mailbox of this registered buffer.
+                let (present_id, ticket) = take_present_mark(published_ino);
                 unsafe {
-                    (*ctx)
-                        .present_id
-                        .store(take_present_mark(published_ino), Ordering::Release)
-                };
+                    (*ctx).present_id.store(present_id, Ordering::Release);
+                    (*ctx).ticket.store(ticket, Ordering::Release);
+                }
                 // Attach a looper to *this* thread the first time we publish.
                 // `ALooper_pollOnce` must run on the thread the looper was
                 // prepared on: polling a looper prepared elsewhere fails with
@@ -2857,7 +2965,9 @@ pub fn serve_scanout(
     // being served when the loop returns however that happens.
     gndrm_daemon::pushes::set_served(fd);
     let _served = ServedGuard(fd);
-    let mut buf = [0u8; ScanoutAllocReq::LEN];
+    // Every inbound type, not just the alloc request: a short buffer on a
+    // SEQPACKET connection truncates the frame instead of failing it.
+    let mut buf = [0u8; gndrm_uapi::wire::INBOUND_MAX];
     // Whether a connection opted in is `gndrm_daemon::pushes`' business: a
     // subscription outlives this loop, so the notes cannot be gated on it here.
     // Whether this connection reads the panel's latch grid, pushed whenever it
@@ -4305,7 +4415,9 @@ pub(crate) fn note_produced(acq: FrameAcquired) {
 /// it, so an alloc request on a retired connection is left to the shim's own
 /// timeout, exactly as it was before any of this.
 pub(crate) fn drain_retired(fd: RawFd) -> bool {
-    let mut buf = [0u8; ScanoutAllocReq::LEN];
+    // Every inbound type, not just the alloc request: a short buffer on a
+    // SEQPACKET connection truncates the frame instead of failing it.
+    let mut buf = [0u8; gndrm_uapi::wire::INBOUND_MAX];
     // SAFETY: `fd` is a connection this module owns until it is forgotten, and
     // `buf` is one full frame; DONTWAIT leaves an unarrived frame for later.
     let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };

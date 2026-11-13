@@ -361,6 +361,16 @@ static LAST_COMMIT_NS: AtomicU64 = AtomicU64::new(0);
 /// causes the compositor's hold. Zero until a second commit has been seen.
 static COMMIT_SPACING_NS: AtomicU64 = AtomicU64::new(0);
 
+/// The ticket the shim stamps on each commit, and the key the daemon's release
+/// note is filed under.
+///
+/// Minted here rather than taken from the guest's present id: most titles chain
+/// none (`VK_KHR_present_id` is optional), so a guest id would be 0 on every
+/// frame of a session, and the release note would have nothing to pair with.
+/// Process-wide and never reused, so a freed dma-buf's inode being recycled into
+/// a new buffer cannot make a stale note free a live slot.
+static TICKET_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// The `COMMIT_GAPS` bucket of a spacing of `gap_ns`.
 fn commit_spacing_bucket(gap_ns: u64) -> usize {
     match gap_ns {
@@ -576,7 +586,7 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
 fn counters() -> String {
     format!(
         "{}",
-        format_args!("acq={} pres={} rel={} commit={} starved={} gendrel={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} acq_fps={:.2} books={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} slot_holds={} slot_us={} slot_avg_us={} slot_max_us={} by_order={}] presus=[n={} sum={} max={} ge16667={}] channel=[unanswered:{} dead:{}] lock=[n:{} us:{}]",
+        format_args!("acq={} pres={} rel={} commit={} starved={} gendrel={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} acq_fps={:.2} books={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} slot_holds={} slot_us={} slot_avg_us={} slot_max_us={} by_order={}] presus=[n={} sum={} max={} ge16667={}] channel=[unanswered:{} dead:{}] lock=[n:{} us:{}] tick=[n:{} off:{}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
@@ -617,7 +627,9 @@ fn counters() -> String {
                 PARK_UNANSWERED.load(Ordering::Relaxed),
                 park_channel_dead(),
                 LOCK_WAIT_N.load(Ordering::Relaxed),
-                LOCK_WAIT_NS.load(Ordering::Relaxed) / 1_000,)
+                LOCK_WAIT_NS.load(Ordering::Relaxed) / 1_000,
+                crate::scanout::note_counts().0,
+                crate::scanout::note_counts().1,)
     )
 }
 
@@ -1050,6 +1062,7 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
         unsafe {
             (*sc).slots.push(GnSlot {
                 park_expired: false,
+                ticket: 0,
                 owner: sc,
                 image: 0,
                 mem: 0,
@@ -2379,8 +2392,13 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
             // the only answer: 2975 of 3407 waits before this was fixed.
             NOID_AT_COMMIT.fetch_add(1, Ordering::Relaxed);
         }
-        if (*s).present_id != 0 && (*s).ino != 0 {
-            crate::scanout::send_present_mark((*s).ino, (*s).present_id);
+        if (*s).ino != 0 {
+            // One ticket per commit, and one mark carrying it. Sent whether or
+            // not the guest chained a present id: the id is only the latch
+            // report's key, while the ticket is the release note's, and a title
+            // that chains no id still needs its buffers released.
+            (*s).ticket = TICKET_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+            crate::scanout::send_present_mark((*s).ino, (*s).present_id, (*s).ticket);
             // One mark per frame: a guest that stops chaining ids must not keep
             // marking later frames with the last one it sent.
             (*s).present_id = 0;
@@ -2682,6 +2700,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     for _ in 0..n_slots {
         sc.slots.push(GnSlot {
             park_expired: false,
+            ticket: 0,
             owner: scp,
             image: 0,
             mem: 0,
@@ -3135,6 +3154,14 @@ unsafe fn slot_just_freed(s: *mut GnSlot, now: u64) -> bool {
     // compositor's release that parks the slot. Anchoring on the commit is what
     // pairs them; anchoring on the park dropped the note for this very frame as
     // stale and left every slot on the bound.
+    // Exact pairing first: the note names the frame this slot committed.
+    if unsafe { crate::scanout::take_released_ticket((*s).ticket) } {
+        NOTES_APPLIED.fetch_add(1, Ordering::Relaxed);
+        PARK_UNANSWERED.store(0, Ordering::Relaxed);
+        let lag = now.saturating_sub(parked);
+        NOTELAG[note_lag_bucket(lag)].fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
     let since = unsafe { (*s).commit_ns }.min(parked);
     if unsafe { crate::scanout::take_released((*s).ino, since) } {
         NOTES_APPLIED.fetch_add(1, Ordering::Relaxed);
@@ -8011,6 +8038,10 @@ pub struct GnSlot {
     /// as stale, leaving every slot to wait out the bound (23.6 fps, slot wait
     /// 25 ms per frame).
     pub commit_ns: u64,
+    /// The ticket this slot's frame was committed under: the key its release note
+    /// is filed under, 0 until the slot has committed once. A note that names it
+    /// frees this slot and no other, with no window, floor or ordering rule.
+    pub ticket: u64,
     // Guest-side trace: the acquire sequence that filled this slot, so a
     // present can be tied back to the acquire that handed the guest the image.
     pub acq_seq: u64,
