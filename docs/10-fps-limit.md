@@ -125,32 +125,40 @@ divisor cap reads its target exactly.
   | unsynced | on | on | cap | `cap × (m−1)` | `cap × m` | note | total |
   | unsynced | off | on | `refresh / m` | `acquire × (m−1)` | `acquire × m` | note | total |
 
-  `hold` is when an acquired image may be drawn into again, and it follows the
-  same split as the rate because `VkPresentModeKHR` is a contract about exactly
-  that: FIFO (and FIFO-relaxed) returns an image when a latched frame replaces
-  it, so the image is held until the compositor's own release report *and* the
-  display's scan-out release after it — `note`. `IMMEDIATE` is served as
-  `MAILBOX` on this route (`choose_live_mode`), which is the one mode
-  substitution the layer makes: a frame that cannot be shown is dropped for the
-  client instead of being scanned out mid-flip, and its hold is `note` because
-  the served mode is mailbox. IMMEDIATE returns it once it is
-  handed over and MAILBOX as soon as a newer one replaces it, so `none`: the slot
-  is free at the compositor's release, and a guest that asked for those modes has
-  already accepted the frames that get dropped. Applying `note` to them applies
-  FIFO's lifetime to a mode that promised none, and the cost is the rate:
-  `min(cap, depth × refresh / hold)` — 106 on a 120 Hz panel at depth 3 where an
-  uncapped immediate session should have been free.
+  `hold` is when an acquired image may be drawn into again. It follows the
+  **served** mode — the same one `on_buffer_release` keys on — and on this route
+  every declaration is served as FIFO or MAILBOX: FIFO for a guest that asked for
+  it, MAILBOX for a generation session and for a declared `IMMEDIATE`
+  (`choose_live_mode`). Both are synced, so the hold is `note` on every row: the
+  image comes back only when the compositor reports its release *and* the display
+  reports its scan-out release after that — measured at 1.5-2.5 display periods
+  (`sf hold`).
+
+  That substitution is what makes a single `note` column possible. Serving a
+  declared `IMMEDIATE` as itself would return the image the moment it was handed
+  over, and the client would draw into a buffer the display was still scanning —
+  the tear Portal 2 showed under direct scan-out. Serving it as `MAILBOX` keeps
+  the guest's intent (no wait on the client, and a frame that cannot be shown is
+  dropped for it) while giving the compositor a buffer it can latch at a vblank
+  instead of one it might replace mid-scan.
+
+  What the hold costs is the rate whenever the pool is shallow:
+  `min(cap, depth × refresh / hold)`. At 3 images against a 2.5-period hold that
+  is ~54 on a 60 Hz panel, which is why the image count follows the served mode
+  as well (`count_present_mode`).
 
   Below the fold, `depth` has to exceed the hold for the rate column to be the
-  binding one; at depth 3 against a 3.4-period hold the pool caps the session
-  instead, which is the 106 above and the 100<->120 oscillation around the
-  crossover at `depth / refresh`.
+  binding one. At 3 images against a 3.4-period hold the pool caps the session
+  instead, and the cap moves in whole periods as the hold crosses
+  `depth / refresh` — the 100<->120 oscillation measured on an uncapped 120 Hz
+  session, where the hold sat either side of 25 ms.
 
   `total` is what the rule lets the session produce: acquired plus generated. It
   is not always what reaches the screen — the synced rows still cap generation at
-  the panel, so 40 + 40 at ×4 on a 60 Hz panel is 40 + 20. The HUD shows `total`,
-  because that is the number the user asked the multiplier for; the cap in force
-  is a separate figure and governs acquires only.
+  the panel, so 40 + 40 at ×4 on a 60 Hz panel is 40 + 20. The `show in HUD`
+  column is what the widget *should* read, `total`, because that is the number the
+  user asked the multiplier for; the cap in force is a separate figure and governs
+  acquires only. What it reads today is the bullet below.
 
   "Synced" is FIFO and FIFO-relaxed, where the panel is the ceiling in both
   directions; "unsynced" is immediate and mailbox, where the guest asked to run
@@ -175,32 +183,45 @@ divisor cap reads its target exactly.
     `setFpsLimit(if (lsfg) 0 else limit)`), so a gamescope session at cap 60 with
     ×2 reaches the shim as `cap=0` and takes the *no cap* row: `refresh / m`
     acquires. The `cap + cap × (m−1)` rows are unreachable from the UI today.
-  - The generator in use is the guest-side layer (`VkrLsfg`), not `flush_due`. Its
-    frames are presented on the same swapchain and are neither an acquire nor a
-    `GEN_COMMITS` entry, so the gate holds that single stream at `acquire_per_s`
-    and the doubling does not happen: measured at cap 30, `guest=29.0 loop=29.9
-    needs=59.9Hz drawn=1` — the layer asks for 60 Hz and 30 get through.
-  - Because `note_produced` counts `Δacquires + ΔGEN_COMMITS`, the app's ring sees
-    source frames only. The HUD is the app's, and it strides the ring by the
-    multiplier, so it cannot read the doubled total either.
+  - Generation runs through `flush_due` and reports in `GEN_COMMITS`: measured on
+    Witcher 3 at cap 30 with ×2, `generated 3103` over a session against
+    `acquire=30 generate=30`. The guest-side layer (`VkrLsfg`) is also loaded and
+    presents its own frames on the same swapchain, where they are neither an
+    acquire nor a `GEN_COMMITS` entry — its counters read `guest=28.0 needs=55.9Hz`
+    while the shim's own generator is doing the work, so the layer's copy is not
+    what reaches the panel.
+  - `note_produced` counts `Δacquires + ΔGEN_COMMITS`, and since a generated frame
+    reports itself at its own commit (`commit_generated`) the ring now receives both
+    streams, one message each, so it holds `total`. The widget strides the ring by
+    the multiplier (`frameSampleStride = m`, `XServerScreen.kt`), which divides that
+    stream back down: it reads the source rate where the column above says `total`.
+    The stride is the app's and is the remaining gap between the table and the
+    HUD.
 
-  Until a present can be identified as generated, `generate_per_s` is a limit
-  nothing consumes on that path and the table's rightmost rows describe the intent
-  rather than the behaviour.
+  `generate_per_s` is consumed as a bound on how many frames one source frame may
+  yield, not as a fourth limiter: `Limits::generate_per_source(m)` caps the batch
+  the generator plans (`proxy.rs`, `lsfg_generate`), and the batch's frames are
+  placed on the latch grid (`docs/17`). The rate in the table is therefore the
+  generator's ceiling; what actually lands is that ceiling, floored to whole frames
+  per source.
 
   The gate (`icd_shim/src/vsync_gate.rs`) is one regulator and one rule: a frame
   may start `1e9 / limit` after the previous frame started, and not before.
 
   ```
   gate:  while now < next_ns { wait until next_ns }
-  book:  next_ns = now + period        (now is the release just granted)
+  book:  next_ns += period             (from the release point, not from now)
+         late by >= one period: next_ns = now + period, and the skip is counted
   ```
 
   So the limit is a maximum by construction — two releases are never closer than
-  one period, because the second is booked one period after the first actually
-  happened — a stall carries no debt (a late frame books the next one after
-  itself, never a catch-up), and a game slower than the limit is never held (its
-  next acquire is already past `next_ns`).
+  one period. A frame that overshoots its release point by less than a period does
+  not move the grid: the following frame gets a proportionally shorter hold, which
+  is what keeps the average *at* the limit instead of below it (`next_ns = now +
+  period` lost 7 % to accumulated lateness). A stall of a whole period or more is a
+  lost frame, not a debt: the schedule re-anchors at `now + period` and counts the
+  skip, so nothing repays itself with back-to-back releases. A game slower than the
+  limit is never held, because its next acquire is already past `next_ns`.
 
   Releases are *not* snapped to the display's vblank grid. A grid-snapped release
   holds the phase but bounds only the average rate: a release a slot wait delayed
@@ -218,11 +239,15 @@ divisor cap reads its target exactly.
   lsfg=… acquire=… generate=…` (`source=generating`: a generated frame, declared
   mailbox; `acquire` and `generate` are the limits in frames per second,
   `acquire=0` for none and `generate=0` for generation off; `gate=clock` is
-  generation's source rate or a limit above the display's rate). With
+  every session with a cap, whatever the display's rate — the gate books its own
+  grid at `1e9 / acquire_per_s` and does not defer to the compositor below a
+  refresh divisor). With
   `GNDRM_LOG_VKSHIM=1` the same line repeats every 10 s with the counters a device
   run checks the pacing against: `acquires= commits= declared_fifo=
-  declared_other= releases= feedback= presented= discarded= fallback=
-  gate_holds= gate_late= skipped= slot_waits= commit_lat_us= spacing=[…]`. They
+  declared_other= releases= feedback= presented= discarded= fallback= at_queue=
+  gate_holds= gate_late= skipped= slot_waits= commit_lat_us= spacing=[…]`, and on
+  the release path `slots=[…] dests=[in_flight/total parked=n] gendrel=`, which is
+  the generation ring's own state. They
   are cumulative except the latency and the spacing: `gate_holds`, acquires the
   gate held; `gate_late`, acquires that started after their release point (not
   the daemon's `late=` on its `vsync: check` line, which counts publishes that
@@ -242,8 +267,9 @@ Open points:
 - **Divisor rounding bites the FIFO route only.** `nVblankDivisor =
   nRefreshHz / nTargetFPS` (`steamcompmgr.cpp:7040`, and `:10621` for the window's
   limited cycle) lands on the nearest divisor of the grid, so with the container
-  set to fifo a 40 or 45 cap on 60 Hz runs at 60. Under mailbox the shim's gate
-  averages a non-divisor cap on vblanks instead.
+  set to fifo a 40 or 45 cap on 60 Hz runs at 60 — for frames gamescope's limiter
+  holds. The shim's own gate is unaffected: it releases on its own grid, so a
+  non-divisor cap is held exactly whatever mode is served.
 - **The client-visible refresh is the mode's, and the mode is the display's.**
   `-r` reaches `g_nOutputRefresh` only transiently (`drm_unset_mode`, `:3680`),
   before `drm_set_mode` (`:3728`) overwrites it with the mode's rate —
@@ -262,8 +288,15 @@ Open points:
   frames than the panel shows — which is the point, and why the publish count is
   kept only as the session's own statistic.
 - **Engagement feedback**: `gamescope_limiter.state` covers the gamescope route;
-  the shim logs `scanout frame cap: fps=… effective=…` (`scanout.rs:148-158`),
+  the shim logs `scanout frame cap: fps=… effective=…` (`scanout.rs:132`),
   `effective` being the target in force once the note is adopted, and reports what
-  the cap delivered in its own census (`cap=[fps= notes= gate_holds= acq_fps=]`,
-  `GNDRM_LOG_VKSHIM=1`): `acq_fps` is the rate at the instant the cap acts, so it
-  — not the app's display-side frame count — is what a target is checked against.
+  the cap delivered in its own census (`cap=[fps= notes= acq_fps= books=
+  gate_holds= gate_us= gate_avg_us= gate_max_us=]`): `acq_fps` is grants per
+  second over the
+  whole window — grants divided by the clock time between the first and the last —
+  so it, not the app's display-side frame count, is what a target is checked
+  against. `books=` counts schedule bookings against the grants: equal to the
+  grant count means every granted frame booked the grid, and short of it means
+  some grants skipped the book. It read as the reciprocal of the mean acquire
+  duration until that was corrected; a rate has to divide frames by elapsed time,
+  not by the sum of their own waits.
