@@ -276,6 +276,8 @@ pub fn lsfg_config() -> Option<LsfgConfig> {
                 apply_vsync(note);
             } else if let Some(done) = gndrm_uapi::wire::PresentDone::decode(&buf[..n as usize]) {
                 crate::present::record(done.id, done.latch_ns);
+            } else if let Some(released) = BufferReleased::decode(&buf[..n as usize]) {
+                apply_release(released);
             } else if gndrm_uapi::wire::FrameAcquired::decode(&buf[..n as usize]).is_some() {
                 // The shim's own counter, echoed nowhere: accepted so it is not
                 // mistaken for a frame this reader does not know.
@@ -529,6 +531,17 @@ fn exchange_req(fd: RawFd, req: ScanoutAllocReq) -> Result<ScanoutBuf, Failure> 
                     if frames < MAX_BURST_FRAMES {
                         continue;
                     }
+                } else if let Some(released) = BufferReleased::decode(buf) {
+                    // The release watcher pushes on its own schedule, so a note
+                    // can stand ahead of the reply; dropping it would leave its
+                    // park to the bound.
+                    if recv_fd >= 0 {
+                        libc::close(recv_fd);
+                    }
+                    apply_release(released);
+                    if frames < MAX_BURST_FRAMES {
+                        continue;
+                    }
                 } else if gndrm_uapi::wire::FrameAcquired::decode(buf).is_some() {
                     // The acquire counter shares this channel and can arrive
                     // while a reply is pending; it is not the reply.
@@ -718,6 +731,20 @@ pub(crate) fn note_buffer_released(ticket: u64, ino: u64, source: u64) {
         ino,
         at: crate::proxy::monotonic_ns(),
     });
+}
+
+/// Adopt one release note, from whichever reader took it off the channel.
+fn apply_release(released: BufferReleased) {
+    // SurfaceFlinger is finished with this scan-out buffer: the producer may
+    // write into it again (see `note_buffer_released`).
+    note_buffer_released(released.ticket, released.ino, released.source);
+    // A release note is the only message that can end a park, so it is the
+    // only one that says parking is worth a bet again. Liveness keyed on the
+    // socket itself is a lie on a device whose daemon still pushes the panel
+    // grid: RP6 sent ~5 000 `VsyncNote`s while releasing nothing, and
+    // `channel=[unanswered:2 dead:false]` never armed the fail-open with
+    // `park_timeouts=5181` of 5 210 acquires.
+    crate::proxy::note_channel_alive();
 }
 
 /// Notes that carried a ticket, and notes whose release did not rest on a
@@ -915,16 +942,7 @@ pub(crate) fn poll_notes() {
         // The panel latched the frame this id was marked for.
         crate::present::record(done.id, done.latch_ns);
     } else if let Some(released) = BufferReleased::decode(&buf[..len]) {
-        // SurfaceFlinger is finished with this scan-out buffer: the producer may
-        // write into it again (see `note_buffer_released`).
-        note_buffer_released(released.ticket, released.ino, released.source);
-        // A release note is the only message that can end a park, so it is the
-        // only one that says parking is worth a bet again. Liveness keyed on the
-        // socket itself is a lie on a device whose daemon still pushes the panel
-        // grid: RP6 sent ~5 000 `VsyncNote`s while releasing nothing, and
-        // `channel=[unanswered:2 dead:false]` never armed the fail-open with
-        // `park_timeouts=5181` of 5 210 acquires.
-        crate::proxy::note_channel_alive();
+        apply_release(released);
     } else if let Some(acq) = gndrm_uapi::wire::FrameAcquired::decode(&buf[..len]) {
         // Sent from the acquire path; nothing to apply here. Accepted so the
         // log does not report it as an unknown frame.
@@ -1216,6 +1234,17 @@ mod tests {
                 // The daemon answers a subscribe with the current target, ahead
                 // of any reply: a note where a reply would be expected.
                 send_bare(conn, &FrameCapNote { fps: 120 }.encode());
+                // And the release watcher pushes whenever a fence signals.
+                send_bare(
+                    conn,
+                    &BufferReleased {
+                        ticket: 4_242,
+                        ino: 4_243,
+                        latch_ns: 0,
+                        source: gndrm_uapi::wire::RELEASE_FENCE,
+                    }
+                    .encode(),
+                );
                 let mut buf = [0u8; ScanoutAllocReq::LEN];
                 let n = libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0);
                 assert_eq!(n as usize, ScanoutAllocReq::LEN);
@@ -1239,6 +1268,7 @@ mod tests {
             }
         });
 
+        let _serial = fresh_notes();
         let fd = connect(&name);
         assert!(fd >= 0, "connect: {}", std::io::Error::last_os_error());
         let got = exchange(fd, 1280, 960)
@@ -1248,6 +1278,9 @@ mod tests {
         assert_eq!(got.ino, ino);
         // The note ahead of the reply set the target.
         assert_eq!(target_fps(), 120);
+        // The release note ahead of the reply was queued, not taken for a dead
+        // channel.
+        assert!(take_released_ticket(4_242));
         // SAFETY: the received descriptor and the connection are live.
         unsafe {
             libc::close(got.fd);
