@@ -821,7 +821,7 @@ pub(crate) fn release_notes_received() -> u64 {
 /// note for a frame arrives (it rides the latch of the frame that replaced it).
 /// Without the margin, depth is effectively one image short — measured at 44 fps
 /// with a 60 cap on a three-image FIFO swapchain.
-pub(crate) fn take_any_released(since_ns: u64) -> bool {
+pub(crate) fn take_any_released(since_ns: u64, ticket: u64) -> bool {
     // One display period of margin, and no more. The note that answers a park is
     // emitted when the *next* frame latches, so it legitimately predates the
     // commit by up to one frame; a floor at the commit itself rejects it and
@@ -831,20 +831,39 @@ pub(crate) fn take_any_released(since_ns: u64) -> bool {
     let floor = since_ns.saturating_sub(1_000_000_000 / hz);
     let mut q = RELEASED.lock().unwrap_or_else(|e| e.into_inner());
     q.retain(|n| n.at >= floor);
-    let had = !q.is_empty();
-    if had {
-        // The oldest note, unconditionally. It describes the frame that latched
-        // when this slot's buffer was replaced, which is the frame *before* the
-        // one parked here — so a floor at the commit would reject the only note
-        // that will ever mention that buffer and leave the park to its bound.
-        //
-        // The margin this gives up is one frame: slot N may be freed by the
-        // release of frame N+1. Both are in order, so the reuse is still older
-        // than the display's newest frame; the stricter identity match above is
-        // unaffected and still runs first where inodes line up.
-        q.remove(0);
+    // The oldest note that does not predate this park's frame. It describes the
+    // frame that latched when this slot's buffer was replaced, which is the frame
+    // *before* the one parked here — so a floor at the commit would reject the
+    // only note that will ever mention that buffer and leave the park to its
+    // bound.
+    //
+    // The margin this gives up is one frame: slot N may be freed by the release
+    // of frame N+1. Both are in order, so the reuse is still older than the
+    // display's newest frame; the stricter identity match above is unaffected
+    // and still runs first where inodes line up.
+    match q.iter().position(|n| !predates(n.ticket, ticket)) {
+        Some(i) => {
+            q.remove(i);
+            true
+        }
+        None => false,
     }
-    had
+}
+
+/// Whether a note's ticket names a frame committed before the park's own.
+///
+/// Such a note cannot answer the park by order or by inode: the frame it
+/// describes left the display no later than the parked one arrived, so it says
+/// nothing about the parked frame. It is a late note for an earlier use of the
+/// same buffer (the park on it expired and the buffer was committed again), or
+/// the note for a commit that was never parked (a hidden slot, a generation
+/// destination), which the park's own frame replaced on the layer. A newer
+/// ticket is still an answer, and is the common one: a note can arrive before
+/// its own slot is parked, and then pays the oldest park, whose frame left the
+/// layer before the note's did. 0 on either side is a daemon or a commit
+/// without tickets, and is not judged.
+fn predates(note_ticket: u64, park_ticket: u64) -> bool {
+    note_ticket != 0 && park_ticket != 0 && note_ticket < park_ticket
 }
 
 /// Take a release note for `ino` that arrived at or after `since_ns`, and drop
@@ -852,8 +871,9 @@ pub(crate) fn take_any_released(since_ns: u64) -> bool {
 ///
 /// `since_ns` is when the slot was parked. A note older than that describes an
 /// earlier frame of the same buffer — it says nothing about the frame now on the
-/// panel — and must not free the slot early. `true` when a note applied.
-pub(crate) fn take_released(ino: u64, since_ns: u64) -> bool {
+/// panel — and must not free the slot early. So does a note that arrived late
+/// but names an earlier `ticket`. `true` when a note applied.
+pub(crate) fn take_released(ino: u64, since_ns: u64, ticket: u64) -> bool {
     if ino == 0 {
         return false;
     }
@@ -863,7 +883,7 @@ pub(crate) fn take_released(ino: u64, since_ns: u64) -> bool {
         if n.ino != ino {
             return true;
         }
-        if n.at < since_ns {
+        if n.at < since_ns || predates(n.ticket, ticket) {
             return false;
         }
         if applied {
@@ -968,19 +988,19 @@ mod tests {
     fn a_release_note_only_applies_to_the_frame_it_describes() {
         let _serial = fresh_notes();
         note_buffer_released(0, 9_001, gndrm_uapi::wire::RELEASE_FENCE);
-        assert!(take_released(9_001, 0), "a note after the park frees the slot");
-        assert!(!take_released(9_001, 0), "and is consumed by it");
+        assert!(take_released(9_001, 0, 0), "a note after the park frees the slot");
+        assert!(!take_released(9_001, 0, 0), "and is consumed by it");
 
         // A note taken before the slot was parked: dropped, and it must not free
         // the slot on the next pass either.
         note_buffer_released(0, 9_002, gndrm_uapi::wire::RELEASE_FENCE);
         let parked = crate::proxy::monotonic_ns() + 1;
-        assert!(!take_released(9_002, parked));
-        assert!(!take_released(9_002, 0));
+        assert!(!take_released(9_002, parked, 0));
+        assert!(!take_released(9_002, 0, 0));
 
         // An inode of 0 is never a registered buffer.
         note_buffer_released(0, 0, gndrm_uapi::wire::RELEASE_FENCE);
-        assert!(!take_released(0, 0));
+        assert!(!take_released(0, 0, 0));
     }
 
     /// A ticket pairs the note to its frame when the inode cannot, which is the
@@ -993,13 +1013,33 @@ mod tests {
         // held — exactly what Odin 3 reports (`slot ino=11411`, `released=[11366
         // 11368 11370]`).
         crate::scanout::note_buffer_released(7, 11_366, gndrm_uapi::wire::RELEASE_FENCE);
-        assert!(!take_released(11_411, 0), "the inode matches nothing");
+        assert!(!take_released(11_411, 0, 0), "the inode matches nothing");
         assert!(take_released_ticket(7), "the ticket still frees its slot");
         assert!(!take_released_ticket(7), "and is consumed by it");
         // A note with no ticket is left for the inode path.
         crate::scanout::note_buffer_released(0, 11_366, gndrm_uapi::wire::RELEASE_FENCE);
         assert!(!take_released_ticket(0), "no ticket, no ticket match");
-        assert!(take_released(11_366, 0), "but the inode path still has it");
+        assert!(take_released(11_366, 0, 0), "but the inode path still has it");
+    }
+
+    /// A note naming an earlier frame than the park's cannot answer it by inode
+    /// or by order; a note naming a later frame still can.
+    #[test]
+    fn a_note_for_an_earlier_ticket_does_not_answer_a_later_park() {
+        let _serial = fresh_notes();
+        // Buffer 5 000 parked as ticket 10, expired, committed again as 13: the
+        // late note for 10 names the same buffer and must not free 13.
+        note_buffer_released(10, 5_000, gndrm_uapi::wire::RELEASE_FENCE);
+        assert!(!take_released(5_000, 0, 13), "a stale note for the same buffer");
+        assert!(!take_any_released(0, 13), "and it was dropped, not left for order");
+
+        // A note for a commit that was never parked (ticket 20), with the oldest
+        // park at 21: skipped by order, while a note for 22 behind it pays.
+        note_buffer_released(20, 6_000, gndrm_uapi::wire::RELEASE_FENCE);
+        note_buffer_released(22, 6_001, gndrm_uapi::wire::RELEASE_FENCE);
+        assert!(take_any_released(0, 21), "the newer note answers the older park");
+        assert!(!take_any_released(0, 21), "the older note does not");
+        assert!(take_released_ticket(20), "and is still there for its own ticket");
     }
 
     /// Its own note, not one an earlier test happened to leave: the suite runs
@@ -1029,12 +1069,12 @@ mod tests {
             note_buffer_released(0, ino, gndrm_uapi::wire::RELEASE_FENCE);
         }
         // Identity never matches this ino, so the slot would wait out its bound.
-        assert!(!take_released(9_999, 0), "no note names this inode");
+        assert!(!take_released(9_999, 0, 0), "no note names this inode");
         // By order the oldest note is spent, and only one per call.
-        assert!(take_any_released(0), "the oldest note is available");
-        assert!(take_any_released(0));
-        assert!(take_any_released(0));
-        assert!(!take_any_released(0), "and the list is spent");
+        assert!(take_any_released(0, 0), "the oldest note is available");
+        assert!(take_any_released(0, 0));
+        assert!(take_any_released(0, 0));
+        assert!(!take_any_released(0, 0), "and the list is spent");
     }
 
     /// A note may be up to one display period older than the park's commit — the
@@ -1048,13 +1088,13 @@ mod tests {
         note_buffer_released(0, 8_500, gndrm_uapi::wire::RELEASE_FENCE);
         // Parked two periods after the note: out of the margin, and dropped.
         let parked = crate::proxy::monotonic_ns() + 2 * period;
-        assert!(!take_any_released(parked), "older than one frame");
-        assert!(!take_any_released(parked), "and it is dropped, not kept");
+        assert!(!take_any_released(parked, 0), "older than one frame");
+        assert!(!take_any_released(parked, 0), "and it is dropped, not kept");
 
         // Within the margin it is usable: that is the case the floor exists for.
         note_buffer_released(0, 8_501, gndrm_uapi::wire::RELEASE_FENCE);
         let within = crate::proxy::monotonic_ns() + period / 2;
-        assert!(take_any_released(within), "inside the one-frame margin");
+        assert!(take_any_released(within, 0), "inside the one-frame margin");
     }
 
     #[test]

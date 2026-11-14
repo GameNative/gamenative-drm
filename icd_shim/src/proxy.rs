@@ -3084,6 +3084,7 @@ unsafe fn answer_park_from_notes(
 ) -> i32 {
     let mut oldest = -1i32;
     let mut oldest_commit = u64::MAX;
+    let mut oldest_ticket = 0u64;
     {
         let slots = unsafe { (*sc).slots.as_ptr() };
         for k in first..end {
@@ -3098,13 +3099,14 @@ unsafe fn answer_park_from_notes(
             if commit < oldest_commit {
                 oldest_commit = commit;
                 oldest = k as i32;
+                oldest_ticket = unsafe { (*s).ticket.load(Ordering::Acquire) };
             }
         }
     }
     if oldest < 0 {
         return -1;
     }
-    if !crate::scanout::take_any_released(oldest_commit) {
+    if !crate::scanout::take_any_released(oldest_commit, oldest_ticket) {
         return -1;
     }
     NOTES_APPLIED.fetch_add(1, Ordering::Relaxed);
@@ -3164,7 +3166,7 @@ unsafe fn slot_just_freed(s: *mut GnSlot, now: u64) -> bool {
         return true;
     }
     let since = unsafe { (*s).commit_ns }.min(parked);
-    if unsafe { crate::scanout::take_released((*s).ino, since) } {
+    if unsafe { crate::scanout::take_released((*s).ino, since, (*s).ticket.load(Ordering::Acquire)) } {
         NOTES_APPLIED.fetch_add(1, Ordering::Relaxed);
         PARK_UNANSWERED.store(0, Ordering::Relaxed);
         let lag = now.saturating_sub(parked);
