@@ -627,6 +627,19 @@ fn take_present_mark(ino: u64) -> (u64, u64) {
     }
 }
 
+/// Forget every mark and the ticket order they were checked against.
+///
+/// Tickets are minted per shim process and start again at 1 in the next one, so
+/// the previous process's highest ticket would refuse every order match of the
+/// new one as skew, and its unclaimed marks would sit at the head of the queue.
+/// A reconnect of the same process loses at most the marks in flight, whose notes
+/// then carry no ticket.
+fn reset_present_marks() {
+    let mut pending = PRESENT_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    pending.clear();
+    MARK_LAST_TICKET.store(0, Ordering::Relaxed);
+}
+
 /// Report a completed present to the shim: queued here, written by the channel.
 fn note_present_done(id: u64, latch_ns: u64) {
     if id == 0 {
@@ -3224,6 +3237,8 @@ pub fn serve_scanout(
                 }
             }
             if sub.caps & CAP_PRESENT_ID != 0 {
+                // A new mark sender, whose tickets may start a new sequence.
+                reset_present_marks();
                 PRESENT_AWARE.store(true, Ordering::Relaxed);
                 PRESENT_FD.store(present_fd, Ordering::Relaxed);
             }
