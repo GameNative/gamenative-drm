@@ -1062,7 +1062,7 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
         unsafe {
             (*sc).slots.push(GnSlot {
                 park_expired: false,
-                ticket: 0,
+                ticket: AtomicU64::new(0),
                 owner: sc,
                 image: 0,
                 mem: 0,
@@ -2397,8 +2397,9 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
             // not the guest chained a present id: the id is only the latch
             // report's key, while the ticket is the release note's, and a title
             // that chains no id still needs its buffers released.
-            (*s).ticket = TICKET_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-            crate::scanout::send_present_mark((*s).ino, (*s).present_id, (*s).ticket);
+            let ticket = TICKET_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+            (*s).ticket.store(ticket, Ordering::Release);
+            crate::scanout::send_present_mark((*s).ino, (*s).present_id, ticket);
             // One mark per frame: a guest that stops chaining ids must not keep
             // marking later frames with the last one it sent.
             (*s).present_id = 0;
@@ -2700,7 +2701,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     for _ in 0..n_slots {
         sc.slots.push(GnSlot {
             park_expired: false,
-            ticket: 0,
+            ticket: AtomicU64::new(0),
             owner: scp,
             image: 0,
             mem: 0,
@@ -3155,7 +3156,7 @@ unsafe fn slot_just_freed(s: *mut GnSlot, now: u64) -> bool {
     // pairs them; anchoring on the park dropped the note for this very frame as
     // stale and left every slot on the bound.
     // Exact pairing first: the note names the frame this slot committed.
-    if unsafe { crate::scanout::take_released_ticket((*s).ticket) } {
+    if unsafe { crate::scanout::take_released_ticket((*s).ticket.load(Ordering::Acquire)) } {
         NOTES_APPLIED.fetch_add(1, Ordering::Relaxed);
         PARK_UNANSWERED.store(0, Ordering::Relaxed);
         let lag = now.saturating_sub(parked);
@@ -8041,7 +8042,14 @@ pub struct GnSlot {
     /// The ticket this slot's frame was committed under: the key its release note
     /// is filed under, 0 until the slot has committed once. A note that names it
     /// frees this slot and no other, with no window, floor or ordering rule.
-    pub ticket: u64,
+    ///
+    /// Atomic, and written with `Release` against an `Acquire` load, because the two
+    /// sides do not share a lock: the commit worker stores it without holding
+    /// `shared`, and `slot_just_freed` reads it with that guard held. As a plain
+    /// `u64` the only ordering was temporal, and a stale read that happened to match
+    /// an unconsumed older note would free the slot a frame early — the exact defect
+    /// the ticket exists to remove.
+    pub ticket: AtomicU64,
     // Guest-side trace: the acquire sequence that filled this slot, so a
     // present can be tied back to the acquire that handed the guest the image.
     pub acq_seq: u64,

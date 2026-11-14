@@ -240,6 +240,8 @@ fn report_hold(now_ns: u64) {
     let settled = MARK_HIT.load(Ordering::Relaxed)
         + MARK_ORDER.load(Ordering::Relaxed)
         + MARK_MISS.load(Ordering::Relaxed)
+        + MARK_STALE.load(Ordering::Relaxed)
+        + MARK_RESYNC.load(Ordering::Relaxed)
         + MARK_SKEW.load(Ordering::Relaxed);
     if settled != MARK_REPORTED.swap(settled, Ordering::Relaxed) {
         let depth = PRESENT_PENDING
@@ -249,10 +251,12 @@ fn report_hold(now_ns: u64) {
         log_always!(
             "{}",
             format_args!(
-                "sf mark: hit={} order={} miss={} skew={} pending={} last={}",
+                "sf mark: hit={} order={} miss={} stale={} resync={} skew={} pending={} last={}",
                 MARK_HIT.load(Ordering::Relaxed),
                 MARK_ORDER.load(Ordering::Relaxed),
                 MARK_MISS.load(Ordering::Relaxed),
+                MARK_STALE.load(Ordering::Relaxed),
+                MARK_RESYNC.load(Ordering::Relaxed),
                 MARK_SKEW.load(Ordering::Relaxed),
                 depth,
                 MARK_LAST_TICKET.load(Ordering::Relaxed)
@@ -409,6 +413,18 @@ struct ReleaseCtx {
     /// what makes a release note exact — the ticket is minted by the process
     /// that owns the slot, so it cannot be ambiguous the way a dma-buf inode can.
     ticket: AtomicU64,
+    /// The ticket this registration carried *when the transaction that replaced it
+    /// was applied* — the frame the release fence actually describes.
+    ///
+    /// Not `ticket`: that field is overwritten by the buffer's next publish, and the
+    /// completion callback runs on SurfaceFlinger's binder thread some time after the
+    /// apply. Normally long before the buffer is reused, but a delayed callback (a
+    /// stalled SF, a suspend) can arrive after the buffer has been published again —
+    /// and the note would then name the *newer* frame, freeing the slot that holds it
+    /// while the display may still be reading it. Snapshotting at the apply removes
+    /// the window: between the apply and the callback this buffer is on the layer and
+    /// cannot be published again.
+    release_ticket: AtomicU64,
     /// Set by the completion callback: SurfaceFlinger reported the flip event
     /// for this registration, so the buffer is safe to hand back out (the
     /// reuse cache keys on it). Never cleared: the flag belongs to this
@@ -510,6 +526,20 @@ static MARK_HIT: AtomicU64 = AtomicU64::new(0);
 static MARK_ORDER: AtomicU64 = AtomicU64::new(0);
 static MARK_MISS: AtomicU64 = AtomicU64::new(0);
 static MARK_SKEW: AtomicU64 = AtomicU64::new(0);
+/// Marks dropped because their ticket was already published. An identity hit can
+/// remove a mark from the middle of the queue, leaving older ones behind that can
+/// never be assigned — discarding them is what stops the queue wedging on a head
+/// no publish will ever match.
+static MARK_STALE: AtomicU64 = AtomicU64::new(0);
+/// Fallbacks that accepted a small forward gap: the marks in between were lost, not
+/// mis-ordered. This is the counter that says whether `sendmsg` is dropping under
+/// load, which nothing measured before.
+static MARK_RESYNC: AtomicU64 = AtomicU64::new(0);
+
+/// The largest forward gap the order fallback will re-seed across. One lost mark is
+/// a dropped send; four is a burst; more than that is a queue this code does not
+/// understand, and the ticket path stands down until identity carries it.
+const MARK_RESYNC_GAP: u64 = 4;
 /// The highest ticket assigned to a registration: the order fallback may only
 /// move it forward, so a lost or late mark cannot pair every later frame with the
 /// one before it.
@@ -546,9 +576,24 @@ fn note_present_mark(mark: PresentMark) {
 /// publish being made now — no window, no floor, no reordering, unlike the shim's
 /// own order arm, which pairs frames that have already been shown.
 ///
-/// The one guard is that order may only move the ticket *forward*. A mark lost to
-/// the queue's cap would otherwise leave every later frame carrying the previous
-/// frame's ticket, which frees the wrong slot one frame early.
+/// The guard on the fallback is exactness, not monotonicity: the next publish must
+/// take the *next* ticket, because one mark is sent per commit in order. A permissive
+/// "greater than the last" rule accepts a mis-assigned ticket — a mark that belongs to
+/// a different frame gets bound to this registration, and when that buffer's release
+/// fires the shim frees the slot holding somebody else's frame. That is a wrong-slot
+/// free, which is a tear, not a reordering: the present path never consults a ticket.
+///
+/// The three outcomes below are what keeps the rule usable:
+///
+/// - **stale** — the head's ticket was already published. Discarded and the queue
+///   re-examined, because an identity hit can remove a mark from the middle and leave
+///   older ones queued that no publish will ever match. Refusing instead would wedge
+///   the head forever.
+/// - **resync** — a small forward gap, so the marks in between were lost rather than
+///   mis-ordered. Accepted and counted: this is the only measurement of `sendmsg`
+///   dropping marks under load, which nothing had.
+/// - **skew** — a gap beyond [`MARK_RESYNC_GAP`]. The queue and the publisher disagree
+///   about where they are, so the ticket path stands down and identity carries it.
 fn take_present_mark(ino: u64) -> (u64, u64) {
     let mut pending = PRESENT_PENDING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(i) = pending.iter().position(|&(marked, _, _)| marked == ino) {
@@ -557,18 +602,29 @@ fn take_present_mark(ino: u64) -> (u64, u64) {
         MARK_LAST_TICKET.fetch_max(ticket, Ordering::Relaxed);
         return (id, ticket);
     }
-    let Some(&(_, id, ticket)) = pending.first() else {
-        MARK_MISS.fetch_add(1, Ordering::Relaxed);
-        return (0, 0);
-    };
-    if ticket == 0 || ticket <= MARK_LAST_TICKET.load(Ordering::Relaxed) {
-        MARK_SKEW.fetch_add(1, Ordering::Relaxed);
-        return (0, 0);
+    loop {
+        let last = MARK_LAST_TICKET.load(Ordering::Relaxed);
+        let Some(&(_, id, ticket)) = pending.first() else {
+            MARK_MISS.fetch_add(1, Ordering::Relaxed);
+            return (0, 0);
+        };
+        if ticket == 0 || ticket <= last {
+            pending.remove(0);
+            MARK_STALE.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        if ticket > last + MARK_RESYNC_GAP {
+            MARK_SKEW.fetch_add(1, Ordering::Relaxed);
+            return (0, 0);
+        }
+        if ticket > last + 1 {
+            MARK_RESYNC.fetch_add(1, Ordering::Relaxed);
+        }
+        pending.remove(0);
+        MARK_ORDER.fetch_add(1, Ordering::Relaxed);
+        MARK_LAST_TICKET.store(ticket, Ordering::Relaxed);
+        return (id, ticket);
     }
-    pending.remove(0);
-    MARK_ORDER.fetch_add(1, Ordering::Relaxed);
-    MARK_LAST_TICKET.store(ticket, Ordering::Relaxed);
-    (id, ticket)
 }
 
 /// Report a completed present to the shim: queued here, written by the channel.
@@ -660,7 +716,7 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ffi::ASurface
                 if watch >= 0 {
                     watch_release(
                         (*prev).ino,
-                        (*prev).ticket.load(Ordering::Relaxed),
+                        (*prev).release_ticket.load(Ordering::Acquire),
                         watch,
                         (*prev).latch_ns.load(Ordering::Relaxed),
                     );
@@ -1304,6 +1360,7 @@ fn new_release_ctx(api: &ffi::ScApi, ino: u64) -> (*mut ReleaseCtx, Arc<AtomicBo
         latch_time: api.st_stats_latch_time,
         latch_ns: AtomicU64::new(0),
         ticket: AtomicU64::new(0),
+        release_ticket: AtomicU64::new(0),
         applied_ns: AtomicU64::new(0),
         present_id: AtomicU64::new(0),
         latched: Arc::clone(&latched),
@@ -2027,7 +2084,17 @@ impl AscState {
                     // fence, so the mailbox that owns it has to be named before
                     // the callback can run.
                     // SAFETY: `ctx` is the leaked mailbox of this slot.
-                    unsafe { (*ctx).replaced_ctx.store(self.last_shown_ctx, Ordering::Relaxed) };
+                    unsafe {
+                        let prev = self.last_shown_ctx;
+                        (*ctx).replaced_ctx.store(prev, Ordering::Relaxed);
+                        // The frame the fence will describe, stamped while this
+                        // buffer is still on the layer and therefore still the one
+                        // `ticket` holds.
+                        if !prev.is_null() {
+                            let t = (*prev).ticket.load(Ordering::Acquire);
+                            (*prev).release_ticket.store(t, Ordering::Release);
+                        }
+                    }
                     match build_show(&api, self.sc, ahb, ctx, rect, fence) {
                         Some(tx) => {
                             apply_transaction(&api, tx);
