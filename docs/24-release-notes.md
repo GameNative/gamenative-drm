@@ -73,6 +73,13 @@ first of:
 3. **The order.** The oldest park by `commit_ns`, with a floor one display period
    before the commit, because the note that answers a park is emitted when the
    *next* frame latches and so legitimately predates the park.
+
+   Neither fallback takes a note whose ticket is older than the park's own: that
+   is a late note for an earlier use of the buffer, or the note of a commit that
+   was never parked (a hidden slot, a generation destination), and the frame it
+   describes says nothing about the parked one. A newer ticket still pays — a
+   note can arrive before its own slot is parked, and the ticket arm only looks
+   at parked slots.
 4. **The bound.** `min(2 × commit spacing, 4 × panel period)`, floored at two
    periods.
 5. **The fail-open.** `PARK_UNANSWERED` counts parks that expired without a note;
