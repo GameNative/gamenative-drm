@@ -749,6 +749,9 @@ pub const INBOUND_MAX: usize = {
     if PresentMark::LEN > m {
         m = PresentMark::LEN;
     }
+    if LsfgConfig::LEN > m {
+        m = LsfgConfig::LEN;
+    }
     m
 };
 
@@ -1110,6 +1113,7 @@ mod tests {
             FrameCapSubscribe::LEN,
             FrameAcquired::LEN,
             PresentMark::LEN,
+            LsfgConfig::LEN,
         ] {
             assert!(
                 len <= INBOUND_MAX,
