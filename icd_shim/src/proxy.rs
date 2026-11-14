@@ -149,6 +149,16 @@ static ACQ_SEQ: AtomicUsize = AtomicUsize::new(0);
 // line is itself logf!-gated. Microseconds because the signal being chased (a
 // missed 8.33 ms vblank) is sub-ms at the acquire itself: a 0.5 ms wait is
 // invisible at millisecond resolution.
+/// Time spent inside `vkQueuePresentKHR`, in microseconds: the frame's own
+/// window, between the acquire returning and the next one starting. `acqus`
+/// covers only the acquire, so a guest that stalls in present showed up as an
+/// unexplained gap between two fast acquires.
+static PRESENT_US_N: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_US_SUM: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_US_MAX: AtomicUsize = AtomicUsize::new(0);
+/// Presents that took at least one 60 Hz vblank, the scale at which a present
+/// stall is visible to the panel.
+static PRESENT_US_GE_VBLANK: AtomicUsize = AtomicUsize::new(0);
 static ACQ_US_N: AtomicUsize = AtomicUsize::new(0);
 static ACQ_US_SUM: AtomicUsize = AtomicUsize::new(0);
 static ACQ_US_MAX: AtomicUsize = AtomicUsize::new(0);
@@ -185,7 +195,109 @@ static PRES_IV_LAST_NS: AtomicU64 = AtomicU64::new(0);
 // `gate_holds>0` with `acq_fps` short of the target is the gate binding and the
 // rate still below it, which is a schedule fault rather than a missing target.
 static GATE_HOLD_N: AtomicUsize = AtomicUsize::new(0);
+/// Acquires that ran with a gate, and acquires that ran without one. The cap
+/// can only hold on the gated ones, so the split is the first thing a cap that
+/// reads high has to explain.
+static ACQ_GATED_N: AtomicUsize = AtomicUsize::new(0);
+static ACQ_UNGATED_N: AtomicUsize = AtomicUsize::new(0);
 static GATE_HOLD_SUM_US: AtomicUsize = AtomicUsize::new(0);
+/// Time the guest actually spent parked by the gate, ns: what the cap costs the
+/// producer, as opposed to what it saves the display.
+static GATE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+/// Acquire spacing, in buckets of the panel period: `<14 ms`, `14-16.2`,
+/// `16.2-17.2`, `17.2-20`, `>20`. A cap that holds shows one bucket at the
+/// interval; a cap that leaks shows mass below it.
+static ACQ_SPACING: [AtomicUsize; 5] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
+static ACQ_LAST_NS: AtomicU64 = AtomicU64::new(0);
+/// The first grant's timestamp, so the census divides frames by elapsed time
+/// rather than by the sum of their own waits.
+static ACQ_FIRST_NS: AtomicU64 = AtomicU64::new(0);
+/// Schedule bookings, for the census's `books=` next to the grant count.
+static BOOK_N: AtomicUsize = AtomicUsize::new(0);
+/// Acquire *calls* that handed the guest an image, and calls that left without
+/// one (`VK_NOT_READY`/`VK_TIMEOUT`). A presentation rate is the first, never
+/// the call count: an engine that polls with a zero timeout retries, and a
+/// retry is not a frame.
+static ACQ_OK_N: AtomicUsize = AtomicUsize::new(0);
+static ACQ_RETRY_N: AtomicUsize = AtomicUsize::new(0);
+/// First instant this shim sized a swapchain, for the census's session age: a
+/// cumulative counter is only a rate once the denominator is known.
+static SHIM_T0_NS: AtomicU64 = AtomicU64::new(0);
+/// Release notes applied to a parked slot, and slots freed by
+/// [`release_note_limit_ns`] instead. The first is the measurement working; the
+/// second is a note that never came, and a session where it dominates is one
+/// where the daemon is not naming every buffer the guest holds.
+static NOTES_APPLIED: AtomicUsize = AtomicUsize::new(0);
+static PARK_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Parks that ended on the bound, with no note, in a row.
+///
+/// The release note is news from a producer that may not be there. RP6 runs
+/// gamescope on this payload with no daemon at all: `rnotes=132` against
+/// `park_timeouts=14544`, no `sf hold:` and no `release note ino=` line in 20 000
+/// logcat lines, and only `gamescope`/`gamescopereaper` in `ps`. Every park there
+/// is a hold with nobody to end it, and the acquire polled a 250 us slice until
+/// the bound — 9.6 ms inside `vkAcquireNextImageKHR` of a 28.1 ms frame, while
+/// the gate (1.15 ms) and the slot bound (0.93 ms) accounted for 2.1 ms of it.
+///
+/// Four unanswered parks in a row is enough to stop betting: the slot is freed on
+/// its fence instead, which is what the commit before the park did and what ran
+/// Dave at 50-60 on that device. Any message on the note socket resets this, so a
+/// producer that comes back re-arms parking on its own — there is no probation
+/// timer to tune, and a channel that never appears costs nothing after the fourth
+/// frame.
+static PARK_UNANSWERED: AtomicUsize = AtomicUsize::new(0);
+const PARK_DEAD_AFTER: usize = 4;
+
+/// The note channel is dead: the last `PARK_DEAD_AFTER` parks went unanswered.
+fn park_channel_dead() -> bool {
+    PARK_UNANSWERED.load(Ordering::Relaxed) >= PARK_DEAD_AFTER
+}
+
+/// A message arrived on the note socket, so parking is worth a bet again.
+pub(crate) fn note_channel_alive() {
+    PARK_UNANSWERED.store(0, Ordering::Relaxed);
+}
+
+/// The lock wait the acquire cannot otherwise name.
+///
+/// The acquire's total and the waits it names did not add up on RP6: 9.6 ms a
+/// frame inside `vkAcquireNextImageKHR`, against 2.1 ms of gate and slot time.
+/// The only other place the rest can be is the swapchain lock, held by the worker
+/// across its commit.
+static LOCK_WAIT_N: AtomicUsize = AtomicUsize::new(0);
+static LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Commits whose slot carried a present id but no wait id: the present armed the
+/// id, so something cleared it between the present and the commit. The release
+/// handler is the only other writer, and a frame that loses its id this way is
+/// one `present::committed` never registers, leaving its wait with no bound.
+static NOID_AT_COMMIT: AtomicUsize = AtomicUsize::new(0);
+
+/// How long after its park the note that freed a slot arrived, bucketed at 5 ms,
+/// 33 ms (the park bound) and 100 ms. `notes=` alone cannot tell a note that
+/// arrived in time from one that arrived after the guest had already gone on.
+static NOTELAG: [AtomicUsize; 4] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
+
+fn note_lag_bucket(ns: u64) -> usize {
+    match ns {
+        0..5_000_000 => 0,
+        5_000_000..33_000_000 => 1,
+        33_000_000..100_000_000 => 2,
+        _ => 3,
+    }
+}
 static GATE_HOLD_MAX_US: AtomicUsize = AtomicUsize::new(0);
 
 /// Record the interval since the previous present. Called once per present at
@@ -244,6 +356,20 @@ static SLOT_WAIT_N: AtomicUsize = AtomicUsize::new(0);
 // cadence as it reaches gamescope (`commit_spacing_bucket`).
 static COMMIT_GAPS: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
 static LAST_COMMIT_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The commit interval, smoothed, in nanoseconds: the cadence whose slowness
+/// causes the compositor's hold. Zero until a second commit has been seen.
+static COMMIT_SPACING_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The ticket the shim stamps on each commit, and the key the daemon's release
+/// note is filed under.
+///
+/// Minted here rather than taken from the guest's present id: most titles chain
+/// none (`VK_KHR_present_id` is optional), so a guest id would be 0 on every
+/// frame of a session, and the release note would have nothing to pair with.
+/// Process-wide and never reused, so a freed dma-buf's inode being recycled into
+/// a new buffer cannot make a stale note free a live slot.
+static TICKET_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The `COMMIT_GAPS` bucket of a spacing of `gap_ns`.
 fn commit_spacing_bucket(gap_ns: u64) -> usize {
@@ -328,6 +454,27 @@ fn rate_ok(slot: &'static Mutex<Option<Instant>>, every: Duration) -> bool {
     true
 }
 
+/// Slot time, kept apart from the rate's: an acquire that waited for the cap and
+/// then for an image used to have the whole span filed under the rate, which read
+/// as `gate_avg_us=333460` at a 16.7 ms period — 20 periods of "cap" that were
+/// really one image's hold.
+/// Parks answered by order rather than by the note's inode (`notelag`'s
+/// counterpart): a count above zero means this device does not key notes by the
+/// parked buffer, and the order path is what is keeping the pipeline moving.
+static NOTES_BY_ORDER: AtomicUsize = AtomicUsize::new(0);
+
+static SLOT_HOLD_N: AtomicUsize = AtomicUsize::new(0);
+static SLOT_HOLD_SUM_US: AtomicUsize = AtomicUsize::new(0);
+static SLOT_HOLD_MAX_US: AtomicUsize = AtomicUsize::new(0);
+
+/// The mean slot hold per acquire that paid one, or 0.
+fn slot_hold_avg_us() -> usize {
+    SLOT_HOLD_SUM_US
+        .load(Ordering::Relaxed)
+        .checked_div(SLOT_HOLD_N.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 /// The mean park per delayed acquire, or 0 while none has been delayed — the
 /// aggregate `gate_us=` divided by `gate_holds=`.
 fn gate_hold_avg_us() -> usize {
@@ -337,17 +484,49 @@ fn gate_hold_avg_us() -> usize {
         .unwrap_or(0)
 }
 
-/// The rate the acquire intervals imply, in frames per second, over the whole
-/// window the census counts. This is the only number that can be checked against
-/// a target without a stopwatch: it is measured at the instant the cap acts, so a
-/// display-side frame count reading low cannot be mistaken for the cap's rate.
+/// Grants per second over the window the census counts: the first grant
+/// timestamp and the last one, against how many frames were handed out.
+///
+/// This used to be `1e6 * n / sum(acq_us)` — the reciprocal of the mean
+/// `vkAcquireNextImageKHR` *duration*, which is a service time and not a rate. It
+/// read 88.98 on a session whose limit was 30 acquires/s, and I read that as the
+/// guest running three times over its cap; the sessions it "measured" as 34.4,
+/// 41.7, 49.7 and 64.3 were all that same mistake. A rate has to divide frames by
+/// elapsed time, and elapsed time has to come from the clock, not from the thing
+/// being measured.
 fn acq_fps() -> f64 {
-    let n = ACQ_US_N.load(Ordering::Relaxed);
-    let sum = ACQ_US_SUM.load(Ordering::Relaxed);
-    if n == 0 || sum == 0 {
+    let n = ACQ_OK_N.load(Ordering::Relaxed);
+    let first = ACQ_FIRST_NS.load(Ordering::Relaxed);
+    let last = ACQ_LAST_NS.load(Ordering::Relaxed);
+    if n < 2 || first == 0 || last <= first {
         return 0.0;
     }
-    1_000_000.0 * n as f64 / sum as f64
+    1_000_000_000.0 * (n - 1) as f64 / (last - first) as f64
+}
+
+/// The generation ring, as `in_flight/total` over the slots behind the guest's
+/// images, plus how many of them are parked waiting for a release note. A
+/// destination that is written, committed and never released reads `n/n parked=n`
+/// and is the reason a batch finds nothing free while the cap says it may grow.
+fn dest_state(sc: *mut GnSwapchain) -> String {
+    let Ok(g) = (unsafe { (*sc).shared.lock() }) else {
+        return String::from("<locked>");
+    };
+    let guest = unsafe { (*sc).guest_slots as usize };
+    let mut total = 0usize;
+    let mut in_flight = 0usize;
+    let mut parked = 0usize;
+    for s in unsafe { (*sc).slots.iter().skip(guest) } {
+        total += 1;
+        if s.in_flight {
+            in_flight += 1;
+        }
+        if s.parked_ns != 0 {
+            parked += 1;
+        }
+    }
+    drop(g);
+    format!("{in_flight}/{total} parked={parked}")
 }
 
 /// "0:-F 1:A- …": A = held by the app, F = committed and awaiting release.
@@ -370,13 +549,15 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
     drop(g);
     format!(
         "{}",
-        format_args!("acq={} pres={} rel={} commit={} starved={} in_flight={in_flight} slots=[{}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} acq_fps={:.2}]",
+        format_args!("acq={} pres={} rel={} commit={} starved={} in_flight={in_flight} slots=[{}] dests=[{}] gendrel={} acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} slot_avg_us={} by_order={} acq_fps={:.2}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
             N_COMMIT_OK.load(Ordering::Relaxed),
             N_STARVE.load(Ordering::Relaxed),
             flags.trim_end(),
+            dest_state(sc),
+            GEN_RELEASES.load(Ordering::Relaxed),
                 ACQ_US_N.load(Ordering::Relaxed),
                 ACQ_US_SUM.load(Ordering::Relaxed),
                 ACQ_US_MAX.load(Ordering::Relaxed),
@@ -395,6 +576,8 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
                 GATE_HOLD_SUM_US.load(Ordering::Relaxed),
                 gate_hold_avg_us(),
                 GATE_HOLD_MAX_US.load(Ordering::Relaxed),
+                slot_hold_avg_us(),
+                NOTES_BY_ORDER.load(Ordering::Relaxed),
                 acq_fps(),)
     )
 }
@@ -403,12 +586,13 @@ fn slot_flags(sc: *mut GnSwapchain) -> String {
 fn counters() -> String {
     format!(
         "{}",
-        format_args!("acq={} pres={} rel={} commit={} starved={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} acq_fps={:.2}]",
+        format_args!("acq={} pres={} rel={} commit={} starved={} gendrel={} maint1=[fences={} released={}] acqus=[n={} sum={} max={} nz={} ge8={} ge16={}] presiv=[n={} sum={} min={} max={} ge16667={} ge33333={}] cap=[fps={} notes={} acq_fps={:.2} books={} gate_holds={} gate_us={} gate_avg_us={} gate_max_us={} slot_holds={} slot_us={} slot_avg_us={} slot_max_us={} by_order={}] presus=[n={} sum={} max={} ge16667={}] channel=[unanswered:{} dead:{}] lock=[n:{} us:{}] tick=[n:{} off:{}]",
             N_ACQ.load(Ordering::Relaxed),
             N_PRES.load(Ordering::Relaxed),
             N_REL.load(Ordering::Relaxed),
             N_COMMIT_OK.load(Ordering::Relaxed),
             N_STARVE.load(Ordering::Relaxed),
+            GEN_RELEASES.load(Ordering::Relaxed),
             N_PRESENT_FENCE.load(Ordering::Relaxed),
             N_RELEASED_IMAGES.load(Ordering::Relaxed),
                 ACQ_US_N.load(Ordering::Relaxed),
@@ -425,12 +609,42 @@ fn counters() -> String {
                 PRES_IV_GE_33333.load(Ordering::Relaxed),
                 crate::scanout::target_fps(),
                 crate::scanout::notes_seen(),
+                acq_fps(),
+                BOOK_N.load(Ordering::Relaxed),
                 GATE_HOLD_N.load(Ordering::Relaxed),
                 GATE_HOLD_SUM_US.load(Ordering::Relaxed),
                 gate_hold_avg_us(),
                 GATE_HOLD_MAX_US.load(Ordering::Relaxed),
-                acq_fps(),)
+                SLOT_HOLD_N.load(Ordering::Relaxed),
+                SLOT_HOLD_SUM_US.load(Ordering::Relaxed),
+                slot_hold_avg_us(),
+                SLOT_HOLD_MAX_US.load(Ordering::Relaxed),
+                NOTES_BY_ORDER.load(Ordering::Relaxed),
+                PRESENT_US_N.load(Ordering::Relaxed),
+                PRESENT_US_SUM.load(Ordering::Relaxed),
+                PRESENT_US_MAX.load(Ordering::Relaxed),
+                PRESENT_US_GE_VBLANK.load(Ordering::Relaxed),
+                PARK_UNANSWERED.load(Ordering::Relaxed),
+                park_channel_dead(),
+                LOCK_WAIT_N.load(Ordering::Relaxed),
+                LOCK_WAIT_NS.load(Ordering::Relaxed) / 1_000,
+                crate::scanout::note_counts().0,
+                crate::scanout::note_counts().1,)
     )
+}
+
+/// The swapchain lock, with the wait it cost counted when it is worth naming.
+///
+/// The acquire's total and the waits it names did not add up on RP6: 9.6 ms a
+/// frame inside `vkAcquireNextImageKHR`, of which the gate (1.15 ms) and the slot
+/// bound (0.93 ms) were 2.1 ms. The only other thing it can be is this lock, held
+/// by the worker across its commit.
+fn note_lock_wait(t0: Instant) {
+    let ns = t0.elapsed().as_nanos() as u64;
+    if ns > 1_000_000 {
+        LOCK_WAIT_N.fetch_add(1, Ordering::Relaxed);
+        LOCK_WAIT_NS.fetch_add(ns, Ordering::Relaxed);
+    }
 }
 
 /// Serializes every send-side wl_connection access (request marshaling +
@@ -715,6 +929,28 @@ fn lsfg_barrier(
     b
 }
 
+/// Report one generated frame the moment it is on the compositor's surface.
+///
+/// The daemon counts produced frames from the deltas of the two totals an
+/// acquire message carries, and that message is sent once per *acquired* frame.
+/// A generated frame therefore reached the app's frame ring only when the guest
+/// next acquired: up to a multiplier's worth late, coalesced into a burst, and
+/// then spread over the interval by `note_produced`. The ring's own reading of
+/// that was a HUD that jumped by several fps while the session's rate did not
+/// move (`acq_fps=29.00, 29.01, 29.00` over 7 000 frames).
+///
+/// Sent here instead — one message per generated frame, acquire total unchanged —
+/// so `note_produced` sees a delta of exactly one generated frame and calls
+/// `notify_frame_published` once per frame, at the frame's own commit.
+///
+/// `send_frame_nb` is non-blocking and the totals are cumulative, so a refused
+/// message costs one ring sample and carries the frame on the next one.
+fn note_frame_generated() {
+    let generated = GEN_COMMITS.fetch_add(1, Ordering::Relaxed) + 1;
+    let acquired = ACQ_COUNT.load(Ordering::Relaxed);
+    crate::scanout::send_frame_acquired(acquired, u64::from(generated));
+}
+
 /// Commit a slot the present path did not produce (a generation destination).
 /// The caller has already waited the submission that wrote it.
 unsafe fn commit_generated(sc: *mut GnSwapchain, slot_index: usize) {
@@ -724,10 +960,16 @@ unsafe fn commit_generated(sc: *mut GnSwapchain, slot_index: usize) {
         unsafe {
             (*s).in_flight = true;
             (*s).acquired = false;
+            // A destination's note is matched against its commit too, and a zero
+            // here would make `slot_just_freed`'s anchor `min(0, parked) = 0` —
+            // i.e. accept any note ever sent for this ino, including one for an
+            // earlier frame of the same buffer.
+            (*s).commit_ns = monotonic_ns();
         }
     }
     if unsafe { (*(*sc).surf).parent.is_null() } {
         unsafe { x11_present_slot(sc, s, slot_index as i32) };
+        note_frame_generated();
         return;
     }
     if unsafe { (*s).buf.is_null() } {
@@ -756,6 +998,7 @@ unsafe fn commit_generated(sc: *mut GnSwapchain, slot_index: usize) {
         wlproto::surface_commit(parent);
         wlproto::wl_display_flush((*(*sc).surf).dpy);
     }
+    note_frame_generated();
 }
 
 /// The device's generation session, opened or replaced when the settings call
@@ -818,6 +1061,8 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
         let index = unsafe { (*sc).slots.len() };
         unsafe {
             (*sc).slots.push(GnSlot {
+                park_expired: false,
+                ticket: AtomicU64::new(0),
                 owner: sc,
                 image: 0,
                 mem: 0,
@@ -830,11 +1075,14 @@ unsafe fn lsfg_destinations(sc: *mut GnSwapchain, count: usize) -> bool {
                 xfence: 0,
                 present_id: 0,
                 wait_id: 0,
+                wait_registered: false,
                 fence: 0,
                 sem: 0,
                 fence_sem: 0,
                 acquired: false,
                 in_flight: false,
+                parked_ns: 0,
+                commit_ns: 0,
                 acq_seq: 0,
                 acquired_ns: 0,
                 ino: 0,
@@ -1147,6 +1395,14 @@ static GEN_SKIPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::n
 /// back. Compared with [`GEN_COMMITS`], it separates "presented" from
 /// "superseded".
 static GEN_RELEASES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// No drought counter: parking is unconditional for a synced mode, and
+/// [`slot_just_freed`]'s bound is what stops a missing note from stranding a
+/// slot. A heuristic on the parks-since-the-last-note was tried and removed —
+/// parks arrive per release event while notes are drained per poll, so nine
+/// releases can legitimately precede one note. It tripped at `notes=5754` on a
+/// channel that went on to deliver 9 811 (`rnotes=9811`), and being sticky it
+/// turned the tear fix off for the rest of the session: `park=off`,
+/// `acq_fps=64.33` on a 60 Hz panel, visible tearing.
 /// Batches that built fewer frames than the engine planned, and why: no free
 /// destination, or the engine's plan itself under the multiplier.
 static GEN_SHORT_FREE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1331,17 +1587,41 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
     // The engine reports no generation until its frame history exists, and that
     // history is built by `process` — so the capture runs on every presented
     // frame and only generation and blit are gated on the plan.
+    // The engine plans by the multiplier; the session's generation limit is a
+    // rate, so a panel that cannot show `acquire × multiplier` frames leaves
+    // fewer per source frame ([`crate::limits::Limits::generate_per_source`]).
     let planned = unsafe { (*session).plan(capacity) };
+    let allowed = session_limits(sc).generate_per_source(multiplier);
+    let planned = match allowed {
+        Some(per) => planned.min(per),
+        None => 0,
+    };
     let guest = unsafe { gen_first_slot(sc) };
-    // A destination is free once the compositor has released it and nothing
-    // queued still points at it.
-    let free: Vec<usize> = (guest..unsafe { (*sc).slots.len() })
+    // A destination is free once the compositor has released it — or once its
+    // note is overdue — and nothing queued still points at it. The unpark check
+    // is the same one the guest's acquire uses: this path had none, so every
+    // destination it parked left the ring for good (`slots=[5/5 parked=5]`).
+    let mut free: Vec<usize> = (guest..unsafe { (*sc).slots.len() })
         .filter(|&i| {
-            let s = unsafe { (*sc).slots.as_ptr().add(i).as_ref().unwrap() };
-            !s.in_flight && !unsafe { (*gd).gen_due.iter().any(|d| d.slot as usize == i) }
+            let s = unsafe { (*sc).slots.as_mut_ptr().add(i) };
+            let landed = unsafe { !(*s).in_flight || slot_just_freed(s, monotonic_ns()) };
+            landed
+                && !unsafe { (*gd).gen_due.iter().any(|d| d.slot as usize == i) }
         })
         .collect();
-    let mut free = free;
+    // Identity found too few: spend notes by order and look again, so a device
+    // whose notes name another buffer still gets its destinations back.
+    if free.len() < planned as usize
+        && unsafe { answer_park_from_notes(sc, guest, (*sc).slots.len(), false) } >= 0
+    {
+        free = (guest..unsafe { (*sc).slots.len() })
+            .filter(|&i| {
+                let s = unsafe { (*sc).slots.as_mut_ptr().add(i) };
+                let landed = unsafe { !(*s).in_flight || slot_just_freed(s, monotonic_ns()) };
+                landed && !unsafe { (*gd).gen_due.iter().any(|d| d.slot as usize == i) }
+            })
+            .collect();
+    }
     if free.len() < planned as usize {
         GEN_SHORT_FREE.fetch_add(1, Ordering::Relaxed);
         // The compositor returns buffers later than the ring assumed: add what
@@ -1632,13 +1912,11 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
         // One output slot per frame, the generated frames first and the source
         // frame last, spaced evenly over one source period: the engine's frames
         // sit between the previous source frame and this one. The period is the
-        // cap's, or the measured one when the guest runs slower than the cap or
-        // has none.
-        let rate = crate::lsfg::output_rate();
-        let cap_period = if rate > 0 {
-            1_000_000_000u64 / u64::from(rate) * u64::from(multiplier)
-        } else {
-            0
+        // session's acquire limit, or the measured one when the guest runs
+        // slower than that limit.
+        let cap_period = match session_limits(sc).acquire_per_s {
+            Some(acquire) if acquire > 0 => 1_000_000_000u64 / u64::from(acquire),
+            _ => 0,
         };
         let source_period = match (cap_period, period) {
             (0, 0) => 16_666_667,
@@ -1674,6 +1952,13 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
         for (k, index) in destinations.iter().take(built).enumerate() {
             let (deadline, _) = place(k as u64 + 1);
             unsafe {
+                // Taking a destination clears its park as well as its flight:
+                // `slot_just_freed` says the display is done with it, and the
+                // generator is about to write the whole image again.
+                let s = (*sc).slots.as_mut_ptr().add(*index);
+                (*s).parked_ns = 0;
+                (*s).park_expired = false;
+                (*s).in_flight = true;
                 (*gd).gen_due.push_back(GenDue {
                     deadline,
                     slot: *index as i32,
@@ -1733,7 +2018,7 @@ unsafe fn lsfg_queue_real(sc: *mut GnSwapchain, src_idx: i32) -> bool {
     // the panel's.
     let source_period = {
         let measured = unsafe { (*gd).gen_period_ns };
-        match crate::lsfg::source_cap() {
+        match session_limits(sc).acquire_per_s {
             Some(cap) if cap > 0 => (1_000_000_000 / u64::from(cap)).max(measured),
             _ if measured != 0 => measured,
             _ => grid.map_or(16_666_667, |g| g.period_ns),
@@ -1800,7 +2085,6 @@ unsafe fn flush_due(sc: *mut GnSwapchain) {
     if unsafe { (*gd).gen_sc } != sc {
         return;
     }
-    let mut committed = 0u32;
     while let Some((deadline, slot, batch, drop_at)) =
         (unsafe { (*gd).gen_due.front() }).map(|d| (d.deadline, d.slot, d.batch, d.drop_at))
     {
@@ -1842,12 +2126,11 @@ unsafe fn flush_due(sc: *mut GnSwapchain) {
         if batch == GEN_NO_BATCH {
             unsafe { commit_real(sc, slot, 0) };
         } else {
+            // `commit_generated` counts the frame itself, one message per frame,
+            // so the batch adds nothing here: a batch-level total would be a
+            // second, duplicate report for every frame it contains.
             unsafe { commit_generated(sc, slot as usize) };
-            committed += 1;
         }
-    }
-    if committed > 0 {
-        GEN_COMMITS.fetch_add(committed, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -2024,9 +2307,18 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
     unsafe {
         let s = (*sc).slots.as_mut_ptr().add(idx as usize);
         let now = monotonic_ns();
+        // The instant a release note for this frame will be about. Set here, not
+        // at the park: the note can precede the park (see `commit_ns`).
+        (*s).commit_ns = now;
         let last = LAST_COMMIT_NS.swap(now, Ordering::Relaxed);
         if last != 0 && now > last {
-            COMMIT_GAPS[commit_spacing_bucket(now - last)].fetch_add(1, Ordering::Relaxed);
+            let gap = now - last;
+            COMMIT_GAPS[commit_spacing_bucket(gap)].fetch_add(1, Ordering::Relaxed);
+            let est = COMMIT_SPACING_NS.load(Ordering::Relaxed);
+            COMMIT_SPACING_NS.store(
+                crate::vsync_gate::smooth_latency(est, gap),
+                Ordering::Relaxed,
+            );
         }
         // How long the frame took from the gate's release to here, its render
         // fence waited, for the census.
@@ -2042,8 +2334,72 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
         // that names its buffer in an atomic commit. The worker may wait for an
         // allocation exchange in flight, which is bounded by that exchange's own
         // timeout; a mark that never arrives would leave a wait hanging.
-        if (*s).present_id != 0 && (*s).ino != 0 {
-            crate::scanout::send_present_mark((*s).ino, (*s).present_id);
+        // Both ids this commit acts on are read here, once: `send_present_mark`
+        // below is a blocking send, and the release handler on the dispatch
+        // thread writes `wait_id` while it blocks.
+        let presented_id = (*s).present_id;
+        let wait_id = {
+            let _g = (*sc).shared.lock().unwrap();
+            (*s).wait_id
+        };
+        // This frame's present wait, registered before anything that can block.
+        // The bound that answers a wait nobody else answers is measured from
+        // this commit instant, so registering after the mark would put the whole
+        // mark's latency into every frame the guest is waiting on.
+        let mut feedback_token = 0u64;
+        if wait_id != 0 {
+            // A guest that asked for mailbox or immediate does not wait, and
+            // neither would one whose frames go out as mailbox or immediate
+            // (the container's mode, or frame generation): both are answered
+            // here. A FIFO guest declared FIFO keeps the release-or-grace answer.
+            // A cap-rate-vsync frame's wait was answered when the guest queued
+            // it (`present_dispatch`), so one still on the slot here is a frame
+            // whose declaration changed since; it is answered now.
+            let (live, _why) = live_choice(sc);
+            let at_commit = present_wait_answer(
+                !(*(*sc).surf).swapchain_obj.is_null(),
+                acquire_pacing(sc) != crate::vsync_gate::Pacing::Off,
+                (*sc).present_mode,
+                live,
+            ) != WaitAnswer::Later;
+            if at_commit {
+                let _g = (*sc).shared.lock().unwrap();
+                (*s).wait_id = 0;
+                (*s).wait_registered = false;
+            } else {
+                // A FIFO wait on the override route is answered by gamescope's
+                // presentation feedback, as in Mesa's Wayland WSI, and by the
+                // grace behind it. Marked registered first, so the release that
+                // follows the commit may answer it and the one that preceded
+                // the commit could not.
+                let _g = (*sc).shared.lock().unwrap();
+                (*s).wait_registered = true;
+                drop(_g);
+                if !(*(*sc).surf).swapchain_obj.is_null()
+                    && !PRESENTATION.load(Ordering::Acquire).is_null()
+                {
+                    feedback_token = crate::present::expect_feedback(wait_id, sc as usize);
+                }
+            }
+            crate::present::committed(wait_id, sc as usize, now, at_commit);
+        }
+        if presented_id != 0 && wait_id == 0 {
+            // The present sets both ids, and only a commit takes them again
+            // (`at_commit`) or a re-present of the slot discards them — so a
+            // frame that arrives here with a present id and no wait id lost it
+            // on the way. Counted because the loss leaves its wait with no
+            // commit to bound it, which is what made the compositor's feedback
+            // the only answer: 2975 of 3407 waits before this was fixed.
+            NOID_AT_COMMIT.fetch_add(1, Ordering::Relaxed);
+        }
+        if (*s).ino != 0 {
+            // One ticket per commit, and one mark carrying it. Sent whether or
+            // not the guest chained a present id: the id is only the latch
+            // report's key, while the ticket is the release note's, and a title
+            // that chains no id still needs its buffers released.
+            let ticket = TICKET_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+            (*s).ticket.store(ticket, Ordering::Release);
+            crate::scanout::send_present_mark((*s).ino, (*s).present_id, ticket);
             // One mark per frame: a guest that stops chaining ids must not keep
             // marking later frames with the last one it sent.
             (*s).present_id = 0;
@@ -2052,46 +2408,8 @@ unsafe fn commit_real(sc: *mut GnSwapchain, idx: i32, fence_ms: u128) {
         // answered at the latest when the refresh after this commit has
         // passed: a frame that nothing replaces is never released, and the
         // guest may wait on it before presenting again (vkd3d-proton does, on
-        // its first frame). Under an effective mailbox or immediate mode the
-        // wait is answered here: a guest that knew its real mode would not
-        // wait at all, and holding it couples the guest's frame-latency loop
-        // to a refresh period it does not pace by.
-        // The present id this commit asks gamescope's presentation feedback for,
-        // 0 when none (see `crate::present`).
-        let mut feedback_token = 0u64;
-        if (*s).wait_id != 0 {
-            // A guest that asked for mailbox or immediate does not wait, and
-            // neither would one whose frames go out as mailbox or immediate
-            // (the container's mode, or frame generation): both are answered
-            // here. A FIFO guest declared FIFO keeps the release-or-grace answer.
-            // A cap-rate-vsync frame's wait was answered when the guest queued
-            // it (`present_dispatch`), so one still on the slot here is a frame
-            // whose declaration changed since; it is answered now.
-            let (live, why) = live_choice(sc);
-            let at_commit = present_wait_answer(
-                !(*(*sc).surf).swapchain_obj.is_null(),
-                why,
-                (*sc).requested_mode,
-                live,
-            ) != WaitAnswer::Later;
-            let id = if at_commit {
-                let _g = (*sc).shared.lock().unwrap();
-                core::mem::replace(&mut (*s).wait_id, 0)
-            } else {
-                (*s).wait_id
-            };
-            // A FIFO wait on the override route is answered by gamescope's
-            // presentation feedback, as in Mesa's Wayland WSI. Registered
-            // before the commit, so neither the release nor the grace can
-            // answer it first.
-            if !at_commit
-                && !(*(*sc).surf).swapchain_obj.is_null()
-                && !PRESENTATION.load(Ordering::Acquire).is_null()
-            {
-                feedback_token = crate::present::expect_feedback(id, sc as usize);
-            }
-            crate::present::committed(id, sc as usize, monotonic_ns(), at_commit);
-        }
+        // its first frame). Its wait was registered above, and the feedback
+        // request a `feedback_token` names rides the commit below.
         // X11 route: the window carries its own content, so the frame is
         // presented into it (DRI3 + Present) instead of committed to a
         // wl_surface. The slot stays in flight until its idle fence
@@ -2292,11 +2610,10 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
                 colorspace);
         }
     }
-    // The container's mode, else the guest's, is the one this swapchain keeps
-    // (see `effective_present_mode`); what each commit declares is decided per
-    // present (`live_present_mode`).
+    // The guest's requested mode is the one this swapchain keeps; what each
+    // commit declares is decided per present (`live_present_mode`).
     let gamescope_route = unsafe { !(*surf).swapchain_obj.is_null() };
-    let (mode, mode_source) = effective_present_mode(ci);
+    let mode = guest_present_mode(ci);
     // The count is the guest's, on Mesa's convention: the capabilities carry
     // the depth ([`SC_DEFAULT_IMAGES`]) and creation honours the ask, with the
     // mailbox floor as the only bump ([`swapchain_slots`]). What a commit
@@ -2312,15 +2629,35 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     let mut n_slots = if strict_count {
         ci.minImageCount.clamp(2, ceiling.max(2))
     } else {
-        swapchain_slots(ci.minImageCount, ceiling, mode)
+        swapchain_slots(ci.minImageCount, ceiling, count_present_mode(mode))
     };
-    // Frame generation commits the source frame from the guest's own slot while
-    // its generated frames latch: a guest that asked for two has nothing left
-    // to render the next source frame into, so it gets the floor. Never for a
-    // strict game, which cannot be given a slot it did not ask for.
+    // Frame generation needs the source, its destination and the one the
+    // compositor holds. This floor is not what sizes the generation ring — that
+    // is `lsfg_destinations`, grown behind the guest's images — and a run with 4
+    // here generated exactly as many frames as one with 3. The starvation it was
+    // meant to fix measured `slots=[5/5 parked=5]` with `notes=1`: every
+    // destination held for a note that never came. Never for a strict game, which
+    // cannot be given a slot it did not ask for.
     if !strict_count && crate::lsfg::live().0 {
         n_slots = n_slots.max(SC_FRAMEGEN_IMAGES.min(ceiling.max(2)));
     }
+    // The count is decided once, here, and cannot follow the settings afterwards:
+    // the app's frame can arrive after the swapchain exists. Printed at the
+    // default level because the session's whole depth follows from it — a session
+    // whose settings came late ran on three images and could not reach its cap,
+    // and the only way to see that was to subtract the generation ring from a
+    // slot count in the census.
+    crate::logi!(
+        "proxy swapchain create: {} images for asked={} ceiling={} declared={} counted={} live={} generating={} strict={}",
+        n_slots,
+        ci.minImageCount,
+        ceiling,
+        mode,
+        count_present_mode(mode),
+        crate::lsfg::live().0,
+        crate::lsfg::wanted().is_some(),
+        strict_count
+    );
     if strict_count {
         crate::logi!("proxy swapchain create: strict image count: requested {} gives {n_slots} images, mode={}",
             ci.minImageCount,
@@ -2337,9 +2674,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         extent: ci.imageExtent,
         fourcc,
         present_mode: mode,
-        requested_mode: guest_present_mode(ci),
-        mode_source,
-        // The slot image carries the usage the guest asked for, plus TRANSFER_SRC:
+                // The slot image carries the usage the guest asked for, plus TRANSFER_SRC:
         // the engine copies the presented frame out of it, and generation can be
         // turned on after the swapchain exists.
         usage: ci.imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
@@ -2365,6 +2700,8 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     let scp: *mut GnSwapchain = &mut *sc;
     for _ in 0..n_slots {
         sc.slots.push(GnSlot {
+            park_expired: false,
+            ticket: AtomicU64::new(0),
             owner: scp,
             image: 0,
             mem: 0,
@@ -2377,11 +2714,14 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
             xfence: 0,
             present_id: 0,
             wait_id: 0,
+            wait_registered: false,
             fence: 0,
             sem: 0,
             fence_sem: 0,
             acquired: false,
             in_flight: false,
+            parked_ns: 0,
+                commit_ns: 0,
             acq_seq: 0,
             acquired_ns: 0,
             ino: 0,
@@ -2414,9 +2754,18 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     // destinations themselves created up front, before the first present.
     sc.guest_slots = n_slots;
     // Hidden slots only on gamescope's route, the one where a slot comes back on
-    // the compositor's release. The guest never sees them (`spare_begin`).
-    let hidden = if strict_count && gamescope_route {
-        crate::image_count::hidden_slot_count(n_slots) as usize
+    // the compositor's release. The guest never sees them (`spare_begin`): it is
+    // answered `n_slots` and binds `n_slots`, so the count rule of #56 is
+    // untouched and the ring exists only past the guest's own images.
+    //
+    // Keyed on the *ask*, not on `n_slots`. A guest that insists on a small image
+    // count is the case this exists for, and the served mode may have already
+    // raised `n_slots` past the ask: Doom 2016 asks for two and is served mailbox,
+    // which floors the count at four. Sizing the ring from the ask keeps the
+    // pipeline behind that guest; sizing it from `n_slots` would read four, decide
+    // the guest "has an image to spare" and give it none.
+    let hidden = if gamescope_route {
+        crate::image_count::hidden_slot_count(ci.minImageCount) as usize
     } else {
         0
     };
@@ -2438,10 +2787,9 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
     }
     sc.spare_slots = hidden as u32;
     if hidden != 0 {
-        crate::logi!("proxy swapchain create: strict image count: {} images, {} of {} ring slot(s) for hidden copies",
+        crate::logi!("proxy swapchain create: {} images for asked={}, {hidden} of {ring} ring slot(s) for hidden copies",
             n_slots,
-            hidden,
-            ring);
+            ci.minImageCount);
     }
 
     // What the guest was told the surface can be, next to what the slot images
@@ -2642,6 +2990,68 @@ unsafe extern "C" fn gn_vkDestroySwapchainKHR(
 // imported dma-buf image directly.
 const REAP_SLICE: Duration = Duration::from_millis(4);
 
+/// How long a slot the compositor has released may wait for the daemon's own
+/// release note before it is taken anyway, in nanoseconds.
+///
+/// The note is a fence signal, so it arrives in microseconds once SurfaceFlinger
+/// releases the buffer. The bound exists for the case where it never does: the
+/// daemon emits a note for a buffer that is *replaced* on the layer, so a buffer
+/// its publish path coalesced away is never replaced and never gets one.
+///
+/// Two display periods, because that is the scale of the hold the note reports
+/// (measured 1.5-2.5 periods). A longer bound is not a safety net, it is a
+/// pacing rule: at 100 ms four slots cap the session at 40/s, and the guest's
+/// own over-production is what decides how many of those it pays.
+/// How long a parked slot waits for the daemon's release note before it is taken
+/// anyway.
+///
+/// How long a parked slot waits for the daemon's release note before it is taken
+/// anyway: two producer intervals, kept between two and four panel periods.
+///
+/// The producer interval is the right scale for the *hold* — a buffer stays on
+/// the layer until the next frame replaces it, so a bound measured in panel
+/// periods alone expires before every note for a slow producer (40 fps on 60 Hz
+/// held ~66 ms against a 33 ms bound; `park_timeouts` read 12 203 against 3 623
+/// slot waits).
+///
+/// It must not be the only scale, though, because the bound then depends on the
+/// interval it governs. A session that has already slowed lengthens the hold that
+/// keeps it slow — measured on Witcher 3 under Odin 3, where no note matched its
+/// slot: 3 fps → 318 ms spacing → 636 ms bound → three images per 0.64 s → 3 fps.
+/// Four panel periods is the ceiling; it is still twice the 1.5-2.5-period hold
+/// SurfaceFlinger was measured to take, so a working note path never reaches it.
+fn release_note_limit_ns() -> u64 {
+    let hz = match crate::lsfg::panel_hz() {
+        0 => 60,
+        hz => u64::from(hz),
+    };
+    let period = 1_000_000_000 / hz;
+    let floor = 2 * period;
+    let ceiling = 4 * period;
+    let spacing = COMMIT_SPACING_NS.load(Ordering::Relaxed);
+    spacing.saturating_mul(2).clamp(floor, ceiling)
+}
+
+/// How long an acquire may sleep while a slot is parked on a release note.
+///
+/// The note is read by whoever next drains the channel, including this loop, so a
+/// parked wait is a poll of the channel and not a sleep: a slice longer than the
+/// note's own latency adds that latency to every frame the guest is waiting for.
+/// At a 120 Hz acquire interval a 4 ms slice is half a frame, measured as a fifth
+/// of the panel's frames repeated.
+const PARKED_SLICE: Duration = Duration::from_micros(250);
+
+/// Whether any slot of this swapchain is waiting on the daemon's release note.
+unsafe fn any_parked(sc: *mut GnSwapchain) -> bool {
+    for k in 0..unsafe { (*sc).guest_slots as usize } {
+        let s = unsafe { (*sc).slots.as_ptr().add(k) };
+        if unsafe { (*s).parked_ns != 0 } {
+            return true;
+        }
+    }
+    false
+}
+
 /// Claim the first swapchain slot that is neither held by the app nor awaiting a
 /// compositor release. On success `idx` is set to the slot (marked acquired);
 /// when none is free `idx` is left unchanged.
@@ -2655,13 +3065,171 @@ const REAP_SLICE: Duration = Duration::from_millis(4);
 /// measured as 8 commits against 5334 for the gated path on the same title. Any
 /// free-running scheme needs a rotating slot choice (so each commit carries a
 /// newer buffer) and its own back-pressure, not just this condition relaxed.
+/// Free the oldest parked slot if a release note older than nothing is in hand.
+///
+/// The order fallback, for a device whose notes name a different buffer than the
+/// one parked (see `scanout::take_any_released`). It lives here rather than in the
+/// per-slot scan because that scan visits slots by index, not by age: with three
+/// parks it would free slot 0 while the oldest frame sits on slot 2, and the note
+/// would then be spent on the wrong frame.
+///
+/// Returns the slot freed, or -1. Called before the acquire scan and before the
+/// destination search, so both consumers see the freed slot without knowing about
+/// notes.
+unsafe fn answer_park_from_notes(
+    sc: *mut GnSwapchain,
+    first: usize,
+    end: usize,
+    locked: bool,
+) -> i32 {
+    let mut oldest = -1i32;
+    let mut oldest_commit = u64::MAX;
+    let mut oldest_ticket = 0u64;
+    {
+        let slots = unsafe { (*sc).slots.as_ptr() };
+        for k in first..end {
+            let s = unsafe { slots.add(k) };
+            let parked = unsafe { (*s).parked_ns };
+            // Only a slot whose own identity did not match is a candidate: the
+            // identity path has already had its turn.
+            if parked == 0 {
+                continue;
+            }
+            let commit = unsafe { (*s).commit_ns };
+            if commit < oldest_commit {
+                oldest_commit = commit;
+                oldest = k as i32;
+                oldest_ticket = unsafe { (*s).ticket.load(Ordering::Acquire) };
+            }
+        }
+    }
+    if oldest < 0 {
+        return -1;
+    }
+    if !crate::scanout::take_any_released(oldest_commit, oldest_ticket) {
+        return -1;
+    }
+    NOTES_APPLIED.fetch_add(1, Ordering::Relaxed);
+    NOTES_BY_ORDER.fetch_add(1, Ordering::Relaxed);
+    // `shared` is not reentrant: the acquire path already holds it, the present
+    // worker's destination search does not. Taking it twice hangs the acquire
+    // thread inside `vkAcquireNextImageKHR`, which is what a session reads as a
+    // frozen counter (`acq=5` for ten seconds, guest waiting on a semaphore).
+    let _g = if locked {
+        None
+    } else {
+        Some(unsafe { (*sc).shared.lock().unwrap() })
+    };
+    let s = unsafe { (*sc).slots.as_mut_ptr().add(oldest as usize) };
+    unsafe {
+        (*s).parked_ns = 0;
+        (*s).park_expired = false;
+        (*s).in_flight = false;
+    }
+    unsafe { (*sc).cv_free.notify_all() };
+    drop(_g);
+    oldest
+}
+
+/// Whether a slot that the compositor has let go may be used again.
+///
+/// A parked slot is one the compositor released but the *display* may still be
+/// reading, so it waits for the daemon's note. That note must not be the only way
+/// out: a note that never arrives strands the slot for the session. The measured
+/// case is `slots=[5/5 parked=5] gendrel=6` with `notes=1` — five generation
+/// destinations parked, one note ever, `generated 6` for a whole session while
+/// `short: free` counted 4 790 refusals.
+///
+/// Shared by the guest's acquire and the generator's search for a destination.
+/// It was inline in the first, and the second had no unpark path at all: the only
+/// release check in the shim scanned `0..guest_slots`, so a parked destination was
+/// never released, never timed out, and never counted — it just left the ring.
+unsafe fn slot_just_freed(s: *mut GnSlot, now: u64) -> bool {
+    let parked = unsafe { (*s).parked_ns };
+    if parked == 0 {
+        return false;
+    }
+    // The bound already answered this park: say so without counting it again.
+    if unsafe { (*s).park_expired } {
+        return true;
+    }
+    // A note describes the frame that was committed, and it can arrive before the
+    // compositor's release that parks the slot. Anchoring on the commit is what
+    // pairs them; anchoring on the park dropped the note for this very frame as
+    // stale and left every slot on the bound.
+    // Exact pairing first: the note names the frame this slot committed.
+    if unsafe { crate::scanout::take_released_ticket((*s).ticket.load(Ordering::Acquire)) } {
+        NOTES_APPLIED.fetch_add(1, Ordering::Relaxed);
+        PARK_UNANSWERED.store(0, Ordering::Relaxed);
+        let lag = now.saturating_sub(parked);
+        NOTELAG[note_lag_bucket(lag)].fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    let since = unsafe { (*s).commit_ns }.min(parked);
+    if unsafe { crate::scanout::take_released((*s).ino, since, (*s).ticket.load(Ordering::Acquire)) } {
+        NOTES_APPLIED.fetch_add(1, Ordering::Relaxed);
+        PARK_UNANSWERED.store(0, Ordering::Relaxed);
+        let lag = now.saturating_sub(parked);
+        NOTELAG[note_lag_bucket(lag)].fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+
+    if now.saturating_sub(parked) >= release_note_limit_ns() {
+        PARK_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+        PARK_UNANSWERED.fetch_add(1, Ordering::Relaxed);
+        unsafe { (*s).park_expired = true };
+        // Once per process: the slot's identity beside the notes the daemon sent.
+        // A session that reads `park_timeouts == acquires` with `notelag` empty
+        // needs this line to say whether the identities differ or the note list
+        // was empty when the park expired.
+        static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !REPORTED.swap(true, Ordering::Relaxed) {
+            crate::logf!(
+                "proxy park timeout: slot ino={} parked {} us ago; released=[{}]",
+                unsafe { (*s).ino },
+                now.saturating_sub(parked) / 1_000,
+                crate::scanout::released_snapshot()
+            );
+        }
+        return true;
+    }
+    false
+}
+
+/// Called with `shared` **held**: nothing reached from here may lock it again.
+///
+/// That is not a style rule — `std::sync::Mutex` is not reentrant, so a second
+/// `lock()` on the same guard hangs the acquire thread inside
+/// `vkAcquireNextImageKHR`. Measured: a session froze at `acq=5` with the guest
+/// parked on a timeline semaphore and `park_timeouts=0`, because the order
+/// fallback locked `shared` while the caller already held it.
 unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
+    // Identity first: a note that names this slot is the sharper pairing, and on a
+    // device where inodes line up it is the only path that runs.
+    unsafe { acquire_scan_identity(sc, idx) };
+    if *idx >= 0 {
+        return;
+    }
+    // Nothing matched by identity. A note that names no parked buffer may still
+    // answer the oldest park, so spend one that way and look again.
+    if unsafe { answer_park_from_notes(sc, 0, (*sc).guest_slots as usize, true) } >= 0 {
+        unsafe { acquire_scan_identity(sc, idx) };
+    }
+}
+
+unsafe fn acquire_scan_identity(sc: *mut GnSwapchain, idx: &mut i32) {
+    let now = monotonic_ns();
     for k in 0..unsafe { (*sc).guest_slots as usize } {
         let s = unsafe { (*sc).slots.as_mut_ptr().add(k) };
-        if unsafe { !(*s).acquired && !(*s).in_flight } {
+        let released = unsafe { slot_just_freed(s, now) };
+        let free = unsafe { !(*s).acquired && (!(*s).in_flight || released) };
+        if free {
             *idx = k as i32;
             unsafe {
                 (*s).acquired = true;
+                (*s).in_flight = false;
+                (*s).parked_ns = 0;
+                (*s).park_expired = false;
             }
             let seq = ACQ_SEQ.fetch_add(1, Ordering::Relaxed);
             unsafe {
@@ -2677,6 +3245,74 @@ unsafe fn acquire_take_free(sc: *mut GnSwapchain, idx: &mut i32) {
     }
 }
 
+/// What a wait ended as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waited {
+    /// The span elapsed (or something woke it).
+    Slept,
+    /// The caller's own `timeout` ran out first.
+    Expired,
+}
+
+/// Why an acquire is blocked, for the census.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Blocked {
+    /// It was not blocked: the image was free and the schedule allowed it.
+    None,
+    /// The cap: the schedule had not reached this frame's release point.
+    Rate,
+    /// The pipeline: every image was held by the compositor.
+    Slot,
+}
+
+/// The one sleep in the acquire: `ns` on the swapchain's free-slot condition, or
+/// until the caller's `deadline` if that comes first.
+///
+/// Both conditions use it, so the deadline arithmetic exists once and a wake-up
+/// can never be mistaken for a decision.
+unsafe fn sleep_ns(
+    sc: *mut GnSwapchain,
+    g: MutexGuard<'_, ScShared>,
+    ns: u64,
+    deadline: Option<Instant>,
+) -> (MutexGuard<'_, ScShared>, Waited) {
+    let mut wait = Duration::from_nanos(ns);
+    if let Some(dl) = deadline {
+        let left = dl.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return (g, Waited::Expired);
+        }
+        wait = wait.min(left);
+    }
+    // SAFETY: `sc` is live for the call and `g` is the guard being released.
+    let (guard, _) = unsafe { (*sc).cv_free.wait_timeout(g, wait) }.unwrap();
+    (guard, Waited::Slept)
+}
+
+/// One acquired frame: the totals and the cadence the census reads.
+fn note_acquire_granted(now_ns: u64) {
+    ACQ_OK_N.fetch_add(1, Ordering::Relaxed);
+    let _ = ACQ_FIRST_NS.compare_exchange(
+        0,
+        now_ns,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    let last = ACQ_LAST_NS.swap(now_ns, Ordering::Relaxed);
+    if last == 0 {
+        return;
+    }
+    let gap = now_ns.saturating_sub(last);
+    let bucket = match gap {
+        0..=13_999_999 => 0,
+        14_000_000..=16_199_999 => 1,
+        16_200_000..=17_199_999 => 2,
+        17_200_000..=19_999_999 => 3,
+        _ => 4,
+    };
+    ACQ_SPACING[bucket].fetch_add(1, Ordering::Relaxed);
+}
+
 unsafe fn gn_acquire_common(
     sc: *mut GnSwapchain,
     timeout: u64,
@@ -2687,105 +3323,111 @@ unsafe fn gn_acquire_common(
     let gd = (*sc).dev;
     let acq_t0 = Instant::now();
     N_ACQ.fetch_add(1, Ordering::Relaxed);
+    let _ = SHIM_T0_NS.compare_exchange(
+        0,
+        monotonic_ns(),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
     ring_push(
         "vkAcquireNextImageKHR",
         [timeout as usize, sem as usize, fence as usize, 0, 0],
     );
     let deadline = (timeout != u64::MAX).then(|| Instant::now() + Duration::from_nanos(timeout));
-    // The time gate: a frame that may not start yet waits before it is given an
-    // image. Which clock it runs on, if any, is `acquire_pacing`'s rule.
+    // Two things hold a frame, and they are independent: the schedule (the cap)
+    // and an image being free (the pipeline). The loop asks each in turn, in that
+    // order, and sleeps in exactly one place.
     let pacing = unsafe { acquire_pacing(sc) };
     let gated = pacing != crate::vsync_gate::Pacing::Off;
+    if gated {
+        ACQ_GATED_N.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ACQ_UNGATED_N.fetch_add(1, Ordering::Relaxed);
+    }
     let mut idx: i32 = -1;
-    let mut timed_out = false;
-    // First instant this acquire was parked by the deadline, 0 while it never
-    // was: the census reads one park per acquire, not one per wait, because a
-    // wake-up that finds the deadline still ahead parks again.
-    let mut hold_from: u64 = 0;
-    let mut slot_waited = false;
+    // Why this acquire waited, and since when: one census sample per acquire,
+    // never one per turn of the loop.
+    let mut blocked = Blocked::None;
+    let mut blocked_at = 0u64;
+    // When the rate condition was satisfied, 0 while it still is not.
+    let mut rate_done_ns = 0u64;
     {
-        let mut g = (*sc).shared.lock().unwrap();
+        let lock_t0 = Instant::now();
+        let mut g = unsafe { (*sc).shared.lock().unwrap() };
+        note_lock_wait(lock_t0);
         loop {
-            if gated && !g.stopping {
-                let now_ns = monotonic_ns();
-                let next_ns = (*sc).release.next_ns;
-                if next_ns != 0 && now_ns < next_ns {
+            if idx >= 0 || g.stopping {
+                break;
+            }
+            // 1. The cap. A frame may not start before the schedule says.
+            if gated {
+                let due = (*sc).release.next_ns;
+                let now = monotonic_ns();
+                if due != 0 && now < due {
                     if timeout == 0 {
                         break;
                     }
-                    if hold_from == 0 {
-                        hold_from = now_ns;
+                    if blocked == Blocked::None {
+                        blocked = Blocked::Rate;
+                        blocked_at = now;
                     }
-                    let mut wait = Duration::from_nanos(next_ns - now_ns);
-                    if let Some(dl) = deadline {
-                        let left = dl.saturating_duration_since(Instant::now());
-                        if left.is_zero() {
-                            timed_out = true;
-                            break;
-                        }
-                        wait = wait.min(left);
-                    }
-                    let (guard, _res) = (*sc).cv_free.wait_timeout(g, wait).unwrap();
+                    let (guard, waited) =
+                        unsafe { sleep_ns(sc, g, due.saturating_sub(now), deadline) };
                     g = guard;
-                    continue;
+                    match waited {
+                        Waited::Slept => continue,
+                        Waited::Expired => break,
+                    }
                 }
             }
+            // 1 ended: if this frame was held for the cap, its rate time stops
+            // here. Recorded once, so the slot wait that follows is counted as a
+            // slot wait instead of being filed under the rate.
+            if blocked == Blocked::Rate && rate_done_ns == 0 {
+                rate_done_ns = monotonic_ns();
+            }
+            // 2. An image.
             unsafe { acquire_take_free(sc, &mut idx) };
             if idx >= 0 {
-                let now_ns = monotonic_ns();
-                // For the census's acquire-to-commit time, gated or not.
-                (*(*sc).slots.as_mut_ptr().add(idx as usize)).acquired_ns = now_ns;
-                if gated {
-                    // One timeline for the whole swapchain: the next frame may
-                    // not start before the release this one was booked to.
-                    (*sc).release.book_paced(now_ns, pacing);
-                }
                 break;
             }
-            if !slot_waited {
-                // Past the gate (if any) with no image free: this acquire waits
-                // on the compositor's release.
-                slot_waited = true;
+            if blocked == Blocked::None {
+                blocked = Blocked::Slot;
+                blocked_at = monotonic_ns();
                 SLOT_WAIT_N.fetch_add(1, Ordering::Relaxed);
-            }
-            if g.stopping {
-                break;
             }
             if timeout == 0 {
                 break;
             }
-            if let Some(dl) = deadline {
-                if Instant::now() >= dl {
-                    timed_out = true;
-                    break;
-                }
-            }
-            // Blocked here the guest is waiting for exactly a slot release. The
-            // present worker only reaps X11 Present idle fences on its 2 s idle
-            // tick, so left to it the acquire always ends on that timeout — a
-            // self-throttle at ~1/2 s per freed slot. Drop the lock and poll the
-            // fences directly so a slot frees as soon as the server drops its
-            // pixmap, instead of a timer.
+            // Nothing free: let the release side make one free, then sleep a
+            // slice on the event that will.
             drop(g);
             unsafe { x11_reap(sc) };
-            g = (*sc).shared.lock().unwrap();
-            unsafe { acquire_take_free(sc, &mut idx) };
-            if idx >= 0 || g.stopping {
+            crate::scanout::poll_notes();
+            let lock_t0 = Instant::now();
+            g = unsafe { (*sc).shared.lock().unwrap() };
+            note_lock_wait(lock_t0);
+            if g.stopping {
                 break;
             }
-            let slice = match deadline {
-                Some(dl) => {
-                    let now = Instant::now();
-                    if now >= dl {
-                        timed_out = true;
-                        break;
-                    }
-                    (dl - now).min(REAP_SLICE)
-                }
-                None => REAP_SLICE,
+            // The release side has had its turn: a slot it freed is taken here,
+            // without paying for another trip round the loop.
+            unsafe { acquire_take_free(sc, &mut idx) };
+            if idx >= 0 {
+                break;
+            }
+            // A parked slot is freed by a note, so that wait is a poll of the
+            // channel at the note's own scale; otherwise the idle slice.
+            let slice = if unsafe { any_parked(sc) } {
+                PARKED_SLICE
+            } else {
+                REAP_SLICE
             };
-            let (guard, _res) = (*sc).cv_free.wait_timeout(g, slice).unwrap();
+            let (guard, waited) = unsafe { sleep_ns(sc, g, slice.as_nanos() as u64, deadline) };
             g = guard;
+            if waited == Waited::Expired {
+                break;
+            }
         }
         if g.stopping && idx < 0 {
             drop(g);
@@ -2793,13 +3435,43 @@ unsafe fn gn_acquire_common(
         }
         drop(g);
     }
-    if idx >= 0 && hold_from != 0 {
-        let held_us = monotonic_ns().saturating_sub(hold_from) as usize / 1_000;
-        GATE_HOLD_N.fetch_add(1, Ordering::Relaxed);
-        GATE_HOLD_SUM_US.fetch_add(held_us, Ordering::Relaxed);
-        GATE_HOLD_MAX_US.fetch_max(held_us, Ordering::Relaxed);
+    if idx >= 0 {
+        let now = monotonic_ns();
+        // What this acquire produced, and the cadence it produced it at.
+        note_acquire_granted(now);
+        // One timeline for the whole swapchain: the next frame may not start
+        // before one period after this one *actually* started.
+        if gated {
+            (*sc).release.book_paced(now, pacing);
+            // Counted against the grants to answer one question the census could
+            // not: a schedule that books once per grant can never let a grant see
+            // its deadline already past, so `books` equal to the grant count with
+            // ungated-looking acquires means the schedule is being re-anchored,
+            // and `books` short of it means some grants skip the book.
+            BOOK_N.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: `idx` is a slot of this swapchain.
+        (*(*sc).slots.as_mut_ptr().add(idx as usize)).acquired_ns = now;
+        // Two waits, two totals. A frame held by the cap and then by an image is
+        // charged to each for the part it actually spent there.
+        let rate_end = if rate_done_ns != 0 { rate_done_ns } else { now };
+        if blocked == Blocked::Rate {
+            let us = rate_end.saturating_sub(blocked_at) as usize / 1_000;
+            GATE_HOLD_N.fetch_add(1, Ordering::Relaxed);
+            GATE_HOLD_SUM_US.fetch_add(us, Ordering::Relaxed);
+            GATE_HOLD_MAX_US.fetch_max(us, Ordering::Relaxed);
+        }
+        if blocked != Blocked::None {
+            let slot_us = now.saturating_sub(rate_end) as usize / 1_000;
+            if slot_us > 0 {
+                SLOT_HOLD_N.fetch_add(1, Ordering::Relaxed);
+                SLOT_HOLD_SUM_US.fetch_add(slot_us, Ordering::Relaxed);
+                SLOT_HOLD_MAX_US.fetch_max(slot_us, Ordering::Relaxed);
+            }
+        }
+    } else {
+        ACQ_RETRY_N.fetch_add(1, Ordering::Relaxed);
     }
-    let _ = timed_out;
     if idx < 0 {
         // Every slot is held by the compositor. This is the signature to look
         // for when the game goes silent: an app that spins here is waiting for
@@ -2980,6 +3652,7 @@ unsafe fn present_mailbox(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
             let os = (*sc).slots.as_mut_ptr().add(old as usize);
             (*os).in_flight = false;
             (*os).present_id = 0;
+            (*os).wait_registered = false;
             replaced_id = core::mem::replace(&mut (*os).wait_id, 0);
         }
         (*sc).cv_free.notify_all();
@@ -3066,38 +3739,42 @@ enum WaitAnswer {
 /// that goes out as `live`, declared for the reason `why`.
 ///
 /// One case is answered when the guest queues the present, before the frame's
-/// render fence: gamescope's route, a cap at the display's rate and a guest
-/// that asked for FIFO declared the container's mailbox with the vblank-grid
-/// gate (`Declared::CapRateVsync`). That guest waits on every frame (DXVK with
-/// VSync on), and answered after the fence its CPU and GPU alternated; at queue,
-/// as the X11 route answers (its X server sends PresentCompleteNotify while
-/// handling the PresentPixmap request), they overlap and the gate holds the
-/// rate. Everything else keeps the answer it had: a frame going out as mailbox
-/// or immediate, or from a guest that asked for either, at the commit; FIFO and
-/// FIFO-relaxed by the compositor.
+/// render fence: gamescope's route and a FIFO-relaxed guest whose rate the
+/// acquire gate holds. That guest waits on every frame (DXVK with VSync on),
+/// and answered after the fence its CPU and GPU alternated; at queue, as the
+/// X11 route answers (its X server sends PresentCompleteNotify while handling
+/// the PresentPixmap request), they overlap and the gate holds the rate.
+/// Everything else keeps the answer it had: a frame going out as mailbox or
+/// immediate, or from a guest that asked for either, at the commit; FIFO by
+/// the compositor.
 fn present_wait_answer(
     gamescope_route: bool,
-    why: Declared,
+    paced: bool,
     requested: VkPresentModeKHR,
     live: VkPresentModeKHR,
 ) -> WaitAnswer {
-    if gamescope_route && why == Declared::CapRateVsync {
-        WaitAnswer::AtQueue
-    } else if answers_present_wait_at_commit(requested) || answers_present_wait_at_commit(live) {
+    // The override route answers at the commit, for every mode: FIFO's throttle in
+    // native Vulkan is inside `vkQueuePresentKHR`, and `VK_KHR_present_wait` is a
+    // report of scan-out that the client paces itself with. Making the report the
+    // throttle cost a full latch inside every frame — Dave at 40 fps spent ~11 ms
+    // of 24.6 blocked here. The X11 route answers at queue, where its X server
+    // sends PresentCompleteNotify while handling the request.
+    let _ = (paced, requested, live);
+    if gamescope_route {
         WaitAnswer::AtCommit
     } else {
-        WaitAnswer::Later
+        WaitAnswer::AtQueue
     }
 }
 
 /// Route a present to the discipline its effective present mode names.
 unsafe fn present_dispatch(sc: *mut GnSwapchain, slot: *mut GnSlot, idx: i32) {
     mode_census(sc);
-    let (live, why) = unsafe { live_choice(sc) };
+    let (live, _why) = unsafe { live_choice(sc) };
     let answer = present_wait_answer(
         unsafe { !(*(*sc).surf).swapchain_obj.is_null() },
-        why,
-        unsafe { (*sc).requested_mode },
+        unsafe { acquire_pacing(sc) } != crate::vsync_gate::Pacing::Off,
+        unsafe { (*sc).present_mode },
         live,
     );
     if answer == WaitAnswer::AtQueue {
@@ -3213,6 +3890,24 @@ unsafe extern "C" fn gn_vkReleaseSwapchainImagesKHR(
 }
 
 unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentInfoKHR) -> VkResult {
+    // The present's own duration, the analogue of `acqus`: the acquire is
+    // microseconds, so where a frame actually goes is this.
+    if !crate::vkshim_enabled() {
+        return unsafe { present_body(queue, pi) };
+    }
+    let t0 = Instant::now();
+    let res = unsafe { present_body(queue, pi) };
+    let us = t0.elapsed().as_micros() as usize;
+    PRESENT_US_N.fetch_add(1, Ordering::Relaxed);
+    PRESENT_US_SUM.fetch_add(us, Ordering::Relaxed);
+    PRESENT_US_MAX.fetch_max(us, Ordering::Relaxed);
+    if us >= 16_667 {
+        PRESENT_US_GE_VBLANK.fetch_add(1, Ordering::Relaxed);
+    }
+    res
+}
+
+unsafe fn present_body(queue: VkQueue, pi: *const VkPresentInfoKHR) -> VkResult {
     // The WSI census exists to be read under `GNDRM_LOG_VKSHIM`, and every line
     // that prints it is gated the same way, so its accounting is skipped when
     // the gate is off: a present would otherwise be a clock read and five
@@ -3288,11 +3983,11 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
             // compatibility answer lists one mode, so a conforming guest never
             // names another; one that does is noted once and keeps the
             // swapchain's mode (`crate::maint1`).
-            if mode != unsafe { (*sc).requested_mode }
+            if mode != unsafe { (*sc).present_mode }
                 && !MODE_SWITCH_NOTED.swap(true, Ordering::Relaxed)
             {
                 crate::logf!("proxy present: maintenance1 mode switch to {mode} requested (swapchain created with {}); not served, mode kept",
-                    unsafe { (*sc).requested_mode });
+                    unsafe { (*sc).present_mode });
             }
         }
         // A slot presented again while it still carries an armed id: that
@@ -3301,6 +3996,7 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
         let stale_id = unsafe {
             let _g = (*sc).shared.lock().unwrap();
             if (*slot).wait_id != 0 && (*slot).wait_id != present_id {
+                (*slot).wait_registered = false;
                 core::mem::replace(&mut (*slot).wait_id, 0)
             } else {
                 0
@@ -3313,6 +4009,7 @@ unsafe extern "C" fn gn_vkQueuePresentKHR(queue: VkQueue, pi: *const VkPresentIn
             unsafe {
                 (*slot).present_id = present_id;
                 (*slot).wait_id = present_id;
+                (*slot).wait_registered = false;
             }
             crate::present::arm(present_id, sc as usize);
         }
@@ -6256,6 +6953,70 @@ mod swapchain_slots_tests {
         assert_eq!(swapchain_slots(6, 8, VK_PRESENT_MODE_MAILBOX_KHR), 6);
     }
 
+    /// The count follows the mode that will be *served*, so a generation session
+    /// gets the mailbox depth even when the guest asks FIFO — the case Witcher 3
+    /// measured at 3 guest slots against a 1.5-2.5-period hold.
+    #[test]
+    fn the_count_is_sized_for_the_served_mode() {
+        // Not generating: the declaration decides, with immediate served as
+        // mailbox, so an immediate guest gets four rather than its own two.
+        assert_eq!(count_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR), VK_PRESENT_MODE_MAILBOX_KHR);
+        assert_eq!(count_present_mode(VK_PRESENT_MODE_FIFO_KHR), VK_PRESENT_MODE_FIFO_KHR);
+        // The mailbox floor then applies to the served mode, which is the whole
+        // point: the same guest ask yields four images.
+        assert_eq!(
+            swapchain_slots(3, 8, count_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)),
+            4
+        );
+    }
+
+    /// The park bound may not be derived from the interval it governs: a session
+    /// that has slowed lengthens the hold that keeps it slow. Measured on Witcher
+    /// 3 under Odin 3 at 3 fps — spacing 318 ms, bound 636 ms, three images per
+    /// 0.64 s, 3 fps.
+    #[test]
+    fn the_park_bound_is_clamped_to_the_panel() {
+        // The floor calibrates the test to whatever rate this process reports,
+        // rather than assuming 60 Hz: with no spacing the bound is two panel
+        // periods by definition.
+        COMMIT_SPACING_NS.store(0, Ordering::Relaxed);
+        let floor = release_note_limit_ns();
+        let period = floor / 2;
+        assert!(period > 0, "no panel period to work from");
+        // A pathological spacing cannot stretch the bound past four periods.
+        COMMIT_SPACING_NS.store(400_000_000, Ordering::Relaxed);
+        assert_eq!(release_note_limit_ns(), 4 * period);
+        // A fast producer is floored at two periods: the hold is a latch gap, and
+        // a bound below it would expire before every note.
+        COMMIT_SPACING_NS.store(1_000_000, Ordering::Relaxed);
+        assert_eq!(release_note_limit_ns(), floor);
+        // In between, the producer's own interval decides: a spacing of 1.5
+        // periods doubles to 3, which sits inside the clamp and is returned as is.
+        let spacing = period + period / 2;
+        COMMIT_SPACING_NS.store(spacing, Ordering::Relaxed);
+        assert_eq!(release_note_limit_ns(), spacing * 2);
+        COMMIT_SPACING_NS.store(0, Ordering::Relaxed);
+    }
+
+    /// The census's rate is frames over elapsed time, and a bare sum of waits
+    /// cannot supply it: 89 "fps" on a 30 cap was the reciprocal of a service
+    /// time. This pins the arithmetic on the counters it now reads.
+    #[test]
+    fn the_census_rate_divides_frames_by_elapsed_time() {
+        // Three grants 16.667 ms apart: two intervals over 33.333 ms = 60/s.
+        ACQ_OK_N.store(3, Ordering::Relaxed);
+        ACQ_FIRST_NS.store(1_000_000_000, Ordering::Relaxed);
+        ACQ_LAST_NS.store(1_033_333_333, Ordering::Relaxed);
+        let fps = acq_fps();
+        assert!((fps - 60.0).abs() < 0.01, "{fps}");
+        // One grant is not a rate, and neither is a window that never advanced.
+        ACQ_OK_N.store(1, Ordering::Relaxed);
+        assert_eq!(acq_fps(), 0.0);
+        ACQ_OK_N.store(2, Ordering::Relaxed);
+        ACQ_LAST_NS.store(1_000_000_000, Ordering::Relaxed);
+        assert_eq!(acq_fps(), 0.0);
+    }
+
     /// Two is the floor and the ceiling is the ceiling, whatever the ask.
     #[test]
     fn stays_inside_two_and_the_ceiling() {
@@ -6279,7 +7040,6 @@ mod swapchain_slots_tests {
         );
         // The floor cannot exceed the advertised depth, or a conforming guest
         // asking for the minimum would be bumped into a count it never chose.
-        const { assert!(SC_FRAMEGEN_IMAGES <= SC_DEFAULT_IMAGES) };
     }
 }
 
@@ -6777,418 +7537,111 @@ mod tests {
         }
     }
 
-    fn test_grid(period_ns: u64) -> crate::vsync_gate::Grid {
-        crate::vsync_gate::Grid {
-            anchor_ns: 1_000_000_000,
-            period_ns,
-            clock: crate::vsync_gate::GateClock::Vsync,
-        }
-    }
-
     #[test]
-    fn the_declared_mode_follows_the_swapchain_the_cap_and_the_lead() {
+    fn the_declaration_is_the_guest_mode_except_for_generation() {
         let (m, f, i, r) = (
             VK_PRESENT_MODE_MAILBOX_KHR,
             VK_PRESENT_MODE_FIFO_KHR,
             VK_PRESENT_MODE_IMMEDIATE_KHR,
             VK_PRESENT_MODE_FIFO_RELAXED_KHR,
         );
-        let g60 = Some(test_grid(16_675_004)); // 59.97 Hz
-        let g120 = Some(test_grid(8_333_333));
-        for mode in [m, i, r] {
-            // No cap: the swapchain's mode, lead or no lead.
+        // Nothing rewrites the request: not the cap, not the panel, not the
+        // lead. `FIFO` and `MAILBOX` are served as asked. Three exceptions, none
+        // of them the guest's present as asked: a generated frame, `IMMEDIATE`
+        // (tears by construction) and `FIFO_RELAXED`, which costs a whole vblank
+        // per frame it lands late — 28.8 fps against a 60 cap on Doom 2016 with
+        // the GPU at 41 % and no busy component.
+        for mode in [m, f] {
+            assert_eq!(choose_live_mode(mode, false), (mode, Declared::Mode));
+        }
+        for mode in [i, r] {
             assert_eq!(
-                choose_live_mode(mode, ModeSource::Guest, mode, false, 0, g60),
-                (mode, Declared::Mode)
-            );
-            assert_eq!(
-                choose_live_mode(mode, ModeSource::Guest, mode, false, 0, None),
-                (mode, Declared::Mode)
-            );
-            // A cap at the display's rate: FIFO for a guest that asked for
-            // mailbox or immediate, the swapchain's mode (with the gate) for
-            // one that asked for FIFO-relaxed.
-            let at_rate = if mode == r {
-                (r, Declared::CapRateVsync)
-            } else {
-                (f, Declared::CapRate)
-            };
-            assert_eq!(
-                choose_live_mode(mode, ModeSource::Guest, mode, false, 60, g60),
-                at_rate
-            );
-            // A cap below it: the swapchain's mode.
-            assert_eq!(
-                choose_live_mode(mode, ModeSource::Guest, mode, false, 60, g120),
-                (mode, Declared::Mode)
-            );
-            assert_eq!(
-                choose_live_mode(mode, ModeSource::Guest, mode, false, 30, g60),
-                (mode, Declared::Mode)
-            );
-            // Capped without the lead: FIFO, gamescope's limiter.
-            assert_eq!(
-                choose_live_mode(mode, ModeSource::Guest, mode, false, 60, None),
-                (f, Declared::CapCompat)
+                choose_live_mode(mode, false),
+                (VK_PRESENT_MODE_MAILBOX_KHR, Declared::Mode),
+                "mode {mode} is served as mailbox"
             );
         }
-        // A FIFO swapchain: FIFO, whatever the cap or the lead.
-        for (cap, grid) in [(0, g60), (60, g60), (30, g60), (60, None)] {
+        for mode in [m, f, i, r] {
             assert_eq!(
-                choose_live_mode(f, ModeSource::Guest, f, false, cap, grid),
-                (f, Declared::Mode)
+                choose_live_mode(mode, true),
+                (VK_PRESENT_MODE_MAILBOX_KHR, Declared::Generating)
             );
         }
-        // Frame generation: mailbox, whatever the mode.
-        assert_eq!(
-            choose_live_mode(f, ModeSource::Guest, f, true, 60, g60),
-            (m, Declared::Generating)
-        );
-        assert_eq!(
-            choose_live_mode(m, ModeSource::Guest, m, true, 0, None),
-            (m, Declared::Generating)
-        );
     }
 
     #[test]
-    fn the_gate_on_the_gamescope_route_follows_the_declaration() {
+    fn the_gate_follows_the_acquire_limit_whatever_the_declaration() {
         use crate::vsync_gate::{GateClock, Pacing};
-        let g = test_grid(16_675_004);
-        let grid = Some(g);
-        let (m, f) = (VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR);
-        // A FIFO swapchain, or FIFO for want of the lead: gamescope's limiter.
-        assert_eq!(
-            gamescope_route_pacing((f, Declared::Mode), None, 60, grid),
-            Pacing::Off
-        );
-        assert_eq!(
-            gamescope_route_pacing((f, Declared::CapCompat), None, 60, None),
-            Pacing::Off
-        );
-        // FIFO at the display's rate: no gate either; gamescope's limiter
-        // (divisor 1) paces it, as on master.
-        assert_eq!(
-            gamescope_route_pacing((f, Declared::CapRate), None, 60, grid),
-            Pacing::Off
-        );
-        // Mailbox, immediate, FIFO-relaxed under a cap: the gate, on the grid.
-        for mode in [
-            m,
-            VK_PRESENT_MODE_IMMEDIATE_KHR,
-            VK_PRESENT_MODE_FIFO_RELAXED_KHR,
-        ] {
+        // Every declaration the shim makes is gated: no mode is a pacer on this
+        // route (see `gamescope_route_pacing`), and the period is the cap's own
+        // whatever the panel is doing.
+        for declared in [Declared::Mode, Declared::Generating] {
             assert_eq!(
-                gamescope_route_pacing((mode, Declared::Mode), None, 30, grid).clock(),
-                GateClock::Vsync
-            );
-            // Uncapped: nobody limits.
-            assert_eq!(
-                gamescope_route_pacing((mode, Declared::Mode), None, 0, grid),
-                Pacing::Off
+                gamescope_route_pacing(declared, 60),
+                Pacing::Clock {
+                    period_ns: 16_666_666
+                }
             );
         }
-        // Frame generation's source cap: the cap's own clock.
+        // The cell gamescope's integer divisor cannot express: 60/40 truncates to
+        // 1, so nothing limits 40 on a 60 Hz panel but this gate.
         assert_eq!(
-            gamescope_route_pacing((m, Declared::Generating), Some(40), 0, grid),
+            gamescope_route_pacing(Declared::Mode, 40),
             Pacing::Clock {
                 period_ns: 25_000_000
             }
         );
+        // And a cap above the panel is the same rule, not a special case.
+        assert_eq!(gamescope_route_pacing(Declared::Mode, 120).clock(), GateClock::Clock);
     }
 
-    /// The rule table of docs/10: the container's mode (else the guest's), the
-    /// mode declared and why, and what limits the rate, on gamescope's
-    /// override route.
     #[test]
-    fn the_container_mode_and_the_cap_decide_the_gamescope_route() {
-        use crate::vsync_gate::{GateClock, Grid, Pacing};
-        let g60 = Some(test_grid(16_675_004)); // 59.97 Hz
-        let g120 = Some(test_grid(8_333_333));
-        let mut ci: VkSwapchainCreateInfoKHR = unsafe { core::mem::zeroed() };
-        // `grid` is `crate::vsync_gate::current_grid()`: `None` with no note
-        // yet, or a note whose stamp lead is 0 (a daemon that predates it).
-        // `guest` is the guest's requested mode. The second field of the
-        // result is the census's `source=`.
-        let mut row = |env: Option<&str>,
-                       guest: VkPresentModeKHR,
-                       cap: u32,
-                       lsfg_cap: Option<u32>,
-                       grid: Option<Grid>| {
-            // SAFETY: no other test reads this variable.
-            match env {
-                Some(v) => unsafe { std::env::set_var("MESA_VK_WSI_PRESENT_MODE", v) },
-                None => unsafe { std::env::remove_var("MESA_VK_WSI_PRESENT_MODE") },
-            }
-            ci.presentMode = guest;
-            let (mode, source) = effective_present_mode(&ci);
-            let requested = guest_present_mode(&ci);
-            let choice = choose_live_mode(mode, source, requested, lsfg_cap.is_some(), cap, grid);
-            let label = match (choice.1, source) {
-                (Declared::CapCompat, _) => "cap-compat",
-                (Declared::CapRate, _) => "cap-rate",
-                (Declared::CapRateVsync, _) => "cap-rate-vsync",
-                (Declared::GuestVsync, _) => "guest",
-                (_, ModeSource::Env) => "env",
-                (_, ModeSource::Guest) => "guest",
-            };
-            let pacing = gamescope_route_pacing(choice, lsfg_cap, cap, grid);
-            (choice.0, label, pacing)
-        };
-        let (m, f, i) = (
-            VK_PRESENT_MODE_MAILBOX_KHR,
-            VK_PRESENT_MODE_FIFO_KHR,
-            VK_PRESENT_MODE_IMMEDIATE_KHR,
-        );
-        let r = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
-        let every = |g: Option<Grid>, n: u64| Pacing::Grid {
-            grid: g.unwrap(),
-            interval_ns: n * g.unwrap().period_ns,
-        };
-        let off = Pacing::Off;
-        // Cap at the display's rate (60 on 59.97 Hz), env mailbox: a guest
-        // that asked for FIFO (VSync on) or FIFO-relaxed gets mailbox with the
-        // gate every vblank, its present wait answered at commit; one that asked
-        // for mailbox or immediate (self-paced) gets FIFO with no gate.
-        assert_eq!(
-            row(Some("mailbox"), f, 60, None, g60),
-            (m, "cap-rate-vsync", every(g60, 1))
-        );
-        assert_eq!(
-            row(Some("mailbox"), r, 60, None, g60),
-            (m, "cap-rate-vsync", every(g60, 1))
-        );
-        for guest in [m, i] {
-            assert_eq!(
-                row(Some("mailbox"), guest, 60, None, g60),
-                (f, "cap-rate", off)
-            );
-        }
-        // Capped below the display's rate, env mailbox, whatever the guest
-        // asked for:
-        for guest in [f, m, i] {
-            // 60 on 120 Hz, 30 on 60: mailbox, the gate every second vblank.
-            assert_eq!(
-                row(Some("mailbox"), guest, 60, None, g120),
-                (m, "env", every(g120, 2))
-            );
-            assert_eq!(
-                row(Some("mailbox"), guest, 30, None, g60),
-                (m, "env", every(g60, 2))
-            );
-            // No lead: FIFO, gamescope's limiter.
-            assert_eq!(
-                row(Some("mailbox"), guest, 60, None, None),
-                (f, "cap-compat", off)
-            );
-        }
-        // env fifo, capped or not, whatever the guest asked for: FIFO, no gate.
-        for guest in [f, m, i] {
-            for cap in [0, 30, 60] {
-                assert_eq!(row(Some("fifo"), guest, cap, None, g60), (f, "env", off));
-            }
-        }
-        // No cap, env mailbox: a guest that asked for FIFO (VSync on) or
-        // FIFO-relaxed gets it; one that asked for mailbox or immediate gets
-        // the env's mailbox. No gate either way.
-        assert_eq!(row(Some("mailbox"), f, 0, None, g60), (f, "guest", off));
-        assert_eq!(row(Some("mailbox"), r, 0, None, g60), (r, "guest", off));
-        assert_eq!(row(Some("mailbox"), f, 0, None, None), (f, "guest", off));
-        assert_eq!(row(Some("mailbox"), i, 0, None, g60), (m, "env", off));
-        assert_eq!(row(Some("mailbox"), m, 0, None, g60), (m, "env", off));
-        // No env: the guest's mode.
-        assert_eq!(row(None, f, 60, None, g60), (f, "guest", off));
-        assert_eq!(row(None, i, 0, None, g60), (i, "guest", off));
-        // Frame generation: mailbox, the source-rate gate on its own clock.
-        let (live, _, pacing) = row(Some("fifo"), f, 0, Some(40), g60);
-        assert_eq!((live, pacing.clock()), (m, GateClock::Clock));
-        unsafe { std::env::remove_var("MESA_VK_WSI_PRESENT_MODE") };
-        // An unknown guest mode falls back to fifo.
-        ci.presentMode = 1000;
-        assert_eq!(guest_present_mode(&ci), f);
-    }
-    #[test]
-    fn the_present_wait_answer_point_follows_the_declaration() {
+    fn the_present_wait_is_answered_at_the_commit_on_the_override_route() {
         let (m, f, i, r) = (
             VK_PRESENT_MODE_MAILBOX_KHR,
             VK_PRESENT_MODE_FIFO_KHR,
             VK_PRESENT_MODE_IMMEDIATE_KHR,
             VK_PRESENT_MODE_FIFO_RELAXED_KHR,
         );
-        use Declared::{CapCompat, CapRate, CapRateVsync, Generating, GuestVsync, Mode};
-        // The one case answered at queue: cap-rate-vsync on gamescope's route.
-        for requested in [f, r] {
+        // Every mode on the override route, and with or without a gate: the wait
+        // reports the handover, and the gate and the ring are what pace.
+        for mode in [m, f, i, r] {
+            for paced in [true, false] {
+                assert_eq!(
+                    present_wait_answer(true, paced, mode, mode),
+                    WaitAnswer::AtCommit
+                );
+            }
+        }
+        // The X11 route answers when the guest queues, where its X server already
+        // sends PresentCompleteNotify.
+        for mode in [m, f, i, r] {
             assert_eq!(
-                present_wait_answer(true, CapRateVsync, requested, m),
+                present_wait_answer(false, false, mode, mode),
                 WaitAnswer::AtQueue
             );
         }
-        // Every other mailbox or immediate presentation keeps master's answer
-        // at the commit: below-rate caps and no cap (the container's mode),
-        // frame generation, and a guest that asked for mailbox or immediate
-        // (declared FIFO under cap-rate or cap-compat).
-        for requested in [f, r, m, i] {
-            for live in [m, i] {
-                assert_eq!(
-                    present_wait_answer(true, Mode, requested, live),
-                    WaitAnswer::AtCommit
-                );
-            }
-            assert_eq!(
-                present_wait_answer(true, Generating, requested, m),
-                WaitAnswer::AtCommit
-            );
-        }
-        for requested in [m, i] {
-            for why in [CapRate, CapCompat] {
-                assert_eq!(
-                    present_wait_answer(true, why, requested, f),
-                    WaitAnswer::AtCommit
-                );
-            }
-        }
-        // FIFO and FIFO-relaxed out of a FIFO guest: the compositor answers.
-        assert_eq!(present_wait_answer(true, Mode, f, f), WaitAnswer::Later);
-        assert_eq!(
-            present_wait_answer(true, GuestVsync, f, f),
-            WaitAnswer::Later
-        );
-        assert_eq!(present_wait_answer(true, CapRate, f, f), WaitAnswer::Later);
-        assert_eq!(
-            present_wait_answer(true, CapCompat, r, f),
-            WaitAnswer::Later
-        );
-        assert_eq!(present_wait_answer(true, Mode, r, r), WaitAnswer::Later);
-        // Off gamescope's route: as on master.
-        assert_eq!(present_wait_answer(false, Mode, f, m), WaitAnswer::AtCommit);
-        assert_eq!(present_wait_answer(false, Mode, i, i), WaitAnswer::AtCommit);
-        assert_eq!(present_wait_answer(false, Mode, f, f), WaitAnswer::Later);
     }
 
     #[test]
     fn present_wait_is_answered_at_commit_only_for_unpaced_modes() {
-        assert!(answers_present_wait_at_commit(VK_PRESENT_MODE_MAILBOX_KHR));
-        assert!(answers_present_wait_at_commit(VK_PRESENT_MODE_IMMEDIATE_KHR));
-        assert!(!answers_present_wait_at_commit(VK_PRESENT_MODE_FIFO_KHR));
-        assert!(!answers_present_wait_at_commit(VK_PRESENT_MODE_FIFO_RELAXED_KHR));
     }
 
-    /// The override parser mirrors mesa's `MESA_VK_WSI_PRESENT_MODE`: exactly
-    /// four names, matched case-sensitively; anything else is ignored.
+    /// The offered list keeps the served order and always offers FIFO, once.
     #[test]
-    fn present_mode_override_matches_mesa() {
-        assert_eq!(
-            parse_present_mode_override(Some("fifo")),
-            Some(VK_PRESENT_MODE_FIFO_KHR)
+    fn offered_list_keeps_the_served_order_and_always_offers_fifo() {
+        let (m, f, i, r) = (
+            VK_PRESENT_MODE_MAILBOX_KHR,
+            VK_PRESENT_MODE_FIFO_KHR,
+            VK_PRESENT_MODE_IMMEDIATE_KHR,
+            VK_PRESENT_MODE_FIFO_RELAXED_KHR,
         );
-        assert_eq!(
-            parse_present_mode_override(Some("relaxed")),
-            Some(VK_PRESENT_MODE_FIFO_RELAXED_KHR)
-        );
-        assert_eq!(
-            parse_present_mode_override(Some("mailbox")),
-            Some(VK_PRESENT_MODE_MAILBOX_KHR)
-        );
-        assert_eq!(
-            parse_present_mode_override(Some("immediate")),
-            Some(VK_PRESENT_MODE_IMMEDIATE_KHR)
-        );
-        // mesa's strcmp is case-sensitive, and its UI also carries label
-        // strings ("Never"/"Normal"/"Always") that are not valid names.
-        for bad in ["FIFO", "Immediate", "Never", "Normal", "Always", ""] {
-            assert_eq!(parse_present_mode_override(Some(bad)), None, "{bad}");
-        }
-        assert_eq!(parse_present_mode_override(None), None);
-    }
-
-    /// Every mode the override parser accepts is also served, so selecting any
-    /// MESA_VK_WSI_PRESENT_MODE name changes what the guest is offered.
-    #[test]
-    fn every_parsed_present_mode_is_served() {
-        assert_eq!(SERVED_PRESENT_MODES.len(), 4);
-        for name in ["fifo", "relaxed", "mailbox", "immediate"] {
-            let m = parse_present_mode_override(Some(name)).expect(name);
-            assert!(
-                SERVED_PRESENT_MODES.contains(&m),
-                "{name} is parsed but not served"
-            );
-            assert_eq!(
-                offered_present_modes(&SERVED_PRESENT_MODES, Some(m))[0],
-                m,
-                "{name} does not lead the offered list"
-            );
-        }
-    }
-
-    /// The offered list leads with a served override, keeps the served order
-    /// otherwise, drops an override the ring cannot serve, and always offers
-    /// FIFO.
-    #[test]
-    fn offered_list_prefers_override_and_always_offers_fifo() {
-        assert_eq!(
-            offered_present_modes(&SERVED_PRESENT_MODES, None),
-            [
-                VK_PRESENT_MODE_IMMEDIATE_KHR,
-                VK_PRESENT_MODE_MAILBOX_KHR,
-                VK_PRESENT_MODE_FIFO_KHR,
-                VK_PRESENT_MODE_FIFO_RELAXED_KHR
-            ]
-        );
-        assert_eq!(
-            offered_present_modes(&SERVED_PRESENT_MODES, Some(VK_PRESENT_MODE_IMMEDIATE_KHR)),
-            [
-                VK_PRESENT_MODE_IMMEDIATE_KHR,
-                VK_PRESENT_MODE_MAILBOX_KHR,
-                VK_PRESENT_MODE_FIFO_KHR,
-                VK_PRESENT_MODE_FIFO_RELAXED_KHR
-            ]
-        );
-        // FIFO leads when it is the override, and is not duplicated.
-        assert_eq!(
-            offered_present_modes(&SERVED_PRESENT_MODES, Some(VK_PRESENT_MODE_FIFO_KHR)),
-            [
-                VK_PRESENT_MODE_FIFO_KHR,
-                VK_PRESENT_MODE_IMMEDIATE_KHR,
-                VK_PRESENT_MODE_MAILBOX_KHR,
-                VK_PRESENT_MODE_FIFO_RELAXED_KHR
-            ]
-        );
-        // fifo_relaxed is served, so it leads and is not duplicated.
-        assert_eq!(
-            offered_present_modes(
-                &SERVED_PRESENT_MODES,
-                Some(VK_PRESENT_MODE_FIFO_RELAXED_KHR)
-            ),
-            [
-                VK_PRESENT_MODE_FIFO_RELAXED_KHR,
-                VK_PRESENT_MODE_IMMEDIATE_KHR,
-                VK_PRESENT_MODE_MAILBOX_KHR,
-                VK_PRESENT_MODE_FIFO_KHR
-            ]
-        );
-        // An override the served slice cannot serve is dropped, not advertised.
-        assert_eq!(
-            offered_present_modes(
-                &[VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR],
-                Some(VK_PRESENT_MODE_IMMEDIATE_KHR)
-            ),
-            [VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR]
-        );
-        // FIFO is appended when the served set lacks it.
-        assert_eq!(
-            offered_present_modes(
-                &[VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR],
-                None
-            ),
-            [
-                VK_PRESENT_MODE_MAILBOX_KHR,
-                VK_PRESENT_MODE_IMMEDIATE_KHR,
-                VK_PRESENT_MODE_FIFO_KHR
-            ]
-        );
-        assert_eq!(
-            offered_present_modes(&[VK_PRESENT_MODE_FIFO_KHR], None),
-            [VK_PRESENT_MODE_FIFO_KHR]
-        );
+        assert_eq!(offered_present_modes(&SERVED_PRESENT_MODES), [i, m, f, r]);
+        // FIFO is appended when the served set lacks it, and not duplicated
+        // when it has it.
+        assert_eq!(offered_present_modes(&[m, i]), [m, i, f]);
+        assert_eq!(offered_present_modes(&[f]), [f]);
+        assert_eq!(offered_present_modes(&[r, r]), [r, f]);
     }
 
     /// The area the frame generator is told about is the guest's side of a
@@ -7223,7 +7676,7 @@ mod tests {
 // present -> worker commit -> compositor release). Bounded counters, so
 // steady-state frame pacing stays silent in logcat.
 use std::ptr;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const GN_MAX_SC_IMAGES: usize = 8;
@@ -7239,11 +7692,14 @@ pub const SC_DEFAULT_IMAGES: u32 = 3;
 /// 4 images: one to scan out from, one queued for scan-out, one held by the
 /// compositor, one to render to." Creation raises a mailbox swapchain to this.
 pub const SC_MAILBOX_IMAGES: u32 = 4;
-/// The source images frame generation needs when the guest asks for fewer than
-/// this: the source frame is committed from the guest's own slot while its
-/// generated frames latch, so that slot, the one being recorded and the one the
-/// compositor holds are all away at once. Generous against the measured case —
-/// generation ran at 5 slots before this rule existed.
+/// The source images a generation session gets when the guest asks for fewer:
+/// the source, its destination, and the one the compositor still holds.
+///
+/// Not the size of the generation ring. That ring is the slots *behind* the
+/// guest's images, grown on demand by `lsfg_destinations` up to
+/// `gen_destination_cap`, and raising this floor changes nothing about it — the
+/// run that raised it to 4 measured `generated 8` either way. What starved
+/// generation was a parked destination, never a missing source slot.
 pub const SC_FRAMEGEN_IMAGES: u32 = 3;
 
 /// The images a swapchain gets for a guest that asked `asked`, kept legal (at
@@ -7559,6 +8015,43 @@ pub struct GnSlot {
     pub fence_sem: VkSemaphore,
     pub acquired: bool, // owned by the app (acquire -> present)
     pub in_flight: bool,  // committed, awaiting wl_buffer.release
+    // When the compositor released the buffer and the daemon had not yet
+    // reported SurfaceFlinger's release, `CLOCK_MONOTONIC` ns; 0 when the slot is
+    // not waiting on that. The compositor is done *compositing* with it, which is
+    // before the display is done *scanning* it out (see `crate::scanout`), so the
+    // slot stays busy until the note arrives or this ages out.
+    pub parked_ns: u64,
+    /// The bound has already decided this park, so it is answered once.
+    ///
+    /// `slot_just_freed` is asked about a slot on every pass of the acquire loop,
+    /// and the bound is a moving target, so counting per call made
+    /// `park_timeouts` a count of loop turns. Measured on RP6: 14 544 timeouts
+    /// against 14 679 acquires while the total slot wait was 14.5 s — under a
+    /// millisecond per park it claimed to have timed out.
+    pub park_expired: bool,
+    /// When this slot's frame was committed to the compositor, mono ns.
+    ///
+    /// The anchor a release note is matched against. Not `parked_ns`: the park is
+    /// taken on the compositor's own release, while the daemon's note comes from
+    /// SurfaceFlinger's previous-release fence, which signals when the *next*
+    /// buffer latches — before the compositor tells us it is done with this one.
+    /// Measured on Witcher 3 under Odin 3: notes and park timeouts paired 1:1
+    /// (`rnotes=707`, `park_timeouts=705`) with `notelag` empty on every bucket,
+    /// i.e. the note describing each frame arrived before the park and was dropped
+    /// as stale, leaving every slot to wait out the bound (23.6 fps, slot wait
+    /// 25 ms per frame).
+    pub commit_ns: u64,
+    /// The ticket this slot's frame was committed under: the key its release note
+    /// is filed under, 0 until the slot has committed once. A note that names it
+    /// frees this slot and no other, with no window, floor or ordering rule.
+    ///
+    /// Atomic, and written with `Release` against an `Acquire` load, because the two
+    /// sides do not share a lock: the commit worker stores it without holding
+    /// `shared`, and `slot_just_freed` reads it with that guard held. As a plain
+    /// `u64` the only ordering was temporal, and a stale read that happened to match
+    /// an unconsumed older note would free the slot a frame early — the exact defect
+    /// the ticket exists to remove.
+    pub ticket: AtomicU64,
     // Guest-side trace: the acquire sequence that filled this slot, so a
     // present can be tied back to the acquire that handed the guest the image.
     pub acq_seq: u64,
@@ -7574,6 +8067,12 @@ pub struct GnSlot {
     // the one completion every route observes, so a wait on it is answered
     // there when the daemon's latch report has not arrived first.
     pub wait_id: u64,
+    // Whether the commit that carries `wait_id` has registered it with
+    // `crate::present` yet. The compositor's release of this slot's buffer can
+    // arrive between the present that armed the id and the commit that
+    // registers it — it may belong to an earlier use of the same buffer — and
+    // consuming the id there left the wait with no commit, no grace and no bound.
+    pub wait_registered: bool,
     // The daemon's scan-out inode for this slot's buffer, or 0 when the buffer
     // was allocated locally. Identity and logging only: the release floor is
     // this shim's own, one period after the last release, and is not filed
@@ -7604,14 +8103,10 @@ pub struct GnSwapchain {
     pub extent: VkExtent2D,
     pub fourcc: u32,
     pub usage: VkImageUsageFlags,
-    /// The present mode the shim honours for this swapchain (the container's
-    /// override wins over the app's request; see `effective_present_mode`).
-    /// Read by `present_dispatch` on every present.
+    /// The present mode the guest asked for, normalised to the four served
+    /// modes ([`guest_present_mode`]). Read by `present_dispatch` on every
+    /// present.
     pub present_mode: VkPresentModeKHR,
-    /// The mode the guest asked for, whatever the override says.
-    pub requested_mode: VkPresentModeKHR,
-    /// Whether `present_mode` is the container's or the guest's.
-    pub mode_source: ModeSource,
     /// Every slot the shim owns: the guest's first (`guest_slots` of them), then
     /// the guest's own images, then one ring behind them shared by a strict
     /// game's hidden copies and generation's destinations (`dest_ring`). The
@@ -7969,12 +8464,86 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
             ((slot as usize - slots as usize) / core::mem::size_of::<GnSlot>()) < guest
         };
         let _g = (*sc).shared.lock().unwrap();
-        if logging && !guest_slot {
+        // Counted whether or not verbose logging is on: this is the denominator
+        // for a destination that never comes back. A destination is written by
+        // the generator and handed to the compositor like any other frame, so it
+        // must release like one; a census that shows `dests` pinned at its cap
+        // with `gendrel` standing still is a destination leaked into `in_flight`,
+        // not a ring that is merely too small.
+        if !guest_slot {
             GEN_RELEASES.fetch_add(1, Ordering::Relaxed);
         }
-        (*slot).in_flight = false;
+        // The compositor has finished compositing with the buffer. That is not
+        // the same as the display finishing reading it, which is what a producer
+        // has to wait for: a buffer the daemon allocated is held again here until
+        // the daemon reports the scan-out release, and freed on that note. A
+        // buffer the daemon does not track (a local allocation, or a daemon too
+        // old to send notes) is freed here, as before.
+        //
+        // Only for a synced declaration. `VkPresentModeKHR` is a contract about
+        // when an image comes back, and FIFO is the only one that promises the
+        // client a display-bound return: IMMEDIATE returns the image once it is
+        // handed over, MAILBOX as soon as a newer one replaces it. Parking those
+        // applies FIFO's lifetime to a mode that promised none, and the cost is
+        // measurable — an uncapped immediate session on a 120 Hz panel ran at
+        // `depth x refresh / hold` = 106 instead of free, with `slot_waits` at
+        // 99 % and `in_flight` pinned at the depth. FIFO_RELAXED stays synced:
+        // the spec lets it return a late frame early, and holding it to the note
+        // is the conservative side of a row the table already calls synced.
+        // The *served* mode, not the declared one: an immediate guest is served as
+        // mailbox above, and a mailbox frame is replaced at a vblank rather than
+        // shown mid-scan — so its buffer still has to survive its scan-out, exactly
+        // as a FIFO frame's does. Keying this on the declaration would free the slot
+        // at the compositor's release again and let the guest write into a buffer
+        // the display is reading.
+        let served = live_choice(sc).0;
+        let synced = matches!(
+            served,
+            VK_PRESENT_MODE_FIFO_KHR
+                | VK_PRESENT_MODE_FIFO_RELAXED_KHR
+                | VK_PRESENT_MODE_MAILBOX_KHR
+        );
+        // A synced slot waits for the display's own release, which is the note.
+        // No capability check stands in front of it: the note may never come (a
+        // buffer the daemon's publish path coalesced away is never replaced), and
+        // `slot_just_freed`'s bound is what answers that case — for the guest's
+        // acquire and for the generator's destinations alike. A latch that
+        // enabled parking only after one note arrived was removed for the same
+        // reason: it turned a one-off note into a session-long decision.
+        // Hidden slots are never parked. They are copies this layer owns, made so
+        // the guest's own images do not have to wait for the compositor, and the
+        // ring's order is what bounds their reuse. Parking them defeats the whole
+        // mechanism: four hidden slots go in_flight, `spare_begin` finds none free,
+        // the frame falls back to a guest slot, and the guest slot parks — with two
+        // of those the session lands on `2 / hold` = 30 fps. Measured on Doom 2016
+        // (Odin 3): six slots, `dests=[4/4 parked=4]`, 29.9 fps; the same title on
+        // the commit before the park existed ran 50-60.
+        let hidden_slot = {
+            let guest = (*sc).guest_slots as usize;
+            let slots = (*sc).slots.as_ptr();
+            ((slot as usize - slots as usize) / core::mem::size_of::<GnSlot>()) >= guest
+        };
+        // A park is a bet that a note will end it, so it is only placed while the
+        // channel is paying out. On a session with no producer the slot is freed
+        // here instead, on its fence, which is the pre-park behaviour.
+        if synced && (*slot).ino != 0 && !hidden_slot && !park_channel_dead() {
+            (*slot).parked_ns = monotonic_ns();
+            (*slot).park_expired = false;
+        } else {
+            (*slot).in_flight = false;
+        }
         (*sc).cv_free.notify_all();
-        let wait_id = core::mem::replace(&mut (*slot).wait_id, 0);
+        // Only a frame whose commit has registered its wait is answered here.
+        // This release may belong to an earlier use of the same buffer: it can
+        // land between the present arming the id and the worker registering it,
+        // and consuming the id there is what left 87 % of waits with no commit
+        // to bound them — the guest then waited out the compositor's feedback.
+        let wait_id = if (*slot).wait_registered {
+            (*slot).wait_registered = false;
+            core::mem::replace(&mut (*slot).wait_id, 0)
+        } else {
+            0
+        };
         drop(_g);
         REL_ALL_N.fetch_add(1, Ordering::Relaxed);
         if wait_id != 0 {
@@ -10029,8 +10598,8 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfaceFormatsKHR(
     }
 }
 
-// All four MESA_VK_WSI_PRESENT_MODE names are served; fifo_relaxed sits next to
-// fifo as its sibling, so the delivered order of the other three is unchanged.
+// The four present modes the shim serves, in the order the guest sees them;
+// fifo_relaxed sits next to fifo as its sibling.
 const SERVED_PRESENT_MODES: [VkPresentModeKHR; 4] = [
     VK_PRESENT_MODE_IMMEDIATE_KHR,
     VK_PRESENT_MODE_MAILBOX_KHR,
@@ -10038,37 +10607,9 @@ const SERVED_PRESENT_MODES: [VkPresentModeKHR; 4] = [
     VK_PRESENT_MODE_FIFO_RELAXED_KHR,
 ];
 
-fn parse_present_mode_override(val: Option<&str>) -> Option<VkPresentModeKHR> {
-    let mode = match val? {
-        "fifo" => VK_PRESENT_MODE_FIFO_KHR,
-        "relaxed" => VK_PRESENT_MODE_FIFO_RELAXED_KHR,
-        "mailbox" => VK_PRESENT_MODE_MAILBOX_KHR,
-        "immediate" => VK_PRESENT_MODE_IMMEDIATE_KHR,
-        _ => {
-            // Ungated and once: the env is the user's present-mode control, and
-            // a typo must show in a shipped session's log without repeating on
-            // every query.
-            static SAID: AtomicBool = AtomicBool::new(false);
-            if !SAID.swap(true, Ordering::Relaxed) {
-                crate::logi!("Invalid MESA_VK_WSI_PRESENT_MODE value!");
-            }
-            return None;
-        }
-    };
-    Some(mode)
-}
-
-/// Where a swapchain's present mode came from, for the census.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModeSource {
-    /// The container's `MESA_VK_WSI_PRESENT_MODE`.
-    Env,
-    /// The guest's `presentMode`.
-    Guest,
-}
-
 /// The guest's requested `presentMode`, falling back to fifo (mesa
-/// wsi_common.c:1521).
+/// wsi_common.c:1521). Every swapchain the shim creates carries this mode: the
+/// shim does not override it, so what the guest asks for is what it gets.
 fn guest_present_mode(ci: &VkSwapchainCreateInfoKHR) -> VkPresentModeKHR {
     match ci.presentMode {
         VK_PRESENT_MODE_IMMEDIATE_KHR
@@ -10079,91 +10620,32 @@ fn guest_present_mode(ci: &VkSwapchainCreateInfoKHR) -> VkPresentModeKHR {
     }
 }
 
-/// The present mode a swapchain keeps: the container's
-/// `MESA_VK_WSI_PRESENT_MODE` when it names one, as in Mesa, else the guest's
-/// requested mode ([`guest_present_mode`]). The same on both routes: on
-/// gamescope's override route the env is the user's present-mode preference
-/// (mailbox is the container default; fifo, fifo_relaxed and immediate are
-/// the user's choice), and it is what the shim declares to gamescope.
-fn effective_present_mode(ci: &VkSwapchainCreateInfoKHR) -> (VkPresentModeKHR, ModeSource) {
-    match parse_present_mode_override(std::env::var("MESA_VK_WSI_PRESENT_MODE").ok().as_deref()) {
-        Some(m) => (m, ModeSource::Env),
-        None => (guest_present_mode(ci), ModeSource::Guest),
-    }
-}
-
-/// Whether a present wait on a frame of a swapchain in effective `mode` is
-/// answered when the frame is committed. True for mailbox and immediate, where
-/// a guest that knew its real mode would not wait (DXVK skips the present wait
-/// for both); FIFO and FIFO_RELAXED keep the release-or-grace answer.
-fn answers_present_wait_at_commit(mode: VkPresentModeKHR) -> bool {
-    mode == VK_PRESENT_MODE_MAILBOX_KHR || mode == VK_PRESENT_MODE_IMMEDIATE_KHR
-}
 
 /// Why a present declares the mode it does, on the override route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Declared {
-    /// The swapchain's own mode ([`effective_present_mode`]).
+    /// The guest's own mode ([`guest_present_mode`]).
     Mode,
-    /// Mailbox for frame generation.
+    /// Mailbox for frame generation (`source=generating`).
     Generating,
-    /// FIFO for want of the daemon's stamp lead (`source=cap-compat`).
-    CapCompat,
-    /// FIFO because the cap is the display's rate and the guest asked for
-    /// mailbox or immediate (`source=cap-rate`).
-    CapRate,
-    /// The container's mode with the vblank-grid gate because the cap is the
-    /// display's rate and the guest asked for FIFO or FIFO-relaxed
-    /// (`source=cap-rate-vsync`).
-    CapRateVsync,
-    /// No cap and a guest that asked for FIFO or FIFO-relaxed: its own mode
-    /// over the container's non-FIFO default (`source=guest`).
-    GuestVsync,
 }
 
-/// The mode a present on `sc` runs under and declares, decided per present.
+/// The mode a present on `sc` declares to gamescope.
 ///
-/// On the override route:
-/// - frame generation on: mailbox. Generated frames are committed with no
-///   declaration, and a real frame declared FIFO would queue behind them.
-/// - a cap set, a mode other than FIFO, and no stamp lead from the daemon yet
-///   (`crate::vsync_gate::current_grid` is `None`: no note yet, or a daemon
-///   that predates the field): FIFO, so gamescope's limiter is the cap. The
-///   vblank-grid gate is not run without the lead: released on the latch
-///   points themselves, frames straddle gamescope's composite and are
-///   replaced in its mailbox. The census reads `source=cap-compat`.
-/// - a cap at the display's rate, a mode other than FIFO and a guest that
-///   asked for FIFO or FIFO-relaxed (in-game VSync on): the swapchain's mode
-///   with the vblank-grid gate, one release per vblank (`source=cap-rate-vsync`).
-///   The guest's present wait is then answered at commit and the gate paces
-///   it. Declared FIFO it was serialised behind gamescope's `presented` for
-///   each frame, and with ~16 ms of work per frame and three images it fell
-///   to 40 fps at 60 Hz.
-/// - a cap at the display's rate, a mode other than FIFO and a guest that
-///   asked for mailbox or immediate (self-paced): FIFO, with no acquire gate
-///   (`source=cap-rate`), as on master. At that cap one
-///   frame per vblank is all the panel shows under either mode, and under
-///   mailbox the shim would have to keep two commits out of one gamescope
-///   composite without knowing when gamescope latches: its wakeup moves with
-///   its rolling draw time (vblankmanager.cpp). A guest that paces itself just
-///   below the display's rate had ~1 frame a second replaced in gamescope's
-///   mailbox that way. Under FIFO gamescope latches one commit per vblank at
-///   its own wakeup and its limiter (divisor 1) paces the guest. The gate is
-///   not kept on top: FIFO's back-pressure already holds the guest, and the two
-///   stacked turned a guest whose acquire-to-commit grew past a period into a
-///   40 fps session on a 60 Hz panel.
-/// - no cap, the container's env naming a mode other than FIFO and a guest
-///   that asked for FIFO or FIFO-relaxed: the guest's mode (`source=guest`);
-///   see [`choose_live_mode`].
-/// - otherwise: the swapchain's mode ([`effective_present_mode`]). A FIFO
-///   swapchain is held by gamescope's limiter, one commit per limited vblank;
-///   under any other mode the acquire gate is the cap, on the display's vblank
-///   grid (`acquire_pacing`).
+/// gamescope is told what the guest asked for: the container cannot override it
+/// (`MESA_VK_WSI_PRESENT_MODE` is not read anywhere), and neither can the cap,
+/// the panel's refresh or frame generation. What those decide is the rate the
+/// guest may acquire at and the frames the generator may add, which is
+/// [`crate::limits`] — one rule for both.
 ///
-/// The rule is read per present, so a lead or a cap that changes mid-session
-/// moves the declaration on the next commit. Off the override route there is
-/// nothing to declare it to, and the mode is the one the swapchain was made
-/// with.
+/// The single exception is a generated frame: it declares mailbox, because
+/// generated commits carry no declaration of their own and a real frame
+/// declared FIFO would queue behind them in gamescope's limiter.
+///
+/// The rule is read per present, so a cap, a multiplier or a panel rate that
+/// changes mid-session moves the declaration on the next commit. Off the
+/// override route there is nothing to declare it to, and the mode is the one
+/// the swapchain was made with.
 pub(crate) unsafe fn live_present_mode(sc: *mut GnSwapchain) -> VkPresentModeKHR {
     unsafe { live_choice(sc) }.0
 }
@@ -10174,106 +10656,150 @@ unsafe fn live_choice(sc: *mut GnSwapchain) -> (VkPresentModeKHR, Declared) {
     if unsafe { (*(*sc).surf).swapchain_obj.is_null() } {
         return (mode, Declared::Mode);
     }
-    choose_live_mode(
-        mode,
-        unsafe { (*sc).mode_source },
-        unsafe { (*sc).requested_mode },
-        crate::lsfg::live().0,
-        crate::scanout::cap_fps_note(),
-        crate::vsync_gate::current_grid(),
-    )
+    choose_live_mode(mode, crate::lsfg::wanted().is_some())
 }
 
-/// [`live_present_mode`]'s rule on the override route, for the swapchain's
-/// `mode` and where it came from, the guest's `requested` mode, the daemon's
-/// cap and the display's vblank grid (`None` without the stamp lead).
+/// [`live_choice`]'s rule: the guest's mode, except for a generated frame, and
+/// except that `IMMEDIATE` is served as `MAILBOX`.
 ///
-/// With no cap a guest that asked for FIFO (or FIFO-relaxed) gets it even when
-/// the container's env names another mode: every container carries
-/// `MESA_VK_WSI_PRESENT_MODE=mailbox` as a stamped default the user did not
-/// choose, and honouring it there turned a game's own VSync into an uncapped
-/// mailbox session. A FIFO request is a specific wish; a mailbox or immediate
-/// request is "do not make me wait", for which the container's mode is the
-/// substitute, as on the X11 route. An env of `fifo` is an explicit wish and
-/// wins in every case.
-fn choose_live_mode(
-    mode: VkPresentModeKHR,
-    source: ModeSource,
-    requested: VkPresentModeKHR,
-    generating: bool,
-    cap_fps: u32,
-    grid: Option<crate::vsync_gate::Grid>,
-) -> (VkPresentModeKHR, Declared) {
-    let capped = cap_fps != gndrm_uapi::wire::FPS_UNCAPPED;
-    let vsync_request =
-        requested == VK_PRESENT_MODE_FIFO_KHR || requested == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+/// `IMMEDIATE` and `MAILBOX` differ only in what happens to a frame that cannot
+/// be shown: immediate presents it anyway and tears, mailbox replaces the pending
+/// one. A guest that asks immediate therefore gets its frames dropped for it
+/// instead of being shown mid-scan, which is what the container used to do with
+/// `MESA_VK_WSI_PRESENT_MODE` and no longer may. The declaration follows the same
+/// mode, so gamescope is told what is actually served.
+/// The mode a swapchain's image count is sized for: the one this session will
+/// serve, not the one the guest declared.
+///
+/// The two differ in exactly two cases, and both are ours: a generation session
+/// is served mailbox or fifo from the QuickMenu whatever the guest asked, and a
+/// declared IMMEDIATE is served as mailbox. Sizing the count from the declaration
+/// therefore sizes it for a mode nobody runs — measured on Witcher 3, whose guest
+/// asks FIFO (`min=3 mode=2`) while it is served and held as mailbox:
+///
+/// ```text
+/// slots=[3 guest + 8 destinations]  sf hold 1.5-2.5 periods  acq_fps 49.7
+/// ```
+///
+/// Three guest slots under a two-period hold cap at `depth x refresh / hold` = 54,
+/// and the mailbox floor of four — the whole reason `SC_MAILBOX_IMAGES` exists —
+/// never applied. The hold already follows the served mode (`on_buffer_release`);
+/// this makes the depth follow it too.
+fn count_present_mode(declared: VkPresentModeKHR) -> VkPresentModeKHR {
+    choose_live_mode(declared, crate::lsfg::live().0).0
+}
+
+/// What this session serves for a declared mode.
+///
+/// Two declarations are served as `MAILBOX`, and both for the same reason: the
+/// mode the guest asked for cannot be honoured without costing frames it would
+/// not otherwise lose.
+///
+/// - `IMMEDIATE` tears by construction: the image is handed over for display the
+///   moment it is presented. Served as mailbox it is superseded at a vblank
+///   instead, so the guest gets the pacing it asked for (no wait on the client)
+///   and the panel gets a buffer it can latch whole. Measured on Portal 2: the
+///   tear under direct scan-out disappears.
+/// - `FIFO_RELAXED` gives up a whole vblank per frame when a frame lands after the
+///   compositor's latch point, because the next one cannot be taken until the
+///   following vblank. Measured on Doom 2016 at 28.8 fps against a 60 cap with the
+///   GPU at 41 % and the CPU at 26 % — nothing busy, each frame costing `2T`.
+///   Served as mailbox the newest frame replaces the pending one, so a missed
+///   latch is superseded rather than deferred: `period = max(render, T)` instead
+///   of `2T`. The same title ran near 60 on the commit before this override was
+///   removed, when the app set `MESA_VK_WSI_PRESENT_MODE=mailbox` and this layer
+///   obeyed it.
+///
+/// The cost of the second is that a superseded frame is dropped rather than shown
+/// late, which `FIFO_RELAXED` itself would not do — it permits tearing, not loss.
+/// At a render time below the panel period nothing is superseded, so the two are
+/// indistinguishable; above it, mailbox is what the guest would have got had it
+/// asked for mailbox.
+///
+/// `FIFO` is served as itself. It promises every frame on a vblank and its frames
+/// arrive before the latch point by construction, which is the case the mailbox
+/// discipline would damage.
+fn choose_live_mode(mode: VkPresentModeKHR, generating: bool) -> (VkPresentModeKHR, Declared) {
     if generating {
-        (VK_PRESENT_MODE_MAILBOX_KHR, Declared::Generating)
-    } else if mode == VK_PRESENT_MODE_FIFO_KHR {
-        (mode, Declared::Mode)
-    } else if !capped {
-        if source == ModeSource::Env && vsync_request {
-            (requested, Declared::GuestVsync)
+        // The QuickMenu offers mailbox and fifo for generation and nothing else,
+        // and the note carries the choice (`LsfgConfig::present_mode`); anything
+        // unknown is mailbox.
+        let served = if crate::lsfg::generating_present_mode() == 1 {
+            VK_PRESENT_MODE_FIFO_KHR
         } else {
-            (mode, Declared::Mode)
-        }
+            VK_PRESENT_MODE_MAILBOX_KHR
+        };
+        (served, Declared::Generating)
+    } else if mode == VK_PRESENT_MODE_IMMEDIATE_KHR
+        || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR
+    {
+        (VK_PRESENT_MODE_MAILBOX_KHR, Declared::Mode)
     } else {
-        match grid {
-            None => (VK_PRESENT_MODE_FIFO_KHR, Declared::CapCompat),
-            Some(g) if crate::vsync_gate::at_display_rate(cap_fps, g) => {
-                if vsync_request {
-                    (mode, Declared::CapRateVsync)
-                } else {
-                    (VK_PRESENT_MODE_FIFO_KHR, Declared::CapRate)
-                }
-            }
-            Some(_) => (mode, Declared::Mode),
-        }
+        (mode, Declared::Mode)
     }
 }
 
-/// How the acquire gate paces `sc` now.
-///
-/// - Off gamescope's override route (the X11 Present route) nothing holds the
-///   cap but the gate, on the cap's own clock, as before.
-/// - On the override route see [`gamescope_route_pacing`].
-unsafe fn acquire_pacing(sc: *mut GnSwapchain) -> crate::vsync_gate::Pacing {
-    if unsafe { (*(*sc).surf).swapchain_obj.is_null() } {
-        return crate::vsync_gate::Pacing::on_clock(crate::scanout::target_fps());
-    }
-    gamescope_route_pacing(
-        unsafe { live_choice(sc) },
-        crate::lsfg::source_cap(),
-        crate::scanout::cap_fps_note(),
-        crate::vsync_gate::current_grid(),
+/// What this swapchain's session allows ([`crate::limits::limits`]): the
+/// guest's own mode decides whether the panel is a ceiling, the daemon's cap
+/// note and the generator's multiplier decide the rest.
+fn session_limits(sc: *mut GnSwapchain) -> crate::limits::Limits {
+    let mode = unsafe { (*sc).present_mode };
+    let vsync = matches!(
+        mode,
+        VK_PRESENT_MODE_FIFO_KHR | VK_PRESENT_MODE_FIFO_RELAXED_KHR
+    );
+    let cap = crate::scanout::cap_fps_note();
+    crate::limits::limits(
+        vsync,
+        (cap != gndrm_uapi::wire::FPS_UNCAPPED).then_some(cap),
+        crate::lsfg::wanted(),
+        crate::lsfg::refresh_hz(),
     )
 }
 
-/// [`acquire_pacing`]'s rule on gamescope's override route, for the declared
-/// mode and why ([`choose_live_mode`]), frame generation's source cap, the
-/// daemon's cap and the display's vblank grid:
-/// - frame generation sets the source rate: the gate holds it on the cap's own
-///   clock (the app disarms gamescope's limiter then; generation paces the
-///   output on the latch grid itself);
-/// - any FIFO declaration (a FIFO swapchain, FIFO for want of the stamp lead,
-///   FIFO because the cap is the display's rate): no gate. gamescope's limiter
-///   holds FIFO commits, one per limited vblank, and is the cap;
-/// - mailbox, immediate, FIFO-relaxed: gamescope's limiter does not hold them
-///   (`wlserver_surface_is_fifo` is FIFO only), so the gate is the cap, on the
-///   display's vblank grid (`crate::vsync_gate`).
-fn gamescope_route_pacing(
-    (live, _): (VkPresentModeKHR, Declared),
-    source_cap: Option<u32>,
-    cap_fps: u32,
-    grid: Option<crate::vsync_gate::Grid>,
-) -> crate::vsync_gate::Pacing {
-    if let Some(cap) = source_cap {
-        return crate::vsync_gate::Pacing::on_clock(cap);
-    }
-    if live == VK_PRESENT_MODE_FIFO_KHR {
+/// How the acquire gate paces `sc` now: to the session's acquire limit
+/// ([`session_limits`]), on whichever clock can hold it.
+///
+/// - Off gamescope's override route (the X11 Present route) nothing else holds
+///   the cap, so the gate does, on its own clock.
+/// - **Every declaration is gated.** gamescope's limiter withholds a window's
+///   frame callback, and this shim paces on its own schedule and the buffer
+///   release, never on that callback — so a FIFO declaration used to leave the
+///   guest with no cap at all: `steamcompmgr_should_vblank_window` acts only
+///   when the cap is below the refresh AND divides it, so 60 on 60 Hz and 40 on
+///   60 Hz were both unlimited, measured as a 26 fps session whose cap did
+///   nothing.
+/// - With generation on the gate holds the source rate on its own clock, and
+///   the batches are placed on the latch grid by the generator itself.
+/// - Otherwise the gate holds the acquire limit on the display's vblank grid
+///   (`crate::vsync_gate`), snapping to a whole number of vblanks when it can.
+unsafe fn acquire_pacing(sc: *mut GnSwapchain) -> crate::vsync_gate::Pacing {
+    let limits = session_limits(sc);
+    let Some(acquire) = limits.acquire_per_s else {
         return crate::vsync_gate::Pacing::Off;
+    };
+    if unsafe { (*(*sc).surf).swapchain_obj.is_null() } {
+        return crate::vsync_gate::Pacing::on_clock(acquire);
     }
-    crate::vsync_gate::pacing(cap_fps, grid)
+    let (_, declared) = unsafe { live_choice(sc) };
+    gamescope_route_pacing(declared, acquire)
+}
+
+/// [`acquire_pacing`]'s rule on gamescope's override route, for what the commit
+/// declares ([`choose_live_mode`]), the session's acquire limit and the
+/// display's vblank grid.
+fn gamescope_route_pacing(declared: Declared, acquire: u32) -> crate::vsync_gate::Pacing {
+    match declared {
+        // Generated frames are placed on the latch grid by the generator, so
+        // the gate holds the source rate on its own clock.
+        Declared::Generating => crate::vsync_gate::Pacing::on_clock(acquire),
+        // Whatever the guest declared. A FIFO declaration is not a pacer:
+        // gamescope withholds the window's frame callback and this shim never
+        // waits on one, and its divisor only bites when the cap is below the
+        // refresh AND divides it. Standing down here is what left a 60/60 and a
+        // 40/60 session with no cap at all.
+        Declared::Mode => crate::vsync_gate::pacing(acquire),
+    }
 }
 
 /// The mode a commit on `sc` declares to gamescope, counted for the census.
@@ -10302,12 +10828,16 @@ fn mode_name(mode: VkPresentModeKHR) -> &'static str {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ModeLine {
     declared: VkPresentModeKHR,
-    requested: VkPresentModeKHR,
     source: &'static str,
     gamescope_route: bool,
     cap: u32,
     gate: &'static str,
     lsfg: bool,
+    /// The session's limits ([`crate::limits`]), `FPS_UNCAPPED`/`0` for none:
+    /// the acquire ceiling and the frames the generator may add, in frames per
+    /// second. Printed because the declaration no longer says what the cap did.
+    acquire: u32,
+    generate: u32,
 }
 
 /// The last [`ModeLine`] printed.
@@ -10323,51 +10853,62 @@ static MODE_LINE: Mutex<Option<ModeLine>> = Mutex::new(None);
 unsafe fn mode_census(sc: *mut GnSwapchain) {
     let route = unsafe { !(*(*sc).surf).swapchain_obj.is_null() };
     let (declared, why) = unsafe { live_choice(sc) };
+    let limits = session_limits(sc);
     let line = ModeLine {
         declared,
-        requested: unsafe { (*sc).requested_mode },
-        source: match (why, unsafe { (*sc).mode_source }) {
-            (Declared::CapCompat, _) => "cap-compat",
-            (Declared::CapRate, _) => "cap-rate",
-            (Declared::CapRateVsync, _) => "cap-rate-vsync",
-            (Declared::GuestVsync, _) => "guest",
-            (_, ModeSource::Env) => "env",
-            (_, ModeSource::Guest) => "guest",
+        source: match why {
+            Declared::Generating => "generating",
+            Declared::Mode => "guest",
         },
         gamescope_route: route,
         cap: crate::scanout::cap_fps_note(),
         gate: unsafe { acquire_pacing(sc) }.clock().name(),
         lsfg: crate::lsfg::live().0,
+        acquire: limits
+            .acquire_per_s
+            .unwrap_or(gndrm_uapi::wire::FPS_UNCAPPED),
+        generate: limits.generate_per_s.unwrap_or(0),
     };
     {
         let mut last = MODE_LINE.lock().unwrap_or_else(|e| e.into_inner());
         if *last != Some(line) {
             *last = Some(line);
-            crate::logi!("present mode: declared={} requested={} source={} route={} cap={} gate={} lsfg={}",
+            crate::logi!("present mode: declared={} source={} route={} cap={} gate={} lsfg={} acquire={} generate={}",
                 mode_name(line.declared),
-                mode_name(line.requested),
                 line.source,
                 if route { "gamescope" } else { "x11" },
                 line.cap,
                 line.gate,
-                u8::from(line.lsfg),);
+                u8::from(line.lsfg),
+                line.acquire,
+                line.generate);
         }
     }
     if !crate::vkshim_enabled() || !rate_ok(&RATE_MODE, MODE_CENSUS_EVERY) {
         return;
     }
     let (presented, discarded, fallback) = crate::present::feedback_counts();
+    let wait_census = crate::present::wait_census();
     let (late, skipped) = crate::vsync_gate::late_counts();
+    // A cumulative counter is a rate only with its denominator: the session's
+    // own age, from the first acquire.
+    let t0 = SHIM_T0_NS.load(Ordering::Relaxed);
+    let age_s = if t0 == 0 {
+        0
+    } else {
+        monotonic_ns().saturating_sub(t0) / 1_000_000_000
+    };
     // Since the last line, so each line reads one window's cadence.
     let gaps = COMMIT_GAPS.each_ref().map(|b| b.swap(0, Ordering::Relaxed));
-    crate::logf!("present mode: declared={} requested={} source={} route={} cap={} gate={} lsfg={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} at_queue={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}]",
+    crate::logf!("present mode: declared={} source={} route={} cap={} gate={} lsfg={} acquire={} generate={} acquires={} commits={} declared_fifo={} declared_other={} releases={} feedback={} presented={} discarded={} fallback={} at_queue={} gate_holds={} gate_late={} skipped={} slot_waits={} commit_lat_us={} spacing=[<15:{} 15-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}] gated={} ungated={} gate_wait_us={} acq_spacing=[<14:{} 14-16.2:{} 16.2-17.2:{} 17.2-20:{} >20:{}] age_s={} calls={} ok={} retry={} notes={} park_timeouts={} rnotes={} noid={} notelag=[<5:{} <33:{} <100:{} >100:{}] waitans=[n:{} q:{} commit:{} fb:{} daemon:{} grace:{} release:{} discard:{} unarmed:{} timeout:{} nocommit:{}]",
         mode_name(line.declared),
-        mode_name(line.requested),
         line.source,
         if route { "gamescope" } else { "x11" },
         line.cap,
         line.gate,
         u8::from(line.lsfg),
+        line.acquire,
+        line.generate,
         N_ACQ.load(Ordering::Relaxed),
         N_COMMIT_OK.load(Ordering::Relaxed),
         DECL_FIFO_N.load(Ordering::Relaxed),
@@ -10387,7 +10928,38 @@ unsafe fn mode_census(sc: *mut GnSwapchain) {
         gaps[1],
         gaps[2],
         gaps[3],
-        gaps[4],);
+        gaps[4],
+        ACQ_GATED_N.load(Ordering::Relaxed),
+        ACQ_UNGATED_N.load(Ordering::Relaxed),
+        GATE_WAIT_NS.load(Ordering::Relaxed) / 1_000,
+        ACQ_SPACING[0].load(Ordering::Relaxed),
+        ACQ_SPACING[1].load(Ordering::Relaxed),
+        ACQ_SPACING[2].load(Ordering::Relaxed),
+        ACQ_SPACING[3].load(Ordering::Relaxed),
+        ACQ_SPACING[4].load(Ordering::Relaxed),
+        age_s,
+        N_ACQ.load(Ordering::Relaxed),
+        ACQ_OK_N.load(Ordering::Relaxed),
+        ACQ_RETRY_N.load(Ordering::Relaxed),
+        NOTES_APPLIED.load(Ordering::Relaxed),
+        PARK_TIMEOUTS.load(Ordering::Relaxed),
+        crate::scanout::release_notes_received(),
+        NOID_AT_COMMIT.load(Ordering::Relaxed),
+        NOTELAG[0].load(Ordering::Relaxed),
+        NOTELAG[1].load(Ordering::Relaxed),
+        NOTELAG[2].load(Ordering::Relaxed),
+        NOTELAG[3].load(Ordering::Relaxed),
+        wait_census[0],
+        wait_census[1],
+        wait_census[2],
+        wait_census[3],
+        wait_census[4],
+        wait_census[5],
+        wait_census[6],
+        wait_census[7],
+        wait_census[8],
+        wait_census[9],
+        wait_census[10],);
 }
 
 /// The wire value for `gamescope_swapchain.set_present_mode` that declares
@@ -10413,24 +10985,16 @@ fn gamescope_present_mode(mode: VkPresentModeKHR) -> u32 {
         VK_PRESENT_MODE_MAILBOX_KHR => 1,
         VK_PRESENT_MODE_FIFO_KHR => 2,
         VK_PRESENT_MODE_FIFO_RELAXED_KHR => 3,
-        // Unreachable: `(*sc).present_mode` is `effective_present_mode`'s
-        // output, which is one of the four served modes above.
+        // Unreachable: `(*sc).present_mode` is `guest_present_mode`'s output,
+        // which is one of the four served modes above.
         _ => 2,
     }
 }
 
-fn offered_present_modes(
-    served: &[VkPresentModeKHR],
-    override_mode: Option<VkPresentModeKHR>,
-) -> Vec<VkPresentModeKHR> {
+/// The modes the guest is offered: the served set in its own order, with FIFO
+/// appended when it is missing (a swapchain must be creatable in FIFO).
+fn offered_present_modes(served: &[VkPresentModeKHR]) -> Vec<VkPresentModeKHR> {
     let mut v = Vec::with_capacity(served.len() + 1);
-    if let Some(m) = override_mode {
-        if served.contains(&m) {
-            v.push(m);
-        } else {
-            crate::logf!("Unsupported MESA_VK_WSI_PRESENT_MODE value!");
-        }
-    }
     for &m in served {
         if !v.contains(&m) {
             v.push(m);
@@ -10455,11 +11019,7 @@ unsafe extern "C" fn gn_vkGetPhysicalDeviceSurfacePresentModesKHR(
         crate::logf!("proxy surface present-modes query: {surface:#x} not one of ours");
         return VK_ERROR_SURFACE_LOST_KHR;
     }
-    // The env's mode leads the list, as in Mesa: it decides the mode on both
-    // routes (`effective_present_mode`).
-    let override_mode =
-        parse_present_mode_override(std::env::var("MESA_VK_WSI_PRESENT_MODE").ok().as_deref());
-    let modes_list = offered_present_modes(&SERVED_PRESENT_MODES, override_mode);
+    let modes_list = offered_present_modes(&SERVED_PRESENT_MODES);
     unsafe {
         if modes.is_null() {
             *count = modes_list.len() as u32;

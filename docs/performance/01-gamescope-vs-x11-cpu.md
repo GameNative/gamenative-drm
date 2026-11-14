@@ -273,13 +273,14 @@ time (`tools/gamescope-cpu-arm.sh`, full numbers in
 | is `vkWaitForPresentKHR` called? | **0 lines** | same |
 | do acquires ever wait for a slot? | **0.0**, dwell **0.013 ms**, `starved=0` | cause C dead, item 3 closed |
 | what depth does the guest actually get? | **4** (mean in flight 1.66, free 2.08) | item 3's "add a 4th slot" was already true |
-| is a FIFO declaration ever made? | **no** — `declared=mailbox requested=immediate source=env`, `declared_fifo=0` over 25 009 presents | item 5 unreachable as well as semantic |
+| is a FIFO declaration ever made? | **no** — `declared=mailbox requested=immediate source=env`, `declared_fifo=0` over 25 009 presents | item 5 unreachable as well as semantic (the `source=env` form of the census no longer exists; the shim declares the guest's mode now) |
 | does the X11 arm exercise the shim? | **no** — `gn-vkshim: ICD loaded` = 0 | the +5.1 pp guest term *is* the shim's existence, not its behaviour |
 
-The container's `MESA_VK_WSI_PRESENT_MODE=mailbox` overrides the title's own
-`immediate` request, which is why no FIFO path is ever taken. That is a
-deliberate container default, and it is also why three of the plan items cannot
-fire on this title.
+At the time of this run the container's `MESA_VK_WSI_PRESENT_MODE=mailbox`
+overrode the title's own `immediate` request, which is why no FIFO path was ever
+taken, and it is also why three of the plan items could not fire on this title.
+The shim reads no such override any more (`refactor/vsync`): the declared mode is
+the guest's request, so a re-run of this arm would declare `immediate`.
 
 ~~One asymmetry is left unexplained: 241.9 atomic commits/s against 357.3
 presents/s.~~ **Withdrawn — the two numbers count different events and were never

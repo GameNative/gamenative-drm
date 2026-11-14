@@ -18,12 +18,13 @@
 
 use gndrm_uapi::wire::{
     scanout_ahb_format, FrameCapNote, FrameCapSubscribe, LsfgConfig, ScanoutAllocReq,
-    ScanoutAllocResp, ScanoutLayout, VsyncNote, CAP_FRAME_CAP, CAP_PRESENT_ID, CAP_VSYNC_NOTE,
+    BufferReleased, ScanoutAllocResp, ScanoutLayout, VsyncNote, CAP_FRAME_CAP, CAP_PRESENT_ID,
+    CAP_RELEASE_NOTE, CAP_VSYNC_NOTE,
     FPS_UNCAPPED, SCANOUT_LAYOUT_ENV, SCANOUT_REQ_AHB_HANDLE,
 };
 use std::ffi::c_void;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Default budget for one exchange, matching the LD_PRELOAD shim's: a daemon
@@ -122,28 +123,6 @@ pub(crate) fn period_ns(target_fps: u32) -> u64 {
     NANOS_PER_SECOND / u64::from(target_fps)
 }
 
-/// The instant the next acquire may start, given the previous one and now.
-///
-/// The cap is applied here rather than to a release: a frame that may not start
-/// yet is the only point where waiting costs neither rendered work nor display
-/// latency. `prev + period` holds the interval at the target while the guest
-/// keeps up: the wait for `prev` returns a hair late, and that hair must not
-/// become the cadence (it did, as `max(prev, now) + period`: a 60 cap ran at
-/// 59.4). Once the guest is a whole period behind it is its own rate again,
-/// `now + period` — never two frames closer than one period, and no debt
-/// carried out of a stall.
-#[must_use]
-pub(crate) fn next_acquire_after(prev_ns: u64, now_ns: u64, period_ns: u64) -> u64 {
-    if period_ns == 0 {
-        return prev_ns;
-    }
-    if prev_ns != 0 && now_ns < prev_ns.saturating_add(period_ns) {
-        prev_ns + period_ns
-    } else {
-        now_ns.saturating_add(period_ns)
-    }
-}
-
 /// Adopt one frame-cap note: the target it carries.
 fn apply_note(note: FrameCapNote) {
     NOTES_N.fetch_add(1, Ordering::Relaxed);
@@ -155,15 +134,9 @@ fn apply_note(note: FrameCapNote) {
         target_fps());
 }
 
-/// The target in force, [`FPS_UNCAPPED`] when none has: read by the shim's
-/// census and by the acquire gate.
+/// The cap the daemon's note carries, [`FPS_UNCAPPED`] when none: what the
+/// session's limits are computed from, and what the frame-cap line reports.
 pub(crate) fn target_fps() -> u32 {
-    // Frame generation owns the source rate while it is on: the app disarms
-    // gamescope's limiter in that case, so a zero from the daemon's cap note is
-    // not "uncapped", it is "paced by the presenter".
-    if let Some(cap) = crate::lsfg::source_cap() {
-        return cap;
-    }
     CAP_FPS.load(Ordering::Relaxed)
 }
 
@@ -176,7 +149,6 @@ pub(crate) fn cap_fps_note() -> u32 {
 /// latch grid, and the acquire gate releases on the vblank grid it gives.
 fn apply_vsync(note: VsyncNote) {
     crate::lsfg::apply_vsync(note);
-    crate::vsync_gate::apply_note(note);
 }
 
 /// How many frame-cap notes have been adopted on this connection, for the same
@@ -304,6 +276,8 @@ pub fn lsfg_config() -> Option<LsfgConfig> {
                 apply_vsync(note);
             } else if let Some(done) = gndrm_uapi::wire::PresentDone::decode(&buf[..n as usize]) {
                 crate::present::record(done.id, done.latch_ns);
+            } else if let Some(released) = BufferReleased::decode(&buf[..n as usize]) {
+                apply_release(released);
             } else if gndrm_uapi::wire::FrameAcquired::decode(&buf[..n as usize]).is_some() {
                 // The shim's own counter, echoed nowhere: accepted so it is not
                 // mistaken for a frame this reader does not know.
@@ -425,7 +399,7 @@ fn connect(path: &str) -> RawFd {
         if !send_frame(
             fd,
             &FrameCapSubscribe {
-                caps: CAP_FRAME_CAP | CAP_VSYNC_NOTE | CAP_PRESENT_ID,
+                caps: CAP_FRAME_CAP | CAP_VSYNC_NOTE | CAP_PRESENT_ID | CAP_RELEASE_NOTE,
             }
             .encode(),
         ) {
@@ -557,6 +531,17 @@ fn exchange_req(fd: RawFd, req: ScanoutAllocReq) -> Result<ScanoutBuf, Failure> 
                     if frames < MAX_BURST_FRAMES {
                         continue;
                     }
+                } else if let Some(released) = BufferReleased::decode(buf) {
+                    // The release watcher pushes on its own schedule, so a note
+                    // can stand ahead of the reply; dropping it would leave its
+                    // park to the bound.
+                    if recv_fd >= 0 {
+                        libc::close(recv_fd);
+                    }
+                    apply_release(released);
+                    if frames < MAX_BURST_FRAMES {
+                        continue;
+                    }
                 } else if gndrm_uapi::wire::FrameAcquired::decode(buf).is_some() {
                     // The acquire counter shares this channel and can arrive
                     // while a reply is pending; it is not the reply.
@@ -665,17 +650,280 @@ pub(crate) fn send_frame_acquired(count: u64, generated: u64) {
 }
 
 /// Mark a frame's present id for the daemon, immediately before the commit that
-/// presents it: the daemon answers when that transaction latches. Best effort by
-/// construction — the channel is shared with the allocator, so an exchange in
-/// flight is waited for (bounded by the exchange's own timeout) rather than
-/// skipped, because a mark that never arrives leaves `vkWaitForPresentKHR`
-/// waiting for a frame the daemon cannot name.
-pub(crate) fn send_present_mark(ino: u64, id: u64) {
+/// presents it: the daemon answers when that transaction latches.
+///
+/// Sent without blocking. This runs on the present worker for every frame, so a
+/// send that waited for the daemon to make room would put the daemon's read rate
+/// into the frame time — measured as a flat 277 ms on a title running at 60 fps
+/// on the route that sends no marks at all. A mark that does not fit is dropped:
+/// its frame's wait is then answered by the compositor's feedback or by the
+/// two-period grace, both of which are bounded, so the cost of a lost mark is a
+/// latch report in the census and nothing the guest can feel.
+pub(crate) fn send_present_mark(ino: u64, id: u64, ticket: u64) {
     let ch = CHAN.lock().unwrap_or_else(|e| e.into_inner());
     if *ch < 0 {
         return;
     }
-    send_frame(*ch, &gndrm_uapi::wire::PresentMark { ino, id }.encode());
+    send_frame_nb(
+        *ch,
+        &gndrm_uapi::wire::PresentMark { ino, id, ticket }.encode(),
+    );
+}
+
+// ------------------------------------------------------ scan-out releases
+//
+// A compositor handing a buffer back means it has finished *compositing* with
+// it. The display may still be reading it: SurfaceFlinger reports a buffer's
+// true release a transaction later, as the previous-release fence of whichever
+// buffer replaced it on the layer, and the daemon turns that fence into a
+// [`BufferReleased`] note. Until the note arrives a slot stays busy, because a
+// producer that reused the buffer on the compositor's release wrote into memory
+// the panel was still scanning — and the panel showed both frames at once for
+// as long as the two writes overlapped.
+
+/// One release note as taken: the ticket it names, the inode it names, and when
+/// this process read it.
+#[derive(Debug, Clone, Copy)]
+struct ReleasedNote {
+    /// The shim's own ticket for the frame, 0 when the daemon sent none.
+    ticket: u64,
+    /// The scan-out inode, kept for the older daemon and for the logs.
+    ino: u64,
+    /// `CLOCK_MONOTONIC` ns when this process took the note.
+    at: u64,
+}
+
+/// Release notes the daemon reported, oldest first. Bounded: a note for a buffer
+/// whose slot is gone is dropped, and a producer cannot grow this list.
+static RELEASED: Mutex<Vec<ReleasedNote>> = Mutex::new(Vec::new());
+
+/// How many releases may be held before the oldest is dropped. A session has one
+/// per buffer in the pool; a note whose slot never comes back is stale.
+const RELEASED_CAP: usize = 32;
+
+/// Release notes seen this session. Zero means the daemon does not send them (an
+/// older build), and a slot is freed on the compositor's release as it was
+/// before: the note improves on that behaviour, it does not depend on it.
+static RELEASE_NOTES: AtomicU64 = AtomicU64::new(0);
+
+/// Record that the daemon reported `ino` released.
+///
+/// A note is not applied here: the slot that owns the buffer is parked, and it is
+/// taken on the next acquire pass (see `acquire_take_free`), so this runs on the
+/// thread that read the note and touches nothing else.
+pub(crate) fn note_buffer_released(ticket: u64, ino: u64, source: u64) {
+    if ino == 0 && ticket == 0 {
+        return;
+    }
+    RELEASE_NOTES.fetch_add(1, Ordering::Relaxed);
+    if ticket != 0 {
+        TICKET_NOTES.fetch_add(1, Ordering::Relaxed);
+    }
+    if source != gndrm_uapi::wire::RELEASE_FENCE {
+        RELEASE_OFF_FENCE.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut q = RELEASED.lock().unwrap_or_else(|e| e.into_inner());
+    if q.len() >= RELEASED_CAP {
+        q.remove(0);
+    }
+    q.push(ReleasedNote {
+        ticket,
+        ino,
+        at: crate::proxy::monotonic_ns(),
+    });
+}
+
+/// Adopt one release note, from whichever reader took it off the channel.
+fn apply_release(released: BufferReleased) {
+    // SurfaceFlinger is finished with this scan-out buffer: the producer may
+    // write into it again (see `note_buffer_released`).
+    note_buffer_released(released.ticket, released.ino, released.source);
+    // A release note is the only message that can end a park, so it is the
+    // only one that says parking is worth a bet again. Liveness keyed on the
+    // socket itself is a lie on a device whose daemon still pushes the panel
+    // grid: RP6 sent ~5 000 `VsyncNote`s while releasing nothing, and
+    // `channel=[unanswered:2 dead:false]` never armed the fail-open with
+    // `park_timeouts=5181` of 5 210 acquires.
+    crate::proxy::note_channel_alive();
+}
+
+/// Notes that carried a ticket, and notes whose release did not rest on a
+/// signalled fence. Two counts because they answer two questions the census
+/// could not: whether the daemon is sending tickets at all, and whether a note
+/// is a guarantee or a timeout.
+static TICKET_NOTES: AtomicU64 = AtomicU64::new(0);
+static RELEASE_OFF_FENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Notes that carried a ticket, and notes off a signalled fence, for the census.
+pub(crate) fn note_counts() -> (u64, u64) {
+    (
+        TICKET_NOTES.load(Ordering::Relaxed),
+        RELEASE_OFF_FENCE.load(Ordering::Relaxed),
+    )
+}
+
+/// The inos of the notes currently held, up to eight, oldest first.
+///
+/// For the one case worth a log line: a park that expired while notes were being
+/// received. Printed beside the slot's own `ino`, it says whether the daemon keys
+/// buffers by an identity this process never holds (a different allocator path on
+/// this SoC) or whether the note list was simply empty by then, which is a timing
+/// question instead.
+pub(crate) fn released_snapshot() -> String {
+    let q = RELEASED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = String::new();
+    for n in q.iter().take(8) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!("{}", n.ino));
+    }
+    out
+}
+
+/// Whether the daemon sends release notes at all. Until one has arrived, a slot
+/// frees on the compositor's release exactly as it did before this note existed.
+/// Whether any note has ever arrived.
+///
+/// The shim no longer decides a park from this: one note followed by silence is
+/// a channel that does not work, and `proxy::park_awaits_note` counts the parks
+/// since the last note instead. Kept as the test-side predicate.
+#[cfg(test)]
+pub(crate) fn release_notes_live() -> bool {
+    RELEASE_NOTES.load(Ordering::Relaxed) != 0
+}
+
+/// Release notes received this session, for the census: the denominator of
+/// `notes=` (parks a note resolved), which says whether a park that timed out
+/// lost the note or was never sent one.
+pub(crate) fn release_notes_received() -> u64 {
+    RELEASE_NOTES.load(Ordering::Relaxed)
+}
+
+/// Take the oldest release note at or after `since_ns`, whatever buffer it names.
+///
+/// The fallback for a device whose notes do not carry the parked buffer's
+/// identity. A note is emitted from SurfaceFlinger's previous-release fence, which
+/// signals when a *later* buffer latches, so under a multi-image rotation the note
+/// names the buffer that replaced ours rather than ours. Measured on Odin 3:
+/// `rnotes=702` with `park_timeouts=700`, `notelag` empty on every bucket, and a
+/// park timeout line reading `slot ino=11411 … released=[11366 11368 11370]` —
+/// same allocator, never the same buffer.
+///
+/// Safe to pair by order because notes arrive one per commit and in commit order:
+/// the oldest outstanding note belongs to the oldest outstanding frame, so freeing
+/// the oldest parked slot with it cannot free a slot the display is still reading.
+/// It is a weaker pairing than the identity match — one frame's worth of margin
+/// traded for a pipeline that works — so identity stays the first attempt.
+///
+/// The margin is exactly one display period: a note may be up to one frame older
+/// than the park's commit and still count, because that is how much later the
+/// note for a frame arrives (it rides the latch of the frame that replaced it).
+/// Without the margin, depth is effectively one image short — measured at 44 fps
+/// with a 60 cap on a three-image FIFO swapchain.
+pub(crate) fn take_any_released(since_ns: u64, ticket: u64) -> bool {
+    // One display period of margin, and no more. The note that answers a park is
+    // emitted when the *next* frame latches, so it legitimately predates the
+    // commit by up to one frame; a floor at the commit itself rejects it and
+    // leaves every park to its bound. Anything older than a period describes a
+    // frame this slot was not part of.
+    let hz = u64::from(crate::lsfg::panel_hz().max(1));
+    let floor = since_ns.saturating_sub(1_000_000_000 / hz);
+    let mut q = RELEASED.lock().unwrap_or_else(|e| e.into_inner());
+    q.retain(|n| n.at >= floor);
+    // The oldest note that does not predate this park's frame. It describes the
+    // frame that latched when this slot's buffer was replaced, which is the frame
+    // *before* the one parked here — so a floor at the commit would reject the
+    // only note that will ever mention that buffer and leave the park to its
+    // bound.
+    //
+    // The margin this gives up is one frame: slot N may be freed by the release
+    // of frame N+1. Both are in order, so the reuse is still older than the
+    // display's newest frame; the stricter identity match above is unaffected
+    // and still runs first where inodes line up.
+    match q.iter().position(|n| !predates(n.ticket, ticket)) {
+        Some(i) => {
+            q.remove(i);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Whether a note's ticket names a frame committed before the park's own.
+///
+/// Such a note cannot answer the park by order or by inode: the frame it
+/// describes left the display no later than the parked one arrived, so it says
+/// nothing about the parked frame. It is a late note for an earlier use of the
+/// same buffer (the park on it expired and the buffer was committed again), or
+/// the note for a commit that was never parked (a hidden slot, a generation
+/// destination), which the park's own frame replaced on the layer. A newer
+/// ticket is still an answer, and is the common one: a note can arrive before
+/// its own slot is parked, and then pays the oldest park, whose frame left the
+/// layer before the note's did. 0 on either side is a daemon or a commit
+/// without tickets, and is not judged.
+fn predates(note_ticket: u64, park_ticket: u64) -> bool {
+    note_ticket != 0 && park_ticket != 0 && note_ticket < park_ticket
+}
+
+/// Take a release note for `ino` that arrived at or after `since_ns`, and drop
+/// every older note for the same buffer.
+///
+/// `since_ns` is when the slot was parked. A note older than that describes an
+/// earlier frame of the same buffer — it says nothing about the frame now on the
+/// panel — and must not free the slot early. So does a note that arrived late
+/// but names an earlier `ticket`. `true` when a note applied.
+pub(crate) fn take_released(ino: u64, since_ns: u64, ticket: u64) -> bool {
+    if ino == 0 {
+        return false;
+    }
+    let mut q = RELEASED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut applied = false;
+    q.retain(|n| {
+        if n.ino != ino {
+            return true;
+        }
+        if n.at < since_ns || predates(n.ticket, ticket) {
+            return false;
+        }
+        if applied {
+            return true;
+        }
+        applied = true;
+        false
+    });
+    applied
+}
+
+/// Take the note for `ticket`, if one is held.
+///
+/// This is the whole pairing rule. A ticket is minted by the process that owns
+/// the slot and is never reused, so there is no window to tune, no floor to
+/// derive, and no ordering assumption: the note either names this slot's frame or
+/// it does not. It replaces, on any device whose daemon sends tickets:
+///
+/// - matching by dma-buf inode, which pairs only while the allocator hands the
+///   same object through to SurfaceFlinger — true for Portal 2 on Nova (6 % of
+///   parks needed the fallback) and false for Dave on the same device (84 %), so
+///   the inode is a property of the title's allocation pattern, not of the device;
+/// - the order fallback's reorder window and its one-display-period floor;
+/// - `since = commit_ns.min(parked)`, which existed to catch a note that arrives
+///   before the park it answers.
+///
+/// A note that names no ticket (`ticket == 0`) is left in the queue for the inode
+/// path, so an older daemon still works.
+pub(crate) fn take_released_ticket(ticket: u64) -> bool {
+    if ticket == 0 {
+        return false;
+    }
+    let mut q = RELEASED.lock().unwrap_or_else(|e| e.into_inner());
+    match q.iter().position(|n| n.ticket == ticket) {
+        Some(i) => {
+            q.remove(i);
+            true
+        }
+        None => false,
+    }
 }
 
 pub(crate) fn poll_notes() {
@@ -713,6 +961,8 @@ pub(crate) fn poll_notes() {
     } else if let Some(done) = gndrm_uapi::wire::PresentDone::decode(&buf[..len]) {
         // The panel latched the frame this id was marked for.
         crate::present::record(done.id, done.latch_ns);
+    } else if let Some(released) = BufferReleased::decode(&buf[..len]) {
+        apply_release(released);
     } else if let Some(acq) = gndrm_uapi::wire::FrameAcquired::decode(&buf[..len]) {
         // Sent from the acquire path; nothing to apply here. Accepted so the
         // log does not report it as an unknown frame.
@@ -721,11 +971,144 @@ pub(crate) fn poll_notes() {
 }
 
 /// Largest frame the daemon pushes unsolicited.
-const PUSH_LEN: usize = LsfgConfig::LEN;
+const PUSH_LEN: usize = if LsfgConfig::LEN > BufferReleased::LEN {
+    LsfgConfig::LEN
+} else {
+    BufferReleased::LEN
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A release note frees the frame it describes and no other: the slot is
+    /// parked before one can arrive, so a note older than the park describes an
+    /// earlier frame of the same buffer and must not free this one.
+    #[test]
+    fn a_release_note_only_applies_to_the_frame_it_describes() {
+        let _serial = fresh_notes();
+        note_buffer_released(0, 9_001, gndrm_uapi::wire::RELEASE_FENCE);
+        assert!(take_released(9_001, 0, 0), "a note after the park frees the slot");
+        assert!(!take_released(9_001, 0, 0), "and is consumed by it");
+
+        // A note taken before the slot was parked: dropped, and it must not free
+        // the slot on the next pass either.
+        note_buffer_released(0, 9_002, gndrm_uapi::wire::RELEASE_FENCE);
+        let parked = crate::proxy::monotonic_ns() + 1;
+        assert!(!take_released(9_002, parked, 0));
+        assert!(!take_released(9_002, 0, 0));
+
+        // An inode of 0 is never a registered buffer.
+        note_buffer_released(0, 0, gndrm_uapi::wire::RELEASE_FENCE);
+        assert!(!take_released(0, 0, 0));
+    }
+
+    /// A ticket pairs the note to its frame when the inode cannot, which is the
+    /// case this whole path exists for: on Nova, Portal 2 paired 94 % of parks by
+    /// inode and Dave paired 84 % by order on the same device.
+    #[test]
+    fn a_ticket_pairs_a_note_whose_inode_is_another_buffer() {
+        let _serial = fresh_notes();
+        // The daemon says "ticket 7 is done", naming a buffer this process never
+        // held — exactly what Odin 3 reports (`slot ino=11411`, `released=[11366
+        // 11368 11370]`).
+        crate::scanout::note_buffer_released(7, 11_366, gndrm_uapi::wire::RELEASE_FENCE);
+        assert!(!take_released(11_411, 0, 0), "the inode matches nothing");
+        assert!(take_released_ticket(7), "the ticket still frees its slot");
+        assert!(!take_released_ticket(7), "and is consumed by it");
+        // A note with no ticket is left for the inode path.
+        crate::scanout::note_buffer_released(0, 11_366, gndrm_uapi::wire::RELEASE_FENCE);
+        assert!(!take_released_ticket(0), "no ticket, no ticket match");
+        assert!(take_released(11_366, 0, 0), "but the inode path still has it");
+    }
+
+    /// A note naming an earlier frame than the park's cannot answer it by inode
+    /// or by order; a note naming a later frame still can.
+    #[test]
+    fn a_note_for_an_earlier_ticket_does_not_answer_a_later_park() {
+        let _serial = fresh_notes();
+        // Buffer 5 000 parked as ticket 10, expired, committed again as 13: the
+        // late note for 10 names the same buffer and must not free 13.
+        note_buffer_released(10, 5_000, gndrm_uapi::wire::RELEASE_FENCE);
+        assert!(!take_released(5_000, 0, 13), "a stale note for the same buffer");
+        assert!(!take_any_released(0, 13), "and it was dropped, not left for order");
+
+        // A note for a commit that was never parked (ticket 20), with the oldest
+        // park at 21: skipped by order, while a note for 22 behind it pays.
+        note_buffer_released(20, 6_000, gndrm_uapi::wire::RELEASE_FENCE);
+        note_buffer_released(22, 6_001, gndrm_uapi::wire::RELEASE_FENCE);
+        assert!(take_any_released(0, 21), "the newer note answers the older park");
+        assert!(!take_any_released(0, 21), "the older note does not");
+        assert!(take_released_ticket(20), "and is still there for its own ticket");
+    }
+
+    /// Its own note, not one an earlier test happened to leave: the suite runs
+    /// these in parallel, so a test that reads a static another test writes is a
+    /// test that passes by scheduler luck.
+    /// Serialises the tests that inject and consume release notes: `RELEASED` is a
+    /// process-wide queue, so two of them running at once consume each other's
+    /// notes and pass or fail by scheduler luck.
+    static NOTE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Empty the queue so a test starts from a known state whatever ran before.
+    fn fresh_notes() -> std::sync::MutexGuard<'static, ()> {
+        let g = NOTE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        RELEASED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        g
+    }
+
+    /// A note that names no parked slot is still usable by order: notes arrive one
+    /// per commit, so the oldest outstanding one belongs to the oldest outstanding
+    /// frame. This is the Odin 3 path — `slot ino=11411` against
+    /// `released=[11366 11368 11370]`.
+    #[test]
+    fn a_note_can_be_taken_by_order_when_its_inode_matches_nothing() {
+        let _serial = fresh_notes();
+        // Notes for buffers the caller will never ask about, newest last.
+        for ino in 8_001..=8_003u64 {
+            note_buffer_released(0, ino, gndrm_uapi::wire::RELEASE_FENCE);
+        }
+        // Identity never matches this ino, so the slot would wait out its bound.
+        assert!(!take_released(9_999, 0, 0), "no note names this inode");
+        // By order the oldest note is spent, and only one per call.
+        assert!(take_any_released(0, 0), "the oldest note is available");
+        assert!(take_any_released(0, 0));
+        assert!(take_any_released(0, 0));
+        assert!(!take_any_released(0, 0), "and the list is spent");
+    }
+
+    /// A note may be up to one display period older than the park's commit — the
+    /// note for a frame rides the latch of the frame that replaced it — and no
+    /// more.
+    #[test]
+    fn a_note_more_than_one_period_older_than_the_commit_is_not_taken() {
+        let _serial = fresh_notes();
+        let hz = u64::from(super::super::lsfg::panel_hz().max(1));
+        let period = 1_000_000_000 / hz;
+        note_buffer_released(0, 8_500, gndrm_uapi::wire::RELEASE_FENCE);
+        // Parked two periods after the note: out of the margin, and dropped.
+        let parked = crate::proxy::monotonic_ns() + 2 * period;
+        assert!(!take_any_released(parked, 0), "older than one frame");
+        assert!(!take_any_released(parked, 0), "and it is dropped, not kept");
+
+        // Within the margin it is usable: that is the case the floor exists for.
+        note_buffer_released(0, 8_501, gndrm_uapi::wire::RELEASE_FENCE);
+        let within = crate::proxy::monotonic_ns() + period / 2;
+        assert!(take_any_released(within, 0), "inside the one-frame margin");
+    }
+
+    #[test]
+    fn release_notes_are_bounded_and_observed() {
+        let _serial = fresh_notes();
+        note_buffer_released(0, 6_999, gndrm_uapi::wire::RELEASE_FENCE);
+        assert!(release_notes_live(), "the note above is recorded");
+        for ino in 0..(RELEASED_CAP as u64 + 8) {
+            note_buffer_released(0, 7_000 + ino, gndrm_uapi::wire::RELEASE_FENCE);
+        }
+        let held = RELEASED.lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert!(held <= RELEASED_CAP, "held {held} of at most {RELEASED_CAP}");
+    }
+
 
     /// Bind a `SOCK_SEQPACKET` listener on the abstract namespace, the way the
     /// daemon's scan-out acceptor does.
@@ -891,6 +1274,17 @@ mod tests {
                 // The daemon answers a subscribe with the current target, ahead
                 // of any reply: a note where a reply would be expected.
                 send_bare(conn, &FrameCapNote { fps: 120 }.encode());
+                // And the release watcher pushes whenever a fence signals.
+                send_bare(
+                    conn,
+                    &BufferReleased {
+                        ticket: 4_242,
+                        ino: 4_243,
+                        latch_ns: 0,
+                        source: gndrm_uapi::wire::RELEASE_FENCE,
+                    }
+                    .encode(),
+                );
                 let mut buf = [0u8; ScanoutAllocReq::LEN];
                 let n = libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0);
                 assert_eq!(n as usize, ScanoutAllocReq::LEN);
@@ -914,6 +1308,7 @@ mod tests {
             }
         });
 
+        let _serial = fresh_notes();
         let fd = connect(&name);
         assert!(fd >= 0, "connect: {}", std::io::Error::last_os_error());
         let got = exchange(fd, 1280, 960)
@@ -923,6 +1318,9 @@ mod tests {
         assert_eq!(got.ino, ino);
         // The note ahead of the reply set the target.
         assert_eq!(target_fps(), 120);
+        // The release note ahead of the reply was queued, not taken for a dead
+        // channel.
+        assert!(take_released_ticket(4_242));
         // SAFETY: the received descriptor and the connection are live.
         unsafe {
             libc::close(got.fd);
@@ -930,38 +1328,11 @@ mod tests {
         }
     }
 
-    /// The acquire schedule: one period after the previous start, never closer,
-    /// and never later than the guest's own next frame when it is slower.
+    /// The cap's period is truncated, never rounded up past `1 / target`, and no
+    /// cap has none. The schedule built on it lives in `crate::vsync_gate`.
     #[test]
-    fn the_cadence_does_not_carry_the_wakeup_overshoot() {
-        let period = 16_666_666;
-        let first = next_acquire_after(0, 1_000_000_000, period);
-        assert_eq!(first, 1_016_666_666);
-        // The wait returned 150 us late: the next deadline is still one period on.
-        let second = next_acquire_after(first, first + 150_000, period);
-        assert_eq!(second, first + period);
-        // A whole period late: no debt.
-        let third = next_acquire_after(second, second + period + 5_000_000, period);
-        assert_eq!(third, second + period + 5_000_000 + period);
-    }
-
-    #[test]
-    fn the_acquire_schedule_spaces_frame_starts() {
-        let period = period_ns(40);
-        assert_eq!(period, 25_000_000);
-        // The first acquire schedules the next one a period later.
-        let first = next_acquire_after(0, 1_000_000_000, period);
-        assert_eq!(first, 1_025_000_000);
-        // A guest faster than the target: every start is exactly one period on.
-        assert_eq!(next_acquire_after(first, 1_001_000_000, period), 1_050_000_000);
-        assert_eq!(next_acquire_after(1_050_000_000, 1_002_000_000, period), 1_075_000_000);
-        // A guest slower than the target keeps its own rate: the gate is a lower
-        // bound, not a delay.
-        assert_eq!(next_acquire_after(1_075_000_000, 1_200_000_000, period), 1_225_000_000);
-        // No cap: the schedule is left alone, so enabling one later does not
-        // inherit a stale deadline.
-        assert_eq!(next_acquire_after(1_225_000_000, 5, 0), 1_225_000_000);
-        // A period is truncated, never rounded up past `1 / target`.
+    fn a_caps_period_is_truncated_and_no_cap_has_none() {
+        assert_eq!(period_ns(40), 25_000_000);
         assert_eq!(period_ns(FPS_UNCAPPED), 0);
         assert_eq!(period_ns(3), 333_333_333);
     }

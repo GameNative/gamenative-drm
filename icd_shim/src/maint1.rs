@@ -28,7 +28,7 @@
 //! `VkSwapchainPresentModeInfo` to switch between the modes it listed at
 //! creation; today the compatibility answer lists one mode, so a conforming
 //! guest never asks, and a request for another mode is logged once and ignored.
-//! Serving it means feeding the requested mode into `effective_present_mode` /
+//! Serving it means feeding the requested mode into `guest_present_mode` /
 //! `live_present_mode` and the cap gate's FIFO-versus-mailbox rule per present
 //! (docs/15), which is the pacing-sensitive part and gets its own change. The
 //! same follow-up may take `VK_KHR_present_id2` / `VK_KHR_present_wait2`

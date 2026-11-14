@@ -534,12 +534,14 @@ impl FrameCapNote {
 /// The daemon latches the capability for the connection and answers with the
 /// current target as a [`FrameCapNote`]; it pushes the same note again whenever
 /// the target changes. `caps` is a bitmask of what the shim can honour:
-/// [`CAP_FRAME_CAP`] and [`CAP_VSYNC_NOTE`]. A shim that never sends this is sent no
+/// [`CAP_FRAME_CAP`], [`CAP_VSYNC_NOTE`], [`CAP_PRESENT_ID`] and
+/// [`CAP_RELEASE_NOTE`]. A shim that never sends this is sent no
 /// [`FrameCapNote`] -- one frame per request, as before -- which is what keeps an
 /// older shim on the channel it expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameCapSubscribe {
-    /// Capability bits: [`CAP_FRAME_CAP`], [`CAP_VSYNC_NOTE`].
+    /// Capability bits: [`CAP_FRAME_CAP`], [`CAP_VSYNC_NOTE`], [`CAP_PRESENT_ID`],
+    /// [`CAP_RELEASE_NOTE`].
     pub caps: u32,
 }
 
@@ -670,20 +672,33 @@ pub const CAP_PRESENT_ID: u32 = 1 << 2;
 
 /// A frame's present id, shim -> daemon.
 ///
-/// Encoded little-endian, 24 bytes:
-/// `magic:u32, reserved:u32, ino:u64, id:u64`. `ino` is the scan-out inode the
-/// frame's slot was allocated from; `id` is the present id the guest chained in
-/// `VkPresentIdKHR`.
+/// Encoded little-endian, 32 bytes:
+/// `magic:u32, reserved:u32, ino:u64, id:u64, ticket:u64`. `ino` is the
+/// scan-out inode the frame's slot was allocated from; `id` is the present id
+/// the guest chained in `VkPresentIdKHR`, 0 when it chained none.
+///
+/// `ticket` is the shim's own monotonic id for this commit, and it is the
+/// pairing key for every note that follows. Not `ino`: an inode is a property of
+/// the dma-buf the *allocator* handed out, and it survives only while gralloc
+/// hands the same object through to `SurfaceFlinger` — which it does on one device
+/// and not on the next, and, measured on Nova, for one title and not another
+/// (6 % of parks paired by identity on Portal 2, 84 % by order on Dave). Not
+/// `id`: most guests never chain a present id, so it is 0 on every frame of a
+/// session that does not use `VK_KHR_present_id`. A ticket always exists, is
+/// unique for the session, and cannot be recycled into a live slot the way a
+/// freed dma-buf's inode can.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PresentMark {
     /// The scan-out inode of the buffer being committed.
     pub ino: u64,
-    /// The guest's present id for this frame.
+    /// The guest's present id for this frame, 0 when it chained none.
     pub id: u64,
+    /// The shim's own id for this commit: monotonic, never reused.
+    pub ticket: u64,
 }
 
 impl PresentMark {
-    pub const LEN: usize = 24;
+    pub const LEN: usize = 32;
 
     #[must_use]
     pub fn encode(self) -> [u8; Self::LEN] {
@@ -691,6 +706,7 @@ impl PresentMark {
         b[0..4].copy_from_slice(&PRESENT_MARK_MAGIC.to_le_bytes());
         b[8..16].copy_from_slice(&self.ino.to_le_bytes());
         b[16..24].copy_from_slice(&self.id.to_le_bytes());
+        b[24..32].copy_from_slice(&self.ticket.to_le_bytes());
         b
     }
 
@@ -702,9 +718,42 @@ impl PresentMark {
         Some(Self {
             ino: u64::from_le_bytes(b[8..16].try_into().ok()?),
             id: u64::from_le_bytes(b[16..24].try_into().ok()?),
+            ticket: u64::from_le_bytes(b[24..32].try_into().ok()?),
         })
     }
 }
+
+/// The largest frame the daemon reads from a shim connection.
+///
+/// Every inbound type must fit, because `SOCK_SEQPACKET` preserves boundaries but
+/// **truncates a frame to the receive buffer and discards the rest** — so a reader
+/// sized for the wrong type does not fail, it silently drops the message. That is
+/// what happened when [`PresentMark`] grew to carry the ticket: the daemon still
+/// read into `ScanoutAllocReq::LEN` (24), every 32-byte mark arrived truncated,
+/// `decode` returned `None`, and the marks never reached `note_present_mark` —
+/// measured on RP6 as `sf mark: hit=0 order=0 miss=3 skew=0 pending=0 last=0` with
+/// `tick=[n:0]` on every census line, i.e. the ticket mechanism was inert on every
+/// device while looking no different from a daemon that does not send tickets.
+///
+/// Derived from the types rather than written as a number, so a struct that grows
+/// past it is a compile-time failure at the `const` rather than a silent drop at
+/// runtime. `INBOUND_MAX` is enforced by a test in this module.
+pub const INBOUND_MAX: usize = {
+    let mut m = ScanoutAllocReq::LEN;
+    if FrameCapSubscribe::LEN > m {
+        m = FrameCapSubscribe::LEN;
+    }
+    if FrameAcquired::LEN > m {
+        m = FrameAcquired::LEN;
+    }
+    if PresentMark::LEN > m {
+        m = PresentMark::LEN;
+    }
+    if LsfgConfig::LEN > m {
+        m = LsfgConfig::LEN;
+    }
+    m
+};
 
 /// A completed present, daemon -> shim.
 ///
@@ -740,6 +789,95 @@ impl PresentDone {
         Some(Self {
             id: u64::from_le_bytes(b[8..16].try_into().ok()?),
             latch_ns: u64::from_le_bytes(b[16..24].try_into().ok()?),
+        })
+    }
+}
+
+/// Buffer-released magic: ASCII "GNBR". Daemon -> shim, on the scan-out channel.
+///
+/// The daemon reports that `SurfaceFlinger` has finished reading a scan-out
+/// buffer, so the producer may write into it again. Only a connection that
+/// declared [`CAP_RELEASE_NOTE`] is sent one.
+///
+/// This is the one thing the producer cannot learn from the compositor: a
+/// compositor hands a buffer back when it has finished *compositing* with it,
+/// which is before the display has finished *scanning* it out. The daemon sees
+/// the difference — `SurfaceFlinger` reports the released buffer's fence in the
+/// completion of the transaction that replaced it — and reports it here.
+pub const BUFFER_RELEASED_MAGIC: u32 = 0x474E_4252;
+
+/// The `caps` bit a [`FrameCapSubscribe`] sets when the shim gates reuse of a
+/// scan-out buffer on [`BufferReleased`]. A daemon pushes no release note to a
+/// connection that did not set it.
+pub const CAP_RELEASE_NOTE: u32 = 1 << 3;
+
+/// A scan-out buffer `SurfaceFlinger` is finished with, daemon -> shim.
+///
+/// Encoded little-endian, 40 bytes:
+/// `magic:u32, reserved:u32, ticket:u64, ino:u64, latch_ns:u64, source:u64`.
+///
+/// `ticket` is the [`PresentMark`] ticket of the frame this buffer carried, and
+/// it is what the shim frees the slot by. It was the one message of the three
+/// that did not carry the token, and every arm of the shim's park existed to
+/// compensate: identity matching on an inode the allocator decides, an order
+/// fallback with a reorder window and a one-period floor, and a bound derived
+/// from the very interval it governed.
+///
+/// `source` says what the release rests on, so a session can tell "the fence
+/// signalled" from "the fence never signalled and we gave up" from "there was
+/// nothing to watch" — which is exactly the distinction that was invisible on
+/// RP6, where 198 notes arrived with no latch time and the census read the same
+/// as a device with no producer at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferReleased {
+    /// The shim's own ticket for the frame, 0 when the mark carried none.
+    pub ticket: u64,
+    /// The scan-out inode of the buffer that may be written again.
+    pub ino: u64,
+    /// The panel's latch time for the frame, 0 when the platform reported none.
+    pub latch_ns: u64,
+    /// What the release rests on; one of the `RELEASE_*` values.
+    pub source: u64,
+}
+
+/// `source`: `SurfaceFlinger`'s release fence signalled.
+pub const RELEASE_FENCE: u64 = 0;
+/// `source`: the fence did not signal within the watcher's budget, so the buffer
+/// was reported released anyway — the compositor is stuck, and holding the
+/// producer behind it would be a hang rather than a tear.
+pub const RELEASE_FENCE_TIMEOUT: u64 = 1;
+/// `source`: the pool copied into the buffer, so nothing outside holds it and
+/// there was no fence to watch.
+pub const RELEASE_POOL_COPY: u64 = 2;
+/// `source`: a buffer no subscription was watching, reported so the shim learns
+/// the buffer is free rather than inferring it from silence.
+pub const RELEASE_UNWATCHED: u64 = 3;
+
+impl BufferReleased {
+    pub const LEN: usize = 40;
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[0..4].copy_from_slice(&BUFFER_RELEASED_MAGIC.to_le_bytes());
+        b[8..16].copy_from_slice(&self.ticket.to_le_bytes());
+        b[16..24].copy_from_slice(&self.ino.to_le_bytes());
+        b[24..32].copy_from_slice(&self.latch_ns.to_le_bytes());
+        b[32..40].copy_from_slice(&self.source.to_le_bytes());
+        b
+    }
+
+    #[must_use]
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN || u32::from_le_bytes(b[0..4].try_into().ok()?) != BUFFER_RELEASED_MAGIC
+        {
+            return None;
+        }
+        Some(Self {
+            ticket: u64::from_le_bytes(b[8..16].try_into().ok()?),
+            ino: u64::from_le_bytes(b[16..24].try_into().ok()?),
+            latch_ns: u64::from_le_bytes(b[24..32].try_into().ok()?),
+            source: u64::from_le_bytes(b[32..40].try_into().ok()?),
         })
     }
 }
@@ -842,6 +980,12 @@ pub struct LsfgConfig {
     /// with the settings because the presenter runs in the app's process, where
     /// the container's environment is not present.
     pub dll: [u8; LSFG_DLL_PATH_MAX],
+    /// The present mode generation is served with: 0 = mailbox, 1 = fifo. The
+    /// `QuickMenu` offers those two and nothing else, because a generated frame
+    /// cannot be told apart from a tear if it is flipped mid-scan, so
+    /// `IMMEDIATE` is never a legal value here and an unknown one falls back to
+    /// mailbox.
+    pub present_mode: u32,
     /// The panel's refresh in millihertz. The engine paces against it and clamps
     /// its generations to what the display can afford (`floor(refresh/source)`
     /// frames per source frame); zero means unknown, which leaves it unclamped.
@@ -857,13 +1001,21 @@ impl Default for LsfgConfig {
             performance: 0,
             fps_limit: 0,
             dll: [0; LSFG_DLL_PATH_MAX],
+            present_mode: 0,
             refresh_mhz: 0,
         }
     }
 }
 
 impl LsfgConfig {
-    pub const LEN: usize = 24 + LSFG_DLL_PATH_MAX + 4;
+    pub const LEN: usize = 24 + LSFG_DLL_PATH_MAX + 8;
+
+    /// The present mode generation is served with, as the two values the
+    /// `QuickMenu` offers. Anything unknown is mailbox.
+    #[must_use]
+    pub fn generating_present_mode(&self) -> u32 {
+        u32::from(self.present_mode == 1)
+    }
 
     /// The DLL path as a string, or `None` when it is empty.
     #[must_use]
@@ -906,7 +1058,9 @@ impl LsfgConfig {
         b[16..20].copy_from_slice(&self.performance.to_le_bytes());
         b[20..24].copy_from_slice(&self.fps_limit.to_le_bytes());
         b[24..24 + LSFG_DLL_PATH_MAX].copy_from_slice(&self.dll);
-        b[24 + LSFG_DLL_PATH_MAX..].copy_from_slice(&self.refresh_mhz.to_le_bytes());
+        b[24 + LSFG_DLL_PATH_MAX..24 + LSFG_DLL_PATH_MAX + 4]
+            .copy_from_slice(&self.present_mode.to_le_bytes());
+        b[24 + LSFG_DLL_PATH_MAX + 4..].copy_from_slice(&self.refresh_mhz.to_le_bytes());
         b
     }
 
@@ -927,7 +1081,14 @@ impl LsfgConfig {
                 dll.copy_from_slice(&b[24..24 + LSFG_DLL_PATH_MAX]);
                 dll
             },
-            refresh_mhz: u32::from_le_bytes(b[24 + LSFG_DLL_PATH_MAX..].try_into().ok()?),
+            present_mode: u32::from_le_bytes(
+                b[24 + LSFG_DLL_PATH_MAX..24 + LSFG_DLL_PATH_MAX + 4]
+                    .try_into()
+                    .ok()?,
+            ),
+            refresh_mhz: u32::from_le_bytes(
+                b[24 + LSFG_DLL_PATH_MAX + 4..].try_into().ok()?,
+            ),
         })
     }
 }
@@ -935,6 +1096,31 @@ impl LsfgConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every inbound frame must fit the reader's buffer.
+    ///
+    /// On `SOCK_SEQPACKET` a receive buffer shorter than the frame truncates it
+    /// and discards the rest, so the reader does not fail — it silently drops the
+    /// message. That is how the ticket never reached the presenter: `PresentMark`
+    /// grew to 32 bytes and the daemon still read into `ScanoutAllocReq::LEN`
+    /// (24), which measured as `sf mark: hit=0 order=0 miss=3 skew=0 pending=0`
+    /// and `tick=[n:0]` on every census line, with the code looking correct at
+    /// both ends.
+    #[test]
+    fn every_inbound_frame_fits_the_readers_buffer() {
+        for len in [
+            ScanoutAllocReq::LEN,
+            FrameCapSubscribe::LEN,
+            FrameAcquired::LEN,
+            PresentMark::LEN,
+            LsfgConfig::LEN,
+        ] {
+            assert!(
+                len <= INBOUND_MAX,
+                "an inbound frame of {len} bytes does not fit INBOUND_MAX {INBOUND_MAX}"
+            );
+        }
+    }
 
     #[test]
     fn vsync_note_round_trips_and_rejects_other_magics() {
@@ -1199,6 +1385,74 @@ mod tests {
         );
         for other in ["", "RGBA", "1", "5", "rgba "] {
             assert_eq!(ScanoutLayout::from_env_value(other), None);
+        }
+    }
+
+    #[test]
+    fn buffer_released_round_trip() {
+        let note = BufferReleased {
+            ticket: 0xfeed,
+            ino: 0x1234_5678_9abc,
+            latch_ns: 0x99,
+            source: RELEASE_FENCE_TIMEOUT,
+        };
+        let enc = note.encode();
+        assert_eq!(enc.len(), BufferReleased::LEN);
+        assert_eq!(enc[0..4], BUFFER_RELEASED_MAGIC.to_le_bytes());
+        assert_eq!(BufferReleased::decode(&enc), Some(note));
+
+        // Its magic is its own, and it decodes to nothing else on the channel:
+        // every push shares the socket, so a shape read as another is a note
+        // applied to the wrong thing.
+        for other in [
+            SCANOUT_MAGIC,
+            FRAME_CAP_MAGIC,
+            FRAME_CAP_SUBSCRIBE_MAGIC,
+            PRESENT_MARK_MAGIC,
+            PRESENT_DONE_MAGIC,
+            VSYNC_MAGIC,
+        ] {
+            assert_ne!(BUFFER_RELEASED_MAGIC, other);
+        }
+        assert_eq!(BufferReleased::decode(&[0u8; BufferReleased::LEN]), None);
+        assert_eq!(BufferReleased::decode(&[]), None);
+        let mut short = note.encode().to_vec();
+        short.truncate(BufferReleased::LEN - 1);
+        assert_eq!(BufferReleased::decode(&short), None);
+        // An inode of 0 is never a buffer the daemon registered, so a zeroed
+        // note cannot be mistaken for a real release.
+        assert_eq!(
+            BufferReleased::decode(
+                &BufferReleased {
+                    ticket: 0,
+                    ino: 0,
+                    latch_ns: 0,
+                    source: RELEASE_FENCE
+                }
+                .encode()
+            ),
+            Some(BufferReleased {
+                ticket: 0,
+                ino: 0,
+                latch_ns: 0,
+                source: RELEASE_FENCE
+            })
+        );
+    }
+
+    #[test]
+    fn release_note_cap_is_its_own_bit() {
+        // Every cap bit is distinct: the shim declares what it honours in one
+        // mask, and a shared bit would have it honour a push it cannot read.
+        for (a, b) in [
+            (CAP_FRAME_CAP, CAP_VSYNC_NOTE),
+            (CAP_FRAME_CAP, CAP_PRESENT_ID),
+            (CAP_FRAME_CAP, CAP_RELEASE_NOTE),
+            (CAP_VSYNC_NOTE, CAP_PRESENT_ID),
+            (CAP_VSYNC_NOTE, CAP_RELEASE_NOTE),
+            (CAP_PRESENT_ID, CAP_RELEASE_NOTE),
+        ] {
+            assert_ne!(a, b);
         }
     }
 

@@ -113,6 +113,7 @@ pub mod advertise;
 pub mod divisor;
 pub mod export;
 pub mod image_count;
+pub(crate) mod limits;
 pub mod placed;
 pub mod present;
 pub mod lsfg;

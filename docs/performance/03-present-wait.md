@@ -231,8 +231,8 @@ fn present_wait_answer(route, why, requested, live) -> WaitAnswer
 ```
 
 with `wait_policy()` reading `GN_VKSHIM_PRESENT_WAIT ∈ {queue, commit, release}`, default
-`queue`, parsed once at first present (same shape as `parse_present_mode_override`,
-`proxy.rs:7181`). `route`, `why`, `requested`, `live` stay in the signature so the
+`queue`, parsed once at first present (the shape `parse_present_mode_override` used
+before `refactor/vsync` deleted it). `route`, `why`, `requested`, `live` stay in the signature so the
 `commit`/`release` arms remain exactly today's behaviour and the existing table test
 (`proxy.rs:7124`–`:7167`) keeps its meaning by being run under `Commit`.
 Reason to keep three arms: §4 risks 1, 3 and 5 all need a per-container revert without a

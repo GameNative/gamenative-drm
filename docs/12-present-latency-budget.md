@@ -21,6 +21,55 @@ emitted with the publish, so a paced frame's present does not wait it out.
 Buffer reuse still rides it — the next publish onto a slot waits on the previous
 release fence the completion stored.
 
+## SurfaceFlinger's hold on a buffer (which release rule is safe)
+
+The page-flip event says the frame was *published*, not that SurfaceFlinger has
+finished with it. A producer handed its buffer at that event may still be
+writing into a buffer on the panel — a scan-out tear, and one no screen
+recording can show, because the buffer is repainted before anything reads it
+again. Deferring the release by one flip removes the tear by removing a buffer
+from every producer: a 3-image swapchain keeps one in flight instead of two, so
+a producer can no longer run ahead of the flip and a late frame has no cushion.
+
+SurfaceFlinger's own release fence is the exact answer, and the daemon already
+receives it. `ASurfaceTransactionStats_getPreviousReleaseFenceFd` reports, in the
+completion of a transaction, the fence of the buffer that transaction
+**replaced** — not the one it published:
+
+```
+publish X, which replaces W   ──▶  completion reports W's fence
+                                   ▼
+                            fence signals: W is free
+```
+
+So the fence is filed on W's mailbox (`ReleaseCtx::replaced_ctx`) rather than on
+the publisher's — that attribution is what makes it usable at all — and it is
+waited on off the completion thread. Two things use it:
+
+- the publish that reuses W waits on it before applying, so the pool never
+  republishes a buffer the panel is still reading;
+- a watcher thread waits on it and pushes `BufferReleased` (`CAP_RELEASE_NOTE`)
+  carrying W's scan-out inode. A shim that declares the cap keeps that slot busy
+  until the note arrives: the compositor's `wl_buffer.release` only parks it.
+
+A producer the shim does not render for — the guest's own GL blits through
+Xwayland — reads no notes, and for that class the deferral above is the only
+lever.
+
+`sf hold:` measures the hold where it ends: the watcher samples the gap from the
+released buffer's latch to the instant its fence signals.
+
+```
+gndrm-daemon: sf hold: n=<samples> <half=<n> half-one=<n> one-1.5=<n> 1.5-2.5=<n> over-2.5=<n> max=<us>us period=<us>us timeouts=<n>
+```
+
+Buckets are halves of one display period, and the period is the latch grid's own
+(median of the last nine accepted gaps; a gap outside 3–50 ms is a burst or a
+stall, not a period). `one-1.5` and above is the share a one-flip deferral does
+**not** cover. `timeouts` counts fences that reached `RELEASE_WATCH_MAX` (500 ms)
+without signalling — the release is reported anyway, so a stuck compositor
+delays a producer instead of hanging it. One line per 10 s.
+
 ## Why the event is emitted with the publish
 
 `commit_worker_loop` emits the page-flip event immediately after the publish
@@ -44,9 +93,9 @@ into every paced frame.
 
 Buffer-reuse safety is unchanged: the scan-out pool still caches a buffer for
 reuse only once the presenter reports SurfaceFlinger's completion (the slot's
-`latched` flag), and the next publish still blocks on the previous release
-fence. Only the *event* — a pacing/visibility signal to the client — stops
-carrying the round trip.
+`latched` flag), and the publish that reuses a buffer still waits on that
+buffer's own release fence. Only the *event* — a pacing/visibility signal to the
+client — stops carrying the round trip.
 
 ## Measured effect
 
@@ -61,11 +110,18 @@ The paced path meets its target, and the
 uncapped rate is bounded upstream — the client's own present lap through the
 ICD shim to gamescope — not by the flip-event path.
 
-### The FIFO declaration is not the throughput cost
+### The FIFO declaration is not the throughput cost, and not a limiter
 
 The shim's per-commit `swapchain_set_present_mode(FIFO)` declaration does not
-bound the uncapped rate — removing both sites left it unchanged. It stays in the
-tree: the request/divisor cap needs it.
+bound the uncapped rate — removing both sites left it unchanged.
+
+It is not a limiter either, and the gate no longer stands down for it.
+gamescope's `steamcompmgr_should_vblank_window` withholds the window's frame
+callback, and this shim never requests one; the divisor also only acts when the
+cap is below the refresh AND divides it. A FIFO guest at 60 on a 60 Hz panel, or
+at 40 on 60 Hz, therefore had no cap at all — measured as a 26 fps Dishonored
+session whose Target FPS did nothing. Every declaration is gated now; gamescope's
+divisor is left as the pacer for content the shim does not present.
 
 ## The X11 arm as a control — pacing is deadline/timer-based, not deferral
 
@@ -96,6 +152,8 @@ number into the arm asymmetry from this.
 
 ## What is NOT proven / open
 
+- `sf hold:` has no device capture yet: the buckets say which release rule is
+  sufficient, and nothing has read them on hardware.
 - The uncapped ceiling (~259 /s on this scene) is **not** the flip-event path;
   it is the client↔gamescope lap (`vkAcquireNextImageKHR` in the ICD shim
   blocking on the compositor's `wl_buffer.release`). Not measured end to end;

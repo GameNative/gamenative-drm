@@ -46,10 +46,19 @@ static STRICT_GAMES: &[Match] = &[
     Match::AppName("DetroitBecomeHuman"),
 ];
 
-/// The hidden slots behind a strict game's swapchain. A swapchain of 3 or more
-/// already has an image to spare, so it gets none. Below that it gets the frame on
-/// screen, the one committed behind it, and one for each of the two frames the guest
-/// can have between its present and the commit.
+/// The hidden slots behind a swapchain that asked for fewer than three images.
+///
+/// A swapchain of 3 or more already has an image to spare, so it gets none. Below
+/// that it gets the frame on screen, the one committed behind it, and one for each
+/// of the two frames the guest can have between its present and the commit.
+///
+/// The rule is the ask, not the game. It began as the strict list's exception, but
+/// the need is a property of the count: a guest with two images cannot pipeline
+/// past the hold the display imposes (`min(cap, depth x refresh / hold)`), and Doom
+/// 2016 measured 24 fps against a cap of 60 with the GPU idle before it had any.
+/// The caller must pass the guest's *requested* count, never the served one: a
+/// mailbox floor can raise the served count past the ask, and a guest that asked
+/// for two has no image to spare however many it was given.
 pub fn hidden_slot_count(guest_slots: u32) -> u32 {
     if guest_slots < 3 {
         4
@@ -164,7 +173,10 @@ mod tests {
 
     #[test]
     fn only_a_swapchain_with_no_image_to_spare_gets_hidden_slots() {
+        // Doom 2016 asks for two and is served mailbox, which floors the count at
+        // four; the ring is sized from the ask, so this is the case that matters.
         assert_eq!(hidden_slot_count(2), 4);
+        // Three already has one to spare, and a larger ask needs nothing.
         assert_eq!(hidden_slot_count(3), 0);
     }
 

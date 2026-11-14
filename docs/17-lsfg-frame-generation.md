@@ -79,22 +79,18 @@ two commits fall inside one period and the first is replaced before it is shown,
 and a rate above the panel's (60 × 3 on a 120 Hz panel) drops frames in a
 drifting pattern. Three rules keep one frame per period, in order:
 
-- **Multiplier.** A batch generates `multiplier - 1` frames and the source frame
-  after them, one batch per acquired source frame, so the session produces
-  `cap × multiplier` frames whatever the display can latch: a 40 cap at x4 on a
-  120 Hz panel produces 160 and the panel shows 120 of them. Generation is not
-  capped by the panel: the mode is the display's rate and never moves for a cap or
-  a multiplier, so capping the output by it would only make x4 at 40 read 120 and
-  say nothing about what the session was doing. The rate is the user's cap, or
-  the measured source interval without one (a source hovering at the threshold,
-  64 fps on 120 Hz, flips between x2 and none from batch to batch), and the
-  display never reshapes it: a 40 cap runs 40 acquires a second on a 60 Hz panel
-  as much as on a 120 Hz one, and the multiplier decides what is generated on
-  top. The source rate is held by the acquire gate on the cap's own clock
-  (`scanout::next_acquire_after`, `gate=clock` in the census), not on the
-  display's vblank grid: the vblank-grid gate of `docs/10` covers a cap without
-  frame generation only, and generated frames are placed on the latch grid
-  below. The panel's rate is the one the app reported (`LsfgConfig.refresh_mhz`),
+- **Multiplier.** A batch generates up to `multiplier - 1` frames and the source
+  frame after them, one batch per acquired source frame, so the session produces
+  `acquire × multiplier` frames: a 40 limit at x4 on a 120 Hz panel produces 160
+  and the panel shows 120 of them. Both numbers are `icd_shim/src/limits.rs`'s
+  answer (`docs/10`): the acquire rate is the user's cap, or `refresh / multiplier`
+  without one, and the generated ceiling is `acquire × (m−1)` — clamped to the
+  panel's rate on a synced present mode, unclamped when the guest asked for
+  immediate or mailbox. A ceiling that is not a whole number of frames per source
+  frame is floored: 40 × 4 on a 60 Hz panel allows 60 generated a second, which is
+  one per source frame. The source rate is held by the acquire gate on its own
+  clock (`gate=clock` in the census), because the batches are placed on the latch
+  grid below. The panel's rate is the one the app reported (`LsfgConfig.refresh_mhz`),
   not a measurement: while the daemon is the only thing publishing, the latch
   samples are spaced by its own rate, so a panel SurfaceFlinger runs below that
   rate (an LTPO panel that dropped to 60 Hz) is still paced at the reported rate
@@ -171,3 +167,12 @@ being created — the feature has to be on the device the pipelines are built on
 - Frame generation for X11 sessions: `legacy` and `native` keep that path.
 - Sharing one engine copy between GameNative and this repo: the copies are
   independent, so an algorithm fix has to be applied in both.
+
+## The served mode with generation on
+
+Generation has exactly two permitted declares: `MAILBOX` and `FIFO`, and which of
+them is served follows the user's QuickMenu setting rather than a hardcoded
+choice. `MAILBOX` is the default because the generated frame must replace the
+pending one rather than queue behind it; `FIFO` is the option for a session that
+wants the output paced by the panel with no drops. `IMMEDIATE` is never served
+here — generation cannot be told apart from a tear if frames are flipped mid-scan.

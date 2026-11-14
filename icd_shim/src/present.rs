@@ -21,7 +21,7 @@
 //! bounded: a guest that marks frames and never waits cannot grow them.
 
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -55,10 +55,9 @@ struct Waits {
     /// answered is two refresh periods after that. `(id, swapchain, ns)`.
     committed: Vec<(u64, usize, u64)>,
     /// Commits that asked gamescope for presentation feedback that has not
-    /// arrived: only `presented` / `discarded` answers them (or, should it
-    /// never come, [`FEEDBACK_SAFETY_NS`] after the commit). `(token, id,
-    /// swapchain)`; the token is the feedback listener's data, unique per
-    /// request.
+    /// arrived: `presented` / `discarded` answers them, and so does the
+    /// two-period grace its frame's commit carries. `(token, id, swapchain)`;
+    /// the token is the feedback listener's data, unique per request.
     feedback: Vec<(u64, u64, usize)>,
 }
 
@@ -76,16 +75,48 @@ static WAITS: Mutex<Waits> = Mutex::new(Waits {
     feedback: Vec::new(),
 });
 
-/// How long after its commit an id whose feedback never came is answered
-/// anyway: far beyond any presentation gamescope makes, so it never answers
-/// early, and well inside the guest's one-second bound.
-const FEEDBACK_SAFETY_NS: u64 = 100_000_000;
-
 /// Presentation feedback outcomes, and waits answered by a fallback (release,
 /// grace or the feedback safety), for the shim's ungated census.
 static PRESENTED_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static DISCARDED_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static FALLBACK_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Which path answered each `vkWaitForPresentKHR`, for the census.
+///
+/// The guest's frame on this route is one frame in flight, so the rate it can
+/// reach is the speed of this answer: a wait answered by the compositor's
+/// feedback is paced by the compositor, and one answered by `grace` or `release`
+/// is not. `nocommit` counts waits whose id had no commit registered — the state
+/// `grace` cannot answer at all, since it has no commit time to bound.
+static WAIT_N: AtomicUsize = AtomicUsize::new(0);
+static ANS_QUEUE: AtomicUsize = AtomicUsize::new(0);
+static ANS_COMMIT: AtomicUsize = AtomicUsize::new(0);
+static ANS_FB: AtomicUsize = AtomicUsize::new(0);
+static ANS_DAEMON: AtomicUsize = AtomicUsize::new(0);
+static ANS_GRACE: AtomicUsize = AtomicUsize::new(0);
+static ANS_RELEASE: AtomicUsize = AtomicUsize::new(0);
+static ANS_DISCARD: AtomicUsize = AtomicUsize::new(0);
+static ANS_UNARMED: AtomicUsize = AtomicUsize::new(0);
+static ANS_TIMEOUT: AtomicUsize = AtomicUsize::new(0);
+static NO_COMMIT: AtomicUsize = AtomicUsize::new(0);
+
+/// `(waits, at queue, at commit, feedback, daemon latch, grace, release,
+/// discarded, unarmed, timeout, no commit registered)`.
+pub(crate) fn wait_census() -> [usize; 11] {
+    [
+        WAIT_N.load(Ordering::Relaxed),
+        ANS_QUEUE.load(Ordering::Relaxed),
+        ANS_COMMIT.load(Ordering::Relaxed),
+        ANS_FB.load(Ordering::Relaxed),
+        ANS_DAEMON.load(Ordering::Relaxed),
+        ANS_GRACE.load(Ordering::Relaxed),
+        ANS_RELEASE.load(Ordering::Relaxed),
+        ANS_DISCARD.load(Ordering::Relaxed),
+        ANS_UNARMED.load(Ordering::Relaxed),
+        ANS_TIMEOUT.load(Ordering::Relaxed),
+        NO_COMMIT.load(Ordering::Relaxed),
+    ]
+}
 
 /// `(presented, discarded, answered by a fallback)` so far.
 pub(crate) fn feedback_counts() -> (usize, usize, usize) {
@@ -148,7 +179,9 @@ fn feedback_done(token: u64, ns: u64) {
     // A token no longer pending belongs to a swapchain that went away, or a
     // frame another path answered: nothing to do.
     if let Some((id, sc)) = key {
-        record_for(id, sc, ns);
+        if record_for(id, sc, ns) {
+            ANS_FB.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -185,14 +218,16 @@ static WAIT_CV: Condvar = Condvar::new();
 /// answered by the compositor's release or, at the latest, two refresh periods
 /// after the commit.
 ///
-/// `answer_now` is for swapchains whose effective present mode is mailbox or
-/// immediate. The guest may believe it has FIFO (the shim applies
-/// `MESA_VK_WSI_PRESENT_MODE` behind its back) and wait on every frame, while a
-/// guest that knew its real mode would not wait at all: DXVK skips the present
-/// wait for mailbox and immediate. Holding the wait for the grace there throttles
-/// the guest's frame-latency loop to `(start-to-commit + 2 periods) / (L + 1)`.
+/// `answer_now` is for swapchains whose declared present mode is mailbox or
+/// immediate. A guest that asked for FIFO can still be declared a non-FIFO mode
+/// under a cap at the display's rate (`docs/10`), and it waits on every frame
+/// because FIFO told it it must; a guest that knew its real mode would not wait
+/// at all, since DXVK skips the present wait for mailbox and immediate. Holding
+/// the wait for the grace there throttles the guest's frame-latency loop to
+/// `(start-to-commit + 2 periods) / (L + 1)`.
 pub(crate) fn committed(id: u64, sc: usize, commit_ns: u64, answer_now: bool) {
     if answer_now {
+        ANS_COMMIT.fetch_add(1, Ordering::Relaxed);
         record_for(id, sc, commit_ns);
     } else {
         note_commit(id, sc, commit_ns);
@@ -207,6 +242,7 @@ static AT_QUEUE_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 /// frame's render fence (see `proxy::present_wait_answer`).
 pub(crate) fn answered_at_queue(id: u64, sc: usize, ns: u64) {
     AT_QUEUE_N.fetch_add(1, Ordering::Relaxed);
+    ANS_QUEUE.fetch_add(1, Ordering::Relaxed);
     record_for(id, sc, ns);
 }
 
@@ -267,18 +303,21 @@ pub(crate) fn record(id: u64, latch_ns: u64) {
             .map(|&(_, sc)| sc)
     };
     if let Some(sc) = sc {
-        record_for(id, sc, latch_ns);
+        if record_for(id, sc, latch_ns) {
+            ANS_DAEMON.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
-/// [`record`] for the frame `id` of swapchain `sc`.
-pub(crate) fn record_for(id: u64, sc: usize, latch_ns: u64) {
+/// [`record`] for the frame `id` of swapchain `sc`. `true` when this answered a
+/// wait, so each path that answers can be counted where it answers.
+pub(crate) fn record_for(id: u64, sc: usize, latch_ns: u64) -> bool {
     if id == 0 {
-        return;
+        return false;
     }
     let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(i) = w.armed.iter().position(|&k| k == (id, sc)) else {
-        return;
+        return false;
     };
     w.armed.remove(i);
     w.committed.retain(|&(c, s, _)| (c, s) != (id, sc));
@@ -289,6 +328,7 @@ pub(crate) fn record_for(id: u64, sc: usize, latch_ns: u64) {
     w.done.push((id, sc, latch_ns));
     drop(w);
     WAIT_CV.notify_all();
+    true
 }
 
 /// The first few wait outcomes, so a log shows whether present waits are being
@@ -318,6 +358,7 @@ pub(crate) fn complete_on_release(id: u64, sc: usize, release_ns: u64) {
     };
     if answers {
         FALLBACK_N.fetch_add(1, Ordering::Relaxed);
+        ANS_RELEASE.fetch_add(1, Ordering::Relaxed);
         record_for(id, sc, release_ns);
     }
 }
@@ -328,7 +369,9 @@ pub(crate) fn complete_on_release(id: u64, sc: usize, release_ns: u64) {
 /// guest does not sit out the bound in `wait`. An id no longer armed was
 /// answered already and is left alone.
 pub(crate) fn discard(id: u64, sc: usize, ns: u64) {
-    record_for(id, sc, ns);
+    if record_for(id, sc, ns) {
+        ANS_DISCARD.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// The swapchain is going away: nothing armed on it will be released or
@@ -368,6 +411,10 @@ pub(crate) fn wait(id: u64, sc: usize, timeout_ns: u64) -> bool {
     };
     let deadline = Some(std::time::Instant::now() + Duration::from_nanos(bound));
     let t0 = std::time::Instant::now();
+    WAIT_N.fetch_add(1, Ordering::Relaxed);
+    // Counted once per wait, and only once a wait has to block: a wait answered
+    // from `done` on the first pass never needed a commit time.
+    let mut counted_no_commit = false;
     let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         if let Some(i) = w
@@ -384,27 +431,34 @@ pub(crate) fn wait(id: u64, sc: usize, timeout_ns: u64) -> bool {
             .iter()
             .any(|&(armed, owner)| armed == id && owner == sc)
         {
+            ANS_UNARMED.fetch_add(1, Ordering::Relaxed);
             note_outcome(id, "unarmed", t0);
             return true;
         }
-        // A committed frame counts as latched two refresh periods after its
-        // commit, whether or not its buffer ever comes back; one whose
-        // presentation feedback is pending only at the feedback safety.
-        let grace = if feedback_pending(&w, id, sc) {
-            FEEDBACK_SAFETY_NS
-        } else {
-            commit_grace_ns()
-        };
+        // Every committed frame counts as latched two refresh periods after its
+        // commit, whether or not its buffer comes back and whether or not the
+        // compositor answers. A longer bound for a frame whose feedback was
+        // pending made the answer depend on the compositor: on a title whose
+        // feedback stopped arriving 30 s into a session, every frame then cost
+        // 100 ms — a 10 fps ceiling this shim imposed on itself. The acquire gate
+        // is what paces the guest, so a wait that outlives two periods is not
+        // measuring a presentation any more.
+        let grace = commit_grace_ns();
         let latch_by = w
             .committed
             .iter()
             .find(|&&(c, s, _)| (c, s) == (id, sc))
             .map(|&(_, _, ns)| ns.saturating_add(grace));
+        if latch_by.is_none() && !counted_no_commit {
+            counted_no_commit = true;
+            NO_COMMIT.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(latch_ns) = latch_by {
             let now_ns = crate::proxy::monotonic_ns();
             if now_ns >= latch_ns {
                 drop(w);
                 FALLBACK_N.fetch_add(1, Ordering::Relaxed);
+                ANS_GRACE.fetch_add(1, Ordering::Relaxed);
                 record_for(id, sc, latch_ns);
                 let mut w2 = WAITS.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(i) = w2
@@ -422,6 +476,7 @@ pub(crate) fn wait(id: u64, sc: usize, timeout_ns: u64) -> bool {
             Some(d) => {
                 let now = std::time::Instant::now();
                 if now >= d {
+                    ANS_TIMEOUT.fetch_add(1, Ordering::Relaxed);
                     note_outcome(id, "timeout", t0);
                     return false;
                 }
@@ -644,13 +699,15 @@ mod tests {
     }
 
     #[test]
-    fn a_feedback_that_never_comes_is_answered_by_the_safety() {
+    fn a_feedback_that_never_comes_is_answered_by_the_grace() {
         arm(601, 10);
         expect_feedback(601, 10);
+        // The same two periods every other frame gets: a compositor that stops
+        // answering must not lengthen the guest's frame.
         committed(
             601,
             10,
-            crate::proxy::monotonic_ns().saturating_sub(FEEDBACK_SAFETY_NS + 1),
+            crate::proxy::monotonic_ns().saturating_sub(commit_grace_ns() + 1),
             false,
         );
         assert!(wait(601, 10, 0));
