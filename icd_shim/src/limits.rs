@@ -16,7 +16,7 @@
 //! |---|---|---|---|---|
 //! | synced | on | off | cap | — |
 //! | synced | off | off | refresh | — |
-//! | synced | on | on | cap | `cap × (m−1)`, at most `refresh` |
+//! | synced | on | on | cap | `cap × (m−1)`, at most `refresh − cap` |
 //! | synced | off | on | `refresh / m` | `acquire × (m−1)` |
 //! | unsynced | on | off | cap | — |
 //! | unsynced | off | off | none | — |
@@ -74,10 +74,23 @@ pub(crate) fn limits(
     let generate_per_s = match (mult, acquire_per_s) {
         (Some(m), Some(a)) => {
             let raw = a.saturating_mul(m - 1);
-            // Synced, the panel bounds what it can show; unsynced, only the
-            // cap does, and the compositor drops the remainder.
+            // Synced, the panel bounds what it can show *and the source frames
+            // are part of that budget*: acquire + generated <= refresh, so what
+            // is left for the generator is `refresh - acquire`. Clamping at
+            // `refresh` alone let a cap 40 ×2 session on a 60 Hz panel produce
+            // 80 commits a second, of which the compositor dropped 20 — the
+            // budget is the panel's, so it belongs in the same subtraction.
+            //
+            // The consequence is deliberate and worth knowing: at 60 Hz, cap 40,
+            // ×2, this leaves 20 generated against 40 source frames, i.e. 0.5
+            // per source frame, which `generate_per_source` floors to 0. Frame
+            // generation therefore does nothing at any cap above half the
+            // refresh, where before it over-subscribed the panel instead.
+            //
+            // Unsynced, only the cap does, and the compositor drops the
+            // remainder by design.
             Some(if vsync && refresh_hz > 0 {
-                raw.min(refresh_hz)
+                raw.min(refresh_hz.saturating_sub(a))
             } else {
                 raw
             })
@@ -114,20 +127,22 @@ mod tests {
                 generate_per_s: None
             }
         );
-        // synced, cap, generation: generation fills up to the panel
+        // synced, cap, generation: generation fills what the panel has left
+        // after the source frames
         assert_eq!(
             limits(true, Some(40), Some(2), 60),
             Limits {
                 acquire_per_s: Some(40),
-                generate_per_s: Some(40)
+                generate_per_s: Some(20)
             }
         );
-        // synced, cap, generation, panel too slow for neither
+        // synced, cap, generation, panel too slow for both: the panel still
+        // leaves its 20 after the source frames whatever the multiplier asks
         assert_eq!(
             limits(true, Some(40), Some(4), 60),
             Limits {
                 acquire_per_s: Some(40),
-                generate_per_s: Some(60)
+                generate_per_s: Some(20)
             }
         );
         // synced, no cap, generation: source derives from the panel
@@ -207,10 +222,29 @@ mod tests {
         // 40 acquires, 60 panel, ×4 asked: the panel leaves 20 generated in
         // total, i.e. none per source frame at this rate.
         let l = limits(true, Some(40), Some(4), 60);
-        assert_eq!(l.generate_per_s, Some(60));
-        assert_eq!(l.generate_per_source(4), Some(1));
+        assert_eq!(l.generate_per_s, Some(20));
+        assert_eq!(l.generate_per_source(4), Some(0));
         // Unsynced the same numbers leave the ask intact.
         let l = limits(false, Some(40), Some(4), 60);
         assert_eq!(l.generate_per_source(4), Some(3));
+    }
+
+    /// The consequence of `refresh - acquire`, pinned so it cannot drift into a
+    /// claim about the feature working: at 60 Hz, cap 40, ×2, the panel leaves 20
+    /// generated against 40 source frames, and half a frame per source floors to
+    /// none. A user with LSFG on at that cap gets no generated frames, which is
+    /// the price of not over-subscribing the panel.
+    #[test]
+    fn a_cap_above_half_the_panel_leaves_no_room_to_generate() {
+        let l = limits(true, Some(40), Some(2), 60);
+        assert_eq!(l.generate_per_s, Some(20));
+        assert_eq!(l.generate_per_source(2), Some(0));
+        // One step lower and generation survives: cap 30 at ×2 on 60 Hz.
+        let l = limits(true, Some(30), Some(2), 60);
+        assert_eq!(l.generate_per_s, Some(30));
+        assert_eq!(l.generate_per_source(2), Some(1));
+        // A cap above the panel cannot underflow: nothing is left to generate.
+        let l = limits(true, Some(120), Some(2), 60);
+        assert_eq!(l.generate_per_s, Some(0));
     }
 }

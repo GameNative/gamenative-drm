@@ -118,12 +118,20 @@ divisor cap reads its target exactly.
   |---|---|---|---|---|---|---|---|
   | synced | on | off | cap | — | `cap` | note | `cap` |
   | synced | off | off | refresh | — | `refresh` | note | `refresh` |
-  | synced | on | on | cap | `cap × (m−1)`, at most `refresh` | `cap + min(cap × (m−1), refresh)` | note | total |
+  | synced | on | on | cap | `cap × (m−1)`, at most `refresh − cap` | `cap + min(cap × (m−1), refresh − cap)` | note | total |
   | synced | off | on | `refresh / m` | `acquire × (m−1)` | `acquire × m` | note | total |
   | unsynced | on | off | cap | — | `cap` | note | `cap` |
   | unsynced | off | off | none | — | none | note | measured |
   | unsynced | on | on | cap | `cap × (m−1)` | `cap × m` | note | total |
   | unsynced | off | on | `refresh / m` | `acquire × (m−1)` | `acquire × m` | note | total |
+
+  **Synced, the source frames are part of the panel's budget.** The generated
+  ceiling on that row is `refresh − acquire`, not `refresh`: a 60 Hz panel can show
+  60 frames whichever way they were made, so a cap 40 session leaves 20 for the
+  generator and no more. The consequence is deliberate and it is not a rounding
+  detail — at cap 40, ×2, that is 20 generated against 40 source frames, half a
+  frame each, which floors to none, so frame generation does nothing at any cap
+  above half the refresh. Lower the cap or the multiplier to make room.
 
   `hold` is when an acquired image may be drawn into again. It follows the
   **served** mode — the same one `on_buffer_release` keys on — and on this route
@@ -167,8 +175,9 @@ divisor cap reads its target exactly.
   session, where the hold sat either side of 25 ms.
 
   `total` is what the rule lets the session produce: acquired plus generated. It
-  is not always what reaches the screen — the synced rows still cap generation at
-  the panel, so 40 + 40 at ×4 on a 60 Hz panel is 40 + 20. The `show in HUD`
+  is not always what reaches the screen — the synced row caps generation at what
+  the panel has left after the source frames, so cap 40 at ×4 on a 60 Hz panel is
+  40 + 20, and at ×2 it is 40 + 20 as well. The `show in HUD`
   column is what the widget *should* read, `total`, because that is the number the
   user asked the multiplier for; the cap in force is a separate figure and governs
   acquires only. What it reads today is the bullet below.
