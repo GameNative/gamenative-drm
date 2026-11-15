@@ -184,12 +184,78 @@ static void dump_tree(xcb_connection_t *c, xcb_window_t w, int depth, int *budge
     }
 }
 
+/* The two X-level ways to ask someone to activate a window, both sent as
+ * ClientMessages rather than as property writes:
+ *
+ *  - _NET_ACTIVE_WINDOW to the root is EWMH's "please activate this". A window
+ *    manager that implements it raises and focuses the window; wine's own WM
+ *    implements some EWMH, so whether it acts on the message is a question and
+ *    not an assumption. Source indication 2 (pager) is used because pagers are
+ *    the callers a WM is least likely to second-guess.
+ *  - WM_TAKE_FOCUS direct to the window is the ICCCM mechanism: a WM sends it
+ *    instead of setting the input focus, and the client answers by calling
+ *    XSetInputFocus itself. Wine advertises WM_TAKE_FOCUS for its managed
+ *    windows, and this also sets the focus so the two paths can be told apart.
+ *
+ * Neither raises WM_ACTIVATE by itself. The point of the experiment is whether
+ * wine converts either into its own foreground state, which is what the game
+ * actually reacts to -- X input focus alone was measured not to. */
+static xcb_atom_t intern(xcb_connection_t *c, const char *name)
+{
+    xcb_intern_atom_cookie_t ck = xcb_intern_atom(c, 1, (uint16_t)strlen(name), name);
+    xcb_intern_atom_reply_t *r = xcb_intern_atom_reply(c, ck, NULL);
+    xcb_atom_t atom = r ? r->atom : XCB_NONE;
+    if (r) free(r);
+    return atom;
+}
+
+static void send_net_active_window(xcb_connection_t *c, xcb_window_t root,
+                                   xcb_window_t w)
+{
+    xcb_atom_t atom = intern(c, "_NET_ACTIVE_WINDOW");
+    if (!atom) { printf("  activate: _NET_ACTIVE_WINDOW not interned\n"); return; }
+    xcb_client_message_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.response_type = XCB_CLIENT_MESSAGE;
+    ev.format = 32;
+    ev.window = w;
+    ev.type = atom;
+    ev.data.data32[0] = 2;          /* source indication: pager */
+    ev.data.data32[1] = XCB_CURRENT_TIME;
+    ev.data.data32[2] = XCB_NONE;   /* currently active window */
+    xcb_send_event(c, 0, root,
+                   XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,
+                   (const char *)&ev);
+    xcb_flush(c);
+    printf("  activate: _NET_ACTIVE_WINDOW ClientMessage -> root, for 0x%08x\n", w);
+}
+
+static void send_take_focus(xcb_connection_t *c, xcb_window_t w)
+{
+    xcb_atom_t protocols = intern(c, "WM_PROTOCOLS");
+    xcb_atom_t take_focus = intern(c, "WM_TAKE_FOCUS");
+    if (!protocols || !take_focus) { printf("  take-focus: atoms not interned\n"); return; }
+    xcb_client_message_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.response_type = XCB_CLIENT_MESSAGE;
+    ev.format = 32;
+    ev.window = w;
+    ev.type = protocols;
+    ev.data.data32[0] = take_focus;
+    ev.data.data32[1] = XCB_CURRENT_TIME;
+    xcb_send_event(c, 0, w, XCB_EVENT_MASK_NO_EVENT, (const char *)&ev);
+    xcb_flush(c);
+    printf("  take-focus: WM_TAKE_FOCUS ClientMessage -> 0x%08x\n", w);
+}
+
 static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [-display <dpy|socket>] [socket-path] [target-xid-hex]\n"
             "           [-focus] [-raise]\n"
             "  -focus / -raise : act on the target xid, then read the state back\n"
+            "  -activate       : send EWMH _NET_ACTIVE_WINDOW ClientMessage for it\n"
+            "  -take-focus     : send ICCCM WM_TAKE_FOCUS, then set X input focus\n"
             "                   one second later. gamescope recomputes focus and\n"
             "                   stacking on the next window event, so the read-back\n"
             "                   says whether the compositor kept the change.\n"
@@ -208,6 +274,8 @@ int main(int argc, char **argv)
     int have_target = 0;
     int do_focus = 0;
     int do_raise = 0;
+    int do_activate = 0;
+    int do_take_focus = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-display") || !strcmp(argv[i], "--display")) {
@@ -220,6 +288,10 @@ int main(int argc, char **argv)
             do_focus = 1;
         } else if (!strcmp(argv[i], "-raise") || !strcmp(argv[i], "--raise")) {
             do_raise = 1;
+        } else if (!strcmp(argv[i], "-activate") || !strcmp(argv[i], "--activate")) {
+            do_activate = 1;
+        } else if (!strcmp(argv[i], "-take-focus") || !strcmp(argv[i], "--take-focus")) {
+            do_take_focus = 1;
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "%s: unknown option '%s'\n", argv[0], argv[i]);
             usage(argv[0]);
@@ -326,7 +398,7 @@ int main(int argc, char **argv)
         }
     }
 
-    if (target && (do_focus || do_raise)) {
+    if (target && (do_focus || do_raise || do_activate || do_take_focus)) {
         printf("--- action on 0x%08x ---\n", target);
         if (do_raise) {
             uint32_t above = XCB_STACK_MODE_ABOVE;
@@ -339,6 +411,14 @@ int main(int argc, char **argv)
                                 XCB_CURRENT_TIME);
             xcb_flush(c);
             printf("  focus: XSetInputFocus(0x%08x) sent\n", target);
+        }
+        if (do_activate) send_net_active_window(c, screen->root, target);
+        if (do_take_focus) {
+            send_take_focus(c, target);
+            /* the ICCCM client's own answer to WM_TAKE_FOCUS */
+            xcb_set_input_focus(c, XCB_INPUT_FOCUS_POINTER_ROOT, target,
+                                XCB_CURRENT_TIME);
+            xcb_flush(c);
         }
 
         /* The server applies a focus or stacking change immediately, but

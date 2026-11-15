@@ -43,6 +43,11 @@
  *                      Without this the process sits on wine's default desktop
  *                      and EnumWindows returns nothing, because windows belong
  *                      to a desktop and the game's belong to explorer's.
+ *   --query-fg         print wine's foreground window and exit, changing
+ *                      nothing. The only read-only way to ask whether wine
+ *                      considers a window active: X input focus is not that
+ *                      answer (measured), and any activation call would mask
+ *                      what we are trying to observe.
  *   --list             print the visible windows and exit (no activation)
  *   --verbose          per-attempt detail
  *
@@ -422,6 +427,7 @@ static void usage(const char *argv0)
             "  --watch-ms N       poll interval in watch mode (default 400)\n"
             "  --desktop NAME     join this wine desktop first (default shell;\n"
             "                     'none' stays put)\n"
+            "  --query-fg         print wine's foreground window and exit\n"
             "  --list             print visible windows and exit\n"
             "  --verbose          per-attempt detail\n",
             argv0);
@@ -430,7 +436,7 @@ static void usage(const char *argv0)
 int main(int argc, char **argv)
 {
     DWORD timeout_ms = 120000, settle_ms = 300, watch_ms = 400;
-    int force_messages = 0, list = 0, watch = 0;
+    int force_messages = 0, list = 0, watch = 0, query_fg = 0;
     const char *desktop = "shell";
     DWORD start;
 
@@ -454,6 +460,8 @@ int main(int argc, char **argv)
             force_messages = 1;
         } else if (!strcmp(a, "--desktop") && i + 1 < argc) {
             desktop = argv[++i];
+        } else if (!strcmp(a, "--query-fg")) {
+            query_fg = 1;
         } else if (!strcmp(a, "--list")) {
             list = 1;
         } else if (!strcmp(a, "--verbose")) {
@@ -476,6 +484,13 @@ int main(int argc, char **argv)
     /* No image argument means "whatever the session puts in front of us": by
      * rule, since at session start only the launcher's name is known. */
     g_any = (g_ntargets == 0);
+
+    if (query_fg) {
+        if (desktop && strcmp(desktop, "none") != 0) join_desktop(desktop, DESKTOP_WAIT_MS);
+        printf("foreground: ");
+        print_foreground("wine");
+        return 0;
+    }
 
     if (list) {
         if (desktop && strcmp(desktop, "none") != 0) join_desktop(desktop, DESKTOP_WAIT_MS);
