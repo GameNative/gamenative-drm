@@ -248,12 +248,57 @@ static void send_take_focus(xcb_connection_t *c, xcb_window_t w)
     printf("  take-focus: WM_TAKE_FOCUS ClientMessage -> 0x%08x\n", w);
 }
 
+/* Largest mapped window below the root's direct children.
+ *
+ * Depth >= 2, not a class test: under `explorer /desktop=shell` the desktop is
+ * the root child everything lives inside, and its WM_CLASS on the X side is
+ * `explorer.exe` (measured), not the DESKTOP_CLASS_ATOM the Win32 side reports --
+ * so a class check matches nothing and the desktop wins on area. The guest's own
+ * window is the largest thing inside it.
+ */
+static xcb_window_t find_guest_window_rec(xcb_connection_t *c, xcb_window_t w,
+                                          int depth, long *best)
+{
+    xcb_window_t best_w = XCB_NONE;
+    if (depth > 12) return best_w;
+    xcb_query_tree_cookie_t qc = xcb_query_tree(c, w);
+    xcb_query_tree_reply_t *qr = xcb_query_tree_reply(c, qc, NULL);
+    if (!qr) return best_w;
+    int n = xcb_query_tree_children_length(qr);
+    xcb_window_t *kids = xcb_query_tree_children(qr);
+    for (int i = 0; i < n; i++) {
+        xcb_get_window_attributes_cookie_t ac = xcb_get_window_attributes(c, kids[i]);
+        xcb_get_window_attributes_reply_t *a = xcb_get_window_attributes_reply(c, ac, NULL);
+        xcb_get_geometry_cookie_t gc = xcb_get_geometry(c, kids[i]);
+        xcb_get_geometry_reply_t *g = xcb_get_geometry_reply(c, gc, NULL);
+        int mapped = a && a->map_state == XCB_MAP_STATE_VIEWABLE;
+        if (a) free(a);
+        if (g) {
+            long area = (long)g->width * (long)g->height;
+            if (mapped && area > 0 && depth >= 2 && area > *best) { *best = area; best_w = kids[i]; }
+            free(g);
+        }
+        /* A descendant only wins if it is strictly larger: the guest's outer
+         * window and its inner child can have identical area, and the outer one
+         * is the one that should be activated (measured: the inner child 0x02200017
+         * was picked over 0x02400001 before this check). */
+        long before = *best;
+        xcb_window_t deeper = find_guest_window_rec(c, kids[i], depth + 1, best);
+        if (deeper != XCB_NONE && *best > before) best_w = deeper;
+    }
+    free(qr);
+    return best_w;
+}
+
 static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [-display <dpy|socket>] [socket-path] [target-xid-hex]\n"
             "           [-focus] [-raise]\n"
             "  -focus / -raise : act on the target xid, then read the state back\n"
+            "  -watch-activate : wait for the guest's window (no xid needed), then\n"
+            "                    attempt X-level activation on it and report back\n"
+            "  -watch-ms N     how long to wait for that window (default 600000)\n"
             "  -activate       : send EWMH _NET_ACTIVE_WINDOW ClientMessage for it\n"
             "  -take-focus     : send ICCCM WM_TAKE_FOCUS, then set X input focus\n"
             "                   one second later. gamescope recomputes focus and\n"
@@ -276,6 +321,8 @@ int main(int argc, char **argv)
     int do_raise = 0;
     int do_activate = 0;
     int do_take_focus = 0;
+    int do_watch = 0;
+    int watch_ms = 600000;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-display") || !strcmp(argv[i], "--display")) {
@@ -292,6 +339,10 @@ int main(int argc, char **argv)
             do_activate = 1;
         } else if (!strcmp(argv[i], "-take-focus") || !strcmp(argv[i], "--take-focus")) {
             do_take_focus = 1;
+        } else if (!strcmp(argv[i], "-watch-activate") || !strcmp(argv[i], "--watch-activate")) {
+            do_watch = 1;
+        } else if (!strcmp(argv[i], "-watch-ms") && i + 1 < argc) {
+            watch_ms = atoi(argv[++i]);
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "%s: unknown option '%s'\n", argv[0], argv[i]);
             usage(argv[0]);
@@ -326,7 +377,18 @@ int main(int argc, char **argv)
                 display, path);
 
     int scr = 0;
-    xcb_connection_t *c = connect_path(path, &scr);
+    xcb_connection_t *c = NULL;
+    if (do_watch) {
+        /* The app arms this at session start, which can precede gamescope's X
+         * socket. Waiting is the job: socket first, then the window. */
+        int waited = 0;
+        while (!c && waited < watch_ms) {
+            c = connect_path(path, &scr);
+            if (!c) { struct timespec ts = { 0, 250000000 }; nanosleep(&ts, NULL); waited += 250; }
+        }
+    } else {
+        c = connect_path(path, &scr);
+    }
     if (!c) return 1;
 
     const xcb_setup_t *setup = xcb_get_setup(c);
@@ -348,6 +410,41 @@ int main(int argc, char **argv)
     er = xcb_query_extension_reply(c, ec, NULL);
     printf("  Present present=%u opcode=%u\n", er ? er->present : 0, er ? er->major_opcode : 0);
     if (er) free(er);
+
+    if (do_watch) {
+        printf("xtree-probe: watching for the guest's window (timeout %dms)\n", watch_ms);
+        fflush(stdout);
+        int waited = 0;
+        while (waited < watch_ms) {
+            long best = 0;
+            xcb_window_t w = find_guest_window_rec(c, screen->root, 0, &best);
+            if (w != XCB_NONE) {
+                printf("  window 0x%08x (%ld px): attempting X-level activation\n", w, best);
+                send_net_active_window(c, screen->root, w);
+                send_take_focus(c, w);
+                xcb_set_input_focus(c, XCB_INPUT_FOCUS_POINTER_ROOT, w, XCB_CURRENT_TIME);
+                xcb_flush(c);
+                struct timespec settle = { 1, 0 };
+                nanosleep(&settle, NULL);
+                xcb_get_input_focus_cookie_t fc = xcb_get_input_focus(c);
+                xcb_get_input_focus_reply_t *fr = xcb_get_input_focus_reply(c, fc, NULL);
+                if (fr) {
+                    printf("  after 1s: X input focus=0x%08x%s\n", fr->focus,
+                           fr->focus == w ? " (kept)" : " (reverted)");
+                    free(fr);
+                }
+                /* Wine's own foreground is the only state that matters and it is
+                 * not readable from here -- measured: both messages left it at
+                 * <none> while SetForegroundWindow moved it. */
+                return 0;
+            }
+            struct timespec ts = { 0, 400000000 };
+            nanosleep(&ts, NULL);
+            waited += 400;
+        }
+        printf("xtree-probe: no guest window after %dms\n", watch_ms);
+        return 2;
+    }
 
     printf("--- tree (depth-first from root) ---\n");
     int budget = 500;
