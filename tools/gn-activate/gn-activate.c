@@ -25,6 +25,11 @@
  *   gn-activate.exe --timeout-ms 180000 --verbose NFS13.exe
  *   gn-activate.exe --list                        # every visible window
  *
+ *   --watch            keep polling for the whole session and activate each
+ *                      eligible window once, when it first appears. This is the
+ *                      shipping shape: the session starts a launcher, and the
+ *                      game's window exists only minutes later.
+ *   --watch-ms N       poll interval in watch mode (default 400)
  *   --timeout-ms N     how long to wait for the window (default 120000)
  *   --settle-ms N      wait after each activation attempt before reading the
  *                      foreground back (default 300)
@@ -42,6 +47,16 @@
  *   --verbose          per-attempt detail
  *
  *   --desktop none     stay on whatever desktop is current
+ *
+ * With no image argument the target is chosen by rule, because at session start
+ * only the launcher is known:
+ *
+ *   the largest visible window that is not wine's desktop window (class
+ *   "#32769", DESKTOP_CLASS_ATOM), not ours, and not already activated.
+ *
+ * That needs no image name and no class deny-list. A title's own window is the
+ * largest thing on the desktop; the desktop window itself is excluded by its
+ * class, which is exact rather than a guess.
  *
  * Exit codes: 0 activated (or already foreground), 1 refused, 2 no window in
  * time, 3 bad usage.
@@ -61,9 +76,16 @@
 #include <ctype.h>
 
 #define MAX_TARGETS 8
+#define MAX_SEEN 128
 #define POLL_MS 100
+#define DESKTOP_WAIT_MS 180000
+
+/* wine's desktop window class: DESKTOP_CLASS_ATOM in programs/explorer/desktop.c */
+#define DESKTOP_CLASS "#32769"
 
 static int g_verbose = 0;
+static int g_any = 0;         /* no image argument: match by rule */
+static DWORD g_own_pid;
 
 struct target {
     char image[64]; /* lower-cased basename, e.g. "nfs13.exe" */
@@ -121,6 +143,7 @@ static void image_of(HWND hwnd, DWORD *pid_out, char *image, size_t image_len)
 
 static int matches_target(const char *image)
 {
+    if (g_any) return 1;
     for (int i = 0; i < g_ntargets; i++)
         if (image[0] && strcmp(image, g_targets[i].image) == 0) return 1;
     return 0;
@@ -142,10 +165,48 @@ static long area(const RECT *r)
     return (w > 0 && h > 0) ? w * h : 0;
 }
 
+/* wine's desktop window is identifiable exactly, by class, so excluding it is
+ * not a guess about sizes or titles. */
+static int is_desktop_window(HWND hwnd)
+{
+    char cls[64];
+    cls[0] = '\0';
+    GetClassNameA(hwnd, cls, sizeof(cls));
+    return strcmp(cls, DESKTOP_CLASS) == 0;
+}
+
+/* An eligible window: visible, real area, not the desktop, not our own. */
+static int eligible(const struct candidate *c)
+{
+    if (!c->hwnd || area(&c->rect) <= 0) return 0;
+    if (c->pid == g_own_pid) return 0;
+    if (!matches_target(c->image)) return 0;
+    return !is_desktop_window(c->hwnd);
+}
+
+/* Windows already activated. In watch mode a window is acted on once: a refused
+ * activation must not be retried every poll, or the watcher becomes a focus
+ * fight with whatever the user is doing. */
+static HWND g_seen[MAX_SEEN];
+static int g_nseen = 0;
+
+static int already_seen(HWND hwnd)
+{
+    for (int i = 0; i < g_nseen; i++)
+        if (g_seen[i] == hwnd) return 1;
+    return 0;
+}
+
+static void mark_seen(HWND hwnd)
+{
+    if (g_nseen < MAX_SEEN) g_seen[g_nseen++] = hwnd;
+}
+
 struct scan {
     struct candidate best;
     int found;
     int list;
+    int skip_seen;
 };
 
 static BOOL CALLBACK scan_proc(HWND hwnd, LPARAM lp)
@@ -167,7 +228,7 @@ static BOOL CALLBACK scan_proc(HWND hwnd, LPARAM lp)
 
     /* The game's window is a child of the desktop window, so a top-level match
      * is a bonus, not the common case; scan children on every top-level too. */
-    if (matches_target(c.image) && area(&c.rect) > 0) {
+    if (eligible(&c) && !(s->skip_seen && already_seen(hwnd))) {
         if (!s->found || area(&c.rect) > area(&s->best.rect)) {
             s->best = c;
             s->found = 1;
@@ -193,7 +254,7 @@ static BOOL CALLBACK child_scan_proc(HWND hwnd, LPARAM lp)
         return TRUE;
     }
 
-    if (matches_target(c.image) && area(&c.rect) > 0) {
+    if (eligible(&c) && !(s->skip_seen && already_seen(hwnd))) {
         if (!s->found || area(&c.rect) > area(&s->best.rect)) {
             s->best = c;
             s->found = 1;
@@ -212,16 +273,59 @@ static BOOL CALLBACK tops_for_children(HWND hwnd, LPARAM lp)
 
 /* One pass over top-levels, then one over their children. Both passes matter:
  * a top-level game window is the rare case, a nested one is ours. */
-static void scan_all(int list, struct candidate *out)
+static void scan_all(int list, int skip_seen, struct candidate *out)
 {
     struct scan s;
     memset(&s, 0, sizeof(s));
     s.list = list;
+    s.skip_seen = skip_seen;
 
     EnumWindows(scan_proc, (LPARAM)&s);
     EnumWindows(tops_for_children, (LPARAM)&s);
 
-    if (out && s.found) *out = s.best;
+    if (out) {
+        if (s.found) *out = s.best;
+        else memset(out, 0, sizeof(*out));
+    }
+}
+
+/* Join a named wine desktop, waiting for it to exist.
+ *
+ * `explorer /desktop=shell` creates it at session start, so a helper spawned by
+ * the app can arrive before it exists. Failing here would leave the process on
+ * the default desktop, where EnumWindows returns nothing at all -- a silent
+ * no-op -- so waiting is the only correct answer. Returns 1 on success. */
+static int join_desktop(const char *name, DWORD wait_ms)
+{
+    DWORD start = GetTickCount();
+    for (;;) {
+        HDESK hdesk = OpenDesktopA(name, 0, FALSE, GENERIC_ALL);
+        if (hdesk) {
+            if (SetThreadDesktop(hdesk)) {
+                printf("gn-activate: joined desktop '%s'\n", name);
+                return 1;
+            }
+            printf("gn-activate: SetThreadDesktop('%s') failed (%lu)\n",
+                   name, (unsigned long)GetLastError());
+            return 0;
+        }
+        if (GetTickCount() - start >= wait_ms) {
+            printf("gn-activate: OpenDesktop('%s') timed out (%lu)\n",
+                   name, (unsigned long)GetLastError());
+            return 0;
+        }
+        Sleep(POLL_MS * 2);
+    }
+}
+
+/* Whether the desktop still exists, so a watcher ends with its session instead
+ * of lingering as an orphan after the game and desktop are gone. */
+static int desktop_alive(const char *name)
+{
+    HDESK hdesk = OpenDesktopA(name, 0, FALSE, DESKTOP_READOBJECTS);
+    if (!hdesk) return 0;
+    CloseDesktop(hdesk);
+    return 1;
 }
 
 static int foreground_is(HWND hwnd)
@@ -314,7 +418,10 @@ static void usage(const char *argv0)
             "                     reading the foreground back (default 300)\n"
             "  --force-messages   fall back to SendMessage WM_ACTIVATE if\n"
             "                     SetForegroundWindow is refused\n"
-            "  --desktop NAME     join this wine desktop first (default shell)\n"
+            "  --watch            activate each eligible window once, as it appears\n"
+            "  --watch-ms N       poll interval in watch mode (default 400)\n"
+            "  --desktop NAME     join this wine desktop first (default shell;\n"
+            "                     'none' stays put)\n"
             "  --list             print visible windows and exit\n"
             "  --verbose          per-attempt detail\n",
             argv0);
@@ -322,14 +429,24 @@ static void usage(const char *argv0)
 
 int main(int argc, char **argv)
 {
-    DWORD timeout_ms = 120000, settle_ms = 300;
-    int force_messages = 0, list = 0;
+    DWORD timeout_ms = 120000, settle_ms = 300, watch_ms = 400;
+    int force_messages = 0, list = 0, watch = 0;
     const char *desktop = "shell";
     DWORD start;
 
+    g_own_pid = GetCurrentProcessId();
+
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if (!strcmp(a, "--timeout-ms") && i + 1 < argc) {
+        if (!strcmp(a, "--watch")) {
+            watch = 1;
+        } else if (!strcmp(a, "--watch-ms") && i + 1 < argc) {
+            watch_ms = (DWORD)strtoul(argv[++i], NULL, 10);
+            /* A poll faster than this is a busy loop on a window list that only
+             * changes on map/unmap; slower than a game's launch gap and the
+             * activation lands after the title has already drawn itself idle. */
+            if (watch_ms < 50) watch_ms = 50;
+        } else if (!strcmp(a, "--timeout-ms") && i + 1 < argc) {
             timeout_ms = (DWORD)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(a, "--settle-ms") && i + 1 < argc) {
             settle_ms = (DWORD)strtoul(argv[++i], NULL, 10);
@@ -356,29 +473,51 @@ int main(int argc, char **argv)
         }
     }
 
+    /* No image argument means "whatever the session puts in front of us": by
+     * rule, since at session start only the launcher's name is known. */
+    g_any = (g_ntargets == 0);
+
+    if (list) {
+        if (desktop && strcmp(desktop, "none") != 0) join_desktop(desktop, DESKTOP_WAIT_MS);
+        printf("-- visible windows --\n");
+        scan_all(1, 0, NULL);
+        return 0;
+    }
+
     /* Windows live on a desktop, and explorer's /desktop=shell put the game on a
      * desktop of that name. A fresh wine process starts on the default desktop
      * and sees nothing at all, so join the named one before enumerating. This
      * must happen before any window is created on this thread. */
-    if (desktop && strcmp(desktop, "none") != 0) {
-        HDESK hdesk = OpenDesktopA(desktop, 0, FALSE, GENERIC_ALL);
-        if (hdesk) {
-            if (SetThreadDesktop(hdesk))
-                printf("gn-activate: joined desktop '%s'\n", desktop);
-            else
-                printf("gn-activate: SetThreadDesktop('%s') failed (%lu)\n",
-                       desktop, (unsigned long)GetLastError());
-        } else {
-            printf("gn-activate: OpenDesktop('%s') failed (%lu), staying put\n",
-                   desktop, (unsigned long)GetLastError());
+    int joined = 0;
+    if (desktop && strcmp(desktop, "none") != 0) joined = join_desktop(desktop, DESKTOP_WAIT_MS);
+
+    if (watch) {
+        printf("gn-activate: watching (poll %lums)%s\n", (unsigned long)watch_ms,
+               joined ? "" : ", not joined");
+        fflush(stdout);
+        for (;;) {
+            struct candidate c;
+            scan_all(0, 1, &c);
+            if (c.hwnd) {
+                printf("gn-activate: window 0x%08lx %s pid=%lu %ldx%ld class=%s\n",
+                       (unsigned long)(ULONG_PTR)c.hwnd,
+                       c.image[0] ? c.image : "?", (unsigned long)c.pid,
+                       c.rect.right - c.rect.left, c.rect.bottom - c.rect.top,
+                       c.cls);
+                fflush(stdout);
+                /* Mark before acting, so a refused activation is not retried on
+                 * every poll: that would be a focus fight, not a fix. */
+                mark_seen(c.hwnd);
+                activate(c.hwnd, (int)settle_ms, force_messages);
+            }
+            if (joined && !desktop_alive(desktop)) {
+                printf("gn-activate: desktop '%s' gone, exiting\n", desktop);
+                return 0;
+            }
+            Sleep(watch_ms);
         }
     }
 
-    if (list) {
-        printf("-- visible windows --\n");
-        scan_all(1, NULL);
-        return 0;
-    }
     if (g_ntargets == 0) {
         usage(argv[0]);
         return 3;
@@ -393,7 +532,7 @@ int main(int argc, char **argv)
     for (;;) {
         struct candidate c;
         memset(&c, 0, sizeof(c));
-        scan_all(0, &c);
+        scan_all(0, 0, &c);
 
         if (c.hwnd) {
             printf("gn-activate: window 0x%08lx %s pid=%lu %ldx%ld class=%s\n",
