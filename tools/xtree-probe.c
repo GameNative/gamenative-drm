@@ -188,6 +188,11 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [-display <dpy|socket>] [socket-path] [target-xid-hex]\n"
+            "           [-focus] [-raise]\n"
+            "  -focus / -raise : act on the target xid, then read the state back\n"
+            "                   one second later. gamescope recomputes focus and\n"
+            "                   stacking on the next window event, so the read-back\n"
+            "                   says whether the compositor kept the change.\n"
             "  -display <dpy> : display selector; a bare `:N` uses\n"
             "                   $GAMESCOPE_X11_DISPLAY then $DISPLAY (the session\n"
             "                   socket is env-provided on Android). An absolute\n"
@@ -201,6 +206,8 @@ int main(int argc, char **argv)
     const char *display = NULL;
     xcb_window_t target = 0;
     int have_target = 0;
+    int do_focus = 0;
+    int do_raise = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-display") || !strcmp(argv[i], "--display")) {
@@ -209,6 +216,10 @@ int main(int argc, char **argv)
                 return 1;
             }
             display = argv[i];
+        } else if (!strcmp(argv[i], "-focus") || !strcmp(argv[i], "--focus")) {
+            do_focus = 1;
+        } else if (!strcmp(argv[i], "-raise") || !strcmp(argv[i], "--raise")) {
+            do_raise = 1;
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "%s: unknown option '%s'\n", argv[0], argv[i]);
             usage(argv[0]);
@@ -312,6 +323,63 @@ int main(int argc, char **argv)
             print_name_class(c, parent);
             if (parent == screen->root) { printf("  (reached root)\n"); break; }
             w = parent;
+        }
+    }
+
+    if (target && (do_focus || do_raise)) {
+        printf("--- action on 0x%08x ---\n", target);
+        if (do_raise) {
+            uint32_t above = XCB_STACK_MODE_ABOVE;
+            xcb_configure_window(c, target, XCB_CONFIG_WINDOW_STACK_MODE, &above);
+            xcb_flush(c);
+            printf("  raise: XCB_STACK_MODE_ABOVE sent\n");
+        }
+        if (do_focus) {
+            xcb_set_input_focus(c, XCB_INPUT_FOCUS_POINTER_ROOT, target,
+                                XCB_CURRENT_TIME);
+            xcb_flush(c);
+            printf("  focus: XSetInputFocus(0x%08x) sent\n", target);
+        }
+
+        /* The server applies a focus or stacking change immediately, but
+         * gamescope recomputes both on the next window event. Waiting a second
+         * is what separates "the X server refused it" from "the compositor
+         * took it back" -- the two causes look identical in an instant
+         * read-back. */
+        struct timespec settle = { 1, 0 };
+        nanosleep(&settle, NULL);
+
+        xcb_get_input_focus_cookie_t fc = xcb_get_input_focus(c);
+        xcb_get_input_focus_reply_t *fr = xcb_get_input_focus_reply(c, fc, NULL);
+        if (fr) {
+            printf("  after 1s: X input focus=0x%08x%s\n", fr->focus,
+                   fr->focus == target ? " (kept)" : " (reverted)");
+            free(fr);
+        }
+
+        /* X stacks a parent's children bottom-to-top, so the last entry is what
+         * the server would composite last among the siblings. The list has to
+         * come from the *parent*, not from the target, whose child list says
+         * nothing about stacking. */
+        xcb_query_tree_cookie_t tc = xcb_query_tree(c, target);
+        xcb_query_tree_reply_t *tr = xcb_query_tree_reply(c, tc, NULL);
+        xcb_window_t parent = tr ? tr->parent : XCB_NONE;
+        if (tr) free(tr);
+        xcb_query_tree_cookie_t qc = xcb_query_tree(c, parent);
+        xcb_query_tree_reply_t *qr = xcb_query_tree_reply(c, qc, NULL);
+        if (qr) {
+            xcb_window_t *kids = xcb_query_tree_children(qr);
+            int n = xcb_query_tree_children_length(qr);
+            printf("  after 1s: siblings under 0x%08x, bottom -> top:\n", parent);
+            for (int i = 0; i < n; i++) {
+                xcb_get_window_attributes_cookie_t ac = xcb_get_window_attributes(c, kids[i]);
+                xcb_get_window_attributes_reply_t *a = xcb_get_window_attributes_reply(c, ac, NULL);
+                printf("    %s0x%08x%s\n", kids[i] == target ? "=> " : "   ", kids[i],
+                       a && a->override_redirect ? "  override" : "");
+                if (a) free(a);
+                print_name_class(c, kids[i]);
+            }
+            free(qr);
         }
     }
 
