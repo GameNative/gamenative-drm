@@ -30,6 +30,8 @@
  *                      shipping shape: the session starts a launcher, and the
  *                      game's window exists only minutes later.
  *   --watch-ms N       poll interval in watch mode (default 400)
+ *   --idle-ms N        exit after this long with no window left to activate
+ *                      (default 60000); 0 disables the idle exit
  *   --timeout-ms N     how long to wait for the window (default 120000)
  *   --settle-ms N      wait after each activation attempt before reading the
  *                      foreground back (default 300)
@@ -62,6 +64,12 @@
  * That needs no image name and no class deny-list. A title's own window is the
  * largest thing on the desktop; the desktop window itself is excluded by its
  * class, which is exact rather than a guess.
+ *
+ * Watch mode ends on its own two ways: the desktop disappears (session over), or
+ * nothing has been left to activate for --idle-ms. The second matters because a
+ * launcher session outlives its game -- `winhandler.exe "steam.exe"` keeps the
+ * desktop and Steam alive after the title exits -- so without it the helper would
+ * poll for the rest of the session doing nothing.
  *
  * Exit codes: 0 activated (or already foreground), 1 refused, 2 no window in
  * time, 3 bad usage.
@@ -425,6 +433,8 @@ static void usage(const char *argv0)
             "                     SetForegroundWindow is refused\n"
             "  --watch            activate each eligible window once, as it appears\n"
             "  --watch-ms N       poll interval in watch mode (default 400)\n"
+            "  --idle-ms N        exit after N ms with no window to activate\n"
+            "                     (default 60000; 0 disables)\n"
             "  --desktop NAME     join this wine desktop first (default shell;\n"
             "                     'none' stays put)\n"
             "  --query-fg         print wine's foreground window and exit\n"
@@ -435,7 +445,7 @@ static void usage(const char *argv0)
 
 int main(int argc, char **argv)
 {
-    DWORD timeout_ms = 120000, settle_ms = 300, watch_ms = 400;
+    DWORD timeout_ms = 120000, settle_ms = 300, watch_ms = 400, idle_ms = 60000;
     int force_messages = 0, list = 0, watch = 0, query_fg = 0;
     const char *desktop = "shell";
     DWORD start;
@@ -452,6 +462,8 @@ int main(int argc, char **argv)
              * changes on map/unmap; slower than a game's launch gap and the
              * activation lands after the title has already drawn itself idle. */
             if (watch_ms < 50) watch_ms = 50;
+        } else if (!strcmp(a, "--idle-ms") && i + 1 < argc) {
+            idle_ms = (DWORD)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(a, "--timeout-ms") && i + 1 < argc) {
             timeout_ms = (DWORD)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(a, "--settle-ms") && i + 1 < argc) {
@@ -507,9 +519,11 @@ int main(int argc, char **argv)
     if (desktop && strcmp(desktop, "none") != 0) joined = join_desktop(desktop, DESKTOP_WAIT_MS);
 
     if (watch) {
-        printf("gn-activate: watching (poll %lums)%s\n", (unsigned long)watch_ms,
+        printf("gn-activate: watching (poll %lums, idle exit %lums)%s\n",
+               (unsigned long)watch_ms, (unsigned long)idle_ms,
                joined ? "" : ", not joined");
         fflush(stdout);
+        DWORD idle_start = GetTickCount();
         for (;;) {
             struct candidate c;
             scan_all(0, 1, &c);
@@ -524,6 +538,12 @@ int main(int argc, char **argv)
                  * every poll: that would be a focus fight, not a fix. */
                 mark_seen(c.hwnd);
                 activate(c.hwnd, (int)settle_ms, force_messages);
+                /* any window worth acting on restarts the idle clock */
+                idle_start = GetTickCount();
+            } else if (idle_ms != 0 && GetTickCount() - idle_start >= idle_ms) {
+                printf("gn-activate: nothing to activate for %lums, exiting\n",
+                       (unsigned long)idle_ms);
+                return 0;
             }
             if (joined && !desktop_alive(desktop)) {
                 printf("gn-activate: desktop '%s' gone, exiting\n", desktop);
