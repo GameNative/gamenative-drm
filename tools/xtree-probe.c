@@ -184,10 +184,126 @@ static void dump_tree(xcb_connection_t *c, xcb_window_t w, int depth, int *budge
     }
 }
 
+/* The two X-level ways to ask someone to activate a window, both sent as
+ * ClientMessages rather than as property writes:
+ *
+ *  - _NET_ACTIVE_WINDOW to the root is EWMH's "please activate this". A window
+ *    manager that implements it raises and focuses the window; wine's own WM
+ *    implements some EWMH, so whether it acts on the message is a question and
+ *    not an assumption. Source indication 2 (pager) is used because pagers are
+ *    the callers a WM is least likely to second-guess.
+ *  - WM_TAKE_FOCUS direct to the window is the ICCCM mechanism: a WM sends it
+ *    instead of setting the input focus, and the client answers by calling
+ *    XSetInputFocus itself. Wine advertises WM_TAKE_FOCUS for its managed
+ *    windows, and this also sets the focus so the two paths can be told apart.
+ *
+ * Neither raises WM_ACTIVATE by itself. The point of the experiment is whether
+ * wine converts either into its own foreground state, which is what the game
+ * actually reacts to -- X input focus alone was measured not to. */
+static xcb_atom_t intern(xcb_connection_t *c, const char *name)
+{
+    xcb_intern_atom_cookie_t ck = xcb_intern_atom(c, 1, (uint16_t)strlen(name), name);
+    xcb_intern_atom_reply_t *r = xcb_intern_atom_reply(c, ck, NULL);
+    xcb_atom_t atom = r ? r->atom : XCB_NONE;
+    if (r) free(r);
+    return atom;
+}
+
+static void send_net_active_window(xcb_connection_t *c, xcb_window_t root,
+                                   xcb_window_t w)
+{
+    xcb_atom_t atom = intern(c, "_NET_ACTIVE_WINDOW");
+    if (!atom) { printf("  activate: _NET_ACTIVE_WINDOW not interned\n"); return; }
+    xcb_client_message_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.response_type = XCB_CLIENT_MESSAGE;
+    ev.format = 32;
+    ev.window = w;
+    ev.type = atom;
+    ev.data.data32[0] = 2;          /* source indication: pager */
+    ev.data.data32[1] = XCB_CURRENT_TIME;
+    ev.data.data32[2] = XCB_NONE;   /* currently active window */
+    xcb_send_event(c, 0, root,
+                   XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,
+                   (const char *)&ev);
+    xcb_flush(c);
+    printf("  activate: _NET_ACTIVE_WINDOW ClientMessage -> root, for 0x%08x\n", w);
+}
+
+static void send_take_focus(xcb_connection_t *c, xcb_window_t w)
+{
+    xcb_atom_t protocols = intern(c, "WM_PROTOCOLS");
+    xcb_atom_t take_focus = intern(c, "WM_TAKE_FOCUS");
+    if (!protocols || !take_focus) { printf("  take-focus: atoms not interned\n"); return; }
+    xcb_client_message_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.response_type = XCB_CLIENT_MESSAGE;
+    ev.format = 32;
+    ev.window = w;
+    ev.type = protocols;
+    ev.data.data32[0] = take_focus;
+    ev.data.data32[1] = XCB_CURRENT_TIME;
+    xcb_send_event(c, 0, w, XCB_EVENT_MASK_NO_EVENT, (const char *)&ev);
+    xcb_flush(c);
+    printf("  take-focus: WM_TAKE_FOCUS ClientMessage -> 0x%08x\n", w);
+}
+
+/* Largest mapped window below the root's direct children.
+ *
+ * Depth >= 2, not a class test: under `explorer /desktop=shell` the desktop is
+ * the root child everything lives inside, and its WM_CLASS on the X side is
+ * `explorer.exe` (measured), not the DESKTOP_CLASS_ATOM the Win32 side reports --
+ * so a class check matches nothing and the desktop wins on area. The guest's own
+ * window is the largest thing inside it.
+ */
+static xcb_window_t find_guest_window_rec(xcb_connection_t *c, xcb_window_t w,
+                                          int depth, long *best)
+{
+    xcb_window_t best_w = XCB_NONE;
+    if (depth > 12) return best_w;
+    xcb_query_tree_cookie_t qc = xcb_query_tree(c, w);
+    xcb_query_tree_reply_t *qr = xcb_query_tree_reply(c, qc, NULL);
+    if (!qr) return best_w;
+    int n = xcb_query_tree_children_length(qr);
+    xcb_window_t *kids = xcb_query_tree_children(qr);
+    for (int i = 0; i < n; i++) {
+        xcb_get_window_attributes_cookie_t ac = xcb_get_window_attributes(c, kids[i]);
+        xcb_get_window_attributes_reply_t *a = xcb_get_window_attributes_reply(c, ac, NULL);
+        xcb_get_geometry_cookie_t gc = xcb_get_geometry(c, kids[i]);
+        xcb_get_geometry_reply_t *g = xcb_get_geometry_reply(c, gc, NULL);
+        int mapped = a && a->map_state == XCB_MAP_STATE_VIEWABLE;
+        if (a) free(a);
+        if (g) {
+            long area = (long)g->width * (long)g->height;
+            if (mapped && area > 0 && depth >= 2 && area > *best) { *best = area; best_w = kids[i]; }
+            free(g);
+        }
+        /* A descendant only wins if it is strictly larger: the guest's outer
+         * window and its inner child can have identical area, and the outer one
+         * is the one that should be activated (measured: the inner child 0x02200017
+         * was picked over 0x02400001 before this check). */
+        long before = *best;
+        xcb_window_t deeper = find_guest_window_rec(c, kids[i], depth + 1, best);
+        if (deeper != XCB_NONE && *best > before) best_w = deeper;
+    }
+    free(qr);
+    return best_w;
+}
+
 static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [-display <dpy|socket>] [socket-path] [target-xid-hex]\n"
+            "           [-focus] [-raise]\n"
+            "  -focus / -raise : act on the target xid, then read the state back\n"
+            "  -watch-activate : wait for the guest's window (no xid needed), then\n"
+            "                    attempt X-level activation on it and report back\n"
+            "  -watch-ms N     how long to wait for that window (default 600000)\n"
+            "  -activate       : send EWMH _NET_ACTIVE_WINDOW ClientMessage for it\n"
+            "  -take-focus     : send ICCCM WM_TAKE_FOCUS, then set X input focus\n"
+            "                   one second later. gamescope recomputes focus and\n"
+            "                   stacking on the next window event, so the read-back\n"
+            "                   says whether the compositor kept the change.\n"
             "  -display <dpy> : display selector; a bare `:N` uses\n"
             "                   $GAMESCOPE_X11_DISPLAY then $DISPLAY (the session\n"
             "                   socket is env-provided on Android). An absolute\n"
@@ -201,6 +317,12 @@ int main(int argc, char **argv)
     const char *display = NULL;
     xcb_window_t target = 0;
     int have_target = 0;
+    int do_focus = 0;
+    int do_raise = 0;
+    int do_activate = 0;
+    int do_take_focus = 0;
+    int do_watch = 0;
+    int watch_ms = 600000;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-display") || !strcmp(argv[i], "--display")) {
@@ -209,6 +331,18 @@ int main(int argc, char **argv)
                 return 1;
             }
             display = argv[i];
+        } else if (!strcmp(argv[i], "-focus") || !strcmp(argv[i], "--focus")) {
+            do_focus = 1;
+        } else if (!strcmp(argv[i], "-raise") || !strcmp(argv[i], "--raise")) {
+            do_raise = 1;
+        } else if (!strcmp(argv[i], "-activate") || !strcmp(argv[i], "--activate")) {
+            do_activate = 1;
+        } else if (!strcmp(argv[i], "-take-focus") || !strcmp(argv[i], "--take-focus")) {
+            do_take_focus = 1;
+        } else if (!strcmp(argv[i], "-watch-activate") || !strcmp(argv[i], "--watch-activate")) {
+            do_watch = 1;
+        } else if (!strcmp(argv[i], "-watch-ms") && i + 1 < argc) {
+            watch_ms = atoi(argv[++i]);
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "%s: unknown option '%s'\n", argv[0], argv[i]);
             usage(argv[0]);
@@ -243,7 +377,18 @@ int main(int argc, char **argv)
                 display, path);
 
     int scr = 0;
-    xcb_connection_t *c = connect_path(path, &scr);
+    xcb_connection_t *c = NULL;
+    if (do_watch) {
+        /* The app arms this at session start, which can precede gamescope's X
+         * socket. Waiting is the job: socket first, then the window. */
+        int waited = 0;
+        while (!c && waited < watch_ms) {
+            c = connect_path(path, &scr);
+            if (!c) { struct timespec ts = { 0, 250000000 }; nanosleep(&ts, NULL); waited += 250; }
+        }
+    } else {
+        c = connect_path(path, &scr);
+    }
     if (!c) return 1;
 
     const xcb_setup_t *setup = xcb_get_setup(c);
@@ -265,6 +410,41 @@ int main(int argc, char **argv)
     er = xcb_query_extension_reply(c, ec, NULL);
     printf("  Present present=%u opcode=%u\n", er ? er->present : 0, er ? er->major_opcode : 0);
     if (er) free(er);
+
+    if (do_watch) {
+        printf("xtree-probe: watching for the guest's window (timeout %dms)\n", watch_ms);
+        fflush(stdout);
+        int waited = 0;
+        while (waited < watch_ms) {
+            long best = 0;
+            xcb_window_t w = find_guest_window_rec(c, screen->root, 0, &best);
+            if (w != XCB_NONE) {
+                printf("  window 0x%08x (%ld px): attempting X-level activation\n", w, best);
+                send_net_active_window(c, screen->root, w);
+                send_take_focus(c, w);
+                xcb_set_input_focus(c, XCB_INPUT_FOCUS_POINTER_ROOT, w, XCB_CURRENT_TIME);
+                xcb_flush(c);
+                struct timespec settle = { 1, 0 };
+                nanosleep(&settle, NULL);
+                xcb_get_input_focus_cookie_t fc = xcb_get_input_focus(c);
+                xcb_get_input_focus_reply_t *fr = xcb_get_input_focus_reply(c, fc, NULL);
+                if (fr) {
+                    printf("  after 1s: X input focus=0x%08x%s\n", fr->focus,
+                           fr->focus == w ? " (kept)" : " (reverted)");
+                    free(fr);
+                }
+                /* Wine's own foreground is the only state that matters and it is
+                 * not readable from here -- measured: both messages left it at
+                 * <none> while SetForegroundWindow moved it. */
+                return 0;
+            }
+            struct timespec ts = { 0, 400000000 };
+            nanosleep(&ts, NULL);
+            waited += 400;
+        }
+        printf("xtree-probe: no guest window after %dms\n", watch_ms);
+        return 2;
+    }
 
     printf("--- tree (depth-first from root) ---\n");
     int budget = 500;
@@ -312,6 +492,71 @@ int main(int argc, char **argv)
             print_name_class(c, parent);
             if (parent == screen->root) { printf("  (reached root)\n"); break; }
             w = parent;
+        }
+    }
+
+    if (target && (do_focus || do_raise || do_activate || do_take_focus)) {
+        printf("--- action on 0x%08x ---\n", target);
+        if (do_raise) {
+            uint32_t above = XCB_STACK_MODE_ABOVE;
+            xcb_configure_window(c, target, XCB_CONFIG_WINDOW_STACK_MODE, &above);
+            xcb_flush(c);
+            printf("  raise: XCB_STACK_MODE_ABOVE sent\n");
+        }
+        if (do_focus) {
+            xcb_set_input_focus(c, XCB_INPUT_FOCUS_POINTER_ROOT, target,
+                                XCB_CURRENT_TIME);
+            xcb_flush(c);
+            printf("  focus: XSetInputFocus(0x%08x) sent\n", target);
+        }
+        if (do_activate) send_net_active_window(c, screen->root, target);
+        if (do_take_focus) {
+            send_take_focus(c, target);
+            /* the ICCCM client's own answer to WM_TAKE_FOCUS */
+            xcb_set_input_focus(c, XCB_INPUT_FOCUS_POINTER_ROOT, target,
+                                XCB_CURRENT_TIME);
+            xcb_flush(c);
+        }
+
+        /* The server applies a focus or stacking change immediately, but
+         * gamescope recomputes both on the next window event. Waiting a second
+         * is what separates "the X server refused it" from "the compositor
+         * took it back" -- the two causes look identical in an instant
+         * read-back. */
+        struct timespec settle = { 1, 0 };
+        nanosleep(&settle, NULL);
+
+        xcb_get_input_focus_cookie_t fc = xcb_get_input_focus(c);
+        xcb_get_input_focus_reply_t *fr = xcb_get_input_focus_reply(c, fc, NULL);
+        if (fr) {
+            printf("  after 1s: X input focus=0x%08x%s\n", fr->focus,
+                   fr->focus == target ? " (kept)" : " (reverted)");
+            free(fr);
+        }
+
+        /* X stacks a parent's children bottom-to-top, so the last entry is what
+         * the server would composite last among the siblings. The list has to
+         * come from the *parent*, not from the target, whose child list says
+         * nothing about stacking. */
+        xcb_query_tree_cookie_t tc = xcb_query_tree(c, target);
+        xcb_query_tree_reply_t *tr = xcb_query_tree_reply(c, tc, NULL);
+        xcb_window_t parent = tr ? tr->parent : XCB_NONE;
+        if (tr) free(tr);
+        xcb_query_tree_cookie_t qc = xcb_query_tree(c, parent);
+        xcb_query_tree_reply_t *qr = xcb_query_tree_reply(c, qc, NULL);
+        if (qr) {
+            xcb_window_t *kids = xcb_query_tree_children(qr);
+            int n = xcb_query_tree_children_length(qr);
+            printf("  after 1s: siblings under 0x%08x, bottom -> top:\n", parent);
+            for (int i = 0; i < n; i++) {
+                xcb_get_window_attributes_cookie_t ac = xcb_get_window_attributes(c, kids[i]);
+                xcb_get_window_attributes_reply_t *a = xcb_get_window_attributes_reply(c, ac, NULL);
+                printf("    %s0x%08x%s\n", kids[i] == target ? "=> " : "   ", kids[i],
+                       a && a->override_redirect ? "  override" : "");
+                if (a) free(a);
+                print_name_class(c, kids[i]);
+            }
+            free(qr);
         }
     }
 
