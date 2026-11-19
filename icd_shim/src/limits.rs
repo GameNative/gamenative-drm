@@ -33,18 +33,34 @@ pub(crate) struct Limits {
 }
 
 impl Limits {
-    /// How many frames the generator may add per source frame, `None` when it
-    /// may not add any.
+    /// How many frames the generator may add after this source frame, `None`
+    /// when it may not add any.
     ///
-    /// The ceiling is a rate, so a panel that cannot show `acquire × multiplier`
-    /// frames leaves the generator fewer per source frame; it never leaves it
-    /// more. `multiplier` is the configured one, and the return value never
-    /// exceeds `multiplier - 1`.
-    pub(crate) fn generate_per_source(&self, multiplier: u32) -> Option<u32> {
-        let generate = self.generate_per_s?;
-        let acquire = self.acquire_per_s?;
-        let asked = multiplier.saturating_sub(1);
-        Some(asked.min(generate / acquire.max(1)))
+    /// The ceiling is a rate, not a ratio, so the batch is not required to be a
+    /// whole number of frames per source frame: a cap 70 session on a 120 Hz
+    /// panel leaves 50 generated against 70 source frames -- five frames every
+    /// seven. `credit` carries the remainder between calls, which is what makes
+    /// the generator's output land on the rate in the table instead of on the
+    /// floor of it. Flooring the ratio instead switched generation off entirely
+    /// at any cap above half the refresh, where the table still promises the
+    /// panel's leftover.
+    ///
+    /// The return value never exceeds `multiplier - 1`: asking for more than the
+    /// configured multiplier is not what a rate bound means.
+    pub(crate) fn generate_batch(&self, multiplier: u32, credit: &mut u64) -> Option<u32> {
+        let generate = self.generate_per_s? as u64;
+        let acquire = self.acquire_per_s? as u64;
+        if acquire == 0 {
+            return Some(0);
+        }
+        *credit += generate;
+        let mut batch = *credit / acquire;
+        *credit %= acquire;
+        let asked = u64::from(multiplier.saturating_sub(1));
+        if batch > asked {
+            batch = asked;
+        }
+        Some(batch as u32)
     }
 }
 
@@ -81,11 +97,11 @@ pub(crate) fn limits(
             // 80 commits a second, of which the compositor dropped 20 — the
             // budget is the panel's, so it belongs in the same subtraction.
             //
-            // The consequence is deliberate and worth knowing: at 60 Hz, cap 40,
-            // ×2, this leaves 20 generated against 40 source frames, i.e. 0.5
-            // per source frame, which `generate_per_source` floors to 0. Frame
-            // generation therefore does nothing at any cap above half the
-            // refresh, where before it over-subscribed the panel instead.
+            // That leftover is a rate, not a ratio of whole frames: at 60 Hz,
+            // cap 40, ×2 it is 20 generated against 40 source frames, one every
+            // other source frame. `generate_batch` carries the remainder so the
+            // average lands on it; flooring the ratio instead zeroed generation
+            // at any cap above half the refresh, where the panel still had room.
             //
             // Unsynced, only the cap does, and the compositor drops the
             // remainder by design.
@@ -218,33 +234,55 @@ mod tests {
     }
 
     #[test]
-    fn generation_per_source_narrows_when_the_panel_is_the_ceiling() {
+    fn the_generator_spends_a_rate_that_is_not_a_whole_frame_per_source() {
         // 40 acquires, 60 panel, ×4 asked: the panel leaves 20 generated in
-        // total, i.e. none per source frame at this rate.
+        // total -- one every other source frame, not none.
         let l = limits(true, Some(40), Some(4), 60);
         assert_eq!(l.generate_per_s, Some(20));
-        assert_eq!(l.generate_per_source(4), Some(0));
-        // Unsynced the same numbers leave the ask intact.
-        let l = limits(false, Some(40), Some(4), 60);
-        assert_eq!(l.generate_per_source(4), Some(3));
+        let mut credit = 0u64;
+        let batches: Vec<u32> = (0..8).map(|_| l.generate_batch(4, &mut credit).unwrap()).collect();
+        assert_eq!(batches, vec![0, 1, 0, 1, 0, 1, 0, 1]);
+        // 20 generated over 40 source frames is exactly the panel's leftover.
+        assert_eq!(batches.iter().sum::<u32>(), 4);
+
+        // and a rate that is more than one per source keeps the multiplier's cap
+        let l = limits(true, Some(30), Some(2), 60);
+        let mut credit = 0u64;
+        assert!((0..20).all(|_| l.generate_batch(2, &mut credit).unwrap() <= 1));
     }
 
-    /// The consequence of `refresh - acquire`, pinned so it cannot drift into a
-    /// claim about the feature working: at 60 Hz, cap 40, ×2, the panel leaves 20
-    /// generated against 40 source frames, and half a frame per source floors to
-    /// none. A user with LSFG on at that cap gets no generated frames, which is
-    /// the price of not over-subscribing the panel.
     #[test]
-    fn a_cap_above_half_the_panel_leaves_no_room_to_generate() {
+    fn a_cap_above_half_the_panel_still_gets_its_leftover() {
+        // 70 on a 120 Hz panel: the table's total is 70 + 50, not 70 + 0.
+        let l = limits(true, Some(70), Some(2), 120);
+        assert_eq!(l.acquire_per_s, Some(70));
+        assert_eq!(l.generate_per_s, Some(50));
+        let mut credit = 0u64;
+        let batches: Vec<u32> = (0..70).map(|_| l.generate_batch(2, &mut credit).unwrap()).collect();
+        // 50 frames over 70 source frames, ~5 every 7
+        assert_eq!(batches.iter().sum::<u32>(), 50);
+        assert!(batches.iter().all(|&b| b <= 1));
+    }
+
+    /// `refresh - acquire` is spent, not rounded away: at 60 Hz, cap 40, ×2 the
+    /// panel leaves 20 generated against 40 source frames -- one every other
+    /// source frame.
+    #[test]
+    fn a_cap_above_half_the_panel_spends_its_leftover() {
         let l = limits(true, Some(40), Some(2), 60);
         assert_eq!(l.generate_per_s, Some(20));
-        assert_eq!(l.generate_per_source(2), Some(0));
-        // One step lower and generation survives: cap 30 at ×2 on 60 Hz.
+        let mut credit = 0u64;
+        let batches: Vec<u32> = (0..40).map(|_| l.generate_batch(2, &mut credit).unwrap()).collect();
+        assert_eq!(batches.iter().sum::<u32>(), 20);
+        // A cap at or below half the panel is one per source.
         let l = limits(true, Some(30), Some(2), 60);
         assert_eq!(l.generate_per_s, Some(30));
-        assert_eq!(l.generate_per_source(2), Some(1));
+        let mut credit = 0u64;
+        assert_eq!(l.generate_batch(2, &mut credit), Some(1));
         // A cap above the panel cannot underflow: nothing is left to generate.
         let l = limits(true, Some(120), Some(2), 60);
         assert_eq!(l.generate_per_s, Some(0));
+        let mut credit = 0u64;
+        assert_eq!(l.generate_batch(2, &mut credit), Some(0));
     }
 }

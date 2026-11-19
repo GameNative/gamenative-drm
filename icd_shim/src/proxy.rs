@@ -1589,9 +1589,10 @@ unsafe fn lsfg_generate(sc: *mut GnSwapchain, src_idx: i32) -> bool {
     // frame and only generation and blit are gated on the plan.
     // The engine plans by the multiplier; the session's generation limit is a
     // rate, so a panel that cannot show `acquire × multiplier` frames leaves
-    // fewer per source frame ([`crate::limits::Limits::generate_per_source`]).
+    // fewer per source frame ([`crate::limits::Limits::generate_batch`]), carried
+    // across frames so a rate that is not a whole frame per source is still spent.
     let planned = unsafe { (*session).plan(capacity) };
-    let allowed = session_limits(sc).generate_per_source(multiplier);
+    let allowed = session_limits(sc).generate_batch(multiplier, unsafe { &mut (*sc).gen_credit });
     let planned = match allowed {
         Some(per) => planned.min(per),
         None => 0,
@@ -2681,6 +2682,7 @@ unsafe extern "C" fn gn_vkCreateSwapchainKHR(
         slots: Vec::new(),
         guest_slots: 0,
         spare_slots: 0,
+        gen_credit: 0,
         spare: None,
         gen_no_grow: false,
         release: crate::vsync_gate::Schedule::default(),
@@ -8118,6 +8120,11 @@ pub struct GnSwapchain {
     /// (`crate::image_count::hidden_slot_count`); 0 when there are none. The
     /// ring itself may be larger when generation's destinations need more.
     pub spare_slots: u32,
+    /// Generation's fractional frame credit, in units of one source frame
+    /// (`limits::Limits::generate_batch`). Carrying the remainder is what lets
+    /// the generator spend a rate that is not a whole number of frames per
+    /// source frame.
+    pub gen_credit: u64,
     /// Made at the first present of a swapchain with hidden slots.
     pub spare: Option<SpareCopy>,
     pub worker: Option<std::thread::JoinHandle<()>>,

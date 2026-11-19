@@ -128,10 +128,16 @@ divisor cap reads its target exactly.
   **Synced, the source frames are part of the panel's budget.** The generated
   ceiling on that row is `refresh − acquire`, not `refresh`: a 60 Hz panel can show
   60 frames whichever way they were made, so a cap 40 session leaves 20 for the
-  generator and no more. The consequence is deliberate and it is not a rounding
-  detail — at cap 40, ×2, that is 20 generated against 40 source frames, half a
-  frame each, which floors to none, so frame generation does nothing at any cap
-  above half the refresh. Lower the cap or the multiplier to make room.
+  generator and no more.
+
+  That leftover is a *rate*, not a ratio of whole frames, so it is spent rather
+  than rounded away. At cap 40, ×2, on 60 Hz the generator gets 20 against 40
+  source frames — one generated frame every other source frame — and the session
+  produces 60. The earlier rule floored the ratio to whole frames per source,
+  which turned those 20 into 0 and made frame generation do nothing at any cap
+  above half the refresh while the panel still had room. Carrying the remainder
+  (`Limits::generate_batch`'s `credit`, one per swapchain) is what keeps the
+  output on the rate in the table; a whole-number-per-source rule cannot.
 
   `hold` is when an acquired image may be drawn into again. It follows the
   **served** mode — the same one `on_buffer_release` keys on — and on this route
@@ -221,11 +227,11 @@ divisor cap reads its target exactly.
     HUD.
 
   `generate_per_s` is consumed as a bound on how many frames one source frame may
-  yield, not as a fourth limiter: `Limits::generate_per_source(m)` caps the batch
-  the generator plans (`proxy.rs`, `lsfg_generate`), and the batch's frames are
-  placed on the latch grid (`docs/17`). The rate in the table is therefore the
-  generator's ceiling; what actually lands is that ceiling, floored to whole frames
-  per source.
+  yield, not as a fourth limiter: `Limits::generate_batch(m, &mut credit)` caps the
+  batch the generator plans (`proxy.rs`, `lsfg_generate`), and the batch's frames
+  are placed on the latch grid (`docs/17`). The rate in the table is therefore the
+  generator's ceiling, and the credit is what makes the average land on it when
+  the rate is not a whole number of frames per source.
 
   The gate (`icd_shim/src/vsync_gate.rs`) is one regulator and one rule: a frame
   may start `1e9 / limit` after the previous frame started, and not before.
