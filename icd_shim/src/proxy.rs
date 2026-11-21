@@ -8487,28 +8487,46 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
         // buffer the daemon does not track (a local allocation, or a daemon too
         // old to send notes) is freed here, as before.
         //
-        // Only for a synced declaration. `VkPresentModeKHR` is a contract about
-        // when an image comes back, and FIFO is the only one that promises the
-        // client a display-bound return: IMMEDIATE returns the image once it is
-        // handed over, MAILBOX as soon as a newer one replaces it. Parking those
-        // applies FIFO's lifetime to a mode that promised none, and the cost is
-        // measurable — an uncapped immediate session on a 120 Hz panel ran at
+        // Only for a mode that promises a display-bound return.
+        // `VkPresentModeKHR` is a contract about when an image comes back, and
+        // FIFO is the only one that promises it: IMMEDIATE returns the image once
+        // it is handed over, MAILBOX as soon as a newer one replaces it. Parking
+        // those applies FIFO's lifetime to a mode that promised none, and the cost
+        // is measurable — an uncapped immediate session on a 120 Hz panel ran at
         // `depth x refresh / hold` = 106 instead of free, with `slot_waits` at
-        // 99 % and `in_flight` pinned at the depth. FIFO_RELAXED stays synced:
-        // the spec lets it return a late frame early, and holding it to the note
-        // is the conservative side of a row the table already calls synced.
-        // The *served* mode, not the declared one: an immediate guest is served as
-        // mailbox above, and a mailbox frame is replaced at a vblank rather than
-        // shown mid-scan — so its buffer still has to survive its scan-out, exactly
-        // as a FIFO frame's does. Keying this on the declaration would free the slot
-        // at the compositor's release again and let the guest write into a buffer
-        // the display is reading.
+        // 99 % and `in_flight` pinned at the depth.
+        //
+        // The other side of the trade, which is why MAILBOX is not in this set. A
+        // mailbox buffer that reaches the panel is scanned for a full period and
+        // must be held that long; a buffer replaced in the pending slot never was,
+        // and nothing else holds it. Parking both holds the latched frames *and*
+        // waits out the bound for the superseded ones, because only a latched
+        // frame is ever released and so only it gets a note. Measured on Odin 3
+        // (Hades II, uncapped, 4 slots, 120 Hz): `commits` 200.4/s against `notes`
+        // 119.8/s — the panel rate — so 40 % of commits had no note to wait for
+        // and fell to `release_note_limit_ns()`; every slot averaged 2.42 periods
+        // against a display hold the daemon measures at 1.0-1.5, and the session
+        // read 200 fps. With this set it reads 330 (5 samples, 328.7-331.0) at
+        // `slot_waits` 2 of 59 356 acquires, `park_timeouts` 0 and a 1.46-period
+        // hold, which is the display's own.
+        //
+        // What it gives up: a mailbox buffer that does reach the panel can be
+        // written again while it is being scanned, so the reuse tear is open on
+        // this path by construction. The principled fix is the compositor's
+        // `wp_presentation_feedback.discarded` — park what was latched, free what
+        // was discarded — which is not subscribed yet (`present::expect_feedback`
+        // requests none when the present carries no id, so the census reads
+        // `presented=0 discarded=0`).
+        //
+        // The *served* mode, not the declared one, so an immediate and a
+        // FIFO-relaxed guest are both served as mailbox (`choose_live_mode`) and
+        // both now take the mailbox rule: FIFO proper is the only declaration this
+        // still parks, and it is the only one the spec gives a display-bound
+        // return to.
         let served = live_choice(sc).0;
         let synced = matches!(
             served,
-            VK_PRESENT_MODE_FIFO_KHR
-                | VK_PRESENT_MODE_FIFO_RELAXED_KHR
-                | VK_PRESENT_MODE_MAILBOX_KHR
+            VK_PRESENT_MODE_FIFO_KHR | VK_PRESENT_MODE_FIFO_RELAXED_KHR
         );
         // A synced slot waits for the display's own release, which is the note.
         // No capability check stands in front of it: the note may never come (a

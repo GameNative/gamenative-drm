@@ -200,9 +200,16 @@ that rate is the display's.
 - **`IMMEDIATE` is served as `MAILBOX`.** The one substitution the layer makes
   (`choose_live_mode`): a frame that cannot be shown is dropped for the client
   instead of being scanned out mid-flip, and the declaration follows the served
-  mode. Its hold is the served mode's too (`note`), so the buffer still waits out
-  its own scan-out — a mode override that changed only the present path would
-  leave the reuse tear open.
+  mode. Its hold is *not* the served mode's: only a FIFO declaration waits out its
+  own scan-out (`note`); a mailbox slot is freed at the compositor's
+  `wl_buffer.release`, which is before the display has finished reading it. A
+  mailbox buffer that is superseded in the pending slot was never scanned and has
+  nothing to wait for, and holding it costs a whole period per frame — measured at
+  200 fps uncapped, 330 with this rule on the same session (Odin 3, Hades II). The
+  trade is that a mailbox buffer which *does* reach the panel can be written again
+  while it is being scanned: the reuse tear is open on that path by construction,
+  and it is the price of the rate. `wp_presentation_feedback.discarded` is the
+  authority that separates the two buffers, and it is not subscribed yet.
 
 ## 4. What the daemon owns
 
