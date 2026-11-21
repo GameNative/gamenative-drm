@@ -201,15 +201,28 @@ that rate is the display's.
   (`choose_live_mode`): a frame that cannot be shown is dropped for the client
   instead of being scanned out mid-flip, and the declaration follows the served
   mode. Its hold is *not* the served mode's: only a FIFO declaration waits out its
-  own scan-out (`note`); a mailbox slot is freed at the compositor's
+  own scan-out (`note`); a plain mailbox slot is freed at the compositor's
   `wl_buffer.release`, which is before the display has finished reading it. A
   mailbox buffer that is superseded in the pending slot was never scanned and has
   nothing to wait for, and holding it costs a whole period per frame — measured at
   200 fps uncapped, 330 with this rule on the same session (Odin 3, Hades II). The
   trade is that a mailbox buffer which *does* reach the panel can be written again
   while it is being scanned: the reuse tear is open on that path by construction,
-  and it is the price of the rate. `wp_presentation_feedback.discarded` is the
-  authority that separates the two buffers, and it is not subscribed yet.
+  and it is the price of the rate.
+
+  **Frame generation takes the other rule even when it is served as mailbox.** The
+  330 above needed an unbounded guest rate, where a source buffer's reuse lap is
+  many frames deep and the write lands long after the scan; a generating session
+  derives its source rate (`refresh / m`) and gates every acquire, so the pool is
+  never the limiter and a display-bound hold costs nothing — measured at
+  `slot_waits` 23 of 52 536 acquires, `gate_avg_us` 15 328 and 59.1 fps in FIFO and
+  in MAILBOX alike (Odin 3, Vampire Survivors, ×2, 120 Hz). Its commits are placed
+  on the latch grid, so a buffer freed early is re-acquired at the same point of
+  every frame, which is a constant tear rather than an occasional one. So
+  `on_buffer_release` parks a MAILBOX slot when and only when generation is on.
+  `wp_presentation_feedback.discarded` remains the authority that would separate a
+  latched buffer from a superseded one for a plain mailbox guest, and it is not
+  subscribed yet.
 
 ## 4. What the daemon owns
 

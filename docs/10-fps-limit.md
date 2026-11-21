@@ -146,11 +146,12 @@ devices measured — because the period it books is the panel's measured one.
   **served** mode — the same one `on_buffer_release` keys on — and on this route
   every declaration is served as FIFO or MAILBOX: FIFO for a guest that asked for
   it, MAILBOX for a generation session and for a declared `IMMEDIATE` or
-  `FIFO_RELAXED` (`choose_live_mode`). Only FIFO is synced, so only a FIFO row
-  holds to `note`: the image comes back when the compositor reports its release
+  `FIFO_RELAXED` (`choose_live_mode`). Only FIFO is synced — plus MAILBOX while
+  generation is on, which is a different trade and is argued below — so only those
+  rows hold to `note`: the image comes back when the compositor reports its release
   *and* the display reports its scan-out release after that — measured at 1.5-2.5
-  display periods (`sf hold`). A mailbox row returns at the compositor's release,
-  which is before the display has finished reading it.
+  display periods (`sf hold`). A plain mailbox row returns at the compositor's
+  release, which is before the display has finished reading it.
   [24-release-notes.md](24-release-notes.md) describes that channel:
   the note names the commit's ticket, so the pairing is exact where it once needed
   an inode, an order window and a bound, and a park whose note never arrives is
