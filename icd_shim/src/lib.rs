@@ -563,7 +563,10 @@ fn init_once() {
         try_system_driver();
     }
     if kgsl && unsafe { DRIVER.handle }.is_null() {
-        if std::env::var_os("GN_VKSHIM_NO_ADRENOTOOLS").is_none() {
+        // Xwayland's glamor (zink) stays on the payload driver: a container's
+        // adrenotools Turnip leaks a dma-buf fd per imported client buffer there,
+        // and a CEF client exhausts device memory within minutes.
+        if std::env::var_os("GN_VKSHIM_NO_ADRENOTOOLS").is_none() && !is_xwayland_binary() {
             try_adrenotools();
         }
         // A wrapper container with no adrenotools driver is on the system
