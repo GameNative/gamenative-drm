@@ -82,10 +82,70 @@ impl Pacing {
 /// release per `1e9 / cap`.
 #[must_use]
 pub(crate) fn pacing(cap_fps: u32) -> Pacing {
+    paced_on(cap_fps, crate::lsfg::latch_grid())
+}
+
+/// [`pacing`] with the panel supplied, so the rule is testable without a session.
+#[must_use]
+pub(crate) fn paced_on(
+    cap_fps: u32,
+    grid: Option<gndrm_lsfg::pacing::Grid>,
+) -> Pacing {
     match crate::scanout::period_ns(cap_fps) {
         0 => Pacing::Off,
-        period_ns => Pacing::Clock { period_ns },
+        period_ns => Pacing::Clock {
+            period_ns: on_panel(period_ns, grid),
+        },
     }
+}
+
+/// How far a cap's period may sit from a whole multiple of the panel's before it
+/// stops counting as that multiple. Two percent: a cap a user picks *is* meant to
+/// be a divisor of the refresh, and the panel's measured rate is not its nominal
+/// one, so the cap and the panel disagree in their own nominals by up to this —
+/// `1e9 / 120` against a measured 8 260 500 ns is 0.88 %, which is the gap on both
+/// devices measured. The headroom past that is for a panel further from its
+/// nominal. A cap that genuinely is not a divisor is further away by construction
+/// — 90 on 120 Hz is 33 % off — and is left alone.
+///
+/// The cost, which is the mapping's and not the tolerance's: a cap up to this
+/// close below a divisor is served at the divisor, so it reads up to 2 % above its
+/// own nominal (119 on a 121 Hz panel is served 121.06, +1.73 %). That is the
+/// trade the mapping makes — the alternative is leaving the cap to beat against
+/// the panel, which is what loses a vblank per frame below.
+const PANEL_SNAP: f64 = 0.02;
+
+/// A cap period measured in the panel's own periods.
+///
+/// The gate's clock does not need to be a lattice of vblanks to hold a rate, but
+/// it does need to not *beat* against one. A period that is a whole multiple of
+/// the panel's stays on the same phase forever, so every release falls in the
+/// same place in the vblank interval and none of them is spent waiting a second
+/// vblank it did not need. That is the whole difference: `1e9 / 120` against a
+/// measured 8 257 000 ns slips 76 us a frame, sweeps the whole interval every
+/// ~108 frames, and the frames that land late of their vblank cost a period each
+/// — 80 fps under a 120 cap on a 120 Hz panel.
+///
+/// It rounds to the *nearest* multiple, which can land marginally faster than the
+/// cap (60 on a 121 Hz panel becomes two periods, 60.55 fps): the multiple is the
+/// only rate the panel can actually show, and rounding up instead would cost a
+/// whole divisor (40 fps).
+///
+/// A cap that is not near a multiple keeps its own period. It cannot be expressed
+/// on this panel anyway, and its achieved rate is already quantized by the
+/// display — 90 on 120 Hz releases every 11.1 ms but a frame can only be shown on
+/// a vblank, so it lands on alternate ones at 60.
+fn on_panel(period_ns: u64, grid: Option<gndrm_lsfg::pacing::Grid>) -> u64 {
+    let Some(grid) = grid.filter(|g| g.period_ns != 0) else {
+        return period_ns;
+    };
+    let panel = grid.period_ns;
+    let ratio = period_ns as f64 / panel as f64;
+    let multiple = ratio.round();
+    if multiple < 1.0 || (ratio - multiple).abs() > multiple * PANEL_SNAP {
+        return period_ns;
+    }
+    (multiple as u64).saturating_mul(panel)
 }
 
 /// Acquires that started more than a period after their release point, and the
@@ -185,10 +245,94 @@ mod tests {
     const P60: u64 = 16_666_666;
 
     fn period(cap: u32) -> u64 {
-        match pacing(cap) {
+        match paced_on(cap, None) {
             Pacing::Clock { period_ns } => period_ns,
             Pacing::Off => panic!("no cap {cap}"),
         }
+    }
+
+    /// A grid whose latch spacing is `panel_ns`.
+    fn grid(panel_ns: u64) -> gndrm_lsfg::pacing::Grid {
+        gndrm_lsfg::pacing::Grid {
+            anchor_ns: 0,
+            period_ns: panel_ns,
+            lead_ns: 0,
+        }
+    }
+
+    fn period_on(cap: u32, panel_ns: u64) -> u64 {
+        match paced_on(cap, Some(grid(panel_ns))) {
+            Pacing::Clock { period_ns } => period_ns,
+            other => panic!("{cap} on a {panel_ns} ns panel gave {other:?}"),
+        }
+    }
+
+    /// A cap at the panel's own rate is released once per panel period, so its
+    /// clock cannot walk across the vblank interval.
+    #[test]
+    fn a_cap_at_the_panels_rate_takes_the_panels_period() {
+        // The reported fault: 1e9/120 is 8 333 333 ns against a measured
+        // 8 257 000 ns panel, so the phase sweeps and a fraction of frames wait a
+        // second vblank. Measuring the period in panel periods removes the walk.
+        assert_eq!(period_on(120, 8_257_000), 8_257_000);
+        assert_eq!(period_on(120, 8_333_333), 8_333_333);
+        assert_eq!(period_on(60, 8_257_000), 16_514_000);
+        assert_eq!(period_on(144, 6_944_444), 6_944_444);
+        // And no grid note leaves the cap on its own clock.
+        assert_eq!(period(120), 8_333_333);
+    }
+
+    /// A cap that divides the refresh keeps its divisor exactly, because the
+    /// panel's own period is what the divisor is a multiple of.
+    #[test]
+    fn a_divisor_cap_is_exact_on_the_panels_period() {
+        let panel = 8_257_000u64;
+        assert_eq!(period_on(30, panel), 4 * panel);
+        assert_eq!(period_on(40, panel), 3 * panel);
+        assert_eq!(period_on(60, panel), 2 * panel);
+        assert_eq!(period_on(24, panel), 5 * panel);
+    }
+
+    /// A cap the panel cannot divide keeps its own period: rounding it to a
+    /// multiple would move the rate to a divisor, and the display quantizes it
+    /// anyway.
+    #[test]
+    fn a_cap_the_panel_cannot_divide_keeps_its_own_period() {
+        let panel = 8_257_000u64;
+        for cap in [90u32, 100, 115] {
+            let own = 1_000_000_000 / u64::from(cap);
+            assert_eq!(period_on(cap, panel), own, "cap {cap}");
+        }
+        // 120 on a 144 Hz panel is 1.2 periods: not a multiple.
+        assert_eq!(period_on(120, 6_944_444), 8_333_333);
+    }
+
+    /// A cap inside the tolerance but not a divisor is served at the neighbour it
+    /// is close to, so it reads above or below its own nominal. Pinned because it
+    /// is the mapping's cost, and because a cap this close is not distinguishable
+    /// from the divisor the user meant to set.
+    #[test]
+    fn a_cap_just_off_a_divisor_takes_the_divisor() {
+        let panel = 8_260_500u64;
+        // 119 is 1.0173 periods: served 121.06 fps, +1.73 % over its nominal.
+        assert_eq!(period_on(119, panel), panel);
+        // 122 is 0.9923 periods: served 121.06 fps, 0.77 % under — a cap may
+        // round down onto the rate it can actually hold.
+        assert_eq!(period_on(122, panel), panel);
+        // Outside the tolerance the cap keeps its own clock, both sides.
+        assert_eq!(period_on(118, panel), 1_000_000_000 / 118);
+        assert_eq!(period_on(124, panel), 1_000_000_000 / 124);
+    }
+
+    /// A cap above the panel keeps its own period. docs/10 is explicit that a cap
+    /// above the panel reads as more frames than the panel shows — the guest
+    /// renders at the cap and the display drops the rest — so shortening it to
+    /// one period would change a documented rate.
+    #[test]
+    fn a_cap_above_the_panel_keeps_its_own_period() {
+        let panel = 8_257_000u64;
+        assert_eq!(period_on(240, panel), 1_000_000_000 / 240);
+        assert_eq!(period_on(165, panel), 1_000_000_000 / 165);
     }
 
     #[test]
