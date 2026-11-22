@@ -8487,29 +8487,62 @@ extern "C" fn on_buffer_release(data: *mut c_void, _buf: *mut wl_proxy) {
         // buffer the daemon does not track (a local allocation, or a daemon too
         // old to send notes) is freed here, as before.
         //
-        // Only for a synced declaration. `VkPresentModeKHR` is a contract about
-        // when an image comes back, and FIFO is the only one that promises the
-        // client a display-bound return: IMMEDIATE returns the image once it is
-        // handed over, MAILBOX as soon as a newer one replaces it. Parking those
-        // applies FIFO's lifetime to a mode that promised none, and the cost is
-        // measurable — an uncapped immediate session on a 120 Hz panel ran at
+        // Only for a mode that promises a display-bound return.
+        // `VkPresentModeKHR` is a contract about when an image comes back, and
+        // FIFO is the only one that promises it: IMMEDIATE returns the image once
+        // it is handed over, MAILBOX as soon as a newer one replaces it. Parking
+        // those applies FIFO's lifetime to a mode that promised none, and the cost
+        // is measurable — an uncapped immediate session on a 120 Hz panel ran at
         // `depth x refresh / hold` = 106 instead of free, with `slot_waits` at
-        // 99 % and `in_flight` pinned at the depth. FIFO_RELAXED stays synced:
-        // the spec lets it return a late frame early, and holding it to the note
-        // is the conservative side of a row the table already calls synced.
-        // The *served* mode, not the declared one: an immediate guest is served as
-        // mailbox above, and a mailbox frame is replaced at a vblank rather than
-        // shown mid-scan — so its buffer still has to survive its scan-out, exactly
-        // as a FIFO frame's does. Keying this on the declaration would free the slot
-        // at the compositor's release again and let the guest write into a buffer
-        // the display is reading.
-        let served = live_choice(sc).0;
+        // 99 % and `in_flight` pinned at the depth.
+        //
+        // The other side of the trade, which is why a plain MAILBOX is not in this
+        // set. A mailbox buffer that reaches the panel is scanned for a full period
+        // and must be held that long; a buffer replaced in the pending slot never
+        // was, and nothing else holds it. Parking both holds the latched frames
+        // *and* waits out the bound for the superseded ones, because only a latched
+        // frame is ever released and so only it gets a note. Measured on Odin 3
+        // (Hades II, uncapped, 4 slots, 120 Hz): `commits` 200.4/s against `notes`
+        // 119.8/s — the panel rate — so 40 % of commits had no note to wait for
+        // and fell to `release_note_limit_ns()`; every slot averaged 2.42 periods
+        // against a display hold the daemon measures at 1.0-1.5, and the session
+        // read 200 fps. With this set it reads 330 (5 samples, 328.7-331.0) at
+        // `slot_waits` 2 of 59 356 acquires, `park_timeouts` 0 and a 1.46-period
+        // hold, which is the display's own.
+        //
+        // Generation is the exception, and it is a different trade rather than a
+        // weaker one. That 330 needed an unbounded guest rate: at 330 fps a source
+        // buffer's reuse lap is many frames deep, so the write lands long after the
+        // scan even when the slot was freed early. A generating session has neither
+        // property. Its source rate is derived (`refresh / m` — 60 on a 120 Hz panel
+        // at x2) and the gate binds on every acquire, so the pool is never the
+        // limiter and a display-bound hold costs nothing: measured on Odin 3
+        // (Vampire Survivors, cap off, x2, 120 Hz) at `slot_waits` 23 of 52 536
+        // acquires in FIFO *and* in MAILBOX, `gate_avg_us` 15 328 and 59.1 frames/s
+        // in both. And the commits are placed on the latch grid (`GenDue`), so a
+        // source buffer freed at the compositor's release is re-acquired at the same
+        // point of every frame: an open window that is open on every frame, which
+        // reads as a constant tear instead of an occasional one. So MAILBOX is
+        // parked here when and only when generation is on.
+        //
+        // What a plain mailbox guest still gives up: a buffer that does reach the
+        // panel can be written again while it is being scanned, so the reuse tear is
+        // open on that path by construction. The principled fix is the compositor's
+        // `wp_presentation_feedback.discarded` — park what was latched, free what
+        // was discarded — which is not subscribed yet (`present::expect_feedback`
+        // requests none when the present carries no id, so the census reads
+        // `presented=0 discarded=0`).
+        //
+        // The *served* mode, not the declared one, so an immediate and a
+        // FIFO-relaxed guest are both served as mailbox (`choose_live_mode`).
+        // `Declared::Generating` is the same predicate that served the mode
+        // (`lsfg::wanted`), so the lifetime applied here and the mode declared
+        // cannot disagree.
+        let (served, declared) = live_choice(sc);
         let synced = matches!(
             served,
-            VK_PRESENT_MODE_FIFO_KHR
-                | VK_PRESENT_MODE_FIFO_RELAXED_KHR
-                | VK_PRESENT_MODE_MAILBOX_KHR
-        );
+            VK_PRESENT_MODE_FIFO_KHR | VK_PRESENT_MODE_FIFO_RELAXED_KHR
+        ) || (served == VK_PRESENT_MODE_MAILBOX_KHR && declared == Declared::Generating);
         // A synced slot waits for the display's own release, which is the note.
         // No capability check stands in front of it: the note may never come (a
         // buffer the daemon's publish path coalesced away is never replaced), and

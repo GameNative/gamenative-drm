@@ -72,8 +72,10 @@ enter it, so the mode is the rate the compositor paints at and the rate clients
 are told. With no `-r` on the launch line, the paint tick, the app-refresh cycle
 and the divisor base all derive from that one rate.
 
-A divisor cap on the grid lands on its target exactly, and the uncapped ceiling
-is the client↔gamescope lap — the grid itself never binds.
+A divisor cap on the grid lands on its target's panel multiple — its nominal plus
+the gap between the panel's nominal rate and its measured period, 0.9 % on both
+devices measured — and the uncapped ceiling is the client↔gamescope lap; the grid
+itself never binds.
 
 | `-r` | presents/s |
 |---|---|
@@ -84,7 +86,8 @@ is the client↔gamescope lap — the grid itself never binds.
 
 The flip event is emitted with the publish (see 12), so a paced frame's present
 does not carry the SurfaceFlinger round trip: `interval ≈ 1 / target`, and a
-divisor cap reads its target exactly.
+divisor cap reads its target's panel multiple — 0.9 % above the nominal, on the
+devices measured — because the period it books is the panel's measured one.
 
 ## How the cap is applied
 
@@ -143,10 +146,13 @@ divisor cap reads its target exactly.
   **served** mode — the same one `on_buffer_release` keys on — and on this route
   every declaration is served as FIFO or MAILBOX: FIFO for a guest that asked for
   it, MAILBOX for a generation session and for a declared `IMMEDIATE` or
-  `FIFO_RELAXED` (`choose_live_mode`). Both are synced, so the hold is `note` on every row: the
-  image comes back only when the compositor reports its release *and* the display
-  reports its scan-out release after that — measured at 1.5-2.5 display periods
-  (`sf hold`). [24-release-notes.md](24-release-notes.md) describes that channel:
+  `FIFO_RELAXED` (`choose_live_mode`). Only FIFO is synced — plus MAILBOX while
+  generation is on, which is a different trade and is argued below — so only those
+  rows hold to `note`: the image comes back when the compositor reports its release
+  *and* the display reports its scan-out release after that — measured at 1.5-2.5
+  display periods (`sf hold`). A plain mailbox row returns at the compositor's
+  release, which is before the display has finished reading it.
+  [24-release-notes.md](24-release-notes.md) describes that channel:
   the note names the commit's ticket, so the pairing is exact where it once needed
   an inode, an order window and a bound, and a park whose note never arrives is
   released on its fence after four tries (`channel=[unanswered:… dead:…]`).
@@ -234,7 +240,10 @@ divisor cap reads its target exactly.
   the rate is not a whole number of frames per source.
 
   The gate (`icd_shim/src/vsync_gate.rs`) is one regulator and one rule: a frame
-  may start `1e9 / limit` after the previous frame started, and not before.
+  may start one period after the previous frame started, and not before. The
+  period is `1e9 / limit`, measured in the panel's own periods when the session
+  has reported its latch grid (`pacing`): a limit the panel can express is
+  `n` panel periods, and one it cannot keeps its own `1e9 / limit`.
 
   ```
   gate:  while now < next_ns { wait until next_ns }
@@ -242,8 +251,30 @@ divisor cap reads its target exactly.
          late by >= one period: next_ns = now + period, and the skip is counted
   ```
 
+  A limit the panel can express *is* its vblank divisor: 60 on 120 Hz is two
+  periods, 40 is three, 30 is four. Snapping the period to a whole multiple of the
+  panel's is what stops the gate beating against the display. `1e9 / 120` is
+  8 333 333 ns against a measured 8 257 000 ns, which slips 76 us a frame and
+  sweeps the whole vblank interval every ~108 frames; the frames that land late of
+  their vblank then wait a second one, and a 120 cap reads 80 fps. Mapped to the
+  panel the phase never moves, and the cap reads the panel's own rate.
+
+  Two things follow. A mapped divisor cap reads above its nominal by the gap
+  between the panel's nominal rate and its measured period — 60.55 for a 60 cap on
+  a 121.1 Hz panel, 0.9 % — because the multiple is the measured period and not the
+  nominal one: the multiple is the only rate the panel can show, and rounding the
+  other way would cost a whole divisor. And a cap *within* 2 % of a multiple is
+  served at that multiple even when it is not one, so 119 on that panel reads 121
+  (+1.7 %) and 122 reads 121. That is the mapping's cost, and the alternative is
+  leaving the cap to beat against the panel, which costs a vblank per frame. A
+  limit further from a multiple — 90 on 120 Hz is 33 % off one — is left on its own
+  clock, because no multiple expresses it and its achieved rate is already
+  quantized by the display.
+
   So the limit is a maximum by construction — two releases are never closer than
-  one period. A frame that overshoots its release point by less than a period does
+  one booked period, and the booked period is the cap's own unless the panel can
+  express the cap, in which case it is the panel's multiple of it (the 0.9 % above).
+  A frame that overshoots its release point by less than a period does
   not move the grid: the following frame gets a proportionally shorter hold, which
   is what keeps the average *at* the limit instead of below it (`next_ns = now +
   period` lost 7 % to accumulated lateness). A stall of a whole period or more is a
@@ -251,15 +282,18 @@ divisor cap reads its target exactly.
   skip, so nothing repays itself with back-to-back releases. A game slower than the
   limit is never held, because its next acquire is already past `next_ns`.
 
-  Releases are *not* snapped to the display's vblank grid. A grid-snapped release
-  holds the phase but bounds only the average rate: a release a slot wait delayed
-  lands between vblanks, and the next booking on the following vblank could be a
-  fraction of a period later. Measured on this path at a 60 limit: 74.7 frames/s
-  with the gate holding 8 % of acquires. The daemon's latch grid is still used
-  where a phase is what is wanted — frame generation places its batches on it
-  (`docs/17`) — not to limit a rate.
+  What the grid decides is the *period*, never the booking. Releases are not
+  snapped individually: the schedule still advances `next_ns` by the whole period
+  from the release point, so a release a slot wait delayed keeps its slot's
+  timeline and cannot shrink its successor. The earlier grid snapped each
+  release to the next vblank and booked from there, which put the successor a
+  fraction of a period later — measured at a 60 limit: 74.7 frames/s with the gate
+  holding 8 % of acquires. Mapping the period instead makes every interval the
+  same length, so that leak has nowhere to come from, and `docs/15`'s "the cap's
+  timeline, placed on the grid" is the same statement in the other direction.
 
-  `gate=clock` is every gated session now; `gate=off` means no limit.
+  `gate=clock` is every gated session (`Pacing` has one gated form; the mapping
+  changes the period, not the kind of release); `gate=off` means no limit.
 
   The census says which path ran. Ungated, once when frames first flow and again
   whenever the declaration, its source, the cap, the limits or the gate changes:
@@ -268,7 +302,8 @@ divisor cap reads its target exactly.
   mailbox; `acquire` and `generate` are the limits in frames per second,
   `acquire=0` for none and `generate=0` for generation off; `gate=clock` is
   every session with a cap, whatever the display's rate — the gate books its own
-  grid at `1e9 / acquire_per_s` and does not defer to the compositor below a
+  grid at `1e9 / acquire_per_s`, mapped to whole panel periods when the session's
+  latch grid can express that rate, and does not defer to the compositor below a
   refresh divisor). With
   `GNDRM_LOG_VKSHIM=1` the same line repeats every 10 s with the counters a device
   run checks the pacing against: `acquires= commits= declared_fifo=
