@@ -301,6 +301,9 @@ const ALLOWED_COMMANDS: &[&str] = &[
     // Dirties the backend and re-polls it: the connector's mode list is read
     // again, so a rate the app changed mid-session becomes the mode.
     "backend_set_dirty",
+    // 0 = gamescope never draws the cursor, 1 = its default. The app sends 0
+    // when the user has the cursor hidden.
+    "cursor_composite",
 ];
 
 /// Whether the session is suspended. Under the `auto`/`manual` suspend policy
